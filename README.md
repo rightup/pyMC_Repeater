@@ -26,6 +26,40 @@ My hope is that **pyMC_repeater** serves as a solid, approachable foundation tha
 
 The repeater daemon runs continuously as a background process, forwarding LoRa packets using `pymc_core`'s Dispatcher and packet routing.
 
+Supported Hardware (Out of the Box)
+
+The following hardware is currently supported out-of-the-box:
+
+Waveshare LoRaWAN/GNSS HAT
+
+    Hardware: Waveshare SX1262 LoRa HAT
+    Platform: Raspberry Pi (or compatible single-board computer)
+    Frequency: 868MHz (EU) or 915MHz (US)
+    TX Power: Up to 22dBm
+    SPI Bus: SPI0
+    GPIO Pins: CS=21, Reset=18, Busy=20, IRQ=16
+
+HackerGadgets uConsole
+
+    Hardware: uConsole RTL-SDR/LoRa/GPS/RTC/USB Hub
+    Platform: Clockwork uConsole (Raspberry Pi CM4/CM5)
+    Frequency: 433/915MHz (configurable)
+    TX Power: Up to 22dBm
+    SPI Bus: SPI1
+    GPIO Pins: CS=-1, Reset=25, Busy=24, IRQ=26
+    Additional Setup: Requires SPI1 overlay and GPS/RTC configuration (see uConsole setup guide)
+
+Frequency Labs meshadv-mini
+
+    Hardware: FrequencyLabs meshadv-mini Hat
+    Platform: Raspberry Pi (or compatible single-board computer)
+    Frequency: 868MHz (EU) or 915MHz (US)
+    TX Power: Up to 22dBm
+    SPI Bus: SPI0
+    GPIO Pins: CS=8, Reset=24, Busy=20, IRQ=16
+
+
+
 ...
 
 ## Screenshots
