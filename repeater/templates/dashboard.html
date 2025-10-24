@@ -1,0 +1,712 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>pyMC Repeater Stats</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@3.9.1"></script>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="layout">
+        <!-- Navigation Component -->
+        <!-- NAVIGATION_PLACEHOLDER -->
+
+        <!-- Main Content -->
+        <main class="content">
+            <header>
+                <h1>Repeater Dashboard</h1>
+                <div class="header-info">
+                    <span>System Status: <strong>Active</strong></span>
+                    <span>Updated: <strong id="update-time">{{ last_updated }}</strong></span>
+                </div>
+            </header>
+
+            <!-- Stats Grid -->
+            <div class="stats-grid">
+                <div class="stat-card success">
+                    <div class="stat-label">RX Packets</div>
+                    <div class="stat-value" id="rx-count">{{ rx_count }}<span class="stat-unit">total</span></div>
+                </div>
+
+                <div class="stat-card success">
+                    <div class="stat-label">Forwarded</div>
+                    <div class="stat-value" id="forwarded-count">{{ forwarded_count }}<span class="stat-unit">packets</span></div>
+                </div>
+
+                <div class="stat-card warning">
+                    <div class="stat-label">Uptime</div>
+                    <div class="stat-value" id="uptime">{{ uptime_hours }}<span class="stat-unit">h</span></div>
+                </div>
+
+                <div class="stat-card error">
+                    <div class="stat-label">Dropped</div>
+                    <div class="stat-value" id="dropped-count">{{ dropped_count }}<span class="stat-unit">packets</span></div>
+                </div>
+            </div>
+
+            <!-- Charts Section -->
+            <h2>Performance Metrics</h2>
+            <div class="charts-grid">
+                <div class="chart-card">
+                    <h3>Packet Rate (RX/TX per hour)</h3>
+                    <div class="chart-container">
+                        <canvas id="packetRateChart"></canvas>
+                    </div>
+                </div>
+
+                <div class="chart-card">
+                    <h3>Signal Quality Distribution</h3>
+                    <div class="chart-container">
+                        <canvas id="signalQualityChart"></canvas>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Packets Table -->
+            <h2>Recent Packets</h2>
+            <div class="table-container">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Time</th>
+                            <th>Type</th>
+                            <th>Route</th>
+                            <th>Len</th>
+                            <th>Path / Hashes</th>
+                            <th>RSSI</th>
+                            <th>SNR</th>
+                            <th>Score</th>
+                            <th>TX Delay</th>
+                            <th>Status</th>
+                        </tr>
+                    </thead>
+                    <tbody id="packet-table">
+                        <tr>
+                            <td colspan="11" class="empty-message">
+                                No packets received yet - waiting for traffic...
+                            </td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+
+            <div class="refresh-info">
+                Real-time updates enabled
+            </div>
+        </main>
+    </div>
+
+    <script>
+        // Initialize charts
+        let packetRateChart = null;
+        let signalQualityChart = null;
+
+        function initCharts() {
+            const chartOptions = {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: {
+                    legend: {
+                        labels: {
+                            color: '#d4d4d4'
+                        }
+                    },
+                    filler: {
+                        propagate: true
+                    }
+                },
+                scales: {
+                    x: {
+                        ticks: { color: '#999' },
+                        grid: { color: '#333' }
+                    },
+                    y: {
+                        ticks: { color: '#999' },
+                        grid: { color: '#333' }
+                    }
+                }
+            };
+
+            // Packet rate chart
+            let packetRateCtx = document.getElementById('packetRateChart').getContext('2d');
+            packetRateChart = new Chart(packetRateCtx, {
+                type: 'line',
+                data: {
+                    labels: [],
+                    datasets: [
+                        {
+                            label: 'RX/hour',
+                            data: [],
+                            borderColor: '#4ec9b0',
+                            backgroundColor: 'rgba(78, 201, 176, 0.1)',
+                            borderWidth: 2,
+                            fill: true,
+                            tension: 0.4,
+                            pointBackgroundColor: '#4ec9b0',
+                            pointBorderColor: '#4ec9b0'
+                        },
+                        {
+                            label: 'TX/hour',
+                            data: [],
+                            borderColor: '#6a9955',
+                            backgroundColor: 'rgba(106, 153, 85, 0.1)',
+                            borderWidth: 2,
+                            fill: true,
+                            tension: 0.4,
+                            pointBackgroundColor: '#6a9955',
+                            pointBorderColor: '#6a9955'
+                        }
+                    ]
+                },
+                options: chartOptions
+            });
+
+            // Signal quality chart
+            let signalQualityCtx = document.getElementById('signalQualityChart').getContext('2d');
+            signalQualityChart = new Chart(signalQualityCtx, {
+                type: 'bar',
+                data: {
+                    labels: ['Excellent', 'Good', 'Fair', 'Poor'],
+                    datasets: [{
+                        label: 'Packet Count',
+                        data: [0, 0, 0, 0],
+                        backgroundColor: ['#6a9955', '#4ec9b0', '#dcdcaa', '#f48771'],
+                        borderRadius: 4
+                    }]
+                },
+                options: chartOptions
+            });
+        }
+
+        function updateStats() {
+            fetch('/api/stats')
+                .then(r => r.json())
+                .then(data => {
+                    // Update stat cards
+                    document.getElementById('rx-count').textContent = data.rx_count || 0;
+                    document.getElementById('forwarded-count').textContent = data.forwarded_count || 0;
+                    document.getElementById('dropped-count').textContent = data.dropped_count || 0;
+
+                    // Safely update uptime - handle missing or invalid values
+                    const uptimeSeconds = data.uptime_seconds || 0;
+                    const uptimeHours = Math.floor(uptimeSeconds / 3600);
+                    document.getElementById('uptime').innerHTML = uptimeHours + '<span class="stat-unit">h</span>';
+
+                    document.getElementById('update-time').textContent = new Date().toLocaleTimeString();
+
+                    // Update packet table with local hash for highlighting
+                    if (data.recent_packets) {
+                        const localHash = data.local_hash ? data.local_hash.replace('0x', '').toUpperCase() : null;
+                        updatePacketTable(data.recent_packets, localHash);
+                    }
+
+                    // Update charts
+                    updateCharts(data);
+                })
+                .catch(e => console.error('Error fetching stats:', e));
+        }
+
+
+        // Helper function to create signal strength bars with SNR value
+        function getSignalBars(snr, spreadingFactor = 8) {
+            // SNR thresholds per SF (matching engine.py)
+            const snrThresholds = {7: -7.5, 8: -10.0, 9: -12.5, 10: -15.0, 11: -17.5, 12: -20.0};
+            const threshold = snrThresholds[spreadingFactor] || -10.0;
+
+            let level, className;
+            if (snr >= threshold + 10) {
+                level = 4; className = 'signal-excellent';
+            } else if (snr >= threshold + 5) {
+                level = 3; className = 'signal-good';
+            } else if (snr >= threshold) {
+                level = 2; className = 'signal-fair';
+            } else {
+                level = 1; className = 'signal-poor';
+            }
+
+            return `<div class="signal-container">
+                <span class="signal-bars ${className}" title="Signal: ${className.replace('signal-', '')}">${'<span class="signal-bar"></span>'.repeat(4)}</span>
+                <span class="snr-value">${snr.toFixed(1)} dB</span>
+            </div>`;
+        }        function updatePacketTable(packets, localHash) {
+            const tbody = document.getElementById('packet-table');
+
+            if (!packets || packets.length === 0) {
+                tbody.innerHTML = `
+                    <tr>
+                        <td colspan="9" class="empty-message">
+                            No packets received yet - waiting for traffic...
+                        </td>
+                    </tr>
+                `;
+                return;
+            }
+
+            tbody.innerHTML = packets.slice(-20).map(pkt => {
+                const time = new Date(pkt.timestamp * 1000).toLocaleTimeString();
+                // Match pyMC_core PAYLOAD_TYPES exactly (from constants.py)
+                const typeNames = {
+                    0: 'REQ',
+                    1: 'RESPONSE',
+                    2: 'TXT_MSG',
+                    3: 'ACK',
+                    4: 'ADVERT',
+                    5: 'GRP_TXT',
+                    6: 'GRP_DATA',
+                    7: 'ANON_REQ',
+                    8: 'PATH',
+                    9: 'TRACE',
+                    15: 'RAW_CUSTOM'
+                };
+                const type = typeNames[pkt.type] || `0x${pkt.type.toString(16).toUpperCase()}`;
+                // Match pyMC_core ROUTE_TYPES exactly
+                const routeNames = {
+                    0: 'TRANSPORT_FLOOD',
+                    1: 'FLOOD',
+                    2: 'DIRECT',
+                    3: 'TRANSPORT_DIRECT'
+                };
+                const route = routeNames[pkt.route] || `UNKNOWN_${pkt.route}`;
+                const status = pkt.transmitted ? 'FORWARDED' : 'DROPPED';
+                const hasDuplicates = pkt.duplicates && pkt.duplicates.length > 0;
+
+                // Format path/hashes column - compact layout for mobile
+                let pathHashesHtml = '';
+
+                // Build path display with transformation
+                if (pkt.path_hash) {
+                    let pathDisplay = pkt.path_hash;
+                    if (localHash) {
+                        pathDisplay = pathDisplay.replace(
+                            new RegExp(`\\b${localHash}\\b`, 'g'),
+                            `<span class="my-hash" title="This repeater (${localHash})">${localHash}</span>`
+                        );
+                    }
+
+                    // Check if path was transformed
+                    if (pkt.transmitted && pkt.original_path && pkt.forwarded_path !== undefined && pkt.forwarded_path !== null) {
+                        const origPath = `[${pkt.original_path.join(', ')}]`;
+                        const fwdPath = pkt.forwarded_path.length > 0 ? `[${pkt.forwarded_path.join(', ')}]` : '[]';
+                        if (origPath !== fwdPath) {
+                            // Compact inline transformation
+                            pathHashesHtml = `<div class="path-info"><span class="path-hash">${pathDisplay}</span> <span class="path-arrow">→</span> <span class="path-hash">${fwdPath}</span></div>`;
+                        } else {
+                            pathHashesHtml = `<div class="path-info"><span class="path-hash">${pathDisplay}</span></div>`;
+                        }
+                    } else {
+                        pathHashesHtml = `<div class="path-info"><span class="path-hash">${pathDisplay}</span></div>`;
+                    }
+                }
+
+                // Add src→dst on separate line for clarity
+                if (pkt.src_hash && pkt.dst_hash) {
+                    pathHashesHtml += `<div class="route-info"><span class="src-dst-hash">${pkt.src_hash} ➜ ${pkt.dst_hash}</span></div>`;
+                } else if (pkt.src_hash || pkt.dst_hash) {
+                    pathHashesHtml += `<div class="route-info"><span class="src-dst-hash">${pkt.src_hash || '?'} ➜ ${pkt.dst_hash || '?'}</span></div>`;
+                }
+
+                if (!pathHashesHtml) {
+                    pathHashesHtml = '<span class="na">-</span>';
+                }
+
+                // Format status with drop reason on separate line
+                let statusHtml = `<span class="status-${status === 'FORWARDED' ? 'tx' : 'dropped'}">${status}</span>`;
+                if (!pkt.transmitted && pkt.drop_reason) {
+                    statusHtml += `<br><small class="drop-reason">${pkt.drop_reason}</small>`;
+                }
+                if (hasDuplicates) {
+                    statusHtml += ` <span class="dupe-badge">${pkt.duplicates.length} dupe${pkt.duplicates.length > 1 ? 's' : ''}</span>`;
+                }
+
+                let mainRow = `
+                    <tr class="${hasDuplicates ? 'has-duplicates' : ''}">
+                        <td data-label="Time">${time}</td>
+                        <td data-label="Type"><span class="packet-type">${type}</span></td>
+                        <td data-label="Route"><span class="route-${route.toLowerCase().replace('_', '-')}">${route}</span></td>
+                        <td data-label="Len">${pkt.length}B</td>
+                        <td data-label="Path/Hashes">${pathHashesHtml}</td>
+                        <td data-label="RSSI">${pkt.rssi}</td>
+                        <td data-label="SNR">${getSignalBars(pkt.snr)}</td>
+                        <td data-label="Score"><span class="score">${pkt.score.toFixed(2)}</span></td>
+                        <td data-label="TX Delay">${pkt.tx_delay_ms.toFixed(0)}ms</td>
+                        <td data-label="Status">${statusHtml}</td>
+                    </tr>
+                `;
+
+                // Add duplicate rows (always visible)
+                if (hasDuplicates) {
+                    mainRow += pkt.duplicates.map(dupe => {
+                        const dupeTime = new Date(dupe.timestamp * 1000).toLocaleTimeString();
+                        const dupeRoute = routeNames[dupe.route] || `UNKNOWN_${dupe.route}`;
+
+                        // Format duplicate path/hashes - match main row format
+                        let dupePathHashesHtml = '';
+                        if (dupe.path_hash) {
+                            let dupePathDisplay = dupe.path_hash;
+                            if (localHash) {
+                                dupePathDisplay = dupePathDisplay.replace(
+                                    new RegExp(`\\b${localHash}\\b`, 'g'),
+                                    `<span class="my-hash" title="This repeater (${localHash})">${localHash}</span>`
+                                );
+                            }
+                            dupePathHashesHtml = `<div class="path-info"><span class="path-hash">${dupePathDisplay}</span></div>`;
+                        }
+                        if (dupe.src_hash && dupe.dst_hash) {
+                            dupePathHashesHtml += `<div class="route-info"><span class="src-dst-hash">${dupe.src_hash} ➜ ${dupe.dst_hash}</span></div>`;
+                        } else if (dupe.src_hash || dupe.dst_hash) {
+                            dupePathHashesHtml += `<div class="route-info"><span class="src-dst-hash">${dupe.src_hash || '?'} ➜ ${dupe.dst_hash || '?'}</span></div>`;
+                        }
+                        if (!dupePathHashesHtml) {
+                            dupePathHashesHtml = '<span class="na">-</span>';
+                        }
+
+                        // Format duplicate status
+                        let dupeStatusHtml = '<span class="status-dropped">DROPPED</span>';
+                        if (dupe.drop_reason) {
+                            dupeStatusHtml += `<br><small class="drop-reason">${dupe.drop_reason}</small>`;
+                        }
+
+                        return `
+                            <tr class="duplicate-row">
+                                <td data-label="Time" style="padding-left: 30px;">↳ ${dupeTime}</td>
+                                <td data-label="Type"><span class="packet-type-dim">${type}</span></td>
+                                <td data-label="Route"><span class="route-${dupeRoute.toLowerCase().replace('_', '-')}">${dupeRoute}</span></td>
+                                <td data-label="Len">${dupe.length}B</td>
+                                <td data-label="Path/Hashes">${dupePathHashesHtml}</td>
+                                <td data-label="RSSI">${dupe.rssi}</td>
+                                <td data-label="SNR">${getSignalBars(dupe.snr)}</td>
+                                <td data-label="Score"><span class="score">${dupe.score.toFixed(2)}</span></td>
+                                <td data-label="TX Delay">${dupe.tx_delay_ms.toFixed(0)}ms</td>
+                                <td data-label="Status">${dupeStatusHtml}</td>
+                            </tr>
+                        `;
+                    }).join('');
+                }
+
+                return mainRow;
+            }).join('');
+        }
+
+        // Track previous values to detect changes
+        let lastRxPerHour = -1;
+        let lastTxPerHour = -1;
+
+        function updateCharts(data) {
+            if (!packetRateChart) return;
+
+            // Use actual hourly rates from backend (packets in last 3600 seconds)
+            const rxPerHour = data.rx_per_hour || 0;
+            const txPerHour = data.forwarded_per_hour || 0;
+
+            // Only update packet rate chart if values changed
+            if (rxPerHour !== lastRxPerHour || txPerHour !== lastTxPerHour) {
+                // Add current timestamp as label
+                const currentTime = new Date().toLocaleTimeString('en-US', {
+                    hour: '2-digit',
+                    minute: '2-digit',
+                    hour12: false
+                });
+
+                packetRateChart.data.labels.push(currentTime);
+                packetRateChart.data.datasets[0].data.push(rxPerHour);
+                packetRateChart.data.datasets[1].data.push(txPerHour);
+
+                // Keep only last 10 data points
+                if (packetRateChart.data.labels.length > 10) {
+                    packetRateChart.data.labels.shift();
+                    packetRateChart.data.datasets[0].data.shift();
+                    packetRateChart.data.datasets[1].data.shift();
+                }
+
+                packetRateChart.update();
+
+                lastRxPerHour = rxPerHour;
+                lastTxPerHour = txPerHour;
+            }
+
+            // Get recent packets for signal quality chart (still use last minute for responsiveness)
+            const now = Date.now() / 1000;
+            const recentPackets = (data.recent_packets || []).filter(p => now - p.timestamp < 60);
+
+            // Update signal quality distribution
+            const excellent = recentPackets.filter(p => p.score > 0.75).length;
+            const good = recentPackets.filter(p => p.score > 0.5 && p.score <= 0.75).length;
+            const fair = recentPackets.filter(p => p.score > 0.25 && p.score <= 0.5).length;
+            const poor = recentPackets.filter(p => p.score <= 0.25).length;
+
+            signalQualityChart.data.datasets[0].data = [excellent, good, fair, poor];
+            signalQualityChart.update();
+        }
+
+        // Handle Send Advert button
+        function sendAdvert() {
+            const btn = document.getElementById('send-advert-btn');
+            if (!btn) return;
+
+            const icon = btn.querySelector('.icon');
+            const iconHTML = icon ? icon.outerHTML : '';
+
+            btn.disabled = true;
+            btn.innerHTML = iconHTML + 'Sending...';
+
+            fetch('/api/send_advert', {
+                method: 'POST'
+            })
+            .then(r => r.json())
+            .then(data => {
+                if (data.success) {
+                    btn.innerHTML = iconHTML + 'Sent!';
+                    setTimeout(() => {
+                        btn.innerHTML = iconHTML + 'Send Advert';
+                        btn.disabled = false;
+                    }, 2000);
+                } else {
+                    btn.innerHTML = iconHTML + 'Error';
+                    console.error('Failed to send advert:', data.error);
+                    setTimeout(() => {
+                        btn.innerHTML = iconHTML + 'Send Advert';
+                        btn.disabled = false;
+                    }, 2000);
+                }
+            })
+            .catch(e => {
+                console.error('Error sending advert:', e);
+                btn.innerHTML = iconHTML + 'Error';
+                setTimeout(() => {
+                    btn.innerHTML = iconHTML + 'Send Advert';
+                    btn.disabled = false;
+                }, 2000);
+            });
+        }
+
+        // Initialize on load
+        document.addEventListener('DOMContentLoaded', () => {
+            initCharts();
+            updateStats();
+
+            // Auto-update every 5 seconds
+            setInterval(updateStats, 5000);
+
+            // Attach send advert button handler
+            const sendAdvertBtn = document.getElementById('send-advert-btn');
+            if (sendAdvertBtn) {
+                sendAdvertBtn.addEventListener('click', sendAdvert);
+            }
+        });
+    </script>
+
+    <style>
+        /* GitHub link styling */
+        .github-link {
+            display: inline-flex;
+            align-items: center;
+            margin-left: 12px;
+            color: #d4d4d4;
+            text-decoration: none;
+            transition: color 0.2s, transform 0.2s;
+            vertical-align: middle;
+        }
+        .github-link:hover {
+            color: #4ec9b0;
+            transform: scale(1.1);
+        }
+        .github-link svg {
+            display: block;
+        }
+
+        .has-duplicates {
+            border-left: 3px solid #4ec9b0;
+        }
+        .duplicate-row {
+            background-color: rgba(244, 135, 113, 0.05);
+        }
+        .duplicate-row td {
+            font-size: 0.9em;
+            color: #999;
+        }
+        .packet-type-dim {
+            opacity: 0.6;
+        }
+        .dupe-badge {
+            display: inline-block;
+            padding: 2px 6px;
+            background-color: rgba(244, 135, 113, 0.2);
+            border-radius: 3px;
+            font-size: 0.85em;
+            color: #f48771;
+            margin-left: 4px;
+        }
+        .status-dropped {
+            color: #f48771;
+            font-weight: 500;
+        }
+        .status-tx {
+            color: #4ade80;
+            font-weight: 500;
+        }
+        .hash {
+            font-family: 'Courier New', monospace;
+            font-size: 0.85em;
+            color: #4ec9b0;
+            background-color: rgba(78, 201, 176, 0.1);
+            padding: 2px 4px;
+            border-radius: 3px;
+        }
+
+        /* Signal strength bars */
+        .signal-container {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 2px;
+        }
+        .signal-bars {
+            display: inline-flex;
+            align-items: flex-end;
+            gap: 2px;
+            height: 14px;
+        }
+        .signal-bar {
+            width: 3px;
+            background-color: #333;
+            border-radius: 1px;
+            transition: background-color 0.3s;
+        }
+        .signal-bar:nth-child(1) { height: 25%; }
+        .signal-bar:nth-child(2) { height: 50%; }
+        .signal-bar:nth-child(3) { height: 75%; }
+        .signal-bar:nth-child(4) { height: 100%; }
+
+        /* Signal strength colors */
+        .signal-excellent .signal-bar { background-color: #4ade80; }
+        .signal-good .signal-bar:nth-child(-n+3) { background-color: #4ade80; }
+        .signal-fair .signal-bar:nth-child(-n+2) { background-color: #fbbf24; }
+        .signal-poor .signal-bar:nth-child(1) { background-color: #f48771; }
+
+        /* SNR value styling */
+        .snr-value {
+            font-size: 0.8em;
+            color: #999;
+            white-space: nowrap;
+        }        /* Path/Hashes column layout */
+        .path-info {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+            flex-wrap: nowrap;
+            margin-bottom: 4px;
+            font-size: 0.85em;
+        }
+        .route-info {
+            font-size: 0.9em;
+            opacity: 0.85;
+        }
+        .path-hash {
+            font-family: 'Courier New', monospace;
+            font-size: 0.85em;
+            color: #dcdcaa;
+            background: rgba(220, 220, 170, 0.1);
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-weight: 500;
+            white-space: nowrap;
+            border: 1px solid rgba(220, 220, 170, 0.2);
+        }
+        .path-arrow {
+            color: #4ec9b0;
+            font-weight: bold;
+            font-size: 1.1em;
+            padding: 0 2px;
+        }
+        .my-hash {
+            background: rgba(86, 156, 214, 0.2);
+            color: #569cd6;
+            font-weight: 700;
+            padding: 2px 6px;
+            border-radius: 4px;
+            border: 1px solid rgba(86, 156, 214, 0.4);
+        }
+        .src-dst-hash {
+            font-family: 'Courier New', monospace;
+            font-size: 0.85em;
+            color: #4ec9b0;
+            font-weight: 500;
+            white-space: nowrap;
+        }
+
+        /* Make the arrow larger and more visible */
+        td {
+            line-height: 1.4;
+        }
+        .drop-reason {
+            color: #888;
+            font-size: 0.8em;
+            font-style: italic;
+            display: block;
+            margin-top: 2px;
+        }
+        .na {
+            color: #666;
+            font-style: italic;
+        }
+
+        /* Mobile optimization */
+        @media (max-width: 768px) {
+            /* Keep path info on same line, allow wrapping if needed */
+            .path-info {
+                flex-wrap: wrap;
+                gap: 4px;
+                margin-bottom: 6px;
+            }
+
+            .path-hash {
+                font-size: 0.8em;
+                padding: 3px 6px;
+                max-width: 100%;
+                overflow: hidden;
+                text-overflow: ellipsis;
+            }
+
+            .my-hash {
+                font-size: 0.8em;
+                padding: 3px 6px;
+            }
+
+            .route-info {
+                font-size: 0.85em;
+                margin-top: 2px;
+            }
+
+            .src-dst-hash {
+                font-size: 0.8em;
+                padding: 2px 6px;
+                background: rgba(78, 201, 176, 0.15);
+                border-radius: 4px;
+                border: 1px solid rgba(78, 201, 176, 0.3);
+            }
+
+            /* Better mobile card spacing */
+            tbody tr {
+                padding: var(--spacing-md);
+            }
+
+            td[data-label="Path/Hashes"] {
+                display: block;
+                width: 100%;
+                margin-top: 8px;
+                padding-top: 8px;
+                border-top: 1px solid rgba(255, 255, 255, 0.1);
+            }
+
+            td[data-label="Status"] {
+                display: block;
+                width: 100%;
+                margin-top: 8px;
+                padding-top: 8px;
+                border-top: 1px solid rgba(255, 255, 255, 0.1);
+            }
+        }
+    </style>
+</body>
+</html>

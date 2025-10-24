@@ -1,0 +1,102 @@
+# Default Repeater Configuration
+
+repeater:
+  # Node name for logging and identification
+  node_name: "mesh-repeater-01"
+
+  # Geographic location (optional)
+  # Latitude in decimal degrees (-90 to 90)
+  latitude: 0.0
+  # Longitude in decimal degrees (-180 to 180)
+  longitude: 0.0
+
+  # Path to identity file (public/private key)
+  # If not specified, a new identity will be generated
+  identity_file: null
+
+  # Duplicate packet cache TTL in seconds
+  cache_ttl: 60
+
+  # Score-based transmission filtering
+  # Enable quality-based packet filtering and adaptive delays
+  use_score_for_tx: false
+
+  # Score threshold for quality monitoring (future use)
+  # Currently reserved for potential future features like dashboard alerts,
+  # proactive statistics collection, or advanced filtering strategies.
+  # Changing this value has no effect on current packet processing.
+  score_threshold: 0.3
+
+  # Automatic advertisement interval in hours
+  # The repeater will send an advertisement packet at this interval
+  # Set to 0 to disable automatic adverts (manual only via web interface)
+  # Range: 0 (disabled) to 24+ hours
+  # Recommended: 10 hours for typical deployments
+  send_advert_interval_hours: 10
+
+radio:
+  # Frequency in Hz (869.618 MHz for EU)
+  frequency: 869618000
+
+  # TX power in dBm
+  tx_power: 14
+
+  # Bandwidth in Hz (62500 = 62.5 kHz)
+  bandwidth: 62500
+
+  # LoRa spreading factor (7-12)
+  spreading_factor: 8
+
+  # Coding rate (5-8)
+  coding_rate: 8
+
+  # Preamble length in symbols
+  preamble_length: 17
+
+  # Sync word (LoRa network ID)
+  sync_word: 13380
+
+  # Enable CRC checking
+  crc_enabled: true
+
+  # Use implicit header mode
+  implicit_header: false
+
+# SX1262 Hardware Configuration
+sx1262:
+  # SPI bus and chip select
+  bus_id: 0
+  cs_id: 0
+
+  # GPIO pins (BCM numbering)
+  cs_pin: 21
+  reset_pin: 18
+  busy_pin: 20
+  irq_pin: 16
+
+  # TX/RX enable pins (-1 to disable)
+  txen_pin: -1
+  rxen_pin: -1
+
+  # Waveshare hardware flag
+  is_waveshare: false
+
+delays:
+  # TX delay factor for flood mode (multiplier)
+  tx_delay_factor: 1.0
+
+  # TX delay factor for direct mode (faster)
+  direct_tx_delay_factor: 0.5
+
+duty_cycle:
+  # Maximum airtime per minute in milliseconds
+  # US/AU FCC limit: 100% duty cycle (3600ms/min)
+  # EU ETSI limit: 1% duty cycle (36ms/min)
+  max_airtime_per_minute: 3600
+
+logging:
+  # Log level: DEBUG, INFO, WARNING, ERROR
+  level: INFO
+
+  # Log format
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"

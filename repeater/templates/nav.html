@@ -1,0 +1,432 @@
+<!-- Shared Navigation Component -->
+<aside class="sidebar" id="sidebar">
+    <div class="sidebar-header">
+        <h1>pyMC Repeater</h1>
+        <button class="menu-toggle" id="menu-toggle" aria-label="Toggle menu">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <line x1="3" y1="6" x2="21" y2="6"></line>
+                <line x1="3" y1="12" x2="21" y2="12"></line>
+                <line x1="3" y1="18" x2="21" y2="18"></line>
+            </svg>
+        </button>
+        <div class="node-name">Node: {{ node_name }}</div>
+        <div class="node-pubkey">&lt;{{ pub_key }}&gt;</div>
+    </div>
+
+    <div class="sidebar-content-wrapper">
+        <nav class="sidebar-nav">
+        <div class="nav-section">
+            <div class="nav-section-title">Actions</div>
+            <button id="send-advert-btn" class="nav-item nav-action">
+                <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                    <circle cx="12" cy="12" r="10"></circle>
+                    <polyline points="12 6 12 12 16 14"></polyline>
+                </svg>
+                Send Advert
+            </button>
+        </div>
+
+        <div class="nav-section">
+            <div class="nav-section-title">Monitoring</div>
+            <a href="/" class="nav-item{{ ' active' if page == 'dashboard' else '' }}">
+                <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                    <rect x="3" y="3" width="7" height="7"></rect>
+                    <rect x="14" y="3" width="7" height="7"></rect>
+                    <rect x="14" y="14" width="7" height="7"></rect>
+                    <rect x="3" y="14" width="7" height="7"></rect>
+                </svg>
+                Dashboard
+            </a>
+            <a href="/neighbors" class="nav-item{{ ' active' if page == 'neighbors' else '' }}">
+                <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path>
+                    <circle cx="9" cy="7" r="4"></circle>
+                    <path d="M23 21v-2a4 4 0 0 0-3-3.87"></path>
+                    <path d="M16 3.13a4 4 0 0 1 0 7.75"></path>
+                </svg>
+                Neighbors
+            </a>
+            <a href="/statistics" class="nav-item{{ ' active' if page == 'statistics' else '' }}">
+                <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                    <line x1="12" y1="2" x2="12" y2="22"></line>
+                    <path d="M17 8v12"></path>
+                    <path d="M7 14v6"></path>
+                </svg>
+                Statistics
+            </a>
+        </div>
+
+        <div class="nav-section">
+            <div class="nav-section-title">System</div>
+            <a href="/configuration" class="nav-item{{ ' active' if page == 'configuration' else '' }}">
+                <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 1 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"></path>
+                </svg>
+                Configuration
+            </a>
+            <a href="/logs" class="nav-item{{ ' active' if page == 'logs' else '' }}">
+                <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+                    <polyline points="14 2 14 8 20 8"></polyline>
+                    <line x1="12" y1="13" x2="16" y2="13"></line>
+                    <line x1="12" y1="17" x2="16" y2="17"></line>
+                </svg>
+                Logs
+            </a>
+            <a href="/help" class="nav-item{{ ' active' if page == 'help' else '' }}">
+                <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                    <circle cx="12" cy="12" r="10"></circle>
+                    <path d="M12 16v-4"></path>
+                    <path d="M12 8h.01"></path>
+                </svg>
+                Help
+            </a>
+        </div>
+    </nav>
+
+    <div class="sidebar-footer">
+        <div style="display: flex; gap: 8px; align-items: center; margin-bottom: var(--spacing-md);">
+            <div class="status-badge" id="status-badge" title="System operational status">Online</div>
+            <div class="version-badge" id="version-badge" title="Software version">v1.0.0</div>
+        </div>
+
+        <!-- Mode Toggle Buttons -->
+        <div class="control-buttons">
+            <button class="control-btn" id="mode-toggle-btn" title="Toggle between Forward and Monitor modes">
+                <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <polyline points="17 1 21 5 17 9"></polyline>
+                    <path d="M3 11V9a4 4 0 0 1 4-4h14"></path>
+                    <polyline points="7 23 3 19 7 15"></polyline>
+                    <path d="M21 13v2a4 4 0 0 1-4 4H3"></path>
+                </svg>
+                <span class="control-label">
+                    <span class="control-title">Mode</span>
+                    <span class="control-value" id="mode-status">Forward</span>
+                </span>
+            </button>
+
+            <button class="control-btn" id="duty-cycle-toggle-btn" title="Toggle duty cycle enforcement">
+                <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M22 12h-4l-3 9L9 3l-3 9H2"></path>
+                </svg>
+                <span class="control-label">
+                    <span class="control-title">Duty Cycle</span>
+                    <span class="control-value" id="duty-cycle-status">Enabled</span>
+                </span>
+            </button>
+        </div>
+
+        <div class="duty-cycle-stats">
+            <div class="duty-cycle-bar-container">
+                <div class="duty-cycle-bar" id="duty-cycle-bar"></div>
+            </div>
+            <small class="duty-cycle-text">
+                Duty Cycle: <strong id="duty-utilization">0.0%</strong> / <span id="duty-max">10.0%</span>
+            </small>
+        </div>
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 8px;">
+            <small>Last updated: <span id="footer-update-time">{{ last_updated }}</span></small>
+            <a href="https://github.com/rightup" target="_blank" class="github-link" title="GitHub">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                    <path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z"/>
+                </svg>
+            </a>
+        </div>
+    </div>
+    </div> <!-- Close sidebar-content-wrapper -->
+</aside>
+
+<style>
+    /* GitHub link styling */
+    .github-link {
+        display: inline-flex;
+        align-items: center;
+        color: #d4d4d4;
+        text-decoration: none;
+        transition: color 0.2s, transform 0.2s;
+    }
+    .github-link:hover {
+        color: #4ec9b0;
+        transform: scale(1.1);
+    }
+    .github-link svg {
+        display: block;
+    }
+</style>
+
+<script>
+    // Mobile menu toggle
+    const menuToggle = document.getElementById('menu-toggle');
+    const sidebar = document.getElementById('sidebar');
+
+    if (menuToggle) {
+        menuToggle.addEventListener('click', () => {
+            sidebar.classList.toggle('menu-open');
+
+            // Prevent body scroll when menu is open on mobile
+            if (sidebar.classList.contains('menu-open')) {
+                document.body.style.overflow = 'hidden';
+            } else {
+                document.body.style.overflow = '';
+            }
+        });
+
+        // Close menu when clicking nav items
+        const navItems = sidebar.querySelectorAll('.nav-item, .nav-action');
+        navItems.forEach(item => {
+            item.addEventListener('click', () => {
+                sidebar.classList.remove('menu-open');
+                document.body.style.overflow = '';
+            });
+        });
+    }
+
+    // Update footer stats periodically
+    function updateFooterStats() {
+        fetch('/api/stats')
+            .then(r => r.json())
+            .then(data => {
+                // Update version badge
+                if (data.version) {
+                    document.getElementById('version-badge').textContent = 'v' + data.version;
+                }
+
+                // Update duty cycle
+                const utilization = data.utilization_percent || 0;
+                const maxPercent = data.config?.duty_cycle?.max_airtime_percent || 10;
+
+                document.getElementById('duty-utilization').textContent = utilization.toFixed(1) + '%';
+                document.getElementById('duty-max').textContent = maxPercent.toFixed(1) + '%';
+
+                // Update progress bar
+                const percentage = Math.min((utilization / maxPercent) * 100, 100);
+                const bar = document.getElementById('duty-cycle-bar');
+                bar.style.width = percentage + '%';
+
+                // Set minimum width so it's always visible
+                if (percentage === 0) {
+                    bar.style.width = '100%';
+                    bar.style.backgroundColor = '#4ade80'; // Green - plenty of capacity
+                } else {
+                    // Color code the bar based on usage
+                    if (percentage > 90) {
+                        bar.style.backgroundColor = '#f48771'; // Red - critical
+                    } else if (percentage > 70) {
+                        bar.style.backgroundColor = '#dcdcaa'; // Yellow - warning
+                    } else {
+                        bar.style.backgroundColor = '#4ade80'; // Green - good
+                    }
+                }
+
+                // Update control button states from config
+                const mode = data.config?.repeater?.mode || 'forward';
+                const dutyCycleEnabled = data.config?.duty_cycle?.enforcement_enabled !== false;
+
+                // Update status badge based on mode and duty cycle
+                const statusBadge = document.getElementById('status-badge');
+                if (mode === 'monitor') {
+                    statusBadge.textContent = 'Monitor Mode';
+                    statusBadge.style.backgroundColor = '#d97706'; // Orange for monitor
+                    statusBadge.style.color = '#ffffff'; // White text
+                    statusBadge.title = 'Monitoring only - not forwarding packets';
+                } else if (!dutyCycleEnabled) {
+                    statusBadge.textContent = 'No Limits';
+                    statusBadge.style.backgroundColor = '#dc2626'; // Red for unlimited
+                    statusBadge.style.color = '#ffffff'; // White text
+                    statusBadge.title = 'Forwarding without duty cycle enforcement';
+                } else {
+                    statusBadge.textContent = 'Active';
+                    statusBadge.style.backgroundColor = '#10b981'; // Green for normal
+                    statusBadge.style.color = '#ffffff'; // White text
+                    statusBadge.title = 'Forwarding with duty cycle enforcement';
+                }
+
+                document.getElementById('mode-status').textContent =
+                    mode.charAt(0).toUpperCase() + mode.slice(1);
+                document.getElementById('duty-cycle-status').textContent =
+                    dutyCycleEnabled ? 'Enabled' : 'Disabled';
+
+                // Update button states
+                const modeBtn = document.getElementById('mode-toggle-btn');
+                const dutyBtn = document.getElementById('duty-cycle-toggle-btn');
+
+                if (mode === 'monitor') {
+                    modeBtn.classList.add('control-btn-warning');
+                    modeBtn.classList.remove('control-btn-active');
+                } else {
+                    modeBtn.classList.add('control-btn-active');
+                    modeBtn.classList.remove('control-btn-warning');
+                }
+
+                if (!dutyCycleEnabled) {
+                    dutyBtn.classList.add('control-btn-warning');
+                    dutyBtn.classList.remove('control-btn-active');
+                } else {
+                    dutyBtn.classList.add('control-btn-active');
+                    dutyBtn.classList.remove('control-btn-warning');
+                }
+
+                // Update timestamp
+                document.getElementById('footer-update-time').textContent = new Date().toLocaleTimeString();
+            })
+            .catch(e => console.error('Error updating footer stats:', e));
+    }
+
+    // Handle Send Advert button - works on all pages
+    function sendAdvert() {
+        const btn = document.getElementById('send-advert-btn');
+        if (!btn) return;
+
+        const icon = btn.querySelector('.icon');
+        const iconHTML = icon ? icon.outerHTML : '';
+
+        btn.disabled = true;
+        btn.innerHTML = iconHTML + 'Sending...';
+
+        fetch('/api/send_advert', {
+            method: 'POST'
+        })
+        .then(r => r.json())
+        .then(data => {
+            if (data.success) {
+                btn.innerHTML = iconHTML + 'Sent!';
+                setTimeout(() => {
+                    btn.innerHTML = iconHTML + 'Send Advert';
+                    btn.disabled = false;
+                }, 2000);
+            } else {
+                btn.innerHTML = iconHTML + 'Error';
+                console.error('Failed to send advert:', data.error);
+                setTimeout(() => {
+                    btn.innerHTML = iconHTML + 'Send Advert';
+                    btn.disabled = false;
+                }, 2000);
+            }
+        })
+        .catch(e => {
+            console.error('Error sending advert:', e);
+            btn.innerHTML = iconHTML + 'Error';
+            setTimeout(() => {
+                btn.innerHTML = iconHTML + 'Send Advert';
+                btn.disabled = false;
+            }, 2000);
+        });
+    }
+
+    // Mode toggle handler
+    function toggleMode() {
+        const btn = document.getElementById('mode-toggle-btn');
+        const statusText = document.getElementById('mode-status');
+        const currentMode = statusText.textContent.toLowerCase();
+        const newMode = currentMode === 'forward' ? 'monitor' : 'forward';
+
+        btn.disabled = true;
+        statusText.textContent = 'Changing...';
+
+        fetch('/api/set_mode', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ mode: newMode })
+        })
+        .then(r => r.json())
+        .then(data => {
+            if (data.success) {
+                statusText.textContent = newMode.charAt(0).toUpperCase() + newMode.slice(1);
+                updateFooterStats(); // Refresh to get updated state
+            } else {
+                statusText.textContent = currentMode.charAt(0).toUpperCase() + currentMode.slice(1);
+                alert('Failed to change mode: ' + (data.error || 'Unknown error'));
+            }
+        })
+        .catch(e => {
+            console.error('Error toggling mode:', e);
+            statusText.textContent = currentMode.charAt(0).toUpperCase() + currentMode.slice(1);
+            alert('Failed to change mode');
+        })
+        .finally(() => {
+            btn.disabled = false;
+        });
+    }
+
+    // Duty cycle toggle handler
+    function toggleDutyCycle() {
+        const btn = document.getElementById('duty-cycle-toggle-btn');
+        const statusText = document.getElementById('duty-cycle-status');
+        const currentEnabled = statusText.textContent === 'Enabled';
+        const newEnabled = !currentEnabled;
+
+        btn.disabled = true;
+        statusText.textContent = 'Changing...';
+
+        fetch('/api/set_duty_cycle', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ enabled: newEnabled })
+        })
+        .then(r => r.json())
+        .then(data => {
+            if (data.success) {
+                statusText.textContent = newEnabled ? 'Enabled' : 'Disabled';
+                updateFooterStats(); // Refresh to get updated state
+            } else {
+                statusText.textContent = currentEnabled ? 'Enabled' : 'Disabled';
+                alert('Failed to change duty cycle: ' + (data.error || 'Unknown error'));
+            }
+        })
+        .catch(e => {
+            console.error('Error toggling duty cycle:', e);
+            statusText.textContent = currentEnabled ? 'Enabled' : 'Disabled';
+            alert('Failed to change duty cycle');
+        })
+        .finally(() => {
+            btn.disabled = false;
+        });
+    }
+
+    // Update immediately and then every 5 seconds
+    document.addEventListener('DOMContentLoaded', () => {
+        updateFooterStats();
+        setInterval(updateFooterStats, 5000);
+
+        // Attach toggle button handlers
+        const modeBtn = document.getElementById('mode-toggle-btn');
+        const dutyBtn = document.getElementById('duty-cycle-toggle-btn');
+        const sendAdvertBtn = document.getElementById('send-advert-btn');
+
+        if (modeBtn) {
+            modeBtn.addEventListener('click', toggleMode);
+        }
+
+        if (dutyBtn) {
+            dutyBtn.addEventListener('click', toggleDutyCycle);
+        }
+
+        // Attach send advert button handler - works on all pages
+        if (sendAdvertBtn) {
+            sendAdvertBtn.addEventListener('click', sendAdvert);
+        }
+    });
+
+    // Add data-label attributes to table cells for mobile display
+    function initMobileTableLabels() {
+        const tables = document.querySelectorAll('table');
+        tables.forEach(table => {
+            const headers = [];
+
+            // Get all header text
+            table.querySelectorAll('thead th').forEach(th => {
+                headers.push(th.textContent.trim());
+            });
+
+            // Add data-label to each cell
+            table.querySelectorAll('tbody td').forEach((td, index) => {
+                const headerIndex = index % headers.length;
+                if (headers[headerIndex]) {
+                    td.setAttribute('data-label', headers[headerIndex]);
+                }
+            });
+        });
+    }
+
+    document.addEventListener('DOMContentLoaded', initMobileTableLabels);
+</script>

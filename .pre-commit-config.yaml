@@ -1,0 +1,40 @@
+# Pre-commit hooks for mc_repeater
+# Install: pip install pre-commit
+# Setup: pre-commit install
+# Run manually: pre-commit run --all-files
+
+repos:
+  # Generic file hygiene checks
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.4.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-added-large-files
+
+  # Python formatting (Black) - apply to all Python files
+  - repo: https://github.com/psf/black
+    rev: 24.4.2
+    hooks:
+      - id: black
+        language_version: python3
+        args: ["--line-length=100"]
+
+  # Python import sorting (isort) - apply to all Python files
+  - repo: https://github.com/pycqa/isort
+    rev: 5.13.2
+    hooks:
+      - id: isort
+        args: ["--profile", "black", "--line-length=100"]
+
+  # Python linting (flake8) - strict settings for code quality
+  - repo: https://github.com/pycqa/flake8
+    rev: 6.0.0
+    hooks:
+      - id: flake8
+        # Strict but reasonable settings
+        args: [
+          "--max-line-length=100",
+          "--extend-ignore=E203,W503"
+        ]
