@@ -99,7 +99,7 @@ echo ""
 
 # Fetch config from API with 5 second timeout, fallback to local file
 echo "Fetching radio settings from API..."
-API_RESPONSE=$(curl -s --max-time 5 https://api.meshcore2.nz/api/v1/config 2>/dev/null)
+API_RESPONSE=$(curl -s --max-time 5 https://api.meshcore.nz/api/v1/config 2>/dev/null)
 
 if [ -z "$API_RESPONSE" ]; then
     echo "Warning: Failed to fetch configuration from API (timeout or error)"
