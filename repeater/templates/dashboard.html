@@ -316,7 +316,7 @@
                     statusHtml += `<br><small class="drop-reason">${pkt.drop_reason}</small>`;
                 }
                 if (hasDuplicates) {
-                    statusHtml += ` <span class="dupe-badge">${pkt.duplicates.length} dupe${pkt.duplicates.length > 1 ? 's' : ''}</span>`;
+                    statusHtml += ` <span class="dupe-badge">${pkt.duplicates.length} Repeat ${pkt.duplicates.length > 1 ? 's' : ''}</span>`;
                 }
 
                 let mainRow = `

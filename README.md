@@ -58,6 +58,14 @@ Frequency Labs meshadv-mini
     SPI Bus: SPI0
     GPIO Pins: CS=8, Reset=24, Busy=20, IRQ=16
 
+Frequency Labs meshadv
+
+    Hardware: FrequencyLabs meshadv-mini Hat
+    Platform: Raspberry Pi (or compatible single-board computer)
+    Frequency: 868MHz (EU) or 915MHz (US)
+    TX Power: Up to 22dBm
+    SPI Bus: SPI0
+    GPIO Pins: CS=21, Reset=18, Busy=20, IRQ=16, TXEN=13, RXEN=12
 
 
 ...
@@ -118,7 +126,28 @@ To reconfigure radio and hardware settings after installation, run:
 ```bash
 sudo bash setup-radio-config.sh /etc/pymc_repeater
 sudo systemctl restart pymc-repeater
+
 ```
+## Upgrading
+
+To upgrade an existing installation to the latest version:
+
+```bash
+# Navigate to your pyMC_Repeater directory
+cd pyMC_Repeater
+
+# Run the upgrade script
+sudo ./upgrade.sh
+```
+
+The upgrade script will:
+- Pull the latest code from the main branch
+- Update all application files
+- Upgrade Python dependencies if needed
+- Restart the service automatically
+- Preserve your existing configuration
+
+
 
 
 ## Uninstallation
@@ -196,3 +225,7 @@ Pre-commit hooks will automatically:
 ## License
 
 This project is licensed under the MIT License - see the LICENSE file for details.
+
+
+
+
