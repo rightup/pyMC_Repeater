@@ -216,8 +216,8 @@
                     icon: L.divIcon({
                         className: 'snr-label',
                         html: `<div class="snr-text">${neighbor.snr ? neighbor.snr.toFixed(1) + ' dB' : 'N/A'}</div>`,
-                        iconSize: [50, 20],
-                        iconAnchor: [25, 10]
+                        iconSize: [65, 24],
+                        iconAnchor: [32, 12]
                     })
                 }).addTo(map);
 
@@ -531,11 +531,13 @@
             border: 1px solid var(--color-border) !important;
             border-radius: var(--radius-md) !important;
             box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3) !important;
+            padding: 0 !important;
         }
 
         .leaflet-popup-content {
             color: var(--color-text-primary) !important;
             margin: 0 !important;
+            padding: 12px 16px !important;
             font-size: 0.9rem;
             line-height: 1.8;
         }
@@ -576,13 +578,15 @@
         .snr-text {
             background: rgba(30, 30, 30, 0.85);
             color: #4ec9b0;
-            padding: 2px 6px;
+            padding: 4px 8px;
             border-radius: 3px;
             font-size: 0.75rem;
             font-weight: 600;
             border: 1px solid #4ec9b0;
             white-space: nowrap;
             text-align: center;
+            display: inline-block;
+            min-width: 55px;
         }
 
         @media (max-width: 768px) {
