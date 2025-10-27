@@ -215,9 +215,9 @@
                 const snrLabel = L.marker([midLat, midLng], {
                     icon: L.divIcon({
                         className: 'snr-label',
-                        html: `<div class="snr-text">${neighbor.snr ? neighbor.snr.toFixed(1) : 'N/A'}</div>`,
-                        iconSize: [40, 20],
-                        iconAnchor: [20, 10]
+                        html: `<div class="snr-text">${neighbor.snr ? neighbor.snr.toFixed(1) + ' dB' : 'N/A'}</div>`,
+                        iconSize: [50, 20],
+                        iconAnchor: [25, 10]
                     })
                 }).addTo(map);
 
@@ -530,21 +530,42 @@
             background: var(--color-bg-secondary) !important;
             border: 1px solid var(--color-border) !important;
             border-radius: var(--radius-md) !important;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3) !important;
         }
 
         .leaflet-popup-content {
             color: var(--color-text-primary) !important;
             margin: 0 !important;
-            font-size: 0.85rem;
+            font-size: 0.9rem;
+            line-height: 1.8;
         }
 
         .leaflet-popup-content strong {
             color: #4ec9b0 !important;
+            font-size: 1.05rem;
+            display: block;
+            margin-bottom: 8px;
+        }
+
+        .leaflet-popup-content br {
+            content: '';
+            display: block;
+            margin: 4px 0;
+        }
+
+        .leaflet-popup-content-wrapper a.leaflet-popup-close-button {
+            color: var(--color-text-tertiary) !important;
+            opacity: 0.6;
+        }
+
+        .leaflet-popup-content-wrapper a.leaflet-popup-close-button:hover {
+            opacity: 1;
         }
 
         .leaflet-popup-tip {
             background: var(--color-bg-secondary) !important;
             border: 1px solid var(--color-border) !important;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2) !important;
         }
 
         .snr-label {
