@@ -67,6 +67,7 @@ Frequency Labs meshadv
     SPI Bus: SPI0
     GPIO Pins: CS=21, Reset=18, Busy=20, IRQ=16, TXEN=13, RXEN=12
 
+
 ...
 
 ## Screenshots
