@@ -85,22 +85,18 @@
     </nav>
 
     <!-- Noise Floor Display -->
+        <div class="noise-floor-display">
+            <div class="noise-floor-label">RF Noise Floor</div>
+            <div class="noise-floor-value">
+                <span id="noise-floor-value">--</span>
+                <span class="noise-floor-unit">dBm</span>
+            </div>
+            <div class="noise-floor-sparkline-container">
+                <svg id="noise-floor-sparkline" width="220" height="48" viewBox="0 0 220 48" preserveAspectRatio="none"></svg>
+            </div>
+        </div>
 
-    <div class="noise-floor-display">
-        <div class="noise-floor-label">RF Noise Floor</div>
-        <div class="noise-floor-value">
-            <span id="noise-floor-value">--</span>
-            <span class="noise-floor-unit">dBm</span>
-        </div>
-        <div class="noise-floor-bar-container">
-            <div class="noise-floor-bar" id="noise-floor-bar"></div>
-        </div>
-        <div class="noise-floor-sparkline-container">
-            <svg id="noise-floor-sparkline" width="100" height="24" viewBox="0 0 100 24" preserveAspectRatio="none"></svg>
-        </div>
-    </div>
-
-    <div class="sidebar-footer">
+        <div class="sidebar-footer">
 
 
 
@@ -176,16 +172,16 @@
     /* Noise Floor Display Styling */
     .noise-floor-sparkline-container {
         width: 100%;
-        height: 24px;
-        margin-top: 4px;
+        height: 56px;
+        margin-top: 8px;
         background: none;
         display: flex;
         align-items: center;
-        justify-content: flex-end;
+        justify-content: center;
     }
     #noise-floor-sparkline {
-        width: 100px;
-        height: 24px;
+        width: 220px;
+        height: 48px;
         display: block;
         background: none;
     }
@@ -229,22 +225,8 @@
         margin-left: 0.125rem;
     }
 
-    .noise-floor-bar-container {
-        width: 100%;
-        height: 4px;
-        background-color: rgba(255, 255, 255, 0.1);
-        border-radius: 2px;
-        overflow: hidden;
-        position: relative;
-    }
-
-    .noise-floor-bar {
-        height: 100%;
-        background: linear-gradient(90deg, #4ade80 0%, #4ec9b0 50%, #dcdcaa 75%, #f48771 100%);
-        border-radius: 2px;
-        transition: width 0.5s ease;
-        width: 0%;
-    }
+    /* Remove noise floor bar styling */
+    .noise-floor-bar-container, .noise-floor-bar { display: none !important; }
 
     /* Color states for noise floor value */
     #noise-floor-value.excellent {
@@ -310,7 +292,7 @@
     function renderNoiseFloorSparkline() {
         const svg = document.getElementById('noise-floor-sparkline');
         if (!svg) return;
-        const w = 100, h = 24;
+        const w = 220, h = 48;
         const minDbm = -120, maxDbm = -80;
         if (noiseFloorHistory.length < 2) {
             svg.innerHTML = '';
@@ -328,7 +310,7 @@
         for (let i = 1; i < points.length; i++) {
             path += ` L${points[i][0]},${points[i][1]}`;
         }
-        svg.innerHTML = `<path d="${path}" fill="none" stroke="#4ec9b0" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />`;
+        svg.innerHTML = `<path d="${path}" fill="none" stroke="#4ec9b0" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" />`;
     }
 
     function updateFooterStats() {
