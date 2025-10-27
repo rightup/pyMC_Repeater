@@ -2,7 +2,7 @@ import asyncio
 import logging
 import time
 from collections import OrderedDict
-from typing import Any, Dict, Optional, Tuple
+from typing import Optional, Tuple
 
 from pymc_core.node.handlers.base import BaseHandler
 from pymc_core.protocol import Packet
@@ -13,46 +13,11 @@ from pymc_core.protocol.constants import (
     ROUTE_TYPE_DIRECT,
     ROUTE_TYPE_FLOOD,
 )
-from pymc_core.protocol.packet_utils import PacketHeaderUtils
+from pymc_core.protocol.packet_utils import PacketHeaderUtils, PacketTimingUtils
 
 from repeater.airtime import AirtimeManager
 
 logger = logging.getLogger("RepeaterHandler")
-
-
-class PacketTimingUtils:
-
-    @staticmethod
-    def estimate_airtime_ms(
-        packet_length_bytes: int, radio_config: Optional[Dict[str, Any]] = None
-    ) -> float:
-
-        if radio_config is None:
-            radio_config = {
-                "spreading_factor": 10,
-                "bandwidth": 250000,
-                "coding_rate": 5,
-                "preamble_length": 8,
-            }
-
-        sf = radio_config.get("spreading_factor", 10)
-        bw = radio_config.get("bandwidth", 250000)  # Hz
-        cr = radio_config.get("coding_rate", 5)
-        preamble = radio_config.get("preamble_length", 8)
-
-        # LoRa symbol duration: Ts = 2^SF / BW
-        symbol_duration_ms = (2**sf) / (bw / 1000)
-
-        # Number of payload symbols
-        payload_symbols = max(
-            8, int((8 * packet_length_bytes - 4 * sf + 28 + 16) / (4 * (sf - 2))) * (cr + 4)
-        )
-
-        # Total time = preamble + payload
-        preamble_ms = (preamble + 4.25) * symbol_duration_ms
-        payload_ms = payload_symbols * symbol_duration_ms
-
-        return preamble_ms + payload_ms
 
 
 class RepeaterHandler(BaseHandler):
@@ -191,7 +156,7 @@ class RepeaterHandler(BaseHandler):
             )
 
         # Check if this is a duplicate
-        pkt_hash = self._packet_hash(packet)
+        pkt_hash = packet.calculate_packet_hash().hex()
         is_dupe = pkt_hash in self.seen_packets and not transmitted
 
         # Set drop reason for duplicates
@@ -281,11 +246,7 @@ class RepeaterHandler(BaseHandler):
         for k in expired:
             del self.seen_packets[k]
 
-    def _packet_hash(self, packet: Packet) -> str:
 
-        if len(packet.payload or b"") >= 8:
-            return packet.payload[:8].hex()
-        return (packet.payload or b"").hex()
 
     def _get_drop_reason(self, packet: Packet) -> str:
 
@@ -389,7 +350,7 @@ class RepeaterHandler(BaseHandler):
 
     def is_duplicate(self, packet: Packet) -> bool:
 
-        pkt_hash = self._packet_hash(packet)
+        pkt_hash = packet.calculate_packet_hash().hex()
         if pkt_hash in self.seen_packets:
             logger.debug(f"Duplicate suppressed: {pkt_hash[:16]}")
             return True
@@ -397,7 +358,7 @@ class RepeaterHandler(BaseHandler):
 
     def mark_seen(self, packet: Packet):
 
-        pkt_hash = self._packet_hash(packet)
+        pkt_hash = packet.calculate_packet_hash().hex()
         self.seen_packets[pkt_hash] = time.time()
 
         if len(self.seen_packets) > self.max_cache_size:
@@ -602,6 +563,20 @@ class RepeaterHandler(BaseHandler):
             except Exception as e:
                 logger.error(f"Error sending periodic advert: {e}", exc_info=True)
 
+    def get_noise_floor(self) -> Optional[float]:
+        """
+        Get the current noise floor (instantaneous RSSI) from the radio in dBm.
+        Returns None if radio is not available or reading fails.
+        """
+        try:
+            radio = self.dispatcher.radio if self.dispatcher else None
+            if radio and hasattr(radio, 'get_noise_floor'):
+                return radio.get_noise_floor()
+            return None
+        except Exception as e:
+            logger.debug(f"Failed to get noise floor: {e}")
+            return None
+
     def get_stats(self) -> dict:
 
         uptime_seconds = time.time() - self.start_time
@@ -620,6 +595,9 @@ class RepeaterHandler(BaseHandler):
         rx_per_hour = len(packets_last_hour)
         forwarded_per_hour = sum(1 for p in packets_last_hour if p.get("transmitted", False))
 
+        # Get current noise floor from radio
+        noise_floor_dbm = self.get_noise_floor()
+
         stats = {
             "local_hash": f"0x{self.local_hash: 02x}",
             "duplicate_cache_size": len(self.seen_packets),
@@ -632,6 +610,7 @@ class RepeaterHandler(BaseHandler):
             "recent_packets": self.recent_packets,
             "neighbors": self.neighbors,
             "uptime_seconds": uptime_seconds,
+            "noise_floor_dbm": noise_floor_dbm,
             # Add configuration data
             "config": {
                 "node_name": repeater_config.get("node_name", "Unknown"),

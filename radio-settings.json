@@ -39,6 +39,19 @@
       "rxen_pin": 12,
       "tx_power": 22,
       "preamble_length": 17
+    },
+      "meshadv": {
+      "name": "MeshAdv",
+      "bus_id": 0,
+      "cs_id": 0,
+      "cs_pin": 21,
+      "reset_pin": 18,
+      "busy_pin": 20,
+      "irq_pin": 16,
+      "txen_pin": 13,
+      "rxen_pin": 12,
+      "tx_power": 22,
+      "preamble_length": 17
     }
   }
 }

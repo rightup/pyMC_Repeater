@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pymc_repeater"
-version = "1.0.0"
+version = "1.0.1"
 authors = [
     {name = "Lloyd", email = "lloyd@rightup.co.uk"},
 ]
@@ -29,19 +29,11 @@ classifiers = [
 keywords = ["mesh", "networking", "lora", "repeater", "daemon", "iot"]
 
 
-#dependencies = [
-#    "pymc_core[hardware]>=1.0.1",
-#    "pyyaml>=6.0.0",
-#    "cherrypy>=18.0.0",
-#]
-
-
 dependencies = [
-    "pymc_core[hardware] @ git+https://github.com/rightup/pyMC_core.git@dev",
+    "pymc_core[hardware]>=1.0.2",
     "pyyaml>=6.0.0",
     "cherrypy>=18.0.0",
 ]
-
 
 
 

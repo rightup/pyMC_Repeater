@@ -89,9 +89,11 @@ delays:
   direct_tx_delay_factor: 0.5
 
 duty_cycle:
+  # Enable/disable duty cycle enforcement
+  # Set to false to disable airtime limits
+  enforcement_enabled: false
+
   # Maximum airtime per minute in milliseconds
-  # US/AU FCC limit: 100% duty cycle (3600ms/min)
-  # EU ETSI limit: 1% duty cycle (36ms/min)
   max_airtime_per_minute: 3600
 
 logging:

@@ -97,13 +97,25 @@ echo ""
 echo "=== Step 2: Select Radio Settings ==="
 echo ""
 
-# Fetch config from API
+# Fetch config from API with 5 second timeout, fallback to local file
 echo "Fetching radio settings from API..."
-API_RESPONSE=$(curl -s https://api.meshcore.nz/api/v1/config)
+API_RESPONSE=$(curl -s --max-time 5 https://api.meshcore.nz/api/v1/config 2>/dev/null)
 
 if [ -z "$API_RESPONSE" ]; then
-    echo "Error: Failed to fetch configuration from API"
-    exit 1
+    echo "Warning: Failed to fetch configuration from API (timeout or error)"
+    echo "Using local radio presets file..."
+    
+    LOCAL_PRESETS="$SCRIPT_DIR/radio-presets.json"
+    if [ ! -f "$LOCAL_PRESETS" ]; then
+        echo "Error: Local radio presets file not found at $LOCAL_PRESETS"
+        exit 1
+    fi
+    
+    API_RESPONSE=$(cat "$LOCAL_PRESETS")
+    if [ -z "$API_RESPONSE" ]; then
+        echo "Error: Failed to read local radio presets file"
+        exit 1
+    fi
 fi
 
 # Parse JSON entries - one per line, extracting each field
