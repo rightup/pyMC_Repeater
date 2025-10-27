@@ -84,7 +84,27 @@
         </div>
     </nav>
 
+    <!-- Noise Floor Display -->
+
+    <div class="noise-floor-display">
+        <div class="noise-floor-label">RF Noise Floor</div>
+        <div class="noise-floor-value">
+            <span id="noise-floor-value">--</span>
+            <span class="noise-floor-unit">dBm</span>
+        </div>
+        <div class="noise-floor-bar-container">
+            <div class="noise-floor-bar" id="noise-floor-bar"></div>
+        </div>
+        <div class="noise-floor-sparkline-container">
+            <svg id="noise-floor-sparkline" width="100" height="24" viewBox="0 0 100 24" preserveAspectRatio="none"></svg>
+        </div>
+    </div>
+
     <div class="sidebar-footer">
+
+
+
+
         <div style="display: flex; gap: 8px; align-items: center; margin-bottom: var(--spacing-md);">
             <div class="status-badge" id="status-badge" title="System operational status">Online</div>
             <div class="version-badge" id="version-badge" title="Software version">v1.0.0</div>
@@ -152,6 +172,107 @@
     .github-link svg {
         display: block;
     }
+
+    /* Noise Floor Display Styling */
+    .noise-floor-sparkline-container {
+        width: 100%;
+        height: 24px;
+        margin-top: 4px;
+        background: none;
+        display: flex;
+        align-items: center;
+        justify-content: flex-end;
+    }
+    #noise-floor-sparkline {
+        width: 100px;
+        height: 24px;
+        display: block;
+        background: none;
+    }
+    .noise-floor-display {
+        padding: var(--spacing-lg) var(--spacing-lg) var(--spacing-md);
+        margin: 0;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+        background: linear-gradient(135deg, rgba(78, 201, 176, 0.05) 0%, rgba(86, 156, 214, 0.05) 100%);
+    }
+
+    .noise-floor-label {
+        font-size: 0.75rem;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        color: #8b949e;
+        margin-bottom: var(--spacing-xs);
+    }
+
+    .noise-floor-value {
+        display: flex;
+        align-items: baseline;
+        gap: 0.25rem;
+        margin-bottom: var(--spacing-sm);
+    }
+
+    #noise-floor-value {
+        font-size: 2rem;
+        font-weight: 300;
+        font-family: 'SF Mono', 'Monaco', 'Inconsolata', 'Roboto Mono', 'Consolas', monospace;
+        color: #4ec9b0;
+        line-height: 1;
+        letter-spacing: -0.02em;
+        transition: color 0.3s ease;
+    }
+
+    .noise-floor-unit {
+        font-size: 0.875rem;
+        font-weight: 500;
+        color: #8b949e;
+        margin-left: 0.125rem;
+    }
+
+    .noise-floor-bar-container {
+        width: 100%;
+        height: 4px;
+        background-color: rgba(255, 255, 255, 0.1);
+        border-radius: 2px;
+        overflow: hidden;
+        position: relative;
+    }
+
+    .noise-floor-bar {
+        height: 100%;
+        background: linear-gradient(90deg, #4ade80 0%, #4ec9b0 50%, #dcdcaa 75%, #f48771 100%);
+        border-radius: 2px;
+        transition: width 0.5s ease;
+        width: 0%;
+    }
+
+    /* Color states for noise floor value */
+    #noise-floor-value.excellent {
+        color: #4ade80;
+    }
+
+    #noise-floor-value.good {
+        color: #4ec9b0;
+    }
+
+    #noise-floor-value.moderate {
+        color: #dcdcaa;
+    }
+
+    #noise-floor-value.poor {
+        color: #f48771;
+    }
+
+    /* Responsive adjustments */
+    @media (max-width: 768px) {
+        .noise-floor-display {
+            padding: var(--spacing-md);
+        }
+
+        #noise-floor-value {
+            font-size: 1.75rem;
+        }
+    }
 </style>
 
 <script>
@@ -182,10 +303,80 @@
     }
 
     // Update footer stats periodically
+    // --- Noise Floor Sparkline State ---
+    const noiseFloorHistory = [];
+    const noiseFloorHistoryMax = 40; // Number of points in sparkline
+
+    function renderNoiseFloorSparkline() {
+        const svg = document.getElementById('noise-floor-sparkline');
+        if (!svg) return;
+        const w = 100, h = 24;
+        const minDbm = -120, maxDbm = -80;
+        if (noiseFloorHistory.length < 2) {
+            svg.innerHTML = '';
+            return;
+        }
+        // Map dBm to Y (inverted: lower dBm = higher Y)
+        const points = noiseFloorHistory.map((v, i) => {
+            const x = (i / (noiseFloorHistoryMax - 1)) * w;
+            let y = h - ((v - minDbm) / (maxDbm - minDbm)) * h;
+            y = Math.max(0, Math.min(h, y));
+            return [x, y];
+        });
+        // Build SVG path
+        let path = `M${points[0][0]},${points[0][1]}`;
+        for (let i = 1; i < points.length; i++) {
+            path += ` L${points[i][0]},${points[i][1]}`;
+        }
+        svg.innerHTML = `<path d="${path}" fill="none" stroke="#4ec9b0" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />`;
+    }
+
     function updateFooterStats() {
         fetch('/api/stats')
             .then(r => r.json())
             .then(data => {
+                // Update noise floor
+                const noiseFloor = data.noise_floor_dbm;
+                const noiseFloorValue = document.getElementById('noise-floor-value');
+                const noiseFloorBar = document.getElementById('noise-floor-bar');
+
+                if (noiseFloor !== null && noiseFloor !== undefined) {
+                    // Display noise floor value
+                    noiseFloorValue.textContent = noiseFloor.toFixed(1);
+
+                    // Calculate bar width (map -120 to -80 dBm range to 0-100%)
+                    const minDbm = -120;
+                    const maxDbm = -80;
+                    const percentage = Math.min(Math.max((noiseFloor - minDbm) / (maxDbm - minDbm) * 100, 0), 100);
+                    noiseFloorBar.style.width = percentage + '%';
+
+                    // Color code based on noise level
+                    noiseFloorValue.className = '';
+                    if (noiseFloor < -115) {
+                        noiseFloorValue.classList.add('excellent'); // Very quiet
+                    } else if (noiseFloor < -105) {
+                        noiseFloorValue.classList.add('good'); // Normal
+                    } else if (noiseFloor < -95) {
+                        noiseFloorValue.classList.add('moderate'); // Moderate noise
+                    } else {
+                        noiseFloorValue.classList.add('poor'); // High noise
+                    }
+
+                    // --- Sparkline update ---
+                    noiseFloorHistory.push(noiseFloor);
+                    if (noiseFloorHistory.length > noiseFloorHistoryMax) {
+                        noiseFloorHistory.shift();
+                    }
+                    renderNoiseFloorSparkline();
+                } else {
+                    noiseFloorValue.textContent = '--';
+                    noiseFloorBar.style.width = '0%';
+                    noiseFloorValue.className = '';
+                    // Sparkline: clear if no data
+                    noiseFloorHistory.length = 0;
+                    renderNoiseFloorSparkline();
+                }
+
                 // Update version badge
                 if (data.version) {
                     document.getElementById('version-badge').textContent = 'v' + data.version;

@@ -563,6 +563,20 @@ class RepeaterHandler(BaseHandler):
             except Exception as e:
                 logger.error(f"Error sending periodic advert: {e}", exc_info=True)
 
+    def get_noise_floor(self) -> Optional[float]:
+        """
+        Get the current noise floor (instantaneous RSSI) from the radio in dBm.
+        Returns None if radio is not available or reading fails.
+        """
+        try:
+            radio = self.dispatcher.radio if self.dispatcher else None
+            if radio and hasattr(radio, 'get_noise_floor'):
+                return radio.get_noise_floor()
+            return None
+        except Exception as e:
+            logger.debug(f"Failed to get noise floor: {e}")
+            return None
+
     def get_stats(self) -> dict:
 
         uptime_seconds = time.time() - self.start_time
@@ -581,6 +595,9 @@ class RepeaterHandler(BaseHandler):
         rx_per_hour = len(packets_last_hour)
         forwarded_per_hour = sum(1 for p in packets_last_hour if p.get("transmitted", False))
 
+        # Get current noise floor from radio
+        noise_floor_dbm = self.get_noise_floor()
+
         stats = {
             "local_hash": f"0x{self.local_hash: 02x}",
             "duplicate_cache_size": len(self.seen_packets),
@@ -593,6 +610,7 @@ class RepeaterHandler(BaseHandler):
             "recent_packets": self.recent_packets,
             "neighbors": self.neighbors,
             "uptime_seconds": uptime_seconds,
+            "noise_floor_dbm": noise_floor_dbm,
             # Add configuration data
             "config": {
                 "node_name": repeater_config.get("node_name", "Unknown"),
