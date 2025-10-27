@@ -209,7 +209,20 @@
                     dashArray: '5, 5'
                 }).addTo(map);
 
+                // Add SNR label to the middle of the line
+                const midLat = (configLat + lat) / 2;
+                const midLng = (configLng + lng) / 2;
+                const snrLabel = L.marker([midLat, midLng], {
+                    icon: L.divIcon({
+                        className: 'snr-label',
+                        html: `<div class="snr-text">${neighbor.snr ? neighbor.snr.toFixed(1) : 'N/A'}</div>`,
+                        iconSize: [40, 20],
+                        iconAnchor: [20, 10]
+                    })
+                }).addTo(map);
+
                 connectionLines.push(line);
+                connectionLines.push(snrLabel);
             });
 
             // Fit map to show all markers
@@ -532,6 +545,23 @@
         .leaflet-popup-tip {
             background: var(--color-bg-secondary) !important;
             border: 1px solid var(--color-border) !important;
+        }
+
+        .snr-label {
+            background: transparent !important;
+            border: none !important;
+        }
+
+        .snr-text {
+            background: rgba(30, 30, 30, 0.85);
+            color: #4ec9b0;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            border: 1px solid #4ec9b0;
+            white-space: nowrap;
+            text-align: center;
         }
 
         @media (max-width: 768px) {
