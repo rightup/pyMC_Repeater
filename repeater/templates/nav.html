@@ -225,8 +225,114 @@
         margin-left: 0.125rem;
     }
 
-    /* Remove noise floor bar styling */
-    .noise-floor-bar-container, .noise-floor-bar { display: none !important; }
+    /* Control button styling */
+    .control-buttons {
+        display: flex;
+        flex-direction: column;
+        gap: var(--spacing-sm);
+        margin-bottom: var(--spacing-md);
+    }
+
+    .control-btn {
+        display: flex;
+        align-items: center;
+        gap: var(--spacing-sm);
+        padding: var(--spacing-sm);
+        background: rgba(255, 255, 255, 0.05);
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        border-radius: 6px;
+        color: #d4d4d4;
+        cursor: pointer;
+        transition: all 0.2s;
+        font-size: 0.875rem;
+    }
+
+    .control-btn:hover {
+        background: rgba(255, 255, 255, 0.1);
+        border-color: rgba(255, 255, 255, 0.2);
+    }
+
+    .control-btn.control-btn-active {
+        background: rgba(16, 185, 129, 0.1);
+        border-color: rgba(16, 185, 129, 0.3);
+        color: #10b981;
+    }
+
+    .control-btn.control-btn-warning {
+        background: rgba(217, 119, 6, 0.1);
+        border-color: rgba(217, 119, 6, 0.3);
+        color: #d97706;
+    }
+
+    .control-btn .icon {
+        width: 18px;
+        height: 18px;
+        flex-shrink: 0;
+    }
+
+    .control-label {
+        display: flex;
+        flex-direction: column;
+        align-items: flex-start;
+        flex-grow: 1;
+    }
+
+    .control-title {
+        font-weight: 500;
+        font-size: 0.875rem;
+    }
+
+    .control-value {
+        font-size: 0.75rem;
+        opacity: 0.8;
+    }
+
+    /* Duty cycle stats styling */
+    .duty-cycle-stats {
+        margin-bottom: var(--spacing-md);
+    }
+
+    .duty-cycle-bar-container {
+        width: 100%;
+        height: 4px;
+        background-color: rgba(255, 255, 255, 0.1);
+        border-radius: 2px;
+        overflow: hidden;
+        margin-bottom: var(--spacing-xs);
+    }
+
+    .duty-cycle-bar {
+        height: 100%;
+        background-color: #4ade80;
+        border-radius: 2px;
+        transition: all 0.3s ease;
+        width: 0%;
+    }
+
+    .duty-cycle-text {
+        color: #8b949e;
+        font-size: 0.75rem;
+    }
+
+    /* Status and version badges */
+    .status-badge, .version-badge {
+        padding: 2px 6px;
+        border-radius: 4px;
+        font-size: 0.75rem;
+        font-weight: 500;
+        text-transform: uppercase;
+        letter-spacing: 0.025em;
+    }
+
+    .status-badge {
+        background-color: #10b981;
+        color: #ffffff;
+    }
+
+    .version-badge {
+        background-color: rgba(255, 255, 255, 0.1);
+        color: #8b949e;
+    }
 
     /* Color states for noise floor value */
     #noise-floor-value.excellent {
@@ -320,17 +426,10 @@
                 // Update noise floor
                 const noiseFloor = data.noise_floor_dbm;
                 const noiseFloorValue = document.getElementById('noise-floor-value');
-                const noiseFloorBar = document.getElementById('noise-floor-bar');
 
                 if (noiseFloor !== null && noiseFloor !== undefined) {
                     // Display noise floor value
                     noiseFloorValue.textContent = noiseFloor.toFixed(1);
-
-                    // Calculate bar width (map -120 to -80 dBm range to 0-100%)
-                    const minDbm = -120;
-                    const maxDbm = -80;
-                    const percentage = Math.min(Math.max((noiseFloor - minDbm) / (maxDbm - minDbm) * 100, 0), 100);
-                    noiseFloorBar.style.width = percentage + '%';
 
                     // Color code based on noise level
                     noiseFloorValue.className = '';
@@ -352,7 +451,6 @@
                     renderNoiseFloorSparkline();
                 } else {
                     noiseFloorValue.textContent = '--';
-                    noiseFloorBar.style.width = '0%';
                     noiseFloorValue.className = '';
                     // Sparkline: clear if no data
                     noiseFloorHistory.length = 0;
