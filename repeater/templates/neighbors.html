@@ -128,45 +128,8 @@
             neighborMarkers = [];
             connectionLines = [];
 
-            // Mock data for testing
-            const mockNeighbors = {
-                "abc123def456abc123def456abc123def456abc123def456abc123def456abc1": {
-                    node_name: "Test Repeater 1",
-                    contact_type: "Repeater",
-                    latitude: 50.7185,
-                    longitude: -1.5339,
-                    rssi: -75,
-                    snr: 8.5,
-                    last_seen: Math.floor(Date.now() / 1000) - 30,
-                    first_seen: Math.floor(Date.now() / 1000) - 3600,
-                    advert_count: 5
-                },
-                "def456abc123def456abc123def456abc123def456abc123def456abc123def4": {
-                    node_name: "Test Repeater 2",
-                    contact_type: "Repeater",
-                    latitude: 50.5185,
-                    longitude: -1.9339,
-                    rssi: -85,
-                    snr: 5.2,
-                    last_seen: Math.floor(Date.now() / 1000) - 60,
-                    first_seen: Math.floor(Date.now() / 1000) - 7200,
-                    advert_count: 12
-                },
-                "ghi789jkl012ghi789jkl012ghi789jkl012ghi789jkl012ghi789jkl012ghi7": {
-                    node_name: "Test Repeater 3",
-                    contact_type: "Repeater",
-                    latitude: 50.6185,
-                    longitude: -1.6339,
-                    rssi: -65,
-                    snr: 12.3,
-                    last_seen: Math.floor(Date.now() / 1000) - 5,
-                    first_seen: Math.floor(Date.now() / 1000) - 1800,
-                    advert_count: 3
-                }
-            };
-
-            // Use mock data instead of real neighbors
-            const neighbors = mockNeighbors;
+            // Use real API data
+            const neighbors = stats.neighbors || {};
             const neighborsArray = Object.entries(neighbors);
 
             if (neighborsArray.length === 0) return;
@@ -291,46 +254,6 @@
 
         // Mock test data function
         function updateNeighborsTable(neighbors) {
-            // Mock data for testing
-            const mockNeighbors = {
-                "abc123def456abc123def456abc123def456abc123def456abc123def456abc1": {
-                    node_name: "Test Repeater 1",
-                    contact_type: "Repeater",
-                    latitude: 50.7185,
-                    longitude: -1.5339,
-                    rssi: -75,
-                    snr: 8.5,
-                    last_seen: Math.floor(Date.now() / 1000) - 30,
-                    first_seen: Math.floor(Date.now() / 1000) - 3600,
-                    advert_count: 5
-                },
-                "def456abc123def456abc123def456abc123def456abc123def456abc123def4": {
-                    node_name: "Test Repeater 2",
-                    contact_type: "Repeater",
-                    latitude: 50.5185,
-                    longitude: -1.9339,
-                    rssi: -85,
-                    snr: 5.2,
-                    last_seen: Math.floor(Date.now() / 1000) - 60,
-                    first_seen: Math.floor(Date.now() / 1000) - 7200,
-                    advert_count: 12
-                },
-                "ghi789jkl012ghi789jkl012ghi789jkl012ghi789jkl012ghi789jkl012ghi7": {
-                    node_name: "Test Repeater 3",
-                    contact_type: "Repeater",
-                    latitude: 50.6185,
-                    longitude: -1.6339,
-                    rssi: -65,
-                    snr: 12.3,
-                    last_seen: Math.floor(Date.now() / 1000) - 5,
-                    first_seen: Math.floor(Date.now() / 1000) - 1800,
-                    advert_count: 3
-                }
-            };
-
-            // Use mock data instead of real neighbors
-            neighbors = mockNeighbors;
-
             const tbody = document.getElementById('neighbors-table');
 
             if (!neighbors || Object.keys(neighbors).length === 0) {
