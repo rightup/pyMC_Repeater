@@ -68,12 +68,12 @@
         let centerMarker = null;
         let neighborMarkers = [];
         let connectionLines = [];
-        let configLat = 50.6185;
-        let configLng = -1.7339;
+        let configLat = null;
+        let configLng = null;
 
         // Initialize map
         function initMap() {
-            if (map) return; // Already initialized
+            if (map || !configLat || !configLng) return; // Already initialized or no coords yet
 
             map = L.map('map').setView([configLat, configLng], 10);
 
@@ -104,16 +104,22 @@
         }
 
         function updateMapData(stats) {
-            if (!map) initMap();
-
-            // Update center position from config
+            // Get lat/lng from API
             if (stats.config && stats.config.repeater) {
-                configLat = stats.config.repeater.latitude || configLat;
-                configLng = stats.config.repeater.longitude || configLng;
+                configLat = stats.config.repeater.latitude;
+                configLng = stats.config.repeater.longitude;
+            }
 
-                if (centerMarker) {
-                    centerMarker.setLatLng([configLat, configLng]);
-                }
+            // Initialize map if needed (after we have coords from API)
+            if (!map) {
+                initMap();
+            }
+
+            if (!map) return; // Still no valid coords
+
+            // Update center marker position
+            if (centerMarker) {
+                centerMarker.setLatLng([configLat, configLng]);
             }
 
             // Clear existing neighbor markers and lines
@@ -233,7 +239,48 @@
                 .catch(e => console.error('Error fetching neighbors:', e));
         }
 
+        // Mock test data function
         function updateNeighborsTable(neighbors) {
+            // Mock data for testing
+            const mockNeighbors = {
+                "abc123def456abc123def456abc123def456abc123def456abc123def456abc1": {
+                    node_name: "Test Repeater 1",
+                    contact_type: "Repeater",
+                    latitude: 50.7185,
+                    longitude: -1.5339,
+                    rssi: -75,
+                    snr: 8.5,
+                    last_seen: Math.floor(Date.now() / 1000) - 30,
+                    first_seen: Math.floor(Date.now() / 1000) - 3600,
+                    advert_count: 5
+                },
+                "def456abc123def456abc123def456abc123def456abc123def456abc123def4": {
+                    node_name: "Test Repeater 2",
+                    contact_type: "Repeater",
+                    latitude: 50.5185,
+                    longitude: -1.9339,
+                    rssi: -85,
+                    snr: 5.2,
+                    last_seen: Math.floor(Date.now() / 1000) - 60,
+                    first_seen: Math.floor(Date.now() / 1000) - 7200,
+                    advert_count: 12
+                },
+                "ghi789jkl012ghi789jkl012ghi789jkl012ghi789jkl012ghi789jkl012ghi7": {
+                    node_name: "Test Repeater 3",
+                    contact_type: "Repeater",
+                    latitude: 50.6185,
+                    longitude: -1.6339,
+                    rssi: -65,
+                    snr: 12.3,
+                    last_seen: Math.floor(Date.now() / 1000) - 5,
+                    first_seen: Math.floor(Date.now() / 1000) - 1800,
+                    advert_count: 3
+                }
+            };
+
+            // Use mock data instead of real neighbors
+            neighbors = mockNeighbors;
+
             const tbody = document.getElementById('neighbors-table');
 
             if (!neighbors || Object.keys(neighbors).length === 0) {
@@ -292,9 +339,69 @@
             }).join('');
         }
 
+        /* ORIGINAL FUNCTION - COMMENTED OUT
+        function updateNeighborsTable(neighbors) {
+            const tbody = document.getElementById('neighbors-table');
+
+            if (!neighbors || Object.keys(neighbors).length === 0) {
+                tbody.innerHTML = `
+                    <tr>
+                        <td colspan="9" class="empty-message">
+                            No repeaters discovered yet - waiting for adverts...
+                        </td>
+                    </tr>
+                `;
+                return;
+            }
+
+            // Sort by last_seen (most recent first)
+            const sortedNeighbors = Object.entries(neighbors).sort((a, b) => {
+                return b[1].last_seen - a[1].last_seen;
+            });
+
+            tbody.innerHTML = sortedNeighbors.map(([pubkey, neighbor]) => {
+                const name = neighbor.node_name || 'Unknown';
+                // Format pubkey properly - it's a 64-char hex string
+                const pubkeyShort = pubkey.length >= 16
+                    ? `&lt;${pubkey.substring(0, 8)}...${pubkey.substring(pubkey.length - 8)}&gt;`
+                    : `&lt;${pubkey}&gt;`;
+                const contactType = neighbor.contact_type || 'Repeater';
+                const location = neighbor.latitude && neighbor.longitude && (neighbor.latitude !== 0.0 || neighbor.longitude !== 0.0)
+                    ? `${neighbor.latitude.toFixed(6)}, ${neighbor.longitude.toFixed(6)}`
+                    : 'N/A';
+                const rssi = neighbor.rssi || 'N/A';
+                const snr = neighbor.snr !== undefined ? neighbor.snr.toFixed(1) + ' dB' : 'N/A';
+                const lastSeen = new Date(neighbor.last_seen * 1000).toLocaleString();
+                const firstSeen = new Date(neighbor.first_seen * 1000).toLocaleString();
+                const advertCount = neighbor.advert_count || 0;
+
+                // Color code RSSI
+                let rssiClass = 'rssi-poor';
+                if (rssi !== 'N/A') {
+                    if (rssi > -80) rssiClass = 'rssi-excellent';
+                    else if (rssi > -90) rssiClass = 'rssi-good';
+                    else if (rssi > -100) rssiClass = 'rssi-fair';
+                }
+
+                return `
+                    <tr>
+                        <td data-label="Node Name"><strong>${name}</strong></td>
+                        <td data-label="Public Key"><code class="pubkey">${pubkeyShort}</code></td>
+                        <td data-label="Contact Type"><span class="contact-type-badge">${contactType}</span></td>
+                        <td data-label="Location">${location}</td>
+                        <td data-label="RSSI"><span class="${rssiClass}">${rssi}</span></td>
+                        <td data-label="SNR">${snr}</td>
+                        <td data-label="Last Seen">${lastSeen}</td>
+                        <td data-label="First Seen">${firstSeen}</td>
+                        <td data-label="Advert Count">${advertCount}</td>
+                    </tr>
+                `;
+            }).join('');
+        }
+        */
+
         // Initialize on load
         document.addEventListener('DOMContentLoaded', () => {
-            initMap();
             updateNeighbors();
 
             // Auto-update every 10 seconds
