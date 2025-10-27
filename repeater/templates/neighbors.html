@@ -5,6 +5,8 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <link rel="stylesheet" href="/static/style.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
 </head>
 <body>
     <div class="layout">
@@ -20,6 +22,14 @@
                     <span>Updated: <strong id="update-time">{{ last_updated }}</strong></span>
                 </div>
             </header>
+
+            <!-- Neighbors Map -->
+            <div class="map-card">
+                <h2>Repeater Network Map</h2>
+                <div id="map-container" class="map-container">
+                    <div id="map"></div>
+                </div>
+            </div>
 
             <!-- Neighbors Table -->
             <div class="table-card">
@@ -54,6 +64,117 @@
 
     <script>
         let updateInterval;
+        let map = null;
+        let centerMarker = null;
+        let neighborMarkers = [];
+        let connectionLines = [];
+        let configLat = 50.6185;
+        let configLng = -1.7339;
+
+        // Initialize map
+        function initMap() {
+            if (map) return; // Already initialized
+
+            map = L.map('map').setView([configLat, configLng], 10);
+
+            // Add OpenStreetMap tiles
+            L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                attribution: '© OpenStreetMap contributors',
+                maxZoom: 19,
+                tileSize: 256,
+                className: 'map-tiles'
+            }).addTo(map);
+
+            // Add center marker (your repeater)
+            centerMarker = L.circleMarker([configLat, configLng], {
+                radius: 8,
+                fillColor: '#6a9955',
+                color: '#4ade80',
+                weight: 3,
+                opacity: 1,
+                fillOpacity: 0.8
+            }).addTo(map);
+
+            centerMarker.bindPopup('<strong>Your Repeater</strong><br>(' + configLat.toFixed(4) + ', ' + configLng.toFixed(4) + ')');
+
+            // Force map to recalculate size after container is visible
+            setTimeout(() => {
+                map.invalidateSize();
+            }, 100);
+        }
+
+        function updateMapData(stats) {
+            if (!map) initMap();
+
+            // Update center position from config
+            if (stats.config && stats.config.repeater) {
+                configLat = stats.config.repeater.latitude || configLat;
+                configLng = stats.config.repeater.longitude || configLng;
+
+                if (centerMarker) {
+                    centerMarker.setLatLng([configLat, configLng]);
+                }
+            }
+
+            // Clear existing neighbor markers and lines
+            neighborMarkers.forEach(m => map.removeLayer(m));
+            connectionLines.forEach(l => map.removeLayer(l));
+            neighborMarkers = [];
+            connectionLines = [];
+
+            // Add neighbor markers and connection lines
+            const neighbors = stats.neighbors || {};
+            const neighborsArray = Object.entries(neighbors);
+
+            if (neighborsArray.length === 0) return;
+
+            neighborsArray.forEach(([pubkey, neighbor]) => {
+                if (!neighbor.latitude || !neighbor.longitude) return;
+                if (neighbor.latitude === 0.0 && neighbor.longitude === 0.0) return;
+
+                const lat = neighbor.latitude;
+                const lng = neighbor.longitude;
+                const name = neighbor.node_name || 'Unknown';
+
+                // Add neighbor marker
+                const marker = L.circleMarker([lat, lng], {
+                    radius: 6,
+                    fillColor: '#4ec9b0',
+                    color: '#ce9178',
+                    weight: 2,
+                    opacity: 1,
+                    fillOpacity: 0.7
+                }).addTo(map);
+
+                const popupText = `<strong>${name}</strong><br>
+                    RSSI: ${neighbor.rssi || 'N/A'}<br>
+                    SNR: ${neighbor.snr ? neighbor.snr.toFixed(1) + ' dB' : 'N/A'}<br>
+                    Adverts: ${neighbor.advert_count || 0}<br>
+                    (${lat.toFixed(4)}, ${lng.toFixed(4)})`;
+
+                marker.bindPopup(popupText);
+                neighborMarkers.push(marker);
+
+                // Draw connection line from center to neighbor
+                const line = L.polyline([
+                    [configLat, configLng],
+                    [lat, lng]
+                ], {
+                    color: '#4ec9b0',
+                    weight: 2,
+                    opacity: 0.6,
+                    dashArray: '5, 5'
+                }).addTo(map);
+
+                connectionLines.push(line);
+            });
+
+            // Fit map to show all markers
+            if (neighborsArray.length > 0) {
+                const group = new L.featureGroup([centerMarker, ...neighborMarkers]);
+                map.fitBounds(group.getBounds(), { padding: [50, 50] });
+            }
+        }
 
         // Handle Send Advert button
         function sendAdvert() {
@@ -107,6 +228,7 @@
                     document.getElementById('update-time').textContent = new Date().toLocaleTimeString();
 
                     updateNeighborsTable(neighbors);
+                    updateMapData(data);
                 })
                 .catch(e => console.error('Error fetching neighbors:', e));
         }
@@ -172,6 +294,7 @@
 
         // Initialize on load
         document.addEventListener('DOMContentLoaded', () => {
+            initMap();
             updateNeighbors();
 
             // Auto-update every 10 seconds
@@ -186,6 +309,121 @@
     </script>
 
     <style>
+        .map-card {
+            background: var(--color-bg-secondary);
+            border: 1px solid var(--color-border);
+            border-radius: var(--radius-lg);
+            padding: var(--spacing-lg);
+            margin-bottom: var(--spacing-lg);
+        }
+
+        .map-card h2 {
+            margin-top: 0;
+            margin-bottom: var(--spacing-md);
+            color: var(--color-text-primary);
+            font-size: 1.5rem;
+        }
+
+        .map-container {
+            border-radius: var(--radius-md);
+            overflow: hidden;
+            border: 1px solid var(--color-border);
+            background: var(--color-bg-tertiary);
+        }
+
+        #map {
+            height: 400px;
+            width: 100%;
+            z-index: 1;
+        }
+
+        /* Dark theme for leaflet */
+        .map-tiles {
+            filter: invert(0.93) hue-rotate(200deg) saturate(0.5);
+        }
+
+        .leaflet-control-attribution {
+            background: rgba(30, 30, 30, 0.7) !important;
+            color: #999 !important;
+            font-size: 0.75rem;
+        }
+
+        .leaflet-control-attribution a {
+            color: #4ec9b0 !important;
+        }
+
+        .leaflet-control {
+            background: var(--color-bg-secondary) !important;
+            border: 1px solid var(--color-border) !important;
+            color: var(--color-text-primary) !important;
+        }
+
+        .leaflet-control-zoom-in,
+        .leaflet-control-zoom-out {
+            color: var(--color-text-primary) !important;
+            background: var(--color-bg-secondary) !important;
+        }
+
+        .leaflet-control-zoom-in:hover,
+        .leaflet-control-zoom-out:hover {
+            background: var(--color-bg-tertiary) !important;
+        }
+
+        .leaflet-popup-content-wrapper {
+            background: var(--color-bg-secondary) !important;
+            border: 1px solid var(--color-border) !important;
+            border-radius: var(--radius-md) !important;
+        }
+
+        .leaflet-popup-content {
+            color: var(--color-text-primary) !important;
+            margin: 0 !important;
+            font-size: 0.85rem;
+        }
+
+        .leaflet-popup-content strong {
+            color: #4ec9b0 !important;
+        }
+
+        .leaflet-popup-tip {
+            background: var(--color-bg-secondary) !important;
+            border: 1px solid var(--color-border) !important;
+        }
+
+        @media (max-width: 768px) {
+            #map {
+                height: 300px;
+            }
+
+            .map-card {
+                padding: var(--spacing-md);
+            }
+
+            .map-card h2 {
+                font-size: 1.25rem;
+            }
+        }
+
+        @media (max-width: 480px) {
+            #map {
+                height: 250px;
+            }
+
+            .map-card {
+                padding: var(--spacing-sm);
+                margin-bottom: var(--spacing-md);
+            }
+
+            .map-card h2 {
+                font-size: 1.1rem;
+                margin-bottom: var(--spacing-sm);
+            }
+
+            .leaflet-popup-content {
+                font-size: 0.75rem;
+            }
+        }
+
         .pubkey {
             font-family: 'Courier New', monospace;
             font-size: 0.85em;

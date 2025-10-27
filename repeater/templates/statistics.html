@@ -34,8 +34,8 @@
                 </div>
 
                 <div class="stat-card">
-                    <div class="stat-label">Success Rate</div>
-                    <div class="stat-value" id="success-rate">0<span class="stat-unit">%</span></div>
+                    <div class="stat-label">Repeats</div>
+                    <div class="stat-value" id="repeat-count">0<span class="stat-unit">packets</span></div>
                 </div>
             </div>
 
@@ -239,11 +239,11 @@
                     // Update summary
                     const rx = data.rx_count || 0;
                     const tx = data.forwarded_count || 0;
-                    const successRate = rx > 0 ? Math.round((tx / rx) * 100) : 0;
+                    const repeats = tx - rx;
 
                     document.getElementById('total-rx').textContent = rx;
                     document.getElementById('total-tx').textContent = tx;
-                    document.getElementById('success-rate').textContent = successRate;
+                    document.getElementById('repeat-count').textContent = repeats;
 
                     // Update charts with data trends
                     const packets = data.recent_packets || [];
