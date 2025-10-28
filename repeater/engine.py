@@ -76,7 +76,7 @@ class RepeaterHandler(BaseHandler):
         self.neighbors = {}
 
         try:
-            self.storage = StorageCollector(config)
+            self.storage = StorageCollector(config.get("storage", {}))
             logger.info("StorageCollector initialized successfully")
         except Exception as e:
             logger.error(f"Failed to initialize StorageCollector: {e}")
