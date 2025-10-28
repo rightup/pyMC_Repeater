@@ -16,6 +16,7 @@ from pymc_core.protocol.constants import (
 from pymc_core.protocol.packet_utils import PacketHeaderUtils, PacketTimingUtils
 
 from repeater.airtime import AirtimeManager
+from repeater.storage import StorageCollector
 
 logger = logging.getLogger("RepeaterHandler")
 
@@ -73,6 +74,13 @@ class RepeaterHandler(BaseHandler):
 
         # Neighbor tracking (repeaters discovered via adverts)
         self.neighbors = {}
+
+        try:
+            self.storage = StorageCollector(config)
+            logger.info("StorageCollector initialized successfully")
+        except Exception as e:
+            logger.error(f"Failed to initialize StorageCollector: {e}")
+            self.storage = None
 
     async def __call__(self, packet: Packet, metadata: Optional[dict] = None) -> None:
 
@@ -217,6 +225,13 @@ class RepeaterHandler(BaseHandler):
             ),
         }
 
+        # Store packet record to persistent storage
+        if self.storage:
+            try:
+                self.storage.record_packet(packet_record)
+            except Exception as e:
+                logger.error(f"Failed to store packet record: {e}")
+
         # If this is a duplicate, try to attach it to the original packet
         if is_dupe and len(self.recent_packets) > 0:
             # Find the original packet with same hash
@@ -320,7 +335,9 @@ class RepeaterHandler(BaseHandler):
             current_time = time.time()
 
             # Update or create neighbor entry
-            if pubkey not in self.neighbors:
+            is_new_neighbor = pubkey not in self.neighbors
+            
+            if is_new_neighbor:
                 self.neighbors[pubkey] = {
                     "node_name": node_name,
                     "contact_type": contact_type,
@@ -344,6 +361,24 @@ class RepeaterHandler(BaseHandler):
                 neighbor["rssi"] = rssi
                 neighbor["snr"] = snr
                 neighbor["advert_count"] = neighbor.get("advert_count", 0) + 1
+
+            # Store advert record to persistent storage
+            if self.storage:
+                try:
+                    advert_record = {
+                        "timestamp": current_time,
+                        "pubkey": pubkey,
+                        "node_name": node_name,
+                        "contact_type": contact_type,
+                        "latitude": latitude,
+                        "longitude": longitude,
+                        "rssi": rssi,
+                        "snr": snr,
+                        "is_new_neighbor": is_new_neighbor
+                    }
+                    self.storage.record_advert(advert_record)
+                except Exception as e:
+                    logger.error(f"Failed to store advert record: {e}")
 
         except Exception as e:
             logger.debug(f"Error processing advert for neighbor tracking: {e}")
@@ -644,3 +679,19 @@ class RepeaterHandler(BaseHandler):
         # Add airtime stats
         stats.update(self.airtime_mgr.get_stats())
         return stats
+
+    def cleanup(self):
+        """Clean shutdown of the repeater handler."""
+        if self.storage:
+            try:
+                self.storage.close()
+                logger.info("StorageCollector closed successfully")
+            except Exception as e:
+                logger.error(f"Error closing StorageCollector: {e}")
+
+    def __del__(self):
+        """Destructor to ensure cleanup."""
+        try:
+            self.cleanup()
+        except Exception:
+            pass
