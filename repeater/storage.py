@@ -284,8 +284,7 @@ class StorageCollector:
             message = json.dumps(payload, default=str)
             
             # Publish
-            result = self.mqtt_client.publish(topic, message, qos=0, retain=False)
-            logger.info(f"Publish result: {result}")
+            self.mqtt_client.publish(topic, message, qos=0, retain=False)
             
         except Exception as e:
             logger.error(f"Failed to publish to MQTT: {e}")
