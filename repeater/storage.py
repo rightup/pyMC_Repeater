@@ -29,11 +29,11 @@ class StorageCollector:
         
         self.sqlite_path = self.storage_dir / "repeater.db"
         self.rrd_path = self.storage_dir / "metrics.rrd"
-        
+
         # MQTT configuration
         self.mqtt_config = config.get("mqtt", {})
         self.mqtt_client = None
-        
+
         # Initialize storage systems
         self._init_sqlite()
         self._init_rrd()
