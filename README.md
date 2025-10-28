@@ -115,6 +115,14 @@ http://<repeater-ip>:8000
 pip install -e .
 ```
 
+For storage features (RRDTool time-series data), install system dependencies first:
+
+```bash
+# Ubuntu/Debian
+sudo apt-get install librrd-dev rrdtool
+
+```
+
 ## Configuration
 
 The configuration file is created and configured during installation at:
