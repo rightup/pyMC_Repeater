@@ -132,7 +132,59 @@ class RepeaterDaemon:
             trace_path = parsed_data["trace_path"]
             trace_path_len = len(trace_path)
             
-        
+          
+            if self.repeater_handler:
+                import time
+                
+                trace_path_bytes = [f"{h:02X}" for h in trace_path[:8]]
+                if len(trace_path) > 8:
+                    trace_path_bytes.append("...")
+                path_hash = "[" + ", ".join(trace_path_bytes) + "]"
+                
+                path_snrs = []
+                path_snr_details = []
+                for i in range(packet.path_len):
+                    if i < len(packet.path):
+                        snr_val = packet.path[i]
+                        snr_db = snr_val / 4.0
+                        path_snrs.append(f"{snr_val}({snr_db:.1f}dB)")
+                        # Create hash->SNR mapping for display
+                        if i < len(trace_path):
+                            path_snr_details.append({
+                                "hash": f"{trace_path[i]:02X}",
+                                "snr_raw": snr_val,
+                                "snr_db": snr_db
+                            })
+                
+                packet_record = {
+                    "timestamp": time.time(),
+                    "type": packet.get_payload_type(),  # 0x09 for trace
+                    "route": packet.get_route_type(),   # Should be direct (1)
+                    "length": len(packet.payload or b""),
+                    "rssi": getattr(packet, "rssi", 0),
+                    "snr": getattr(packet, "snr", 0.0),
+                    "score": self.repeater_handler.calculate_packet_score(
+                        getattr(packet, "snr", 0.0), 
+                        len(packet.payload or b""), 
+                        self.repeater_handler.radio_config.get("spreading_factor", 8)
+                    ),
+                    "tx_delay_ms": 0,  
+                    "transmitted": False,  
+                    "is_duplicate": False,  
+                    "packet_hash": packet.calculate_packet_hash().hex()[:16],
+                    "drop_reason": "trace_received",
+                    "path_hash": path_hash,
+                    "src_hash": None,  
+                    "dst_hash": None,
+                    "original_path": [f"{h:02X}" for h in trace_path],  
+                    "forwarded_path": None,
+                    # Add trace-specific SNR path information
+                    "path_snrs": path_snrs,  # ["58(14.5dB)", "19(4.8dB)"]
+                    "path_snr_details": path_snr_details,  # [{"hash": "29", "snr_raw": 58, "snr_db": 14.5}]
+                    "is_trace": True,  
+                }
+                self.repeater_handler.log_trace_record(packet_record)
+    
             path_snrs = []
             path_hashes = []
             for i in range(packet.path_len):
@@ -156,6 +208,13 @@ class RepeaterDaemon:
                 trace_path[packet.path_len] == self.local_hash and
                 self.repeater_handler and not self.repeater_handler.is_duplicate(packet)):
                 
+                if self.repeater_handler and hasattr(self.repeater_handler, 'recent_packets'):
+                    packet_hash = packet.calculate_packet_hash().hex()[:16]
+                    for record in reversed(self.repeater_handler.recent_packets):
+                        if record.get("packet_hash") == packet_hash:
+                            record["transmitted"] = True
+                            record["drop_reason"] = "trace_forwarded"
+                            break
    
                 snr_scaled = int(packet.get_snr() * 4)
                 snr_byte = snr_scaled & 0xFF

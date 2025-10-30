@@ -239,6 +239,18 @@ class RepeaterHandler(BaseHandler):
         if len(self.recent_packets) > self.max_recent_packets:
             self.recent_packets.pop(0)
 
+    def log_trace_record(self, packet_record: dict) -> None:
+        self.recent_packets.append(packet_record)
+        
+        self.rx_count += 1
+        if packet_record.get("transmitted", False):
+            self.forwarded_count += 1
+        else:
+            self.dropped_count += 1
+        
+        if len(self.recent_packets) > self.max_recent_packets:
+            self.recent_packets.pop(0)
+
     def cleanup_cache(self):
 
         now = time.time()
@@ -564,10 +576,6 @@ class RepeaterHandler(BaseHandler):
                 logger.error(f"Error sending periodic advert: {e}", exc_info=True)
 
     def get_noise_floor(self) -> Optional[float]:
-        """
-        Get the current noise floor (instantaneous RSSI) from the radio in dBm.
-        Returns None if radio is not available or reading fails.
-        """
         try:
             radio = self.dispatcher.radio if self.dispatcher else None
             if radio and hasattr(radio, 'get_noise_floor'):
