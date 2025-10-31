@@ -291,8 +291,6 @@ class RepeaterDaemon:
                     stats["public_key"] = pubkey.hex()
                 except Exception:
                     stats["public_key"] = None
-            if self.radio:
-                stats["radio_instance"] = self.radio
             return stats
         return {}
 
@@ -376,6 +374,7 @@ class RepeaterDaemon:
             send_advert_func=self.send_advert,
             config=self.config,  # Pass the config reference
             event_loop=current_loop,  # Pass the main event loop
+            daemon_instance=self,  # Pass the daemon instance for CAD calibration
         )
 
         try:

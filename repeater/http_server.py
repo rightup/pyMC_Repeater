@@ -47,8 +47,8 @@ _log_buffer = LogBuffer(max_lines=100)
 class CADCalibrationEngine:
     """Real-time CAD calibration engine"""
     
-    def __init__(self, stats_getter: Optional[Callable] = None, event_loop=None):
-        self.stats_getter = stats_getter
+    def __init__(self, daemon_instance=None, event_loop=None):
+        self.daemon_instance = daemon_instance
         self.event_loop = event_loop
         self.running = False
         self.results = {}
@@ -103,17 +103,15 @@ class CADCalibrationEngine:
     def calibration_worker(self, samples: int, delay_ms: int):
         """Worker thread for calibration process"""
         try:
-            # Get radio from stats
-            if not self.stats_getter:
-                self.broadcast_to_clients({"type": "error", "message": "No stats getter available"})
+            # Get radio from daemon instance
+            if not self.daemon_instance:
+                self.broadcast_to_clients({"type": "error", "message": "No daemon instance available"})
                 return
                 
-            stats = self.stats_getter()
-            if not stats or "radio_instance" not in stats:
+            radio = getattr(self.daemon_instance, 'radio', None)
+            if not radio:
                 self.broadcast_to_clients({"type": "error", "message": "Radio instance not available"})
                 return
-                
-            radio = stats["radio_instance"]
             if not hasattr(radio, 'perform_cad'):
                 self.broadcast_to_clients({"type": "error", "message": "Radio does not support CAD"})
                 return
@@ -236,15 +234,17 @@ class APIEndpoints:
         send_advert_func: Optional[Callable] = None,
         config: Optional[dict] = None,
         event_loop=None,
+        daemon_instance=None,
     ):
 
         self.stats_getter = stats_getter
         self.send_advert_func = send_advert_func
         self.config = config or {}
         self.event_loop = event_loop  # Store reference to main event loop
+        self.daemon_instance = daemon_instance  # Store reference to daemon instance
         
         # Initialize CAD calibration engine
-        self.cad_calibration = CADCalibrationEngine(stats_getter, event_loop)
+        self.cad_calibration = CADCalibrationEngine(daemon_instance, event_loop)
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
@@ -442,6 +442,7 @@ class StatsApp:
         send_advert_func: Optional[Callable] = None,
         config: Optional[dict] = None,
         event_loop=None,
+        daemon_instance=None,
     ):
 
         self.stats_getter = stats_getter
@@ -452,7 +453,7 @@ class StatsApp:
         self.config = config or {}
 
         # Create nested API object for routing
-        self.api = APIEndpoints(stats_getter, send_advert_func, self.config, event_loop)
+        self.api = APIEndpoints(stats_getter, send_advert_func, self.config, event_loop, daemon_instance)
 
         # Load template on init
         if template_dir:
@@ -669,12 +670,13 @@ class HTTPStatsServer:
         send_advert_func: Optional[Callable] = None,
         config: Optional[dict] = None,
         event_loop=None,
+        daemon_instance=None,
     ):
 
         self.host = host
         self.port = port
         self.app = StatsApp(
-            stats_getter, template_dir, node_name, pub_key, send_advert_func, config, event_loop
+            stats_getter, template_dir, node_name, pub_key, send_advert_func, config, event_loop, daemon_instance
         )
 
     def start(self):
