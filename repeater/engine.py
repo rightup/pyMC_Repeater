@@ -3,18 +3,27 @@ import logging
 import time
 from collections import OrderedDict
 from typing import Optional, Tuple
-
 from pymc_core.node.handlers.base import BaseHandler
 from pymc_core.protocol import Packet
 from pymc_core.protocol.constants import (
     MAX_PATH_SIZE,
-    PAYLOAD_TYPE_ADVERT,
     PH_ROUTE_MASK,
     ROUTE_TYPE_DIRECT,
     ROUTE_TYPE_FLOOD,
+    PAYLOAD_TYPE_REQ,
+    PAYLOAD_TYPE_RESPONSE,
+    PAYLOAD_TYPE_TXT_MSG,
+    PAYLOAD_TYPE_ACK,
+    PAYLOAD_TYPE_ADVERT,
+    PAYLOAD_TYPE_GRP_TXT,
+    PAYLOAD_TYPE_GRP_DATA,
+    PAYLOAD_TYPE_ANON_REQ,
+    PAYLOAD_TYPE_PATH,
+    PAYLOAD_TYPE_TRACE,
+    PAYLOAD_TYPE_RAW_CUSTOM,
+
 )
 from pymc_core.protocol.packet_utils import PacketHeaderUtils, PacketTimingUtils
-
 from repeater.airtime import AirtimeManager
 
 logger = logging.getLogger("RepeaterHandler")
@@ -79,7 +88,6 @@ class RepeaterHandler(BaseHandler):
         if metadata is None:
             metadata = {}
 
-        # Track incoming packet
         self.rx_count += 1
 
         # Check if it's time to send a periodic advertisement
@@ -104,21 +112,23 @@ class RepeaterHandler(BaseHandler):
         original_path = list(packet.path) if packet.path else []
 
         # Process for forwarding (skip if in monitor mode)
-        result = None if monitor_mode else self.process_packet(packet, snr)
+        if monitor_mode:
+            result = None, 0.0, "Monitor mode"
+        else:
+            result = self.process_packet(packet, snr)
+        
         forwarded_path = None
-        if result:
-            fwd_pkt, delay = result
+        fwd_pkt, delay, process_drop_reason = result
+        
+        if fwd_pkt is not None:
             tx_delay_ms = delay * 1000.0
 
             # Capture the forwarded path (after modification)
             forwarded_path = list(fwd_pkt.path) if fwd_pkt.path else []
 
             # Check duty-cycle before scheduling TX
-            packet_bytes = (
-                fwd_pkt.write_to() if hasattr(fwd_pkt, "write_to") else fwd_pkt.payload or b""
-            )
+            packet_bytes = fwd_pkt.write_to()
             airtime_ms = PacketTimingUtils.estimate_airtime_ms(len(packet_bytes), self.radio_config)
-
             can_tx, wait_time = self.airtime_mgr.can_transmit(airtime_ms)
 
             if not can_tx:
@@ -135,33 +145,21 @@ class RepeaterHandler(BaseHandler):
                 await self.schedule_retransmit(fwd_pkt, delay, airtime_ms)
         else:
             self.dropped_count += 1
-            # Determine drop reason from process_packet result
-            if monitor_mode:
-                drop_reason = "Monitor mode"
-            else:
-                drop_reason = self._get_drop_reason(packet)
+            # Use drop reason from process_packet
+            drop_reason = process_drop_reason
             logger.debug(f"Packet not forwarded: {drop_reason}")
 
         # Extract packet type and route from header
-        if not hasattr(packet, "header") or packet.header is None:
-            logger.error(f"Packet missing header attribute! Packet: {packet}")
-            payload_type = 0
-            route_type = 0
-        else:
-            header_info = PacketHeaderUtils.parse_header(packet.header)
-            payload_type = header_info["payload_type"]
-            route_type = header_info["route_type"]
-            logger.debug(
-                f"Packet header=0x{packet.header:02x}, type={payload_type}, route={route_type}"
-            )
+        header_info = PacketHeaderUtils.parse_header(packet.header)
+        payload_type = header_info["payload_type"]
+        route_type = header_info["route_type"]
+        logger.debug(
+            f"Packet header=0x{packet.header:02x}, type={payload_type}, route={route_type}"
+        )
 
-        # Check if this is a duplicate
+        # Check if this is a duplicate (for statistics only, duplicates now handled in routing methods)
         pkt_hash = packet.calculate_packet_hash().hex()
-        is_dupe = pkt_hash in self.seen_packets and not transmitted
-
-        # Set drop reason for duplicates
-        if is_dupe and drop_reason is None:
-            drop_reason = "Duplicate"
+        is_dupe = False  # We now handle duplicates in routing methods, not here
 
         # Process adverts for neighbor tracking
         if payload_type == PAYLOAD_TYPE_ADVERT:
@@ -182,14 +180,14 @@ class RepeaterHandler(BaseHandler):
         dst_hash = None
 
         # Payload types with dest_hash and src_hash as first 2 bytes
-        if payload_type in [0x00, 0x01, 0x02, 0x08]:
-            if hasattr(packet, "payload") and packet.payload and len(packet.payload) >= 2:
+        if payload_type in [PAYLOAD_TYPE_REQ, PAYLOAD_TYPE_RESPONSE, PAYLOAD_TYPE_TXT_MSG, PAYLOAD_TYPE_PATH]:
+            if packet.payload and len(packet.payload) >= 2:
                 dst_hash = f"{packet.payload[0]:02X}"
                 src_hash = f"{packet.payload[1]:02X}"
 
         # ADVERT packets have source identifier as first byte
         elif payload_type == PAYLOAD_TYPE_ADVERT:
-            if hasattr(packet, "payload") and packet.payload and len(packet.payload) >= 1:
+            if packet.payload and len(packet.payload) >= 1:
                 src_hash = f"{packet.payload[0]:02X}"
 
         # Record packet for charts
@@ -385,18 +383,30 @@ class RepeaterHandler(BaseHandler):
             return False, "Path at max size"
 
         return True, ""
+    
 
-    def flood_forward(self, packet: Packet) -> Optional[Packet]:
 
-        # Validate
+    #   ______ _                 _    __             _ 
+    #  |  ____| |               | |  / _|           | |
+    #  | |__  | | ___   ___   __| | | |___      ____| |
+    #  |  __| | |/ _ \ / _ \ / _` | |  _\ \ /\ / / _` |
+    #  | |    | | (_) | (_) | (_| | | |  \ V  V / (_| |
+    #  |_|    |_|\___/ \___/ \__,_| |_|   \_/\_/ \__,_|
+    # -----------------------------------------------------------------------------------
+
+    def flood_forward(self, packet: Packet) -> Tuple[Optional[Packet], Optional[str]]:
+
         valid, reason = self.validate_packet(packet)
         if not valid:
             logger.debug(f"Flood validation failed: {reason}")
-            return None
+            return None, f"Flood: {reason}"
 
-        # Suppress duplicates
+
         if self.is_duplicate(packet):
-            return None
+            logger.debug("Flood: duplicate packet")
+            return None, "Duplicate"
+
+        self.mark_seen(packet)
 
         if packet.path is None:
             packet.path = bytearray()
@@ -406,24 +416,41 @@ class RepeaterHandler(BaseHandler):
         packet.path.append(self.local_hash)
         packet.path_len = len(packet.path)
 
-        self.mark_seen(packet)
         logger.debug(f"Flood: forwarding with path len {packet.path_len}")
 
-        return packet
+        return packet, None  # Success, no drop reason
 
-    def direct_forward(self, packet: Packet) -> Optional[Packet]:
 
-        # Check if we're the next hop
+
+    #   _____  _               _      __             _ 
+    #  |  __ \(_)             | |    / _|           | |
+    #  | |  | |_ _ __ ___  ___| |_  | |___      ____| |
+    #  | |  | | | '__/ _ \/ __| __| |  _\ \ /\ / / _` |
+    #  | |__| | | | |  __/ (__| |_  | |  \ V  V / (_| |
+    #  |_____/|_|_|  \___|\___|\__| |_|   \_/\_/ \__,_|
+    # -----------------------------------------------------------------------------------
+
+    def direct_forward(self, packet: Packet) -> Tuple[Optional[Packet], Optional[str]]:
+
+        # Check if we're the next hop FIRST
         if not packet.path or len(packet.path) == 0:
             logger.debug("Direct: no path")
-            return None
+            return None, "Direct: no path"
 
         next_hop = packet.path[0]
         if next_hop != self.local_hash:
             logger.debug(
                 f"Direct: not our hop (next={next_hop:02X}, local={self.local_hash:02X})"
             )
-            return None
+            return None, "Direct: not for us"
+
+        # NOW check for duplicates after confirming we're next hop
+        if self.is_duplicate(packet):
+            logger.debug("Direct: duplicate packet")
+            return None, "Duplicate"
+
+        # Mark as seen before forwarding
+        self.mark_seen(packet)
 
         original_path = list(packet.path)
         packet.path = bytearray(packet.path[1:])
@@ -433,7 +460,7 @@ class RepeaterHandler(BaseHandler):
         new_path = [f"{b:02X}" for b in packet.path]
         logger.debug(f"Direct: forwarding, path {old_path} -> {new_path}")
 
-        return packet
+        return packet, None  # Success, no drop reason
 
     @staticmethod
     def calculate_packet_score(snr: float, packet_len: int, spreading_factor: int = 8) -> float:
@@ -486,7 +513,7 @@ class RepeaterHandler(BaseHandler):
             delay_s = self.direct_tx_delay_factor
 
         # Apply score-based delay adjustment ONLY if delay >= 50ms threshold
-        # (matching C++ reactive behavior in Dispatcher::calcRxDelay)
+        # (matching behavior in Dispatcher::calcRxDelay)
         if delay_s >= 0.05 and self.use_score_for_tx:
             score = self.calculate_packet_score(snr, packet_len)
             # Higher score = shorter delay: max(0.2, 1.0 - score)
@@ -509,27 +536,27 @@ class RepeaterHandler(BaseHandler):
 
         return delay_s
 
-    def process_packet(self, packet: Packet, snr: float = 0.0) -> Optional[Tuple[Packet, float]]:
+    def process_packet(self, packet: Packet, snr: float = 0.0) -> Tuple[Optional[Packet], float, Optional[str]]:
 
         route_type = packet.header & PH_ROUTE_MASK
 
         if route_type == ROUTE_TYPE_FLOOD:
-            fwd_pkt = self.flood_forward(packet)
+            fwd_pkt, drop_reason = self.flood_forward(packet)
             if fwd_pkt is None:
-                return None
+                return None, 0.0, drop_reason
             delay = self._calculate_tx_delay(fwd_pkt, snr)
-            return fwd_pkt, delay
+            return fwd_pkt, delay, None
 
         elif route_type == ROUTE_TYPE_DIRECT:
-            fwd_pkt = self.direct_forward(packet)
+            fwd_pkt, drop_reason = self.direct_forward(packet)
             if fwd_pkt is None:
-                return None
+                return None, 0.0, drop_reason
             delay = self._calculate_tx_delay(fwd_pkt, snr)
-            return fwd_pkt, delay
+            return fwd_pkt, delay, None
 
         else:
             logger.debug(f"Unknown route type: {route_type}")
-            return None
+            return None, 0.0, f"Unknown route type: {route_type}"
 
     async def schedule_retransmit(self, fwd_pkt: Packet, delay: float, airtime_ms: float = 0.0):
 
