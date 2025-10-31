@@ -1,0 +1,634 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>pyMC Repeater - CAD Calibration</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link rel="stylesheet" href="/static/style.css">
+    <style>
+        .calibration-controls {
+            background: var(--bg-secondary);
+            border-radius: 8px;
+            padding: 20px;
+            margin: 20px 0;
+            border: 1px solid var(--border-color);
+        }
+        
+        .heatmap-container {
+            background: var(--bg-secondary);
+            border-radius: 8px;
+            padding: 20px;
+            margin: 20px 0;
+            border: 1px solid var(--border-color);
+            min-height: 400px;
+        }
+        
+        .heatmap-grid {
+            display: grid;
+            gap: 2px;
+            margin: 20px 0;
+            font-size: 11px;
+        }
+        
+        .heatmap-cell {
+            width: 30px;
+            height: 30px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: 3px;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            color: white;
+            font-weight: bold;
+            text-shadow: 1px 1px 1px rgba(0,0,0,0.5);
+        }
+        
+        .heatmap-cell:hover {
+            transform: scale(1.1);
+            z-index: 10;
+            position: relative;
+        }
+        
+        .heatmap-cell.testing {
+            animation: pulse 1s infinite;
+        }
+        
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.6; }
+        }
+        
+        .status-bar {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            background: var(--bg-tertiary);
+            padding: 10px 15px;
+            border-radius: 5px;
+            margin: 10px 0;
+        }
+        
+        .controls-row {
+            display: flex;
+            gap: 15px;
+            align-items: center;
+            margin: 15px 0;
+            flex-wrap: wrap;
+        }
+        
+        .control-group {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        
+        .control-group label {
+            font-weight: 500;
+            min-width: 80px;
+        }
+        
+        .control-group select, .control-group input {
+            padding: 5px 8px;
+            border: 1px solid var(--border-color);
+            border-radius: 4px;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+        }
+        
+        .btn {
+            padding: 8px 16px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-weight: 500;
+            transition: all 0.2s ease;
+        }
+        
+        .btn-primary {
+            background: var(--accent-color);
+            color: white;
+        }
+        
+        .btn-primary:hover:not(:disabled) {
+            background: var(--accent-hover);
+        }
+        
+        .btn-secondary {
+            background: var(--bg-tertiary);
+            color: var(--text-primary);
+            border: 1px solid var(--border-color);
+        }
+        
+        .btn-secondary:hover:not(:disabled) {
+            background: var(--bg-secondary);
+        }
+        
+        .btn:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+        }
+        
+        .legend {
+            display: flex;
+            gap: 15px;
+            align-items: center;
+            margin: 15px 0;
+            font-size: 12px;
+        }
+        
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+        }
+        
+        .legend-color {
+            width: 16px;
+            height: 16px;
+            border-radius: 2px;
+        }
+        
+        .progress-container {
+            margin: 15px 0;
+        }
+        
+        .progress-bar {
+            width: 100%;
+            height: 8px;
+            background: var(--bg-tertiary);
+            border-radius: 4px;
+            overflow: hidden;
+        }
+        
+        .progress-fill {
+            height: 100%;
+            background: var(--accent-color);
+            transition: width 0.3s ease;
+            width: 0%;
+        }
+        
+        .results-summary {
+            background: var(--bg-tertiary);
+            padding: 15px;
+            border-radius: 5px;
+            margin: 15px 0;
+        }
+        
+        .results-row {
+            display: flex;
+            justify-content: space-between;
+            margin: 5px 0;
+        }
+        
+        .tooltip {
+            position: absolute;
+            background: rgba(0,0,0,0.9);
+            color: white;
+            padding: 8px 12px;
+            border-radius: 4px;
+            font-size: 11px;
+            pointer-events: none;
+            z-index: 1000;
+            display: none;
+        }
+    </style>
+</head>
+<body>
+    <div class="layout">
+        <!-- Navigation Component -->
+        <!-- NAVIGATION_PLACEHOLDER -->
+
+        <!-- Main Content -->
+        <main class="content">
+            <header>
+                <h1>CAD Calibration</h1>
+                <p>Real-time Channel Activity Detection calibration tool</p>
+            </header>
+
+            <div class="info-box">
+                This tool helps you find optimal CAD thresholds for your environment. Lower detection rates (blue/green) are better for mesh networking.
+            </div>
+
+            <!-- Controls -->
+            <div class="calibration-controls">
+                <h3>Calibration Settings</h3>
+                
+                <div class="controls-row">
+                    <div class="control-group">
+                        <label for="samples">Samples:</label>
+                        <select id="samples">
+                            <option value="4">4 (Fast)</option>
+                            <option value="8" selected>8 (Standard)</option>
+                            <option value="16">16 (Thorough)</option>
+                        </select>
+                    </div>
+                    
+                    <div class="control-group">
+                        <label for="delay">Delay (ms):</label>
+                        <input type="number" id="delay" value="100" min="50" max="1000" step="50">
+                    </div>
+                    
+                    <button id="startBtn" class="btn btn-primary">Start Calibration</button>
+                    <button id="stopBtn" class="btn btn-secondary" disabled>Stop</button>
+                    <button id="resetBtn" class="btn btn-secondary">Reset</button>
+                </div>
+
+                <div class="status-bar">
+                    <div>
+                        <strong>Status:</strong> <span id="status">Ready</span>
+                    </div>
+                    <div>
+                        <strong>Progress:</strong> <span id="progress">0/0</span>
+                    </div>
+                    <div>
+                        <strong>Current:</strong> Peak=<span id="currentPeak">-</span>, Min=<span id="currentMin">-</span>
+                    </div>
+                </div>
+
+                <div class="progress-container">
+                    <div class="progress-bar">
+                        <div class="progress-fill" id="progressFill"></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Heatmap -->
+            <div class="heatmap-container">
+                <h3>Detection Rate Heatmap</h3>
+                
+                <div class="legend">
+                    <div class="legend-item">
+                        <div class="legend-color" style="background: #2563eb;"></div>
+                        <span>0% (Quiet)</span>
+                    </div>
+                    <div class="legend-item">
+                        <div class="legend-color" style="background: #16a34a;"></div>
+                        <span>1-10% (Low)</span>
+                    </div>
+                    <div class="legend-item">
+                        <div class="legend-color" style="background: #eab308;"></div>
+                        <span>11-30% (Medium)</span>
+                    </div>
+                    <div class="legend-item">
+                        <div class="legend-color" style="background: #dc2626;"></div>
+                        <span>31%+ (High)</span>
+                    </div>
+                    <div class="legend-item">
+                        <div class="legend-color" style="background: #6b7280;"></div>
+                        <span>Not tested</span>
+                    </div>
+                </div>
+
+                <div class="heatmap-grid" id="heatmapGrid">
+                    <!-- Grid will be populated by JavaScript -->
+                </div>
+            </div>
+
+            <!-- Results Summary -->
+            <div class="results-summary" id="resultsSummary" style="display: none;">
+                <h3>Best Results</h3>
+                <div id="bestResults">
+                    <!-- Best results will be populated here -->
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <!-- Tooltip -->
+    <div class="tooltip" id="tooltip"></div>
+
+    <script>
+        let calibrationState = {
+            running: false,
+            results: new Map(),
+            currentIndex: 0,
+            totalTests: 0,
+            peakRange: [],
+            minRange: [],
+            samples: 8,
+            delay: 100
+        };
+
+        let eventSource = null;
+
+        function initializeCalibration() {
+            // Get radio config to determine ranges
+            fetch('/api/stats')
+                .then(r => r.json())
+                .then(data => {
+                    const config = data.config || {};
+                    const radio = config.radio || {};
+                    const sf = radio.spreading_factor || 8;
+                    
+                    // Set ranges based on spreading factor (same logic as Python tool)
+                    const ranges = {
+                        7:  { peak: [16, 28], min: [6, 14] },
+                        8:  { peak: [16, 28], min: [6, 14] },
+                        9:  { peak: [18, 30], min: [7, 15] },
+                        10: { peak: [20, 32], min: [8, 15] },
+                        11: { peak: [22, 34], min: [9, 16] },
+                        12: { peak: [24, 36], min: [10, 17] }
+                    };
+                    
+                    const range = ranges[sf] || ranges[8];
+                    calibrationState.peakRange = [];
+                    calibrationState.minRange = [];
+                    
+                    for (let i = range.peak[0]; i <= range.peak[1]; i++) {
+                        calibrationState.peakRange.push(i);
+                    }
+                    for (let i = range.min[0]; i <= range.min[1]; i++) {
+                        calibrationState.minRange.push(i);
+                    }
+                    
+                    calibrationState.totalTests = calibrationState.peakRange.length * calibrationState.minRange.length;
+                    
+                    setupHeatmapGrid();
+                    updateStatus('Ready - SF' + sf + ' ranges loaded');
+                })
+                .catch(e => {
+                    console.error('Error loading radio config:', e);
+                    updateStatus('Error loading radio configuration');
+                });
+        }
+
+        function setupHeatmapGrid() {
+            const grid = document.getElementById('heatmapGrid');
+            grid.innerHTML = '';
+            
+            // Set grid template columns based on min range length
+            grid.style.gridTemplateColumns = `60px repeat(${calibrationState.minRange.length}, 30px)`;
+            
+            // Add header row
+            const cornerCell = document.createElement('div');
+            cornerCell.className = 'heatmap-cell';
+            cornerCell.style.background = 'transparent';
+            cornerCell.style.color = 'var(--text-primary)';
+            cornerCell.style.fontWeight = 'bold';
+            cornerCell.textContent = 'Peak\\Min';
+            grid.appendChild(cornerCell);
+            
+            calibrationState.minRange.forEach(minVal => {
+                const headerCell = document.createElement('div');
+                headerCell.className = 'heatmap-cell';
+                headerCell.style.background = 'var(--bg-tertiary)';
+                headerCell.style.color = 'var(--text-primary)'; 
+                headerCell.style.fontWeight = 'bold';
+                headerCell.textContent = minVal;
+                grid.appendChild(headerCell);
+            });
+            
+            // Add data rows
+            calibrationState.peakRange.forEach(peakVal => {
+                // Row header
+                const rowHeader = document.createElement('div');
+                rowHeader.className = 'heatmap-cell';
+                rowHeader.style.background = 'var(--bg-tertiary)';
+                rowHeader.style.color = 'var(--text-primary)';
+                rowHeader.style.fontWeight = 'bold';
+                rowHeader.textContent = peakVal;
+                grid.appendChild(rowHeader);
+                
+                // Data cells
+                calibrationState.minRange.forEach(minVal => {
+                    const cell = document.createElement('div');
+                    cell.className = 'heatmap-cell';
+                    cell.id = `cell-${peakVal}-${minVal}`;
+                    cell.style.background = '#6b7280'; // Not tested
+                    cell.textContent = '-';
+                    
+                    cell.addEventListener('mouseenter', (e) => showTooltip(e, peakVal, minVal));
+                    cell.addEventListener('mouseleave', hideTooltip);
+                    
+                    grid.appendChild(cell);
+                });
+            });
+        }
+
+        function showTooltip(event, peak, min) {
+            const tooltip = document.getElementById('tooltip');
+            const key = `${peak}-${min}`;
+            const result = calibrationState.results.get(key);
+            
+            let content = `Peak: ${peak}, Min: ${min}`;
+            if (result) {
+                content += `<br>Detection Rate: ${result.detection_rate.toFixed(1)}%`;
+                content += `<br>Detections: ${result.detections}/${result.samples}`;
+                content += `<br>Status: ${getStatusText(result.detection_rate)}`;
+            } else {
+                content += '<br>Not tested yet';
+            }
+            
+            tooltip.innerHTML = content;
+            tooltip.style.display = 'block';
+            tooltip.style.left = event.pageX + 10 + 'px';
+            tooltip.style.top = event.pageY + 10 + 'px';
+        }
+
+        function hideTooltip() {
+            document.getElementById('tooltip').style.display = 'none';
+        }
+
+        function getStatusText(rate) {
+            if (rate === 0) return 'QUIET';
+            if (rate < 10) return 'LOW';
+            if (rate < 30) return 'MEDIUM';
+            return 'HIGH';
+        }
+
+        function getColorForRate(rate) {
+            if (rate === 0) return '#2563eb';      // Blue - Quiet
+            if (rate < 10) return '#16a34a';      // Green - Low  
+            if (rate < 30) return '#eab308';      // Yellow - Medium
+            return '#dc2626';                     // Red - High
+        }
+
+        function updateHeatmapCell(peak, min, result) {
+            const cell = document.getElementById(`cell-${peak}-${min}`);
+            if (cell) {
+                const rate = result.detection_rate;
+                cell.style.background = getColorForRate(rate);
+                cell.textContent = Math.round(rate);
+                cell.classList.remove('testing');
+            }
+        }
+
+        function markCellTesting(peak, min) {
+            const cell = document.getElementById(`cell-${peak}-${min}`);
+            if (cell) {
+                cell.classList.add('testing');
+            }
+        }
+
+        function updateStatus(message) {
+            document.getElementById('status').textContent = message;
+        }
+
+        function updateProgress(current, total) {
+            document.getElementById('progress').textContent = `${current}/${total}`;
+            const percentage = total > 0 ? (current / total) * 100 : 0;
+            document.getElementById('progressFill').style.width = percentage + '%';
+        }
+
+        function updateCurrentTest(peak, min) {
+            document.getElementById('currentPeak').textContent = peak || '-';
+            document.getElementById('currentMin').textContent = min || '-';
+        }
+
+        function updateBestResults() {
+            const results = Array.from(calibrationState.results.values());
+            if (results.length === 0) return;
+            
+            // Sort by detection_rate, then by peak (lower is better)
+            results.sort((a, b) => {
+                if (a.detection_rate !== b.detection_rate) {
+                    return a.detection_rate - b.detection_rate;
+                }
+                return a.det_peak - b.det_peak;
+            });
+            
+            const top5 = results.slice(0, 5);
+            const summaryDiv = document.getElementById('resultsSummary');
+            const bestDiv = document.getElementById('bestResults');
+            
+            bestDiv.innerHTML = '';
+            top5.forEach((result, index) => {
+                const div = document.createElement('div');
+                div.className = 'results-row';
+                div.innerHTML = `
+                    <span>#${index + 1}: Peak=${result.det_peak}, Min=${result.det_min}</span>
+                    <span>${result.detection_rate.toFixed(1)}% (${result.detections}/${result.samples})</span>
+                `;
+                bestDiv.appendChild(div);
+            });
+            
+            summaryDiv.style.display = 'block';
+        }
+
+        function startCalibration() {
+            if (calibrationState.running) return;
+            
+            calibrationState.running = true;
+            calibrationState.currentIndex = 0;
+            calibrationState.samples = parseInt(document.getElementById('samples').value);
+            calibrationState.delay = parseInt(document.getElementById('delay').value);
+            
+            document.getElementById('startBtn').disabled = true;
+            document.getElementById('stopBtn').disabled = false;
+            document.getElementById('samples').disabled = true;
+            document.getElementById('delay').disabled = true;
+            
+            updateStatus('Starting calibration...');
+            
+            // Start Server-Sent Events connection
+            eventSource = new EventSource('/api/cad-calibration-stream');
+            
+            eventSource.onmessage = function(event) {
+                const data = JSON.parse(event.data);
+                
+                if (data.type === 'progress') {
+                    updateProgress(data.current, data.total);
+                    updateCurrentTest(data.peak, data.min);
+                    
+                    if (data.peak && data.min) {
+                        markCellTesting(data.peak, data.min);
+                    }
+                }
+                else if (data.type === 'result') {
+                    const key = `${data.det_peak}-${data.det_min}`;
+                    calibrationState.results.set(key, data);
+                    updateHeatmapCell(data.det_peak, data.det_min, data);
+                    updateBestResults();
+                }
+                else if (data.type === 'status') {
+                    updateStatus(data.message);
+                }
+                else if (data.type === 'completed') {
+                    stopCalibration();
+                    updateStatus('Calibration completed');
+                }
+                else if (data.type === 'error') {
+                    stopCalibration();
+                    updateStatus('Error: ' + data.message);
+                }
+            };
+            
+            eventSource.onerror = function() {
+                stopCalibration();
+                updateStatus('Connection error');
+            };
+            
+            // Start the calibration process
+            fetch('/api/cad-calibration-start', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    samples: calibrationState.samples,
+                    delay: calibrationState.delay
+                })
+            })
+            .catch(e => {
+                stopCalibration();
+                updateStatus('Failed to start calibration');
+                console.error('Start calibration error:', e);
+            });
+        }
+
+        function stopCalibration() {
+            calibrationState.running = false;
+            
+            if (eventSource) {
+                eventSource.close();
+                eventSource = null;
+            }
+            
+            // Stop the calibration process
+            fetch('/api/cad-calibration-stop', { method: 'POST' })
+                .catch(e => console.error('Stop calibration error:', e));
+            
+            document.getElementById('startBtn').disabled = false;
+            document.getElementById('stopBtn').disabled = true;
+            document.getElementById('samples').disabled = false;
+            document.getElementById('delay').disabled = false;
+            
+            updateCurrentTest();
+            
+            // Remove all testing classes
+            document.querySelectorAll('.heatmap-cell.testing').forEach(cell => {
+                cell.classList.remove('testing');
+            });
+        }
+
+        function resetCalibration() {
+            if (calibrationState.running) {
+                stopCalibration();
+            }
+            
+            calibrationState.results.clear();
+            calibrationState.currentIndex = 0;
+            
+            setupHeatmapGrid();
+            updateProgress(0, calibrationState.totalTests);
+            updateCurrentTest();
+            updateStatus('Reset - Ready to start');
+            document.getElementById('resultsSummary').style.display = 'none';
+        }
+
+        // Event listeners
+        document.getElementById('startBtn').addEventListener('click', startCalibration);
+        document.getElementById('stopBtn').addEventListener('click', stopCalibration);
+        document.getElementById('resetBtn').addEventListener('click', resetCalibration);
+
+        // Initialize on page load
+        document.addEventListener('DOMContentLoaded', initializeCalibration);
+
+        // Cleanup on page unload
+        window.addEventListener('beforeunload', () => {
+            if (eventSource) {
+                eventSource.close();
+            }
+        });
+    </script>
+</body>
+</html>

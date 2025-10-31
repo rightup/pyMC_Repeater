@@ -1,9 +1,13 @@
+import asyncio
+import json
 import logging
 import os
 import re
+import threading
+import time
 from collections import deque
 from datetime import datetime
-from typing import Callable, Optional
+from typing import Callable, Optional, Dict, Any
 
 import cherrypy
 from pymc_core.protocol.utils import PAYLOAD_TYPES, ROUTE_TYPES
@@ -40,6 +44,190 @@ class LogBuffer(logging.Handler):
 _log_buffer = LogBuffer(max_lines=100)
 
 
+class CADCalibrationEngine:
+    """Real-time CAD calibration engine"""
+    
+    def __init__(self, stats_getter: Optional[Callable] = None, event_loop=None):
+        self.stats_getter = stats_getter
+        self.event_loop = event_loop
+        self.running = False
+        self.results = {}
+        self.current_test = None
+        self.progress = {"current": 0, "total": 0}
+        self.clients = set()  # SSE clients
+        self.calibration_thread = None
+        
+    def get_test_ranges(self, spreading_factor: int):
+        """Get CAD test ranges based on spreading factor"""
+        sf_ranges = {
+            7:  (range(16, 29, 1), range(6, 15, 1)),
+            8:  (range(16, 29, 1), range(6, 15, 1)),  
+            9:  (range(18, 31, 1), range(7, 16, 1)),
+            10: (range(20, 33, 1), range(8, 16, 1)),
+            11: (range(22, 35, 1), range(9, 17, 1)),
+            12: (range(24, 37, 1), range(10, 18, 1)),
+        }
+        return sf_ranges.get(spreading_factor, sf_ranges[8])
+    
+    async def test_cad_config(self, radio, det_peak: int, det_min: int, samples: int = 8) -> Dict[str, Any]:
+        """Test a single CAD configuration with multiple samples"""
+        detections = 0
+        
+        for _ in range(samples):
+            try:
+                result = await radio.perform_cad(det_peak=det_peak, det_min=det_min, timeout=0.6)
+                if result:
+                    detections += 1
+            except Exception:
+                pass
+            await asyncio.sleep(0.03)
+        
+        return {
+            'det_peak': det_peak,
+            'det_min': det_min,
+            'samples': samples,  
+            'detections': detections,
+            'detection_rate': (detections / samples) * 100,
+        }
+    
+    def broadcast_to_clients(self, data):
+        """Send data to all connected SSE clients"""
+        message = f"data: {json.dumps(data)}\n\n"
+        for client in self.clients.copy():
+            try:
+                client.write(message.encode())
+                client.flush()
+            except Exception:
+                self.clients.discard(client)
+    
+    def calibration_worker(self, samples: int, delay_ms: int):
+        """Worker thread for calibration process"""
+        try:
+            # Get radio from stats
+            if not self.stats_getter:
+                self.broadcast_to_clients({"type": "error", "message": "No stats getter available"})
+                return
+                
+            stats = self.stats_getter()
+            if not stats or "radio_instance" not in stats:
+                self.broadcast_to_clients({"type": "error", "message": "Radio instance not available"})
+                return
+                
+            radio = stats["radio_instance"]
+            if not hasattr(radio, 'perform_cad'):
+                self.broadcast_to_clients({"type": "error", "message": "Radio does not support CAD"})
+                return
+            
+            # Get spreading factor
+            config = stats.get("config", {})
+            radio_config = config.get("radio", {})
+            sf = radio_config.get("spreading_factor", 8)
+            
+            # Get test ranges
+            peak_range, min_range = self.get_test_ranges(sf)
+            
+            total_tests = len(peak_range) * len(min_range)
+            self.progress = {"current": 0, "total": total_tests}
+            
+            self.broadcast_to_clients({
+                "type": "status", 
+                "message": f"Starting calibration: SF{sf}, {total_tests} tests"
+            })
+            
+            current = 0
+            
+            # Run calibration in event loop
+            if self.event_loop:
+                for det_peak in peak_range:
+                    if not self.running:
+                        break
+                        
+                    for det_min in min_range:
+                        if not self.running:
+                            break
+                            
+                        current += 1
+                        self.progress["current"] = current
+                        
+                        # Update progress
+                        self.broadcast_to_clients({
+                            "type": "progress",
+                            "current": current,
+                            "total": total_tests,
+                            "peak": det_peak,
+                            "min": det_min
+                        })
+                        
+                        # Run the test
+                        future = asyncio.run_coroutine_threadsafe(
+                            self.test_cad_config(radio, det_peak, det_min, samples),
+                            self.event_loop
+                        )
+                        
+                        try:
+                            result = future.result(timeout=30)  # 30 second timeout per test
+                            
+                            # Store result
+                            key = f"{det_peak}-{det_min}"
+                            self.results[key] = result
+                            
+                            # Send result to clients
+                            self.broadcast_to_clients({
+                                "type": "result",
+                                **result
+                            })
+                        except Exception as e:
+                            logger.error(f"CAD test failed for peak={det_peak}, min={det_min}: {e}")
+                            
+                        # Delay between tests
+                        if self.running and delay_ms > 0:
+                            time.sleep(delay_ms / 1000.0)
+            
+            if self.running:
+                self.broadcast_to_clients({"type": "completed", "message": "Calibration completed"})
+            else:
+                self.broadcast_to_clients({"type": "status", "message": "Calibration stopped"})
+                
+        except Exception as e:
+            logger.error(f"Calibration worker error: {e}")
+            self.broadcast_to_clients({"type": "error", "message": str(e)})
+        finally:
+            self.running = False
+    
+    def start_calibration(self, samples: int = 8, delay_ms: int = 100):
+        """Start calibration process"""
+        if self.running:
+            return False
+            
+        self.running = True
+        self.results.clear()
+        self.progress = {"current": 0, "total": 0}
+        
+        # Start calibration in separate thread
+        self.calibration_thread = threading.Thread(
+            target=self.calibration_worker,
+            args=(samples, delay_ms)
+        )
+        self.calibration_thread.daemon = True
+        self.calibration_thread.start()
+        
+        return True
+    
+    def stop_calibration(self):
+        """Stop calibration process"""
+        self.running = False
+        if self.calibration_thread:
+            self.calibration_thread.join(timeout=2)
+    
+    def add_client(self, response_stream):
+        """Add SSE client"""
+        self.clients.add(response_stream)
+    
+    def remove_client(self, response_stream):
+        """Remove SSE client"""
+        self.clients.discard(response_stream)
+
+
 class APIEndpoints:
 
     def __init__(
@@ -54,6 +242,9 @@ class APIEndpoints:
         self.send_advert_func = send_advert_func
         self.config = config or {}
         self.event_loop = event_loop  # Store reference to main event loop
+        
+        # Initialize CAD calibration engine
+        self.cad_calibration = CADCalibrationEngine(stats_getter, event_loop)
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
@@ -167,6 +358,78 @@ class APIEndpoints:
             logger.error(f"Error fetching logs: {e}")
             return {"error": str(e), "logs": []}
 
+    # CAD Calibration endpoints
+    @cherrypy.expose
+    @cherrypy.tools.json_out()  
+    @cherrypy.tools.json_in()
+    def cad_calibration_start(self):
+        """Start CAD calibration"""
+        if cherrypy.request.method != "POST":
+            return {"success": False, "error": "Method not allowed"}
+        
+        try:
+            data = cherrypy.request.json or {}
+            samples = data.get("samples", 8)
+            delay = data.get("delay", 100)
+            
+            if self.cad_calibration.start_calibration(samples, delay):
+                return {"success": True, "message": "Calibration started"}
+            else:
+                return {"success": False, "error": "Calibration already running"}
+                
+        except Exception as e:
+            logger.error(f"Error starting CAD calibration: {e}")
+            return {"success": False, "error": str(e)}
+    
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    def cad_calibration_stop(self):
+        """Stop CAD calibration"""
+        if cherrypy.request.method != "POST":
+            return {"success": False, "error": "Method not allowed"}
+        
+        try:
+            self.cad_calibration.stop_calibration()
+            return {"success": True, "message": "Calibration stopped"}
+        except Exception as e:
+            logger.error(f"Error stopping CAD calibration: {e}")
+            return {"success": False, "error": str(e)}
+    
+    @cherrypy.expose
+    def cad_calibration_stream(self):
+        """Server-Sent Events stream for real-time updates"""
+        cherrypy.response.headers['Content-Type'] = 'text/event-stream'
+        cherrypy.response.headers['Cache-Control'] = 'no-cache'
+        cherrypy.response.headers['Connection'] = 'keep-alive'
+        cherrypy.response.headers['Access-Control-Allow-Origin'] = '*'
+        
+        def generate():
+            # Add client to calibration engine
+            response = cherrypy.response
+            self.cad_calibration.add_client(response)
+            
+            try:
+                # Send initial connection message
+                yield f"data: {json.dumps({'type': 'connected', 'message': 'Connected to CAD calibration stream'})}\n\n"
+                
+                # Keep connection alive - the calibration engine will send data
+                while True:
+                    time.sleep(1)
+                    # Send keepalive every second
+                    yield f"data: {json.dumps({'type': 'keepalive'})}\n\n"
+                    
+            except Exception as e:
+                logger.error(f"SSE stream error: {e}")
+            finally:
+                # Remove client when connection closes
+                self.cad_calibration.remove_client(response)
+        
+        return generate()
+    
+    cad_calibration_stream._cp_config = {'response.stream': True}
+
+
+
 
 class StatsApp:
 
@@ -231,6 +494,11 @@ class StatsApp:
         """Serve help documentation."""
         return self._serve_template("help.html")
 
+    @cherrypy.expose
+    def cad_calibration(self):
+        """Serve CAD calibration page."""
+        return self._serve_template("cad-calibration.html")
+
     def _serve_template(self, template_name: str):
         """Serve HTML template with stats."""
         if not self.template_dir:
@@ -270,6 +538,7 @@ class StatsApp:
                 "neighbors.html": "neighbors",
                 "statistics.html": "statistics",
                 "configuration.html": "configuration",
+                "cad-calibration.html": "cad-calibration",
                 "logs.html": "logs",
                 "help.html": "help",
             }

@@ -291,6 +291,8 @@ class RepeaterDaemon:
                     stats["public_key"] = pubkey.hex()
                 except Exception:
                     stats["public_key"] = None
+            if self.radio:
+                stats["radio_instance"] = self.radio
             return stats
         return {}
 
