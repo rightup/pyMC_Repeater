@@ -31,14 +31,13 @@ class RepeaterDaemon:
         self.http_server = None
         self.trace_handler = None
 
-        # Setup logging
+
         log_level = config.get("logging", {}).get("level", "INFO")
         logging.basicConfig(
             level=getattr(logging, log_level),
             format=config.get("logging", {}).get("format"),
         )
 
-        # Add log buffer handler to capture logs for web display
         root_logger = logging.getLogger()
         _log_buffer.setLevel(getattr(logging, log_level))
         root_logger.addHandler(_log_buffer)
@@ -51,12 +50,32 @@ class RepeaterDaemon:
             logger.info("Initializing radio hardware...")
             try:
                 self.radio = get_radio_for_board(self.config)
+                
+
+                if hasattr(self.radio, 'set_custom_cad_thresholds'):
+                    self.radio.set_custom_cad_thresholds(peak=23, min_val=11)
+                    logger.info("CAD thresholds set: peak=23, min=11")
+                else:
+                    logger.warning("Radio does not support CAD configuration")
+                
+
+                if hasattr(self.radio, 'get_frequency'):
+                    logger.info(f"Radio config - Freq: {self.radio.get_frequency():.1f}MHz")
+                if hasattr(self.radio, 'get_spreading_factor'):
+                    logger.info(f"Radio config - SF: {self.radio.get_spreading_factor()}")
+                if hasattr(self.radio, 'get_bandwidth'):
+                    logger.info(f"Radio config - BW: {self.radio.get_bandwidth()}kHz")
+                if hasattr(self.radio, 'get_coding_rate'):
+                    logger.info(f"Radio config - CR: {self.radio.get_coding_rate()}")
+                if hasattr(self.radio, 'get_tx_power'):
+                    logger.info(f"Radio config - TX Power: {self.radio.get_tx_power()}dBm")
+                
                 logger.info("Radio hardware initialized")
             except Exception as e:
                 logger.error(f"Failed to initialize radio hardware: {e}")
                 raise RuntimeError("Repeater requires real LoRa hardware") from e
 
-        # Create dispatcher from pymc_core
+
         try:
             from pymc_core import LocalIdentity
             from pymc_core.node.dispatcher import Dispatcher
@@ -73,14 +92,14 @@ class RepeaterDaemon:
             self.local_identity = local_identity
             self.dispatcher.local_identity = local_identity
 
-            # Get the actual hash from the identity (first byte of public key)
+
             pubkey = local_identity.get_public_key()
             self.local_hash = pubkey[0]
             logger.info(f"Local identity set: {local_identity.get_address_bytes().hex()}")
             local_hash_hex = f"0x{self.local_hash: 02x}"
             logger.info(f"Local node hash (from identity): {local_hash_hex}")
 
-            # Override _is_own_packet to always return False
+
             self.dispatcher._is_own_packet = lambda pkt: False
 
             self.repeater_handler = RepeaterHandler(
@@ -146,9 +165,11 @@ class RepeaterDaemon:
                 for i in range(packet.path_len):
                     if i < len(packet.path):
                         snr_val = packet.path[i]
-                        snr_db = snr_val / 4.0
+                   
+                        snr_signed = snr_val if snr_val < 128 else snr_val - 256
+                        snr_db = snr_signed / 4.0
                         path_snrs.append(f"{snr_val}({snr_db:.1f}dB)")
-                        # Create hash->SNR mapping for display
+                 
                         if i < len(trace_path):
                             path_snr_details.append({
                                 "hash": f"{trace_path[i]:02X}",
@@ -190,7 +211,9 @@ class RepeaterDaemon:
             for i in range(packet.path_len):
                 if i < len(packet.path):
                     snr_val = packet.path[i]
-                    path_snrs.append(f"{snr_val}({snr_val/4:.1f}dB)")
+                    snr_signed = snr_val if snr_val < 128 else snr_val - 256
+                    snr_db = snr_signed / 4.0
+                    path_snrs.append(f"{snr_val}({snr_db:.1f}dB)")
                 if i < len(trace_path):
                     path_hashes.append(f"0x{trace_path[i]:02x}")
             
@@ -216,16 +239,25 @@ class RepeaterDaemon:
                             record["drop_reason"] = "trace_forwarded"
                             break
    
-                snr_scaled = int(packet.get_snr() * 4)
-                snr_byte = snr_scaled & 0xFF
+                current_snr = packet.get_snr()
                 
+    
+                snr_scaled = int(current_snr * 4)
+       
+                if snr_scaled > 127:
+                    snr_scaled = 127
+                elif snr_scaled < -128:
+                    snr_scaled = -128
+
+                snr_byte = snr_scaled if snr_scaled >= 0 else (256 + snr_scaled)
+        
                 while len(packet.path) <= packet.path_len:
                     packet.path.append(0)
                     
                 packet.path[packet.path_len] = snr_byte
                 packet.path_len += 1
                 
-                logger.info(f"[TraceHandler] Forwarding trace, stored SNR {packet.get_snr():.1f}dB ({snr_byte}) at position {packet.path_len-1}")
+                logger.info(f"[TraceHandler] Forwarding trace, stored SNR {current_snr:.1f}dB at position {packet.path_len-1}")
                 
                 # Mark as seen and forward directly (bypass normal routing, no ACK required)
                 self.repeater_handler.mark_seen(packet)
