@@ -116,8 +116,8 @@ class CADCalibrationEngine:
                 self.broadcast_to_clients({"type": "error", "message": "Radio does not support CAD"})
                 return
             
-            # Get spreading factor
-            config = stats.get("config", {})
+            # Get spreading factor from daemon instance
+            config = getattr(self.daemon_instance, 'config', {})
             radio_config = config.get("radio", {})
             sf = radio_config.get("spreading_factor", 8)
             
