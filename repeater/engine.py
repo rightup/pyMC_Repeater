@@ -13,14 +13,14 @@ from pymc_core.protocol.constants import (
     PAYLOAD_TYPE_REQ,
     PAYLOAD_TYPE_RESPONSE,
     PAYLOAD_TYPE_TXT_MSG,
-    PAYLOAD_TYPE_ACK,
+    # PAYLOAD_TYPE_ACK,
     PAYLOAD_TYPE_ADVERT,
     PAYLOAD_TYPE_GRP_TXT,
     PAYLOAD_TYPE_GRP_DATA,
     PAYLOAD_TYPE_ANON_REQ,
     PAYLOAD_TYPE_PATH,
-    PAYLOAD_TYPE_TRACE,
-    PAYLOAD_TYPE_RAW_CUSTOM,
+    # PAYLOAD_TYPE_TRACE,
+    # PAYLOAD_TYPE_RAW_CUSTOM,
 
 )
 from pymc_core.protocol.packet_utils import PacketHeaderUtils, PacketTimingUtils
@@ -178,6 +178,7 @@ class RepeaterHandler(BaseHandler):
 
         src_hash = None
         dst_hash = None
+        channel_hash = None
 
         # Payload types with dest_hash and src_hash as first 2 bytes
         if payload_type in [PAYLOAD_TYPE_REQ, PAYLOAD_TYPE_RESPONSE, PAYLOAD_TYPE_TXT_MSG, PAYLOAD_TYPE_PATH]:
@@ -189,6 +190,16 @@ class RepeaterHandler(BaseHandler):
         elif payload_type == PAYLOAD_TYPE_ADVERT:
             if packet.payload and len(packet.payload) >= 1:
                 src_hash = f"{packet.payload[0]:02X}"
+
+        # ANON_REQ packets have dest_hash only as first byte
+        elif payload_type == PAYLOAD_TYPE_ANON_REQ:
+            if packet.payload and len(packet.payload) >= 1:
+                dst_hash = f"{packet.payload[0]:02X}"
+
+        # Group packets have channel_hash as first byte
+        elif payload_type in [PAYLOAD_TYPE_GRP_TXT, PAYLOAD_TYPE_GRP_DATA]:
+            if packet.payload and len(packet.payload) >= 1:
+                channel_hash = f"{packet.payload[0]:02X}"
 
         # Record packet for charts
         packet_record = {
@@ -209,6 +220,7 @@ class RepeaterHandler(BaseHandler):
             "path_hash": path_hash,
             "src_hash": src_hash,
             "dst_hash": dst_hash,
+            "channel_hash": channel_hash,
             "original_path": ([f"{b:02X}" for b in original_path] if original_path else None),
             "forwarded_path": (
                 [f"{b:02X}" for b in forwarded_path] if forwarded_path is not None else None
