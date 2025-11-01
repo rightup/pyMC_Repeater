@@ -5,8 +5,9 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <link rel="stylesheet" href="/static/style.css">
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/chartjs-chart-matrix@2.0.1/dist/chartjs-chart-matrix.min.js"></script>
+    <script src="https://d3js.org/d3.v7.min.js"></script>
+    <script src="https://d3js.org/d3-scale-chromatic.v1.min.js"></script>
+    <script src="https://d3js.org/d3-hexbin.v0.2.min.js"></script>
     <style>
         .calibration-controls {
             background: var(--bg-secondary);
@@ -15,35 +16,108 @@
             margin: 20px 0;
             border: 1px solid var(--border-color);
             display: flex;
-            gap: 20px;
+            justify-content: center;
             align-items: center;
-            flex-wrap: wrap;
-        }
-        
-        .control-group {
-            display: flex;
-            flex-direction: column;
-            gap: 5px;
-        }
-        
-        .control-group label {
-            font-weight: 600;
-            color: var(--text-secondary);
-        }
-        
-        .control-group input {
-            padding: 8px 12px;
-            border: 1px solid var(--border-color);
-            border-radius: 4px;
-            background: var(--bg-primary);
-            color: var(--text-primary);
-            width: 80px;
         }
         
         .buttons {
             display: flex;
-            gap: 10px;
-            margin-left: auto;
+            gap: 16px;
+        }
+
+        /* Control button styling - matching site design system */
+        .control-btn {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            padding: 12px 16px;
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 6px;
+            color: #d4d4d4;
+            cursor: pointer;
+            transition: all 0.2s;
+            font-size: 0.875rem;
+            font-family: inherit;
+            min-width: 160px;
+        }
+
+        .control-btn:hover:not(:disabled) {
+            background: rgba(255, 255, 255, 0.1);
+            border-color: rgba(255, 255, 255, 0.2);
+            transform: translateY(-1px);
+        }
+
+        .control-btn:disabled {
+            opacity: 0.4;
+            cursor: not-allowed;
+            background: rgba(255, 255, 255, 0.02);
+        }
+
+        .control-btn-start {
+            background: rgba(16, 185, 129, 0.1);
+            border-color: rgba(16, 185, 129, 0.3);
+            color: #10b981;
+        }
+
+        .control-btn-start:hover:not(:disabled) {
+            background: rgba(16, 185, 129, 0.2);
+            border-color: rgba(16, 185, 129, 0.4);
+            box-shadow: 0 4px 12px rgba(16, 185, 129, 0.15);
+        }
+
+        .control-btn-danger {
+            background: rgba(239, 68, 68, 0.1);
+            border-color: rgba(239, 68, 68, 0.3);
+            color: #ef4444;
+        }
+
+        .control-btn-danger:hover:not(:disabled) {
+            background: rgba(239, 68, 68, 0.2);
+            border-color: rgba(239, 68, 68, 0.4);
+            box-shadow: 0 4px 12px rgba(239, 68, 68, 0.15);
+        }
+
+        .control-btn .icon {
+            width: 20px;
+            height: 20px;
+            flex-shrink: 0;
+        }
+
+        .control-label {
+            display: flex;
+            flex-direction: column;
+            align-items: flex-start;
+            flex-grow: 1;
+        }
+
+        .control-title {
+            font-weight: 500;
+            font-size: 0.875rem;
+            line-height: 1.2;
+        }
+
+        .control-value {
+            font-size: 0.75rem;
+            opacity: 0.8;
+            line-height: 1.1;
+        }
+
+        .control-btn-save {
+            background: rgba(59, 130, 246, 0.1);
+            border-color: rgba(59, 130, 246, 0.3);
+            color: #3b82f6;
+        }
+
+        .control-btn-save:hover:not(:disabled) {
+            background: rgba(59, 130, 246, 0.2);
+            border-color: rgba(59, 130, 246, 0.4);
+            box-shadow: 0 4px 12px rgba(59, 130, 246, 0.15);
+        }
+
+        .save-controls {
+            display: flex;
+            justify-content: center;
         }
         
         .chart-container {
@@ -52,8 +126,106 @@
             padding: 20px;
             margin: 20px 0;
             border: 1px solid var(--border-color);
-            height: 500px;
+            height: 600px; /* Increased to match new chart height */
             position: relative;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+        
+        .heatmap-svg {
+            border-radius: 4px;
+            background: var(--bg-primary);
+        }
+        
+        .heatmap-cell {
+            stroke: var(--border-color);
+            stroke-width: 1;
+            cursor: pointer;
+        }
+        
+        .heatmap-cell:hover {
+            stroke: var(--primary);
+            stroke-width: 2;
+        }
+        
+        .axis-label {
+            font-size: 12px;
+            fill: var(--text-secondary);
+        }
+        
+        .axis-title {
+            font-size: 14px;
+            font-weight: bold;
+            fill: var(--text-primary);
+        }
+        
+        .legend-title {
+            font-size: 12px;
+            font-weight: bold;
+            fill: var(--text-primary);
+        }
+        
+        .legend-label {
+            font-size: 10px;
+            fill: var(--text-secondary);
+        }
+        
+        .axis {
+            font-size: 12px;
+        }
+        
+        .axis path,
+        .axis line {
+            fill: none;
+            stroke: #888;
+            shape-rendering: crispEdges;
+        }
+        
+        .axis text {
+            fill: #fff !important;
+            font-weight: bold;
+        }
+        
+        .hexagon {
+            cursor: pointer;
+        }
+        
+        .hexagon:hover {
+            opacity: 1 !important;
+        }
+        
+        .non-detected {
+            cursor: pointer;
+        }
+        
+        .chart-background {
+            pointer-events: none;
+        }
+        
+        .heatmap-tooltip {
+            position: absolute;
+            background-color: white;
+            border: solid 2px #333;
+            border-radius: 5px;
+            padding: 8px;
+            font-size: 12px;
+            color: #333;
+            pointer-events: none;
+            opacity: 0;
+            z-index: 1000;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+        }
+        
+        .heatmap-title {
+            fill: #fff !important;
+            font-size: 18px;
+            font-weight: bold;
+        }
+        
+        .heatmap-subtitle {
+            fill: #ccc !important;
+            font-size: 14px;
         }
         
         .status-container {
@@ -134,47 +306,72 @@
     </style>
 </head>
 <body>
-    <div class="container">
-        <!-- Include navigation -->
-        <nav class="nav-container">
-            <div class="nav-brand">
-                <a href="/" class="nav-link">
-                    <i class="nav-icon">📡</i>
-                    <span>{{ node_name }}</span>
-                </a>
-            </div>
-            <div class="nav-links">
-                <a href="/" class="nav-link">Dashboard</a>
-                <a href="/configuration" class="nav-link">Configuration</a>
-                <a href="/cad-calibration" class="nav-link active">CAD Calibration</a>
-            </div>
-        </nav>
+    <div class="layout">
+        <!-- Navigation Component -->
+        <!-- NAVIGATION_PLACEHOLDER -->
 
-        <div class="content">
-            <div class="page-header">
+        <!-- Main Content -->
+        <main class="content">
+            <header>
                 <h1>CAD Calibration Tool</h1>
-                <p>Real-time Channel Activity Detection calibration with heatmap visualization</p>
-            </div>
+                <p>Real-time Channel Activity Detection calibration</p>
+            </header>
 
             <!-- Controls -->
             <div class="calibration-controls">
-                <div class="control-group">
-                    <label for="samples">Samples per test:</label>
-                    <input type="number" id="samples" value="50" min="10" max="200">
-                </div>
-                <div class="control-group">
-                    <label for="delay">Delay (ms):</label>
-                    <input type="number" id="delay" value="100" min="50" max="500">
-                </div>
                 <div class="buttons">
-                    <button id="start-btn" class="btn btn-primary">Start Calibration</button>
-                    <button id="stop-btn" class="btn btn-danger" disabled>Stop</button>
+                    <button id="start-btn" class="control-btn control-btn-start">
+                        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <polygon points="5 3 19 12 5 21 5 3"></polygon>
+                        </svg>
+                        <span class="control-label">
+                            <span class="control-title">Start Calibration</span>
+                      
+                        </span>
+                    </button>
+                    <button id="stop-btn" class="control-btn control-btn-danger" disabled>
+                        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <rect x="6" y="6" width="12" height="12"></rect>
+                        </svg>
+                        <span class="control-label">
+                            <span class="control-title">Stop</span>
+                            <span class="control-value">Halt calibration</span>
+                        </span>
+                    </button>
                 </div>
             </div>
 
             <!-- Status and Progress -->
             <div class="status-container">
                 <div id="status-message">Ready to start calibration</div>
+                <div id="range-info" style="margin: 10px 0; padding: 10px; background: var(--bg-tertiary); border-radius: 4px; font-size: 14px; display: none;">
+                    <strong>Configuration:</strong> 
+                    <span id="sf-display">SF?</span> | 
+                    <span id="peak-range">Peak: ? - ?</span> | 
+                    <span id="min-range">Min: ? - ?</span> | 
+                    <span id="total-tests">? tests</span>
+                </div>
+                <div id="visualization-legend" style="margin: 10px 0; padding: 10px; background: var(--bg-tertiary); border-radius: 4px; font-size: 12px; display: none;">
+                    <strong>Legend:</strong>
+                    <div style="display: flex; flex-wrap: wrap; gap: 15px; margin-top: 5px;">
+                        <div style="display: flex; align-items: center; gap: 5px;">
+                            <div style="width: 12px; height: 12px; background: linear-gradient(45deg, rgba(0, 150, 150, 0.2), rgba(0, 200, 200, 0.9)); border-radius: 2px;"></div>
+                            <span>Detection density (light to bright)</span>
+                        </div>
+                        <div style="display: flex; align-items: center; gap: 5px;">
+                            <div style="width: 12px; height: 12px; background: #333333; border-radius: 2px;"></div>
+                            <span>Tested - No detections</span>
+                        </div>
+                        <div style="display: flex; align-items: center; gap: 5px;">
+                            <div style="width: 12px; height: 12px; background: rgba(68, 1, 84, 0.1); border: 1px solid #555; border-radius: 2px;"></div>
+                            <span>Not yet tested</span>
+                        </div>
+                        <div style="display: flex; align-items: center; gap: 5px;">
+                            <div style="width: 6px; height: 6px; background: #ffffff; border-radius: 50%;"></div>
+                            <span>Individual detections</span>
+                        </div>
+                    </div>
+                </div>
                 <div class="progress-container">
                     <div class="progress-bar">
                         <div id="progress-fill" class="progress-fill"></div>
@@ -205,7 +402,7 @@
 
             <!-- Chart -->
             <div class="chart-container">
-                <canvas id="heatmapChart"></canvas>
+                <div id="heatmap-container"></div>
             </div>
 
             <!-- Results -->
@@ -214,125 +411,426 @@
                 <div id="best-result" class="best-result hidden">
                     <h4>Optimal Settings Found:</h4>
                     <p id="best-settings"></p>
+                    <div class="save-controls" style="margin-top: 20px;">
+                        <button id="save-settings-btn" class="control-btn control-btn-save">
+                            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"></path>
+                            </svg>
+                            <span class="control-label">
+                                <span class="control-title">Save Settings</span>
+                                <span class="control-value">Apply to configuration</span>
+                            </span>
+                        </button>
+                    </div>
+                </div>
+                <div id="no-results" class="best-result hidden">
+                    <h4>No Optimal Settings Found</h4>
+                    <p>All tested combinations showed low detection rates. Consider running calibration again or adjusting test parameters.</p>
                 </div>
             </div>
-        </div>
+        </main>
     </div>
 
     <script>
         let eventSource = null;
-        let heatmapChart = null;
+        let svg = null;
         let isRunning = false;
         let startTime = null;
         let calibrationData = {};
-        let peakRange = [];
-        let minRange = [];
+        let individualSamples = []; // Store all individual sample data points for hexbin
+        let allTestResults = {}; // Store aggregated test results by peak/min
+        
+        // D3.js hexbin configuration
+        const margin = {top: 80, right: 25, bottom: 60, left: 60};
+        const width = 700 - margin.left - margin.right;
+        const height = 500 - margin.top - margin.bottom;
+        
+        let x, y, colorScale, tooltip, hexbin;
 
-        // Initialize Chart.js heatmap
+        // Initialize D3.js hexbin chart
         function initChart() {
-            const ctx = document.getElementById('heatmapChart').getContext('2d');
+            console.log('Initializing hexbin chart...');
             
-            heatmapChart = new Chart(ctx, {
-                type: 'scatter',
-                data: {
-                    datasets: [{
-                        label: 'Detection Rate (%)',
-                        data: [],
-                        backgroundColor: function(context) {
-                            const value = context.parsed.v || 0;
-                            return getHeatmapColor(value);
-                        },
-                        pointRadius: function(context) {
-                            const canvas = context.chart.canvas;
-                            const width = canvas.width;
-                            const height = canvas.height;
-                            return Math.min(width, height) / 50; // Adjust based on canvas size
-                        },
-                        pointHoverRadius: function(context) {
-                            const canvas = context.chart.canvas;
-                            const width = canvas.width;
-                            const height = canvas.height;
-                            return Math.min(width, height) / 40;
-                        }
-                    }]
-                },
-                options: {
-                    responsive: true,
-                    maintainAspectRatio: false,
-                    plugins: {
-                        legend: {
-                            display: false
-                        },
-                        tooltip: {
-                            callbacks: {
-                                title: function(context) {
-                                    const point = context[0];
-                                    return `Peak: ${point.parsed.x}, Min: ${point.parsed.y}`;
-                                },
-                                label: function(context) {
-                                    return `Detection Rate: ${context.parsed.v.toFixed(1)}%`;
-                                }
-                            }
-                        }
-                    },
-                    scales: {
-                        x: {
-                            type: 'linear',
-                            position: 'bottom',
-                            title: {
-                                display: true,
-                                text: 'CAD Peak Threshold'
-                            },
-                            grid: {
-                                display: true
-                            }
-                        },
-                        y: {
-                            type: 'linear',
-                            title: {
-                                display: true,
-                                text: 'CAD Min Threshold'
-                            },
-                            grid: {
-                                display: true
-                            }
-                        }
-                    },
-                    onHover: function(event, activeElements) {
-                        event.native.target.style.cursor = activeElements.length > 0 ? 'pointer' : 'default';
+            // Clear any existing chart
+            d3.select("#heatmap-container").selectAll("*").remove();
+            
+            // Create main SVG
+            svg = d3.select("#heatmap-container")
+                .append("svg")
+                .attr("width", width + margin.left + margin.right)
+                .attr("height", height + margin.top + margin.bottom)
+                .append("g")
+                .attr("transform", "translate(" + margin.left + "," + margin.top + ")");
+            
+            // Add title
+            svg.append("text")
+                .attr("x", width / 2)
+                .attr("y", -50)
+                .attr("text-anchor", "middle")
+                .attr("class", "heatmap-title")
+                .text("CAD Detection Rate");
+            
+            // Add subtitle
+            svg.append("text")
+                .attr("x", width / 2)
+                .attr("y", -25)
+                .attr("text-anchor", "middle")
+                .attr("class", "heatmap-subtitle")
+                .text("detection density visualization");
+            
+            // Create scales for peak and min values - will be updated dynamically
+            x = d3.scaleLinear()
+                .domain([16, 35])  // Default range, will be updated when calibration starts
+                .range([0, width]);
+                
+            y = d3.scaleLinear()
+                .domain([6, 20])   // Default range, will be updated when calibration starts
+                .range([height, 0]);
+            
+            // Add dark background for the chart area
+            svg.append("rect")
+                .attr("class", "chart-background")
+                .attr("x", 0)
+                .attr("y", 0)
+                .attr("width", width)
+                .attr("height", height)
+                .style("fill", "#1a1a1a")
+                .style("stroke", "#444")
+                .style("stroke-width", "1px");
+            
+            // Add X axis
+            svg.append("g")
+                .attr("class", "axis x-axis")
+                .attr("transform", "translate(0," + height + ")")
+                .call(d3.axisBottom(x).tickFormat(d3.format("d")))
+                .selectAll("text")
+                .style("fill", "#fff");
+            
+            // Add Y axis
+            svg.append("g")
+                .attr("class", "axis y-axis")
+                .call(d3.axisLeft(y).tickFormat(d3.format("d")))
+                .selectAll("text")
+                .style("fill", "#fff");
+                
+            // Add axis labels
+            svg.append("text")
+                .attr("class", "axis-label")
+                .attr("x", width / 2)
+                .attr("y", height + 45)
+                .attr("text-anchor", "middle")
+                .style("fill", "#fff")
+                .style("font-weight", "bold")
+                .text("CAD Peak Threshold");
+                
+            svg.append("text")
+                .attr("class", "axis-label")
+                .attr("transform", "rotate(-90)")
+                .attr("x", -height / 2)
+                .attr("y", -40)
+                .attr("text-anchor", "middle")
+                .style("fill", "#fff")
+                .style("font-weight", "bold")
+                .text("CAD Min Threshold");
+            
+            // Initialize hexbin with fixed radius for consistent shape
+            hexbin = d3.hexbin()
+                .radius(12) // Fixed radius matching mesh generation
+                .extent([[0, 0], [width, height]]);
+            
+            // Color scale for hexbin density - single color fading from light to bright
+            colorScale = d3.scaleLinear()
+                .range(["rgba(0, 150, 150, 0.1)", "rgba(0, 200, 200, 0.9)"]) // Light teal to bright teal
+                .domain([0, 10]); // Will be updated dynamically
+            
+            // Create tooltip
+            tooltip = d3.select("#heatmap-container")
+                .append("div")
+                .attr("class", "heatmap-tooltip");
+                
+            console.log('Hexbin chart initialized');
+        }
+        
+        // Update hexbin chart when new data arrives
+        function updateChart(peak, min, rate, samples, detections) {
+            if (!svg) return;
+            
+            console.log(`Adding data: Peak=${peak}, Min=${min}, Rate=${rate}%, Samples=${samples}, Detections=${detections}`);
+            
+            // Store aggregated result for statistics
+            const key = `${peak}_${min}`;
+            if (!allTestResults[key]) {
+                allTestResults[key] = { peak, min, detections: 0, samples: 0 };
+            }
+            allTestResults[key].detections += detections;
+            allTestResults[key].samples += samples;
+            
+            // Add individual sample points to the data array
+            if (samples && detections !== undefined) {
+                // Get current domain bounds and add safety margin
+                const xDomain = x.domain();
+                const yDomain = y.domain();
+                
+                // Only add samples if they're within the actual test range
+                if (peak >= xDomain[0] && peak <= xDomain[1] && 
+                    min >= yDomain[0] && min <= yDomain[1]) {
+                    
+                    for (let i = 0; i < samples; i++) {
+                        // Add small random offset but ensure it stays within bounds
+                        let offsetPeak = peak + (Math.random() - 0.5) * 0.3; // Smaller offset
+                        let offsetMin = min + (Math.random() - 0.5) * 0.3;   // Smaller offset
+                        
+                        // Strict clamping to actual domain bounds
+                        offsetPeak = Math.max(xDomain[0] + 0.1, Math.min(xDomain[1] - 0.1, offsetPeak));
+                        offsetMin = Math.max(yDomain[0] + 0.1, Math.min(yDomain[1] - 0.1, offsetMin));
+                        
+                        individualSamples.push({
+                            peak: offsetPeak,
+                            min: offsetMin,
+                            detected: i < detections,  // First 'detections' samples are detected
+                            originalPeak: peak,
+                            originalMin: min,
+                            sampleIndex: i + 1,
+                            testRun: Object.keys(calibrationData).length + 1
+                        });
                     }
+                    console.log(`Added ${samples} individual samples for Peak=${peak}, Min=${min}. Total samples: ${individualSamples.length}`);
+                } else {
+                    console.log(`Skipping out-of-range sample: Peak=${peak}, Min=${min} (outside domain)`);
                 }
-            });
-        }
-
-        // Color mapping for heatmap
-        function getHeatmapColor(value) {
-            if (value >= 80) return '#4CAF50';  // Green - Excellent
-            if (value >= 60) return '#8BC34A';  // Light Green - Good
-            if (value >= 40) return '#FFC107';  // Yellow - Moderate
-            if (value >= 20) return '#FF9800';  // Orange - Poor
-            if (value > 0) return '#F44336';    // Red - Very poor
-            return '#9E9E9E';                   // Gray - No data
-        }
-
-        // Update chart with new data
-        function updateChart(peak, min, rate) {
-            if (!heatmapChart) return;
+            }
             
-            const dataPoint = {
-                x: peak,
-                y: min,
-                v: rate
+            // Update hexbin visualization
+            updateHexbin();
+        }
+        
+        function updateHexbin() {
+            if (individualSamples.length === 0) return;
+            
+            // Prepare data for smooth contour patches - only detected samples for density
+            const detectedSamples = individualSamples
+                .filter(d => d.detected)
+                .map(d => [x(d.peak), y(d.min)]);
+                
+            console.log(`Updating smooth contours with ${detectedSamples.length} detected samples out of ${individualSamples.length} total`);
+            
+            // Create density grid for smooth contour patches
+            const gridSize = 20; // Grid resolution for density calculation
+            const densityGrid = [];
+            
+            // Calculate density at each grid point
+            for (let i = 0; i < gridSize; i++) {
+                densityGrid[i] = [];
+                for (let j = 0; j < gridSize; j++) {
+                    const gridX = (i / (gridSize - 1)) * width;
+                    const gridY = (j / (gridSize - 1)) * height;
+                    
+                    // Count nearby detected samples using Gaussian kernel
+                    let density = 0;
+                    const bandwidth = 30; // Bandwidth for smoothing
+                    
+                    detectedSamples.forEach(sample => {
+                        const dx = gridX - sample[0];
+                        const dy = gridY - sample[1];
+                        const distance = Math.sqrt(dx * dx + dy * dy);
+                        density += Math.exp(-(distance * distance) / (2 * bandwidth * bandwidth));
+                    });
+                    
+                    densityGrid[i][j] = density;
+                }
+            }
+            
+            // Find maximum density for scaling
+            const maxDensity = Math.max(...densityGrid.flat()) || 1;
+            colorScale.domain([0, maxDensity * 0.8]); // Scale to 80% for better contrast
+            
+            // Create STRICT clip path to absolutely contain patches within chart area
+            svg.select("#clip").remove();
+            svg.append("clipPath")
+                .attr("id", "clip")
+                .append("rect")
+                .attr("x", 0)
+                .attr("y", 0)
+                .attr("width", width)
+                .attr("height", height);
+            
+            // Tooltip functions
+            const mouseover = function(event, d) {
+                tooltip.style("opacity", 1);
+                d3.select(this)
+                    .style("stroke", "white")
+                    .style("stroke-width", "2px");
             };
             
-            heatmapChart.data.datasets[0].data.push(dataPoint);
-            heatmapChart.update('none'); // No animation for real-time updates
+            const mousemove = function(event, d) {
+                // Calculate approximate peak/min values for this hexagon
+                const peakVal = Math.round(x.invert(d.x));
+                const minVal = Math.round(y.invert(d.y));
+                
+                // Find samples in this area
+                const samplesInHex = individualSamples.filter(sample => {
+                    const sampleX = x(sample.peak);
+                    const sampleY = y(sample.min);
+                    const distance = Math.sqrt(Math.pow(sampleX - d.x, 2) + Math.pow(sampleY - d.y, 2));
+                    return distance <= hexbin.radius();
+                });
+                
+                const detectedInHex = samplesInHex.filter(s => s.detected).length;
+                const totalInHex = samplesInHex.length;
+                const detectionRate = totalInHex > 0 ? (detectedInHex / totalInHex * 100) : 0;
+                
+                let tooltipHtml = `<strong>Area: Peak≈${peakVal}, Min≈${minVal}</strong><br>`;
+                tooltipHtml += `<strong>Samples in area: ${totalInHex}</strong><br>`;
+                tooltipHtml += `<strong>Detected: ${detectedInHex}</strong><br>`;
+                tooltipHtml += `<strong>Detection rate: ${detectionRate.toFixed(1)}%</strong>`;
+                
+                tooltip
+                    .html(tooltipHtml)
+                    .style("left", (event.pageX + 10) + "px")
+                    .style("top", (event.pageY - 10) + "px")
+                    .style("opacity", 1);
+            };
+            
+            const mouseleave = function(event, d) {
+                tooltip.style("opacity", 0);
+                d3.select(this)
+                    .style("stroke", "#888")
+                    .style("stroke-width", "1px");
+            };
+            
+            // Remove old elements
+            svg.selectAll(".contour-patch").remove();
+            svg.selectAll(".tested-area").remove();
+            
+            // Create smooth contour patches for detected areas
+            const patchSize = width / (gridSize - 1);
+            const patches = [];
+            
+            for (let i = 0; i < gridSize - 1; i++) {
+                for (let j = 0; j < gridSize - 1; j++) {
+                    const density = densityGrid[i][j];
+                    
+                    if (density > 0.1) { // Only create patches where there's meaningful density
+                        const x1 = i * patchSize;
+                        const y1 = j * patchSize;
+                        const x2 = (i + 1) * patchSize;
+                        const y2 = (j + 1) * patchSize;
+                        
+                        patches.push({
+                            x: x1,
+                            y: y1,
+                            width: x2 - x1,
+                            height: y2 - y1,
+                            density: density
+                        });
+                    }
+                }
+            }
+            
+            // Add tested areas with zero detections as background
+            Object.keys(allTestResults).forEach(testKey => {
+                const testResult = allTestResults[testKey];
+                if (testResult.detections === 0 && testResult.samples > 0) {
+                    const testX = x(testResult.peak);
+                    const testY = y(testResult.min);
+                    
+                    svg.append("circle")
+                        .attr("class", "tested-area")
+                        .attr("cx", testX)
+                        .attr("cy", testY)
+                        .attr("r", 8)
+                        .attr("clip-path", "url(#clip)")
+                        .style("fill", "#333333")
+                        .style("opacity", 0.3)
+                        .style("stroke", "none");
+                }
+            });
+            
+            // Create smooth patches with gradient fills
+            svg.selectAll(".contour-patch")
+                .data(patches)
+                .enter().append("rect")
+                .attr("class", "contour-patch")
+                .attr("x", d => d.x)
+                .attr("y", d => d.y)
+                .attr("width", d => d.width)
+                .attr("height", d => d.height)
+                .attr("clip-path", "url(#clip)")
+                .style("fill", d => colorScale(d.density))
+                .style("stroke", "none")
+                .style("opacity", d => Math.min(0.9, d.density / maxDensity + 0.1))
+                .style("rx", "2px") // Slightly rounded corners for smooth appearance
+                .style("ry", "2px")
+                .on("mouseover", function(event, d) {
+                    tooltip.style("opacity", 1);
+                    d3.select(this)
+                        .style("stroke", "rgba(255, 255, 255, 0.8)")
+                        .style("stroke-width", "1px");
+                })
+                .on("mousemove", function(event, d) {
+                    const peakVal = Math.round(x.invert(d.x + d.width/2));
+                    const minVal = Math.round(y.invert(d.y + d.height/2));
+                    
+                    let tooltipHtml = `<strong>Detection Zone</strong><br>`;
+                    tooltipHtml += `<strong>Area: Peak≈${peakVal}, Min≈${minVal}</strong><br>`;
+                    tooltipHtml += `<strong>Detection Density: ${(d.density).toFixed(1)}</strong><br>`;
+                    tooltipHtml += `<strong>Status: Active detection area</strong>`;
+                    
+                    tooltip
+                        .html(tooltipHtml)
+                        .style("left", (event.pageX + 10) + "px")
+                        .style("top", (event.pageY - 10) + "px")
+                        .style("opacity", 1);
+                })
+                .on("mouseleave", function(event, d) {
+                    tooltip.style("opacity", 0);
+                    d3.select(this)
+                        .style("stroke", "none");
+                });
+                
+            // Add subtle dots for individual samples (optional overlay)
+            svg.selectAll(".sample-dot").remove();
+            svg.selectAll(".sample-dot")
+                .data(individualSamples.filter(d => d.detected)) // Only show detected samples as tiny dots
+                .enter().append("circle")
+                .attr("class", "sample-dot")
+                .attr("cx", d => {
+                    const cx = x(d.peak);
+                    return Math.max(1, Math.min(width - 1, cx)); // Keep dots well within chart bounds
+                })
+                .attr("cy", d => {
+                    const cy = y(d.min);
+                    return Math.max(1, Math.min(height - 1, cy)); // Keep dots well within chart bounds
+                })
+                .attr("r", 1.0) // Slightly larger for better visibility
+                .attr("clip-path", "url(#clip)") // Ensure dots are clipped to chart area
+                .style("fill", "#ffffff")
+                .style("opacity", 0.6) // More visible
+                .style("stroke", "none");
+                
+            console.log(`Total sample dots rendered: ${individualSamples.filter(d => d.detected).length}`);
+                
+            console.log(`Rendered ${patches.length} smooth contour patches`);
+            console.log(`Total individual samples stored: ${individualSamples.length}`);
+            console.log(`Detected samples for contours: ${detectedSamples.length}`);
+            
+            // Debug: Log sample distribution by peak/min
+            const samplesByLocation = {};
+            individualSamples.forEach(sample => {
+                const key = `${sample.originalPeak}_${sample.originalMin}`;
+                if (!samplesByLocation[key]) {
+                    samplesByLocation[key] = { detected: 0, total: 0 };
+                }
+                samplesByLocation[key].total++;
+                if (sample.detected) samplesByLocation[key].detected++;
+            });
+            console.log('Samples by location:', samplesByLocation);
         }
 
         // Start calibration
         async function startCalibration() {
-            const samples = parseInt(document.getElementById('samples').value);
-            const delay = parseInt(document.getElementById('delay').value);
+            const samples = 10; // Fixed samples per test
+            const delay = 50;   // Fixed delay in ms
             
             try {
                 const response = await fetch('/api/cad-calibration-start', {
@@ -351,16 +849,36 @@
                     startTime = Date.now();
                     calibrationData = {};
                     
-                    // Clear chart
-                    if (heatmapChart) {
-                        heatmapChart.data.datasets[0].data = [];
-                        heatmapChart.update();
+                    // Clear chart and reset data
+                    individualSamples = [];
+                    calibrationData = {};
+                    allTestResults = {}; // Clear all individual test results
+                    
+                    // Hide range info and legend until new calibration starts
+                    document.getElementById('range-info').style.display = 'none';
+                    document.getElementById('visualization-legend').style.display = 'none';
+                    
+                    if (svg) {
+                        svg.selectAll(".contour-patch").remove();
+                        svg.selectAll(".tested-area").remove();
+                        svg.selectAll(".sample-dot").remove();
+                        svg.select("#clip").remove();
+                        console.log('Cleared contour patches and reset data structures');
                     }
                     
                     // Update UI
                     document.getElementById('start-btn').disabled = true;
                     document.getElementById('stop-btn').disabled = false;
                     document.getElementById('results-container').classList.add('hidden');
+                    document.getElementById('best-result').classList.add('hidden');
+                    
+                    // Reset statistics
+                    document.getElementById('tests-completed').textContent = '0';
+                    document.getElementById('best-rate').textContent = '0%';
+                    document.getElementById('avg-rate').textContent = '0%';
+                    document.getElementById('elapsed-time').textContent = '0s';
+                    document.getElementById('progress-fill').style.width = '0%';
+                    document.getElementById('progress-text').textContent = '0 / 0 tests completed';
                     
                     // Start SSE connection
                     connectEventSource();
@@ -420,11 +938,81 @@
             };
         }
 
+        // Update chart scales based on test ranges
+        function updateChartScales(ranges) {
+            if (!ranges || !x || !y || !svg) {
+                console.log('Cannot update scales - missing components:', { ranges, x: !!x, y: !!y, svg: !!svg });
+                return;
+            }
+            
+            console.log('Updating chart scales with ranges:', ranges);
+            
+            // Calculate total tests
+            const peakCount = ranges.peak_max - ranges.peak_min + 1;
+            const minCount = ranges.min_max - ranges.min_min + 1;
+            const totalTests = peakCount * minCount;
+            
+            // Update range info display
+            document.getElementById('range-info').style.display = 'block';
+            document.getElementById('visualization-legend').style.display = 'block';
+            document.getElementById('sf-display').textContent = `SF${ranges.spreading_factor}`;
+            document.getElementById('peak-range').textContent = `Peak: ${ranges.peak_min} - ${ranges.peak_max}`;
+            document.getElementById('min-range').textContent = `Min: ${ranges.min_min} - ${ranges.min_max}`;
+            document.getElementById('total-tests').textContent = `${totalTests} tests`;
+            
+            // Use FIXED domains for consistent hexagon positioning
+            // This prevents auto-scaling issues that distort hexagon placement
+            const newPeakDomain = [ranges.peak_min - 0.5, ranges.peak_max + 0.5];
+            const newMinDomain = [ranges.min_min - 0.5, ranges.min_max + 0.5];
+            
+            console.log('Setting FIXED domains:', {
+                peak: newPeakDomain,
+                min: newMinDomain
+            });
+            
+            x.domain(newPeakDomain);
+            y.domain(newMinDomain);
+            
+            // Update hexbin extent to match EXACT scale bounds
+            if (hexbin) {
+                hexbin.extent([[0, 0], [width, height]]);
+                console.log('Updated hexbin extent to chart bounds');
+            }
+            
+            // Update axes WITHOUT transitions to prevent positioning issues
+            const xAxisSelection = svg.select(".x-axis");
+            const yAxisSelection = svg.select(".y-axis");
+            
+            if (!xAxisSelection.empty()) {
+                xAxisSelection.call(d3.axisBottom(x).tickFormat(d3.format("d")));
+            }
+                
+            if (!yAxisSelection.empty()) {
+                yAxisSelection.call(d3.axisLeft(y).tickFormat(d3.format("d")));
+            }
+            
+            // Ensure axis text stays white
+            svg.selectAll(".axis text").style("fill", "#fff");
+            
+            console.log('Chart scale update completed with fixed positioning');
+        }
+
         // Handle calibration updates
         function handleCalibrationUpdate(data) {
+            console.log('Received calibration update:', data);
             switch (data.type) {
                 case 'status':
                     document.getElementById('status-message').textContent = data.message;
+                    
+                    // Update chart scales if test ranges are provided
+                    console.log('Status message received:', data.message);
+                    console.log('Test ranges in status:', data.test_ranges);
+                    if (data.test_ranges) {
+                        console.log('Calling updateChartScales with ranges:', data.test_ranges);
+                        updateChartScales(data.test_ranges);
+                    } else {
+                        console.log('No test_ranges in status message');
+                    }
                     break;
                     
                 case 'progress':
@@ -435,19 +1023,25 @@
                     break;
                     
                 case 'result':
-                    // Store result and update chart
+                    // Store result and update chart with individual sample breakdown
+                    console.log('Processing result:', data);
                     const key = `${data.det_peak}_${data.det_min}`;
                     calibrationData[key] = data;
-                    updateChart(data.det_peak, data.det_min, data.detection_rate);
+                    
+                    // Pass samples and detections to create individual sample visualizations
+                    updateChart(data.det_peak, data.det_min, data.detection_rate, data.samples, data.detections);
                     updateStats();
                     break;
                     
                 case 'complete':
+                case 'completed':
                     isRunning = false;
                     document.getElementById('start-btn').disabled = false;
                     document.getElementById('stop-btn').disabled = true;
-                    document.getElementById('status-message').textContent = 'Calibration completed';
-                    showResults(data.results);
+                    document.getElementById('status-message').textContent = data.message || 'Calibration completed';
+                    
+                    // Calculate and show results from our collected data
+                    calculateAndShowResults();
                     
                     if (eventSource) {
                         eventSource.close();
@@ -480,16 +1074,45 @@
             document.getElementById('avg-rate').textContent = avgRate.toFixed(1) + '%';
         }
 
-        // Show results
-        function showResults(results) {
+        // Calculate and show results from collected data
+        function calculateAndShowResults() {
+            console.log('Calculating results from collected data...');
+            console.log('Calibration data:', calibrationData);
+            
             document.getElementById('results-container').classList.remove('hidden');
             
-            if (results && results.best) {
-                const best = results.best;
-                document.getElementById('best-result').classList.remove('hidden');
-                document.getElementById('best-settings').innerHTML = 
-                    `Peak: <strong>${best.det_peak}</strong>, Min: <strong>${best.det_min}</strong>, Rate: <strong>${best.detection_rate.toFixed(1)}%</strong>`;
+            // Find best result from our collected data
+            let bestResult = null;
+            let bestRate = 0;
+            
+            for (const [key, result] of Object.entries(calibrationData)) {
+                if (result.detection_rate > bestRate) {
+                    bestRate = result.detection_rate;
+                    bestResult = result;
+                }
             }
+            
+            console.log('Best result found:', bestResult);
+            
+            // Store globally for save functionality
+            bestCalibrationResult = bestResult;
+            
+            if (bestResult && bestRate > 0) {
+                document.getElementById('best-result').classList.remove('hidden');
+                document.getElementById('no-results').classList.add('hidden');
+                document.getElementById('best-settings').innerHTML = 
+                    `Peak: <strong>${bestResult.det_peak}</strong>, Min: <strong>${bestResult.det_min}</strong>, Rate: <strong>${bestResult.detection_rate.toFixed(1)}%</strong>`;
+            } else {
+                // Show no results message
+                document.getElementById('best-result').classList.add('hidden');
+                document.getElementById('no-results').classList.remove('hidden');
+                bestCalibrationResult = null;
+            }
+        }
+
+        // Legacy function for backward compatibility
+        function showResults(results) {
+            calculateAndShowResults();
         }
 
         // Show error message
@@ -498,13 +1121,88 @@
             document.getElementById('status-message').style.color = 'var(--error)';
         }
 
+        // Save calibration settings to config
+        async function saveSettings() {
+            const saveBtn = document.getElementById('save-settings-btn');
+            if (!bestCalibrationResult) {
+                showError('No calibration results to save');
+                return;
+            }
+            
+            // Disable save button and show loading
+            saveBtn.disabled = true;
+            const originalContent = saveBtn.innerHTML;
+            saveBtn.innerHTML = `
+                <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M21 12a9 9 0 11-6.219-8.56"></path>
+                </svg>
+                <span class="control-label">
+                    <span class="control-title">Saving...</span>
+                    <span class="control-value">Updating configuration</span>
+                </span>
+            `;
+            
+            try {
+                const response = await fetch('/api/save_cad_settings', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        peak: bestCalibrationResult.det_peak,
+                        min_val: bestCalibrationResult.det_min,
+                        detection_rate: bestCalibrationResult.detection_rate
+                    })
+                });
+                
+                const result = await response.json();
+                if (result.success) {
+                    // Success feedback
+                    saveBtn.innerHTML = `
+                        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <polyline points="20 6 9 17 4 12"></polyline>
+                        </svg>
+                        <span class="control-label">
+                            <span class="control-title">Saved!</span>
+                            <span class="control-value">Settings applied</span>
+                        </span>
+                    `;
+                    
+                    // Show success message
+                    document.getElementById('status-message').textContent = 
+                        `Settings saved! Peak=${bestCalibrationResult.det_peak}, Min=${bestCalibrationResult.det_min} applied to configuration.`;
+                    document.getElementById('status-message').style.color = 'var(--success)';
+                    
+                    // Reset button after 3 seconds
+                    setTimeout(() => {
+                        saveBtn.innerHTML = originalContent;
+                        saveBtn.disabled = false;
+                    }, 3000);
+                } else {
+                    throw new Error(result.error || 'Failed to save settings');
+                }
+            } catch (error) {
+                console.error('Save error:', error);
+                showError('Failed to save settings: ' + error.message);
+                saveBtn.innerHTML = originalContent;
+                saveBtn.disabled = false;
+            }
+        }
+
+        // Store best result globally for saving
+        let bestCalibrationResult = null;
+
         // Event listeners
         document.getElementById('start-btn').addEventListener('click', startCalibration);
         document.getElementById('stop-btn').addEventListener('click', stopCalibration);
+        document.getElementById('save-settings-btn').addEventListener('click', saveSettings);
 
         // Initialize chart when page loads
         document.addEventListener('DOMContentLoaded', function() {
+            console.log('Initializing CAD calibration hexbin chart...');
             initChart();
+            // Reset data tracking
+            individualSamples = [];
+            calibrationData = {};
+            allTestResults = {};
         });
 
         // Cleanup on page unload

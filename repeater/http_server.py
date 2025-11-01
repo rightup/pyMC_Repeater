@@ -58,14 +58,14 @@ class CADCalibrationEngine:
         self.calibration_thread = None
         
     def get_test_ranges(self, spreading_factor: int):
-        """Get CAD test ranges based on spreading factor"""
+        """Get CAD test ranges based on spreading factor - comprehensive coverage"""
         sf_ranges = {
-            7:  (range(16, 29, 1), range(6, 15, 1)),
-            8:  (range(16, 29, 1), range(6, 15, 1)),  
-            9:  (range(18, 31, 1), range(7, 16, 1)),
-            10: (range(20, 33, 1), range(8, 16, 1)),
-            11: (range(22, 35, 1), range(9, 17, 1)),
-            12: (range(24, 37, 1), range(10, 18, 1)),
+            7:  (range(17, 26, 1), range(7, 15, 1)),   # Full range coverage
+            8:  (range(17, 26, 1), range(7, 15, 1)),   # Full range coverage
+            9:  (range(19, 28, 1), range(8, 16, 1)),   # Full range coverage
+            10: (range(21, 30, 1), range(9, 17, 1)),   # Full range coverage
+            11: (range(23, 32, 1), range(10, 18, 1)),  # Full range coverage
+            12: (range(25, 34, 1), range(11, 19, 1)),  # Full range coverage
         }
         return sf_ranges.get(spreading_factor, sf_ranges[8])
     
@@ -75,12 +75,12 @@ class CADCalibrationEngine:
         
         for _ in range(samples):
             try:
-                result = await radio.perform_cad(det_peak=det_peak, det_min=det_min, timeout=0.6)
+                result = await radio.perform_cad(det_peak=det_peak, det_min=det_min, timeout=0.3)
                 if result:
                     detections += 1
             except Exception:
                 pass
-            await asyncio.sleep(0.03)
+            await asyncio.sleep(0.01)  # Reduced sleep time
         
         return {
             'det_peak': det_peak,
@@ -92,13 +92,12 @@ class CADCalibrationEngine:
     
     def broadcast_to_clients(self, data):
         """Send data to all connected SSE clients"""
-        message = f"data: {json.dumps(data)}\n\n"
-        for client in self.clients.copy():
-            try:
-                client.write(message.encode())
-                client.flush()
-            except Exception:
-                self.clients.discard(client)
+        # Store the message for clients to pick up
+        self.last_message = data
+        # Also store in a queue for clients to consume
+        if not hasattr(self, 'message_queue'):
+            self.message_queue = []
+        self.message_queue.append(data)
     
     def calibration_worker(self, samples: int, delay_ms: int):
         """Worker thread for calibration process"""
@@ -129,60 +128,105 @@ class CADCalibrationEngine:
             
             self.broadcast_to_clients({
                 "type": "status", 
-                "message": f"Starting calibration: SF{sf}, {total_tests} tests"
+                "message": f"Starting calibration: SF{sf}, {total_tests} tests",
+                "test_ranges": {
+                    "peak_min": min(peak_range),
+                    "peak_max": max(peak_range),
+                    "min_min": min(min_range),
+                    "min_max": max(min_range),
+                    "spreading_factor": sf,
+                    "total_tests": total_tests
+                }
             })
             
             current = 0
             
-            # Run calibration in event loop
+            import random
+            
+
+            peak_list = list(peak_range)
+            min_list = list(min_range)
+            
+            # Create all test combinations
+            test_combinations = []
+            for det_peak in peak_list:
+                for det_min in min_list:
+                    test_combinations.append((det_peak, det_min))
+            
+            # Sort by distance from center for center-out pattern
+            peak_center = (max(peak_list) + min(peak_list)) / 2
+            min_center = (max(min_list) + min(min_list)) / 2
+            
+            def distance_from_center(combo):
+                peak, min_val = combo
+                return ((peak - peak_center) ** 2 + (min_val - min_center) ** 2) ** 0.5
+            
+            # Sort by distance from center
+            test_combinations.sort(key=distance_from_center)
+            
+
+            band_size = max(1, len(test_combinations) // 8)  # Create 8 bands
+            randomized_combinations = []
+            
+            for i in range(0, len(test_combinations), band_size):
+                band = test_combinations[i:i + band_size]
+                random.shuffle(band)  # Randomize within each band
+                randomized_combinations.extend(band)
+            
+            # Run calibration in event loop with center-out randomized pattern
             if self.event_loop:
-                for det_peak in peak_range:
+                for det_peak, det_min in randomized_combinations:
                     if not self.running:
                         break
                         
-                    for det_min in min_range:
-                        if not self.running:
-                            break
-                            
-                        current += 1
-                        self.progress["current"] = current
+                    current += 1
+                    self.progress["current"] = current
+                    
+                    # Update progress
+                    self.broadcast_to_clients({
+                        "type": "progress",
+                        "current": current,
+                        "total": total_tests,
+                        "peak": det_peak,
+                        "min": det_min
+                    })
+                    
+                    # Run the test
+                    future = asyncio.run_coroutine_threadsafe(
+                        self.test_cad_config(radio, det_peak, det_min, samples),
+                        self.event_loop
+                    )
+                    
+                    try:
+                        result = future.result(timeout=30)  # 30 second timeout per test
                         
-                        # Update progress
+                        # Store result
+                        key = f"{det_peak}-{det_min}"
+                        self.results[key] = result
+                        
+                        # Send result to clients
                         self.broadcast_to_clients({
-                            "type": "progress",
-                            "current": current,
-                            "total": total_tests,
-                            "peak": det_peak,
-                            "min": det_min
+                            "type": "result",
+                            **result
                         })
+                    except Exception as e:
+                        logger.error(f"CAD test failed for peak={det_peak}, min={det_min}: {e}")
                         
-                        # Run the test
-                        future = asyncio.run_coroutine_threadsafe(
-                            self.test_cad_config(radio, det_peak, det_min, samples),
-                            self.event_loop
-                        )
-                        
-                        try:
-                            result = future.result(timeout=30)  # 30 second timeout per test
-                            
-                            # Store result
-                            key = f"{det_peak}-{det_min}"
-                            self.results[key] = result
-                            
-                            # Send result to clients
-                            self.broadcast_to_clients({
-                                "type": "result",
-                                **result
-                            })
-                        except Exception as e:
-                            logger.error(f"CAD test failed for peak={det_peak}, min={det_min}: {e}")
-                            
-                        # Delay between tests
-                        if self.running and delay_ms > 0:
-                            time.sleep(delay_ms / 1000.0)
+                    # Delay between tests
+                    if self.running and delay_ms > 0:
+                        time.sleep(delay_ms / 1000.0)
             
             if self.running:
-                self.broadcast_to_clients({"type": "completed", "message": "Calibration completed"})
+                # Find best result
+                best_result = None
+                if self.results:
+                    best_result = max(self.results.values(), key=lambda x: x['detection_rate'])
+                
+                self.broadcast_to_clients({
+                    "type": "completed", 
+                    "message": "Calibration completed",
+                    "results": {"best": best_result} if best_result else None
+                })
             else:
                 self.broadcast_to_clients({"type": "status", "message": "Calibration stopped"})
                 
@@ -200,6 +244,7 @@ class CADCalibrationEngine:
         self.running = True
         self.results.clear()
         self.progress = {"current": 0, "total": 0}
+        self.clear_message_queue()  # Clear any old messages
         
         # Start calibration in separate thread
         self.calibration_thread = threading.Thread(
@@ -217,15 +262,10 @@ class CADCalibrationEngine:
         if self.calibration_thread:
             self.calibration_thread.join(timeout=2)
     
-    def add_client(self, response_stream):
-        """Add SSE client"""
-        self.clients.add(response_stream)
-    
-    def remove_client(self, response_stream):
-        """Remove SSE client"""
-        self.clients.discard(response_stream)
-
-
+    def clear_message_queue(self):
+        """Clear the message queue when starting a new calibration"""
+        if hasattr(self, 'message_queue'):
+            self.message_queue.clear()
 class APIEndpoints:
 
     def __init__(
@@ -235,13 +275,15 @@ class APIEndpoints:
         config: Optional[dict] = None,
         event_loop=None,
         daemon_instance=None,
+        config_path=None,
     ):
 
         self.stats_getter = stats_getter
         self.send_advert_func = send_advert_func
         self.config = config or {}
-        self.event_loop = event_loop  # Store reference to main event loop
-        self.daemon_instance = daemon_instance  # Store reference to daemon instance
+        self.event_loop = event_loop
+        self.daemon_instance = daemon_instance
+        self._config_path = config_path or '/etc/pymc_repeater/config.yaml'
         
         # Initialize CAD calibration engine
         self.cad_calibration = CADCalibrationEngine(daemon_instance, event_loop)
@@ -396,6 +438,72 @@ class APIEndpoints:
             return {"success": False, "error": str(e)}
     
     @cherrypy.expose
+    @cherrypy.tools.json_out()
+    @cherrypy.tools.json_in()
+    def save_cad_settings(self):
+        """Save CAD calibration settings to config"""
+        if cherrypy.request.method != "POST":
+            return {"success": False, "error": "Method not allowed"}
+        
+        try:
+            data = cherrypy.request.json or {}
+            peak = data.get("peak")
+            min_val = data.get("min_val")
+            detection_rate = data.get("detection_rate", 0)
+            
+            if peak is None or min_val is None:
+                return {"success": False, "error": "Missing peak or min_val parameters"}
+            
+            # Update the radio immediately if available
+            if self.daemon_instance and hasattr(self.daemon_instance, 'radio') and self.daemon_instance.radio:
+                if hasattr(self.daemon_instance.radio, 'set_custom_cad_thresholds'):
+                    self.daemon_instance.radio.set_custom_cad_thresholds(peak=peak, min_val=min_val)
+                    logger.info(f"Applied CAD settings to radio: peak={peak}, min={min_val}")
+            
+            # Update the in-memory config
+            if "radio" not in self.config:
+                self.config["radio"] = {}
+            if "cad" not in self.config["radio"]:
+                self.config["radio"]["cad"] = {}
+            
+            self.config["radio"]["cad"]["peak_threshold"] = peak
+            self.config["radio"]["cad"]["min_threshold"] = min_val
+            
+            # Save to config file
+            config_path = getattr(self, '_config_path', '/etc/pymc_repeater/config.yaml')
+            self._save_config_to_file(config_path)
+            
+            logger.info(f"Saved CAD settings to config: peak={peak}, min={min_val}, rate={detection_rate:.1f}%")
+            return {
+                "success": True, 
+                "message": f"CAD settings saved: peak={peak}, min={min_val}",
+                "settings": {"peak": peak, "min_val": min_val, "detection_rate": detection_rate}
+            }
+            
+        except Exception as e:
+            logger.error(f"Error saving CAD settings: {e}")
+            return {"success": False, "error": str(e)}
+
+    def _save_config_to_file(self, config_path):
+        """Save current config to YAML file"""
+        try:
+            import yaml
+            import os
+            
+            # Ensure directory exists
+            os.makedirs(os.path.dirname(config_path), exist_ok=True)
+            
+            # Write config to file
+            with open(config_path, 'w') as f:
+                yaml.dump(self.config, f, default_flow_style=False, indent=2)
+                
+            logger.info(f"Configuration saved to {config_path}")
+            
+        except Exception as e:
+            logger.error(f"Failed to save config to {config_path}: {e}")
+            raise
+
+    @cherrypy.expose
     def cad_calibration_stream(self):
         """Server-Sent Events stream for real-time updates"""
         cherrypy.response.headers['Content-Type'] = 'text/event-stream'
@@ -404,25 +512,62 @@ class APIEndpoints:
         cherrypy.response.headers['Access-Control-Allow-Origin'] = '*'
         
         def generate():
-            # Add client to calibration engine
-            response = cherrypy.response
-            self.cad_calibration.add_client(response)
+            
+            if not hasattr(self.cad_calibration, 'message_queue'):
+                self.cad_calibration.message_queue = []
             
             try:
-                # Send initial connection message
+          
                 yield f"data: {json.dumps({'type': 'connected', 'message': 'Connected to CAD calibration stream'})}\n\n"
                 
-                # Keep connection alive - the calibration engine will send data
+               
+                if self.cad_calibration.running:
+             
+                    config = getattr(self.cad_calibration.daemon_instance, 'config', {})
+                    radio_config = config.get("radio", {})
+                    sf = radio_config.get("spreading_factor", 8)
+                    
+         
+                    peak_range, min_range = self.cad_calibration.get_test_ranges(sf)
+                    total_tests = len(peak_range) * len(min_range)
+                    
+              
+                    status_message = {
+                        "type": "status", 
+                        "message": f"Calibration in progress: SF{sf}, {total_tests} tests",
+                        "test_ranges": {
+                            "peak_min": min(peak_range),
+                            "peak_max": max(peak_range),
+                            "min_min": min(min_range),
+                            "min_max": max(min_range),
+                            "spreading_factor": sf,
+                            "total_tests": total_tests
+                        }
+                    }
+                    yield f"data: {json.dumps(status_message)}\n\n"
+                
+                last_message_index = len(self.cad_calibration.message_queue)
+                
+               
                 while True:
-                    time.sleep(1)
-                    # Send keepalive every second
-                    yield f"data: {json.dumps({'type': 'keepalive'})}\n\n"
+                   
+                    current_queue_length = len(self.cad_calibration.message_queue)
+                    if current_queue_length > last_message_index:
+                    
+                        for i in range(last_message_index, current_queue_length):
+                            message = self.cad_calibration.message_queue[i]
+                            yield f"data: {json.dumps(message)}\n\n"
+                        last_message_index = current_queue_length
+                    else:
+                       
+                        yield f"data: {json.dumps({'type': 'keepalive'})}\n\n"
+                    
+                    time.sleep(0.5)  
                     
             except Exception as e:
                 logger.error(f"SSE stream error: {e}")
             finally:
-                # Remove client when connection closes
-                self.cad_calibration.remove_client(response)
+                pass  
         
         return generate()
     
@@ -443,6 +588,7 @@ class StatsApp:
         config: Optional[dict] = None,
         event_loop=None,
         daemon_instance=None,
+        config_path=None,
     ):
 
         self.stats_getter = stats_getter
@@ -453,7 +599,7 @@ class StatsApp:
         self.config = config or {}
 
         # Create nested API object for routing
-        self.api = APIEndpoints(stats_getter, send_advert_func, self.config, event_loop, daemon_instance)
+        self.api = APIEndpoints(stats_getter, send_advert_func, self.config, event_loop, daemon_instance, config_path)
 
         # Load template on init
         if template_dir:
@@ -671,12 +817,13 @@ class HTTPStatsServer:
         config: Optional[dict] = None,
         event_loop=None,
         daemon_instance=None,
+        config_path=None,
     ):
 
         self.host = host
         self.port = port
         self.app = StatsApp(
-            stats_getter, template_dir, node_name, pub_key, send_advert_func, config, event_loop, daemon_instance
+            stats_getter, template_dir, node_name, pub_key, send_advert_func, config, event_loop, daemon_instance, config_path
         )
 
     def start(self):

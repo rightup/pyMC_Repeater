@@ -29,11 +29,13 @@ classifiers = [
 keywords = ["mesh", "networking", "lora", "repeater", "daemon", "iot"]
 
 
+
 dependencies = [
-    "pymc_core[hardware]>=1.0.2",
+    "pymc_core[hardware] @ git+https://github.com/rightup/pyMC_core.git@feat/cad",
     "pyyaml>=6.0.0",
     "cherrypy>=18.0.0",
 ]
+
 
 
 

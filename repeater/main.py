@@ -12,12 +12,6 @@ from pymc_core.protocol.constants import MAX_PATH_SIZE, ROUTE_TYPE_DIRECT
 logger = logging.getLogger("RepeaterDaemon")
 
 
-
-
-
-logger = logging.getLogger("RepeaterDaemon")
-
-
 class RepeaterDaemon:
 
     def __init__(self, config: dict, radio=None):
@@ -53,8 +47,13 @@ class RepeaterDaemon:
                 
 
                 if hasattr(self.radio, 'set_custom_cad_thresholds'):
-                    self.radio.set_custom_cad_thresholds(peak=23, min_val=11)
-                    logger.info("CAD thresholds set: peak=23, min=11")
+                    # Load CAD settings from config, with defaults
+                    cad_config = self.config.get("radio", {}).get("cad", {})
+                    peak_threshold = cad_config.get("peak_threshold", 23)
+                    min_threshold = cad_config.get("min_threshold", 11)
+                    
+                    self.radio.set_custom_cad_thresholds(peak=peak_threshold, min_val=min_threshold)
+                    logger.info(f"CAD thresholds set from config: peak={peak_threshold}, min={min_threshold}")
                 else:
                     logger.warning("Radio does not support CAD configuration")
                 
@@ -361,7 +360,6 @@ class RepeaterDaemon:
             else:
                 pub_key_formatted = pub_key_hex
 
-        # Get the current event loop (the main loop where the radio was initialized)
         current_loop = asyncio.get_event_loop()
 
         self.http_server = HTTPStatsServer(
@@ -372,9 +370,10 @@ class RepeaterDaemon:
             node_name=node_name,
             pub_key=pub_key_formatted,
             send_advert_func=self.send_advert,
-            config=self.config,  # Pass the config reference
-            event_loop=current_loop,  # Pass the main event loop
-            daemon_instance=self,  # Pass the daemon instance for CAD calibration
+            config=self.config, 
+            event_loop=current_loop, 
+            daemon_instance=self,  
+            config_path=getattr(self, 'config_path', '/etc/pymc_repeater/config.yaml'),
         )
 
         try:
@@ -410,12 +409,14 @@ def main():
 
     # Load configuration
     config = load_config(args.config)
+    config_path = args.config if args.config else '/etc/pymc_repeater/config.yaml'
 
     if args.log_level:
         config["logging"]["level"] = args.log_level
 
     # Don't initialize radio here - it will be done inside the async event loop
     daemon = RepeaterDaemon(config, radio=None)
+    daemon.config_path = config_path
 
     # Run
     try:
