@@ -31,7 +31,7 @@ keywords = ["mesh", "networking", "lora", "repeater", "daemon", "iot"]
 
 
 dependencies = [
-    "pymc_core[hardware]>=1.0.3,
+    "pymc_core[hardware]>=1.0.3",
     "pyyaml>=6.0.0",
     "cherrypy>=18.0.0",
 ]
