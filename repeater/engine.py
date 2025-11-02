@@ -90,7 +90,7 @@ class RepeaterHandler(BaseHandler):
         monitor_mode = mode == "monitor"
 
         logger.debug(
-            f"RX packet: header=0x{packet.header: 02x}, payload_len={len(packet.payload or b'')}, "
+            f"RX packet: header=0x{packet.header:02x}, payload_len={len(packet.payload or b'')}, "
             f"path_len={len(packet.path) if packet.path else 0}, "
             f"rssi={metadata.get('rssi', 'N/A')}, snr={metadata.get('snr', 'N/A')}, mode={mode}"
         )
@@ -123,8 +123,8 @@ class RepeaterHandler(BaseHandler):
 
             if not can_tx:
                 logger.warning(
-                    f"Duty-cycle limit exceeded. Airtime={airtime_ms: .1f}ms, "
-                    f"wait={wait_time: .1f}s before retry"
+                    f"Duty-cycle limit exceeded. Airtime={airtime_ms:.1f}ms, "
+                    f"wait={wait_time:.1f}s before retry"
                 )
                 self.dropped_count += 1
                 drop_reason = "Duty cycle limit"
@@ -152,7 +152,7 @@ class RepeaterHandler(BaseHandler):
             payload_type = header_info["payload_type"]
             route_type = header_info["route_type"]
             logger.debug(
-                f"Packet header=0x{packet.header: 02x}, type={payload_type}, route={route_type}"
+                f"Packet header=0x{packet.header:02x}, type={payload_type}, route={route_type}"
             )
 
         # Check if this is a duplicate
@@ -173,7 +173,7 @@ class RepeaterHandler(BaseHandler):
         )
         if display_path and len(display_path) > 0:
             # Format path as array of uppercase hex bytes
-            path_bytes = [f"{b: 02X}" for b in display_path[:8]]  # First 8 bytes max
+            path_bytes = [f"{b:02X}" for b in display_path[:8]]  # First 8 bytes max
             if len(display_path) > 8:
                 path_bytes.append("...")
             path_hash = "[" + ", ".join(path_bytes) + "]"
@@ -184,13 +184,13 @@ class RepeaterHandler(BaseHandler):
         # Payload types with dest_hash and src_hash as first 2 bytes
         if payload_type in [0x00, 0x01, 0x02, 0x08]:
             if hasattr(packet, "payload") and packet.payload and len(packet.payload) >= 2:
-                dst_hash = f"{packet.payload[0]: 02X}"
-                src_hash = f"{packet.payload[1]: 02X}"
+                dst_hash = f"{packet.payload[0]:02X}"
+                src_hash = f"{packet.payload[1]:02X}"
 
         # ADVERT packets have source identifier as first byte
         elif payload_type == PAYLOAD_TYPE_ADVERT:
             if hasattr(packet, "payload") and packet.payload and len(packet.payload) >= 1:
-                src_hash = f"{packet.payload[0]: 02X}"
+                src_hash = f"{packet.payload[0]:02X}"
 
         # Record packet for charts
         packet_record = {
@@ -211,9 +211,9 @@ class RepeaterHandler(BaseHandler):
             "path_hash": path_hash,
             "src_hash": src_hash,
             "dst_hash": dst_hash,
-            "original_path": ([f"{b: 02X}" for b in original_path] if original_path else None),
+            "original_path": ([f"{b:02X}" for b in original_path] if original_path else None),
             "forwarded_path": (
-                [f"{b: 02X}" for b in forwarded_path] if forwarded_path is not None else None
+                [f"{b:02X}" for b in forwarded_path] if forwarded_path is not None else None
             ),
         }
 
@@ -236,6 +236,18 @@ class RepeaterHandler(BaseHandler):
             # Not a duplicate or first occurrence
             self.recent_packets.append(packet_record)
 
+        if len(self.recent_packets) > self.max_recent_packets:
+            self.recent_packets.pop(0)
+
+    def log_trace_record(self, packet_record: dict) -> None:
+        self.recent_packets.append(packet_record)
+        
+        self.rx_count += 1
+        if packet_record.get("transmitted", False):
+            self.forwarded_count += 1
+        else:
+            self.dropped_count += 1
+        
         if len(self.recent_packets) > self.max_recent_packets:
             self.recent_packets.pop(0)
 
@@ -409,7 +421,7 @@ class RepeaterHandler(BaseHandler):
         next_hop = packet.path[0]
         if next_hop != self.local_hash:
             logger.debug(
-                f"Direct: not our hop (next={next_hop: 02X}, local={self.local_hash: 02X})"
+                f"Direct: not our hop (next={next_hop:02X}, local={self.local_hash:02X})"
             )
             return None
 
@@ -417,8 +429,8 @@ class RepeaterHandler(BaseHandler):
         packet.path = bytearray(packet.path[1:])
         packet.path_len = len(packet.path)
 
-        old_path = [f"{b: 02X}" for b in original_path]
-        new_path = [f"{b: 02X}" for b in packet.path]
+        old_path = [f"{b:02X}" for b in original_path]
+        new_path = [f"{b:02X}" for b in packet.path]
         logger.debug(f"Direct: forwarding, path {old_path} -> {new_path}")
 
         return packet
@@ -483,8 +495,8 @@ class RepeaterHandler(BaseHandler):
             score_multiplier = max(0.2, 1.0 - score)
             delay_s = delay_s * score_multiplier
             logger.debug(
-                f"Congestion detected (delay >= 50ms), score={score: .2f}, "
-                f"delay multiplier={score_multiplier: .2f}"
+                f"Congestion detected (delay >= 50ms), score={score:.2f}, "
+                f"delay multiplier={score_multiplier:.2f}"
             )
 
         # Cap at 5 seconds maximum
@@ -492,7 +504,7 @@ class RepeaterHandler(BaseHandler):
 
         logger.debug(
             f"Route={'FLOOD' if route_type == ROUTE_TYPE_FLOOD else 'DIRECT'}, "
-            f"len={packet_len}B, airtime={airtime_ms: .1f}ms, delay={delay_s: .3f}s"
+            f"len={packet_len}B, airtime={airtime_ms:.1f}ms, delay={delay_s:.3f}s"
         )
 
         return delay_s
@@ -530,7 +542,7 @@ class RepeaterHandler(BaseHandler):
                     self.airtime_mgr.record_tx(airtime_ms)
                 packet_size = len(fwd_pkt.payload)
                 logger.info(
-                    f"Retransmitted packet ({packet_size} bytes, {airtime_ms: .1f}ms airtime)"
+                    f"Retransmitted packet ({packet_size} bytes, {airtime_ms:.1f}ms airtime)"
                 )
             except Exception as e:
                 logger.error(f"Retransmit failed: {e}")
@@ -549,8 +561,8 @@ class RepeaterHandler(BaseHandler):
         # Check if interval has elapsed
         if time_since_last_advert >= interval_seconds:
             logger.info(
-                f"Periodic advert interval elapsed ({time_since_last_advert: .0f}s >= "
-                f"{interval_seconds: .0f}s). Sending advert..."
+                f"Periodic advert interval elapsed ({time_since_last_advert:.0f}s >= "
+                f"{interval_seconds:.0f}s). Sending advert..."
             )
             try:
                 # Call the send_advert function
@@ -564,10 +576,6 @@ class RepeaterHandler(BaseHandler):
                 logger.error(f"Error sending periodic advert: {e}", exc_info=True)
 
     def get_noise_floor(self) -> Optional[float]:
-        """
-        Get the current noise floor (instantaneous RSSI) from the radio in dBm.
-        Returns None if radio is not available or reading fails.
-        """
         try:
             radio = self.dispatcher.radio if self.dispatcher else None
             if radio and hasattr(radio, 'get_noise_floor'):
@@ -599,7 +607,7 @@ class RepeaterHandler(BaseHandler):
         noise_floor_dbm = self.get_noise_floor()
 
         stats = {
-            "local_hash": f"0x{self.local_hash: 02x}",
+            "local_hash": f"0x{self.local_hash:02x}",
             "duplicate_cache_size": len(self.seen_packets),
             "cache_ttl": self.cache_ttl,
             "rx_count": self.rx_count,
