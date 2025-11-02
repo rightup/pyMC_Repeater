@@ -6,6 +6,8 @@ import sys
 from repeater.config import get_radio_for_board, load_config
 from repeater.engine import RepeaterHandler
 from repeater.http_server import HTTPStatsServer, _log_buffer
+from pymc_core.node.handlers.trace import TraceHandler
+from pymc_core.protocol.constants import MAX_PATH_SIZE, ROUTE_TYPE_DIRECT
 
 logger = logging.getLogger("RepeaterDaemon")
 
@@ -21,15 +23,15 @@ class RepeaterDaemon:
         self.local_hash = None
         self.local_identity = None
         self.http_server = None
+        self.trace_handler = None
 
-        # Setup logging
+
         log_level = config.get("logging", {}).get("level", "INFO")
         logging.basicConfig(
             level=getattr(logging, log_level),
             format=config.get("logging", {}).get("format"),
         )
 
-        # Add log buffer handler to capture logs for web display
         root_logger = logging.getLogger()
         _log_buffer.setLevel(getattr(logging, log_level))
         root_logger.addHandler(_log_buffer)
@@ -42,12 +44,37 @@ class RepeaterDaemon:
             logger.info("Initializing radio hardware...")
             try:
                 self.radio = get_radio_for_board(self.config)
+                
+
+                if hasattr(self.radio, 'set_custom_cad_thresholds'):
+                    # Load CAD settings from config, with defaults
+                    cad_config = self.config.get("radio", {}).get("cad", {})
+                    peak_threshold = cad_config.get("peak_threshold", 23)
+                    min_threshold = cad_config.get("min_threshold", 11)
+                    
+                    self.radio.set_custom_cad_thresholds(peak=peak_threshold, min_val=min_threshold)
+                    logger.info(f"CAD thresholds set from config: peak={peak_threshold}, min={min_threshold}")
+                else:
+                    logger.warning("Radio does not support CAD configuration")
+                
+
+                if hasattr(self.radio, 'get_frequency'):
+                    logger.info(f"Radio config - Freq: {self.radio.get_frequency():.1f}MHz")
+                if hasattr(self.radio, 'get_spreading_factor'):
+                    logger.info(f"Radio config - SF: {self.radio.get_spreading_factor()}")
+                if hasattr(self.radio, 'get_bandwidth'):
+                    logger.info(f"Radio config - BW: {self.radio.get_bandwidth()}kHz")
+                if hasattr(self.radio, 'get_coding_rate'):
+                    logger.info(f"Radio config - CR: {self.radio.get_coding_rate()}")
+                if hasattr(self.radio, 'get_tx_power'):
+                    logger.info(f"Radio config - TX Power: {self.radio.get_tx_power()}dBm")
+                
                 logger.info("Radio hardware initialized")
             except Exception as e:
                 logger.error(f"Failed to initialize radio hardware: {e}")
                 raise RuntimeError("Repeater requires real LoRa hardware") from e
 
-        # Create dispatcher from pymc_core
+
         try:
             from pymc_core import LocalIdentity
             from pymc_core.node.dispatcher import Dispatcher
@@ -64,14 +91,14 @@ class RepeaterDaemon:
             self.local_identity = local_identity
             self.dispatcher.local_identity = local_identity
 
-            # Get the actual hash from the identity (first byte of public key)
+
             pubkey = local_identity.get_public_key()
             self.local_hash = pubkey[0]
             logger.info(f"Local identity set: {local_identity.get_address_bytes().hex()}")
             local_hash_hex = f"0x{self.local_hash: 02x}"
             logger.info(f"Local node hash (from identity): {local_hash_hex}")
 
-            # Override _is_own_packet to always return False
+
             self.dispatcher._is_own_packet = lambda pkt: False
 
             self.repeater_handler = RepeaterHandler(
@@ -80,6 +107,16 @@ class RepeaterDaemon:
 
             self.dispatcher.register_fallback_handler(self._repeater_callback)
             logger.info("Repeater handler registered (forwarder mode)")
+
+            self.trace_handler = TraceHandler(log_fn=logger.info)
+            
+            self.dispatcher.register_handler(
+                TraceHandler.payload_type(),
+                self._trace_callback,
+            )
+            logger.info("Trace handler registered for network diagnostics")
+
+            
 
         except Exception as e:
             logger.error(f"Failed to initialize dispatcher: {e}")
@@ -96,30 +133,151 @@ class RepeaterDaemon:
             }
             await self.repeater_handler(packet, metadata)
 
-    def _get_keypair(self):
-        """Create a PyNaCl SigningKey for map API."""
+    async def _trace_callback(self, packet):
+
         try:
-            from nacl.signing import SigningKey
+            # Only process direct route trace packets
+            if packet.get_route_type() != ROUTE_TYPE_DIRECT or packet.path_len >= MAX_PATH_SIZE:
+                return
 
-            if not self.local_identity:
-                return None
+         
+            parsed_data = self.trace_handler._parse_trace_payload(packet.payload)
+            
+            if not parsed_data.get("valid", False):
+                logger.warning(f"[TraceHandler] Invalid trace packet: {parsed_data.get('error', 'Unknown error')}")
+                return
+            
+            trace_path = parsed_data["trace_path"]
+            trace_path_len = len(trace_path)
+            
+          
+            if self.repeater_handler:
+                import time
+                
+                trace_path_bytes = [f"{h:02X}" for h in trace_path[:8]]
+                if len(trace_path) > 8:
+                    trace_path_bytes.append("...")
+                path_hash = "[" + ", ".join(trace_path_bytes) + "]"
+                
+                path_snrs = []
+                path_snr_details = []
+                for i in range(packet.path_len):
+                    if i < len(packet.path):
+                        snr_val = packet.path[i]
+                   
+                        snr_signed = snr_val if snr_val < 128 else snr_val - 256
+                        snr_db = snr_signed / 4.0
+                        path_snrs.append(f"{snr_val}({snr_db:.1f}dB)")
+                 
+                        if i < len(trace_path):
+                            path_snr_details.append({
+                                "hash": f"{trace_path[i]:02X}",
+                                "snr_raw": snr_val,
+                                "snr_db": snr_db
+                            })
+                
+                packet_record = {
+                    "timestamp": time.time(),
+                    "type": packet.get_payload_type(),  # 0x09 for trace
+                    "route": packet.get_route_type(),   # Should be direct (1)
+                    "length": len(packet.payload or b""),
+                    "rssi": getattr(packet, "rssi", 0),
+                    "snr": getattr(packet, "snr", 0.0),
+                    "score": self.repeater_handler.calculate_packet_score(
+                        getattr(packet, "snr", 0.0), 
+                        len(packet.payload or b""), 
+                        self.repeater_handler.radio_config.get("spreading_factor", 8)
+                    ),
+                    "tx_delay_ms": 0,  
+                    "transmitted": False,  
+                    "is_duplicate": False,  
+                    "packet_hash": packet.calculate_packet_hash().hex()[:16],
+                    "drop_reason": "trace_received",
+                    "path_hash": path_hash,
+                    "src_hash": None,  
+                    "dst_hash": None,
+                    "original_path": [f"{h:02X}" for h in trace_path],  
+                    "forwarded_path": None,
+                    # Add trace-specific SNR path information
+                    "path_snrs": path_snrs,  # ["58(14.5dB)", "19(4.8dB)"]
+                    "path_snr_details": path_snr_details,  # [{"hash": "29", "snr_raw": 58, "snr_db": 14.5}]
+                    "is_trace": True,  
+                }
+                self.repeater_handler.log_trace_record(packet_record)
+    
+            path_snrs = []
+            path_hashes = []
+            for i in range(packet.path_len):
+                if i < len(packet.path):
+                    snr_val = packet.path[i]
+                    snr_signed = snr_val if snr_val < 128 else snr_val - 256
+                    snr_db = snr_signed / 4.0
+                    path_snrs.append(f"{snr_val}({snr_db:.1f}dB)")
+                if i < len(trace_path):
+                    path_hashes.append(f"0x{trace_path[i]:02x}")
+            
+       
+            parsed_data["snr"] = packet.get_snr()
+            parsed_data["rssi"] = getattr(packet, "rssi", 0)
+            formatted_response = self.trace_handler._format_trace_response(parsed_data)
+            
+            logger.info(f"[TraceHandler] {formatted_response}")
+            logger.info(f"[TraceHandler] Path SNRs: [{', '.join(path_snrs)}], Hashes: [{', '.join(path_hashes)}]")
+            
+     
+            if (packet.path_len < trace_path_len and 
+                len(trace_path) > packet.path_len and
+                trace_path[packet.path_len] == self.local_hash and
+                self.repeater_handler and not self.repeater_handler.is_duplicate(packet)):
+                
+                if self.repeater_handler and hasattr(self.repeater_handler, 'recent_packets'):
+                    packet_hash = packet.calculate_packet_hash().hex()[:16]
+                    for record in reversed(self.repeater_handler.recent_packets):
+                        if record.get("packet_hash") == packet_hash:
+                            record["transmitted"] = True
+                            record["drop_reason"] = "trace_forwarded"
+                            break
+   
+                current_snr = packet.get_snr()
+                
+    
+                snr_scaled = int(current_snr * 4)
+       
+                if snr_scaled > 127:
+                    snr_scaled = 127
+                elif snr_scaled < -128:
+                    snr_scaled = -128
 
-            # Get the seed from config
-            identity_key = self.config.get("mesh", {}).get("identity_key")
-            if not identity_key:
-                return None
-
-            # Convert to bytes if it's a hex string, otherwise use as-is
-            if isinstance(identity_key, str):
-                seed_bytes = bytes.fromhex(identity_key)
+                snr_byte = snr_scaled if snr_scaled >= 0 else (256 + snr_scaled)
+        
+                while len(packet.path) <= packet.path_len:
+                    packet.path.append(0)
+                    
+                packet.path[packet.path_len] = snr_byte
+                packet.path_len += 1
+                
+                logger.info(f"[TraceHandler] Forwarding trace, stored SNR {current_snr:.1f}dB at position {packet.path_len-1}")
+                
+                # Mark as seen and forward directly (bypass normal routing, no ACK required)
+                self.repeater_handler.mark_seen(packet)
+                if self.dispatcher:
+                    await self.dispatcher.send_packet(packet, wait_for_ack=False)
             else:
-                seed_bytes = identity_key
+                # Show why we didn't forward
+                if packet.path_len >= trace_path_len:
+                    logger.info(f"[TraceHandler] Trace completed (reached end of path)")
+                elif len(trace_path) <= packet.path_len:
+                    logger.info(f"[TraceHandler] Path index out of bounds")
+                elif trace_path[packet.path_len] != self.local_hash:
+                    expected_hash = trace_path[packet.path_len] if packet.path_len < len(trace_path) else None
+                    logger.info(f"[TraceHandler] Not our turn (next hop: 0x{expected_hash:02x})")
+                elif self.repeater_handler and self.repeater_handler.is_duplicate(packet):
+                    logger.info(f"[TraceHandler] Duplicate packet, ignoring")
 
-            signing_key = SigningKey(seed_bytes)
-            return signing_key
         except Exception as e:
-            logger.warning(f"Failed to create keypair for map API: {e}")
-            return None
+            logger.error(f"[TraceHandler] Error processing trace packet: {e}")
+
+
 
     def get_stats(self) -> dict:
 
@@ -165,7 +323,7 @@ class RepeaterDaemon:
             )
 
             # Send via dispatcher
-            await self.dispatcher.send_packet(packet)
+            await self.dispatcher.send_packet(packet, wait_for_ack=False)
 
             # Mark our own advert as seen to prevent re-forwarding it
             if self.repeater_handler:
@@ -202,7 +360,6 @@ class RepeaterDaemon:
             else:
                 pub_key_formatted = pub_key_hex
 
-        # Get the current event loop (the main loop where the radio was initialized)
         current_loop = asyncio.get_event_loop()
 
         self.http_server = HTTPStatsServer(
@@ -213,8 +370,10 @@ class RepeaterDaemon:
             node_name=node_name,
             pub_key=pub_key_formatted,
             send_advert_func=self.send_advert,
-            config=self.config,  # Pass the config reference
-            event_loop=current_loop,  # Pass the main event loop
+            config=self.config, 
+            event_loop=current_loop, 
+            daemon_instance=self,  
+            config_path=getattr(self, 'config_path', '/etc/pymc_repeater/config.yaml'),
         )
 
         try:
@@ -250,12 +409,14 @@ def main():
 
     # Load configuration
     config = load_config(args.config)
+    config_path = args.config if args.config else '/etc/pymc_repeater/config.yaml'
 
     if args.log_level:
         config["logging"]["level"] = args.log_level
 
     # Don't initialize radio here - it will be done inside the async event loop
     daemon = RepeaterDaemon(config, radio=None)
+    daemon.config_path = config_path
 
     # Run
     try:

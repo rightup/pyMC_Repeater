@@ -229,6 +229,61 @@
                 <span class="signal-bars ${className}" title="Signal: ${className.replace('signal-', '')}">${'<span class="signal-bar"></span>'.repeat(4)}</span>
                 <span class="snr-value">${snr.toFixed(1)} dB</span>
             </div>`;
+        }
+
+        // Helper function to display SNR for trace packets with path information
+        function getTraceSnrDisplay(pkt, localHash) {
+            if (!pkt.is_trace || !pkt.path_snr_details || pkt.path_snr_details.length === 0) {
+                // Regular packet or no path SNR data
+                return getSignalBars(pkt.snr);
+            }
+
+            // Build trace path SNR display
+            let pathSnrHtml = `<div class="trace-snr-container">`;
+            
+            // Show received packet SNR first
+            pathSnrHtml += `<div class="rx-snr">${getSignalBars(pkt.snr)}</div>`;
+            
+            // Show path SNRs if available
+            if (pkt.path_snr_details.length > 0) {
+                pathSnrHtml += `<div class="path-snrs">`;
+                pathSnrHtml += `<div class="path-snr-label">Path (${pkt.path_snr_details.length} hops):</div>`;
+                
+                // Handle many hops - show first few and indicate if there are more
+                const maxDisplayHops = 4;
+                const hopsToShow = pkt.path_snr_details.slice(0, maxDisplayHops);
+                const hasMoreHops = pkt.path_snr_details.length > maxDisplayHops;
+                
+                hopsToShow.forEach((pathSnr, index) => {
+                    const isMyHash = localHash && pathSnr.hash === localHash;
+                    const hashClass = isMyHash ? 'my-hash' : 'path-hash';
+                    
+                    // Get signal quality class for color coding
+                    let snrClass = 'snr-poor';
+                    if (pathSnr.snr_db >= 10) snrClass = 'snr-excellent';
+                    else if (pathSnr.snr_db >= 5) snrClass = 'snr-good';
+                    else if (pathSnr.snr_db >= 0) snrClass = 'snr-fair';
+                    
+                    pathSnrHtml += `<div class="path-snr-item">
+                        <span class="hop-index">${index + 1}.</span>
+                        <span class="${hashClass}">${pathSnr.hash}</span>
+                        <span class="snr-value ${snrClass}">${pathSnr.snr_db.toFixed(1)}dB</span>
+                    </div>`;
+                });
+                
+                // Show indicator if there are more hops
+                if (hasMoreHops) {
+                    const remainingCount = pkt.path_snr_details.length - maxDisplayHops;
+                    pathSnrHtml += `<div class="path-snr-item">
+                        <span class="more-hops">+${remainingCount} more hop${remainingCount > 1 ? 's' : ''}</span>
+                    </div>`;
+                }
+                
+                pathSnrHtml += `</div>`;
+            }
+            
+            pathSnrHtml += `</div>`;
+            return pathSnrHtml;
         }        function updatePacketTable(packets, localHash) {
             const tbody = document.getElementById('packet-table');
 
@@ -244,7 +299,13 @@
             }
 
             tbody.innerHTML = packets.slice(-20).map(pkt => {
-                const time = new Date(pkt.timestamp * 1000).toLocaleTimeString();
+                const time = new Date(pkt.timestamp * 1000).toLocaleTimeString('en-US', {
+                    hour12: false,
+                    hour: '2-digit',
+                    minute: '2-digit',
+                    second: '2-digit',
+                    fractionalSecondDigits: 3
+                });
                 // Match pyMC_core PAYLOAD_TYPES exactly (from constants.py)
                 const typeNames = {
                     0: 'REQ',
@@ -327,7 +388,7 @@
                         <td data-label="Len">${pkt.length}B</td>
                         <td data-label="Path/Hashes">${pathHashesHtml}</td>
                         <td data-label="RSSI">${pkt.rssi}</td>
-                        <td data-label="SNR">${getSignalBars(pkt.snr)}</td>
+                        <td data-label="SNR">${getTraceSnrDisplay(pkt, localHash)}</td>
                         <td data-label="Score"><span class="score">${pkt.score.toFixed(2)}</span></td>
                         <td data-label="TX Delay">${pkt.tx_delay_ms.toFixed(0)}ms</td>
                         <td data-label="Status">${statusHtml}</td>
@@ -337,7 +398,13 @@
                 // Add duplicate rows (always visible)
                 if (hasDuplicates) {
                     mainRow += pkt.duplicates.map(dupe => {
-                        const dupeTime = new Date(dupe.timestamp * 1000).toLocaleTimeString();
+                        const dupeTime = new Date(dupe.timestamp * 1000).toLocaleTimeString('en-US', {
+                            hour12: false,
+                            hour: '2-digit',
+                            minute: '2-digit',
+                            second: '2-digit',
+                            fractionalSecondDigits: 3
+                        });
                         const dupeRoute = routeNames[dupe.route] || `UNKNOWN_${dupe.route}`;
 
                         // Format duplicate path/hashes - match main row format
@@ -375,7 +442,7 @@
                                 <td data-label="Len">${dupe.length}B</td>
                                 <td data-label="Path/Hashes">${dupePathHashesHtml}</td>
                                 <td data-label="RSSI">${dupe.rssi}</td>
-                                <td data-label="SNR">${getSignalBars(dupe.snr)}</td>
+                                <td data-label="SNR">${getTraceSnrDisplay(dupe, localHash)}</td>
                                 <td data-label="Score"><span class="score">${dupe.score.toFixed(2)}</span></td>
                                 <td data-label="TX Delay">${dupe.tx_delay_ms.toFixed(0)}ms</td>
                                 <td data-label="Status">${dupeStatusHtml}</td>
@@ -589,6 +656,85 @@
             font-size: 0.8em;
             color: #999;
             white-space: nowrap;
+        }
+
+        /* Trace packet SNR display */
+        .trace-snr-container {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            align-items: center;
+            min-width: 120px;
+        }
+        .rx-snr {
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+            padding-bottom: 4px;
+        }
+        .path-snrs {
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+            font-size: 0.85em;
+            width: 100%;
+        }
+        .path-snr-label {
+            font-size: 0.75em;
+            color: #888;
+            text-align: center;
+            margin-bottom: 2px;
+            font-weight: 500;
+        }
+        .path-snr-item {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+            white-space: nowrap;
+            justify-content: space-between;
+        }
+        .hop-index {
+            font-size: 0.7em;
+            color: #666;
+            min-width: 16px;
+            text-align: right;
+        }
+        .path-snr-item .path-hash {
+            font-family: 'Courier New', monospace;
+            font-size: 0.75em;
+            color: #dcdcaa;
+            background: rgba(220, 220, 170, 0.1);
+            padding: 1px 3px;
+            border-radius: 3px;
+            min-width: 24px;
+            text-align: center;
+        }
+        .path-snr-item .my-hash {
+            font-family: 'Courier New', monospace;
+            font-size: 0.75em;
+            background: rgba(86, 156, 214, 0.2);
+            color: #569cd6;
+            font-weight: 700;
+            padding: 1px 3px;
+            border-radius: 3px;
+            min-width: 24px;
+            text-align: center;
+        }
+        .path-snr-item .snr-value {
+            font-size: 0.75em;
+            font-weight: 500;
+            min-width: 48px;
+            text-align: right;
+        }
+        /* SNR quality color coding */
+        .snr-excellent { color: #4ade80; }
+        .snr-good { color: #4ec9b0; }
+        .snr-fair { color: #fbbf24; }
+        .snr-poor { color: #f48771; }
+        .more-hops {
+            font-size: 0.7em;
+            color: #888;
+            font-style: italic;
+            text-align: center;
+            width: 100%;
         }        /* Path/Hashes column layout */
         .path-info {
             display: flex;
