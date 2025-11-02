@@ -103,7 +103,12 @@
 
         <div style="display: flex; gap: 8px; align-items: center; margin-bottom: var(--spacing-md);">
             <div class="status-badge" id="status-badge" title="System operational status">Online</div>
-            <div class="version-badge" id="version-badge" title="Software version">v1.0.0</div>
+        </div>
+        
+        <!-- Version badges -->
+        <div style="display: flex; gap: 6px; align-items: center; margin-bottom: var(--spacing-md); flex-wrap: wrap;">
+            <div class="version-badge" id="repeater-version-badge" title="pyMC_Repeater version">R:v1.0.1</div>
+            <div class="version-badge" id="core-version-badge" title="pyMC_Core version">C:v1.0.2</div>
         </div>
 
         <!-- Mode Toggle Buttons -->
@@ -457,9 +462,12 @@
                     renderNoiseFloorSparkline();
                 }
 
-                // Update version badge
+                // Update version badges
                 if (data.version) {
-                    document.getElementById('version-badge').textContent = 'v' + data.version;
+                    document.getElementById('repeater-version-badge').textContent = 'R:v' + data.version;
+                }
+                if (data.core_version) {
+                    document.getElementById('core-version-badge').textContent = 'C:v' + data.core_version;
                 }
 
                 // Update duty cycle

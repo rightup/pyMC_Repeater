@@ -295,6 +295,13 @@ class APIEndpoints:
         try:
             stats = self.stats_getter() if self.stats_getter else {}
             stats["version"] = __version__
+            
+            # Add pyMC_Core version
+            try:
+                import pymc_core
+                stats["core_version"] = pymc_core.__version__
+            except ImportError:
+                stats["core_version"] = "unknown"
 
             return stats
         except Exception as e:
