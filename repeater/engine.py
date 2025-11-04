@@ -195,6 +195,9 @@ class RepeaterHandler(BaseHandler):
         # Record packet for charts
         packet_record = {
             "timestamp": time.time(),
+            "header": f"0x{packet.header:02X}" if hasattr(packet, "header") and packet.header is not None else None,
+            "payload": packet.payload.hex() if hasattr(packet, "payload") and packet.payload else None,
+            "payload_length": len(packet.payload) if hasattr(packet, "payload") and packet.payload else 0,
             "type": payload_type,
             "route": route_type,
             "length": len(packet.payload or b""),
@@ -215,6 +218,7 @@ class RepeaterHandler(BaseHandler):
             "forwarded_path": (
                 [f"{b:02X}" for b in forwarded_path] if forwarded_path is not None else None
             ),
+
         }
 
         # If this is a duplicate, try to attach it to the original packet

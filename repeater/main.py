@@ -178,6 +178,9 @@ class RepeaterDaemon:
                 
                 packet_record = {
                     "timestamp": time.time(),
+                    "header": f"0x{packet.header:02X}" if hasattr(packet, "header") and packet.header is not None else None,
+                    "payload": packet.payload.hex() if hasattr(packet, "payload") and packet.payload else None,
+                    "payload_length": len(packet.payload) if hasattr(packet, "payload") and packet.payload else 0,
                     "type": packet.get_payload_type(),  # 0x09 for trace
                     "route": packet.get_route_type(),   # Should be direct (1)
                     "length": len(packet.payload or b""),

@@ -97,6 +97,21 @@
         </main>
     </div>
 
+    <!-- Packet Details Dialog -->
+    <div id="packet-dialog" class="dialog-overlay">
+        <div class="dialog-content">
+            <div class="dialog-header">
+                <h3>Packet Details</h3>
+                <button class="dialog-close" onclick="closePacketDialog()">&times;</button>
+            </div>
+            <div class="dialog-body">
+                <div class="packet-details-grid">
+                    <!-- Content will be populated by JavaScript -->
+                </div>
+            </div>
+        </div>
+    </div>
+
     <script>
         // Initialize charts
         let packetRateChart = null;
@@ -381,7 +396,7 @@
                 }
 
                 let mainRow = `
-                    <tr class="${hasDuplicates ? 'has-duplicates' : ''}">
+                    <tr class="${hasDuplicates ? 'has-duplicates' : ''} clickable-row" onclick="showPacketDetails(${JSON.stringify(pkt).replace(/"/g, '&quot;')})">
                         <td data-label="Time">${time}</td>
                         <td data-label="Type"><span class="packet-type">${type}</span></td>
                         <td data-label="Route"><span class="route-${route.toLowerCase().replace('_', '-')}">${route}</span></td>
@@ -435,7 +450,7 @@
                         }
 
                         return `
-                            <tr class="duplicate-row">
+                            <tr class="duplicate-row clickable-row" onclick="showPacketDetails(${JSON.stringify(dupe).replace(/"/g, '&quot;')})">
                                 <td data-label="Time" style="padding-left: 30px;">↳ ${dupeTime}</td>
                                 <td data-label="Type"><span class="packet-type-dim">${type}</span></td>
                                 <td data-label="Route"><span class="route-${dupeRoute.toLowerCase().replace('_', '-')}">${dupeRoute}</span></td>
@@ -505,6 +520,188 @@
             signalQualityChart.data.datasets[0].data = [excellent, good, fair, poor];
             signalQualityChart.update();
         }
+
+        // Packet Details Dialog Functions
+        function showPacketDetails(packet) {
+            const dialog = document.getElementById('packet-dialog');
+            const detailsGrid = dialog.querySelector('.packet-details-grid');
+            
+            // Format timestamp
+            const timestamp = new Date(packet.timestamp * 1000).toLocaleString();
+            
+            // Format payload for display (with line breaks every 32 characters)
+            const formatPayload = (payload) => {
+                if (!payload) return 'None';
+                return payload.match(/.{1,32}/g).join('\n');
+            };
+            
+            // Create the packet details HTML with sections
+            detailsGrid.innerHTML = `
+                <div class="detail-section">
+                    <h4>Basic Information</h4>
+                    <div class="detail-item">
+                        <span class="detail-label">Timestamp:</span>
+                        <span class="detail-value">${timestamp}</span>
+                    </div>
+                    <div class="detail-item">
+                        <span class="detail-label">Packet Hash:</span>
+                        <span class="detail-value monospace">${packet.packet_hash}</span>
+                    </div>
+                    <div class="detail-item">
+                        <span class="detail-label">Header:</span>
+                        <span class="detail-value monospace">${packet.header || 'None'}</span>
+                    </div>
+                    <div class="detail-item">
+                        <span class="detail-label">Type:</span>
+                        <span class="detail-value">${packet.type} (${getTypeName(packet.type)})</span>
+                    </div>
+                    <div class="detail-item">
+                        <span class="detail-label">Route:</span>
+                        <span class="detail-value">${packet.route} (${getRouteName(packet.route)})</span>
+                    </div>
+                </div>
+
+                <div class="detail-section">
+                    <h4>Payload Data</h4>
+                    <div class="detail-item">
+                        <span class="detail-label">Payload Length:</span>
+                        <span class="detail-value">${packet.payload_length || packet.length} bytes</span>
+                    </div>
+                    <div class="detail-item">
+                        <span class="detail-label">Payload (Hex):</span>
+                        <div class="detail-value payload-hex">${formatPayload(packet.payload)}</div>
+                    </div>
+                </div>
+
+                <div class="detail-section">
+                    <h4>Path Information</h4>
+                    <div class="detail-item">
+                        <span class="detail-label">Original Path:</span>
+                        <span class="detail-value monospace">${packet.original_path ? '[' + packet.original_path.join(', ') + ']' : 'None'}</span>
+                    </div>
+                    ${packet.transmitted ? `
+                    <div class="detail-item">
+                        <span class="detail-label">Forwarded Path:</span>
+                        <span class="detail-value monospace">${packet.forwarded_path ? '[' + packet.forwarded_path.join(', ') + ']' : 'None'}</span>
+                    </div>
+                    ` : ''}
+                    <div class="detail-item">
+                        <span class="detail-label">Source Hash:</span>
+                        <span class="detail-value monospace">${packet.src_hash || 'None'}</span>
+                    </div>
+                    <div class="detail-item">
+                        <span class="detail-label">Destination Hash:</span>
+                        <span class="detail-value monospace">${packet.dst_hash || 'None'}</span>
+                    </div>
+                </div>
+
+                <div class="detail-section">
+                    <h4>Signal & Processing</h4>
+                    <div class="detail-item">
+                        <span class="detail-label">RSSI:</span>
+                        <span class="detail-value">${packet.rssi} dBm</span>
+                    </div>
+                    <div class="detail-item">
+                        <span class="detail-label">SNR:</span>
+                        <span class="detail-value">${packet.snr.toFixed(2)} dB</span>
+                    </div>
+                    ${packet.is_trace && packet.path_snr_details && packet.path_snr_details.length > 0 ? `
+                    <div class="detail-item">
+                        <span class="detail-label">Path SNRs:</span>
+                        <div class="detail-value">
+                            <div class="path-snrs-detail">
+                                ${packet.path_snr_details.map((pathSnr, index) => {
+                                    let snrClass = 'snr-poor';
+                                    if (pathSnr.snr_db >= 10) snrClass = 'snr-excellent';
+                                    else if (pathSnr.snr_db >= 5) snrClass = 'snr-good';
+                                    else if (pathSnr.snr_db >= 0) snrClass = 'snr-fair';
+                                    
+                                    return `<div class="path-snr-item-detail">
+                                        <span class="hop-index">${index + 1}.</span>
+                                        <span class="path-hash">${pathSnr.hash}</span>
+                                        <span class="snr-value ${snrClass}">${pathSnr.snr_db.toFixed(1)}dB</span>
+                                    </div>`;
+                                }).join('')}
+                            </div>
+                        </div>
+                    </div>
+                    ` : ''}
+                    <div class="detail-item">
+                        <span class="detail-label">Score:</span>
+                        <span class="detail-value">${packet.score.toFixed(3)}</span>
+                    </div>
+                    <div class="detail-item">
+                        <span class="detail-label">TX Delay:</span>
+                        <span class="detail-value">${packet.tx_delay_ms.toFixed(1)} ms</span>
+                    </div>
+                    <div class="detail-item">
+                        <span class="detail-label">Transmitted:</span>
+                        <span class="detail-value ${packet.transmitted ? 'status-tx' : 'status-dropped'}">${packet.transmitted ? 'Yes' : 'No'}</span>
+                    </div>
+                    <div class="detail-item">
+                        <span class="detail-label">Is Duplicate:</span>
+                        <span class="detail-value">${packet.is_duplicate ? 'Yes' : 'No'}</span>
+                    </div>
+                    ${packet.drop_reason ? `
+                    <div class="detail-item">
+                        <span class="detail-label">Drop Reason:</span>
+                        <span class="detail-value status-dropped">${packet.drop_reason}</span>
+                    </div>
+                    ` : ''}
+                </div>
+            `;
+            
+            dialog.style.display = 'flex';
+            document.body.style.overflow = 'hidden';
+        }
+
+        function closePacketDialog() {
+            const dialog = document.getElementById('packet-dialog');
+            dialog.style.display = 'none';
+            document.body.style.overflow = 'auto';
+        }
+
+        function getTypeName(type) {
+            const typeNames = {
+                0: 'REQ',
+                1: 'RESPONSE', 
+                2: 'TXT_MSG',
+                3: 'ACK',
+                4: 'ADVERT',
+                5: 'GRP_TXT',
+                6: 'GRP_DATA',
+                7: 'ANON_REQ',
+                8: 'PATH',
+                9: 'TRACE',
+                15: 'RAW_CUSTOM'
+            };
+            return typeNames[type] || `Unknown (0x${type.toString(16).toUpperCase()})`;
+        }
+
+        function getRouteName(route) {
+            const routeNames = {
+                0: 'TRANSPORT_FLOOD',
+                1: 'FLOOD',
+                2: 'DIRECT', 
+                3: 'TRANSPORT_DIRECT'
+            };
+            return routeNames[route] || `Unknown (${route})`;
+        }
+
+        // Close dialog when clicking outside
+        document.addEventListener('click', function(event) {
+            const dialog = document.getElementById('packet-dialog');
+            if (event.target === dialog) {
+                closePacketDialog();
+            }
+        });
+
+        // Close dialog on Escape key
+        document.addEventListener('keydown', function(event) {
+            if (event.key === 'Escape') {
+                closePacketDialog();
+            }
+        });
 
         // Handle Send Advert button
         function sendAdvert() {
@@ -795,6 +992,249 @@
         .na {
             color: #666;
             font-style: italic;
+        }
+
+        /* Clickable row styling */
+        .clickable-row {
+            cursor: pointer;
+            transition: background-color 0.2s ease;
+        }
+        .clickable-row:hover {
+            background-color: rgba(78, 201, 176, 0.1);
+        }
+
+        /* Dialog styling */
+        .dialog-overlay {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0, 0, 0, 0.8);
+            z-index: 1000;
+            justify-content: center;
+            align-items: center;
+            backdrop-filter: blur(4px);
+        }
+
+        .dialog-content {
+            background: linear-gradient(135deg, #1e1e1e 0%, #252526 100%);
+            border-radius: 12px;
+            border: 1px solid rgba(86, 156, 214, 0.3);
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.6);
+            max-width: 800px;
+            max-height: 80vh;
+            width: 90%;
+            overflow: hidden;
+        }
+
+        .dialog-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 20px 24px 16px;
+            border-bottom: 1px solid rgba(86, 156, 214, 0.2);
+            background: linear-gradient(90deg, rgba(86, 156, 214, 0.1) 0%, rgba(86, 156, 214, 0.05) 100%);
+        }
+
+        .dialog-header h3 {
+            margin: 0;
+            color: #569cd6;
+            font-size: 1.4em;
+            font-weight: 600;
+        }
+
+        .dialog-close {
+            background: none;
+            border: none;
+            color: #d4d4d4;
+            font-size: 1.8em;
+            cursor: pointer;
+            padding: 0;
+            width: 32px;
+            height: 32px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: 6px;
+            transition: all 0.2s ease;
+        }
+
+        .dialog-close:hover {
+            background-color: rgba(244, 135, 113, 0.2);
+            color: #f48771;
+            transform: scale(1.1);
+        }
+
+        .dialog-body {
+            padding: 24px;
+            overflow-y: auto;
+            max-height: calc(80vh - 80px);
+        }
+
+        .packet-details-grid {
+            display: grid;
+            gap: 24px;
+        }
+
+        .detail-section {
+            background: rgba(30, 30, 30, 0.6);
+            border: 1px solid rgba(86, 156, 214, 0.2);
+            border-radius: 8px;
+            padding: 20px;
+        }
+
+        .detail-section h4 {
+            margin: 0 0 16px 0;
+            color: #569cd6;
+            font-size: 1.1em;
+            font-weight: 600;
+            padding-bottom: 8px;
+            border-bottom: 1px solid rgba(86, 156, 214, 0.3);
+        }
+
+        .detail-item {
+            display: grid;
+            grid-template-columns: 140px 1fr;
+            gap: 16px;
+            padding: 8px 0;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+            align-items: start;
+        }
+
+        .detail-item:last-child {
+            border-bottom: none;
+        }
+
+        .detail-label {
+            color: #dcdcaa;
+            font-weight: 500;
+            font-size: 0.9em;
+        }
+
+        .detail-value {
+            color: #d4d4d4;
+            font-size: 0.9em;
+            word-break: break-all;
+        }
+
+        .detail-value.monospace {
+            font-family: 'Courier New', monospace;
+            background: rgba(220, 220, 170, 0.1);
+            color: #dcdcaa;
+            padding: 4px 8px;
+            border-radius: 4px;
+            border: 1px solid rgba(220, 220, 170, 0.2);
+            font-size: 0.85em;
+        }
+
+        .payload-hex {
+            font-family: 'Courier New', monospace;
+            background: rgba(30, 30, 30, 0.8);
+            padding: 12px;
+            border-radius: 6px;
+            border: 1px solid rgba(86, 156, 214, 0.2);
+            font-size: 0.8em;
+            line-height: 1.4;
+            white-space: pre-wrap;
+            word-break: break-all;
+            max-height: 200px;
+            overflow-y: auto;
+            color: #dcdcaa;
+        }
+
+        /* Path SNR details in dialog */
+        .path-snrs-detail {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            background: rgba(30, 30, 30, 0.6);
+            padding: 12px;
+            border-radius: 6px;
+            border: 1px solid rgba(86, 156, 214, 0.2);
+        }
+
+        .path-snr-item-detail {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            white-space: nowrap;
+        }
+
+        .path-snr-item-detail .hop-index {
+            font-size: 0.8em;
+            color: #666;
+            min-width: 20px;
+            text-align: right;
+        }
+
+        .path-snr-item-detail .path-hash {
+            font-family: 'Courier New', monospace;
+            font-size: 0.85em;
+            color: #dcdcaa;
+            background: rgba(220, 220, 170, 0.1);
+            padding: 3px 6px;
+            border-radius: 4px;
+            min-width: 32px;
+            text-align: center;
+            border: 1px solid rgba(220, 220, 170, 0.2);
+        }
+
+        .path-snr-item-detail .snr-value {
+            font-size: 0.85em;
+            font-weight: 500;
+            min-width: 60px;
+            text-align: right;
+        }
+
+        /* Mobile optimization */
+        @media (max-width: 768px) {
+            .dialog-content {
+                width: 95%;
+                max-height: 90vh;
+            }
+
+            .dialog-header {
+                padding: 16px 20px 12px;
+            }
+
+            .dialog-header h3 {
+                font-size: 1.2em;
+            }
+
+            .dialog-body {
+                padding: 20px;
+            }
+
+            .detail-item {
+                grid-template-columns: 1fr;
+                gap: 8px;
+            }
+
+            .detail-label {
+                font-weight: 600;
+                color: #569cd6;
+            }
+
+            .payload-hex {
+                font-size: 0.75em;
+                padding: 8px;
+            }
+
+            .path-snrs-detail {
+                padding: 8px;
+            }
+
+            .path-snr-item-detail .path-hash {
+                font-size: 0.8em;
+                min-width: 28px;
+            }
+
+            .path-snr-item-detail .snr-value {
+                font-size: 0.8em;
+                min-width: 50px;
+            }
         }
 
         /* Mobile optimization */
