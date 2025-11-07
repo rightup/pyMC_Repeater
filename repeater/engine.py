@@ -16,6 +16,7 @@ from pymc_core.protocol.constants import (
 from pymc_core.protocol.packet_utils import PacketHeaderUtils, PacketTimingUtils
 
 from repeater.airtime import AirtimeManager
+from repeater.storage import StorageCollector
 
 logger = logging.getLogger("RepeaterHandler")
 
@@ -69,10 +70,15 @@ class RepeaterHandler(BaseHandler):
         self.dropped_count = 0
         self.recent_packets = []
         self.max_recent_packets = 50
-        self.start_time = time.time()  # For uptime calculation
+        self.start_time = time.time()
 
-        # Neighbor tracking (repeaters discovered via adverts)
-        self.neighbors = {}
+        # Storage collector for persistent packet logging
+        try:
+            self.storage = StorageCollector(config)
+            logger.info("StorageCollector initialized successfully")
+        except Exception as e:
+            logger.error(f"Failed to initialize StorageCollector: {e}")
+            self.storage = None
 
     async def __call__(self, packet: Packet, metadata: Optional[dict] = None) -> None:
 
@@ -221,6 +227,15 @@ class RepeaterHandler(BaseHandler):
 
         }
 
+        # Store packet record to persistent storage
+        if self.storage:
+            try:
+                self.storage.record_packet(packet_record)
+            except Exception as e:
+                logger.error(f"Failed to store packet record: {e}")
+
+
+
         # If this is a duplicate, try to attach it to the original packet
         if is_dupe and len(self.recent_packets) > 0:
             # Find the original packet with same hash
@@ -295,6 +310,7 @@ class RepeaterHandler(BaseHandler):
                 decode_appdata,
                 get_contact_type_name,
                 parse_advert_payload,
+                determine_contact_type_from_flags,
             )
 
             # Parse advert payload
@@ -317,14 +333,8 @@ class RepeaterHandler(BaseHandler):
 
             appdata_decoded = decode_appdata(appdata)
             flags = appdata_decoded.get("flags", 0)
-
             is_repeater = bool(flags & ADVERT_FLAG_IS_REPEATER)
-
-            if not is_repeater:
-                return  # Not a repeater, skip
-
-            from pymc_core.protocol.utils import determine_contact_type_from_flags
-
+            route_type = packet.header & PH_ROUTE_MASK
             contact_type_id = determine_contact_type_from_flags(flags)
             contact_type = get_contact_type_name(contact_type_id)
 
@@ -334,32 +344,34 @@ class RepeaterHandler(BaseHandler):
             longitude = appdata_decoded.get("longitude")
 
             current_time = time.time()
+            
+            # Check if this is a new neighbor
+            current_neighbors = self.storage.get_neighbors() if self.storage else {}
+            is_new_neighbor = pubkey not in current_neighbors
 
-            # Update or create neighbor entry
-            if pubkey not in self.neighbors:
-                self.neighbors[pubkey] = {
-                    "node_name": node_name,
-                    "contact_type": contact_type,
-                    "latitude": latitude,
-                    "longitude": longitude,
-                    "first_seen": current_time,
-                    "last_seen": current_time,
-                    "rssi": rssi,
-                    "snr": snr,
-                    "advert_count": 1,
-                }
-                logger.info(f"Discovered new repeater: {node_name} ({pubkey[:16]}...)")
-            else:
-                # Update existing neighbor
-                neighbor = self.neighbors[pubkey]
-                neighbor["node_name"] = node_name  # Update name in case it changed
-                neighbor["contact_type"] = contact_type
-                neighbor["latitude"] = latitude
-                neighbor["longitude"] = longitude
-                neighbor["last_seen"] = current_time
-                neighbor["rssi"] = rssi
-                neighbor["snr"] = snr
-                neighbor["advert_count"] = neighbor.get("advert_count", 0) + 1
+            # Create advert record for storage
+            advert_record = {
+                "timestamp": current_time,
+                "pubkey": pubkey,
+                "node_name": node_name,
+                "is_repeater": is_repeater,
+                "route_type": route_type,
+                "contact_type": contact_type,
+                "latitude": latitude,
+                "longitude": longitude,
+                "rssi": rssi,
+                "snr": snr,
+                "is_new_neighbor": is_new_neighbor,
+            }
+
+            # Store to database
+            if self.storage:
+                try:
+                    self.storage.record_advert(advert_record)
+                    if is_new_neighbor:
+                        logger.info(f"Discovered new neighbor: {node_name} ({pubkey[:16]}...)")
+                except Exception as e:
+                    logger.error(f"Failed to store advert record: {e}")
 
         except Exception as e:
             logger.debug(f"Error processing advert for neighbor tracking: {e}")
@@ -610,6 +622,9 @@ class RepeaterHandler(BaseHandler):
         # Get current noise floor from radio
         noise_floor_dbm = self.get_noise_floor()
 
+        # Get neighbors from database
+        neighbors = self.storage.get_neighbors() if self.storage else {}
+
         stats = {
             "local_hash": f"0x{self.local_hash:02x}",
             "duplicate_cache_size": len(self.seen_packets),
@@ -620,7 +635,7 @@ class RepeaterHandler(BaseHandler):
             "rx_per_hour": rx_per_hour,
             "forwarded_per_hour": forwarded_per_hour,
             "recent_packets": self.recent_packets,
-            "neighbors": self.neighbors,
+            "neighbors": neighbors,
             "uptime_seconds": uptime_seconds,
             "noise_floor_dbm": noise_floor_dbm,
             # Add configuration data
@@ -656,3 +671,17 @@ class RepeaterHandler(BaseHandler):
         # Add airtime stats
         stats.update(self.airtime_mgr.get_stats())
         return stats
+
+    def cleanup(self):
+        if self.storage:
+            try:
+                self.storage.close()
+                logger.info("StorageCollector closed successfully")
+            except Exception as e:
+                logger.error(f"Error closing StorageCollector: {e}")
+
+    def __del__(self):
+        try:
+            self.cleanup()
+        except Exception:
+            pass

@@ -5,7 +5,7 @@ import sys
 
 from repeater.config import get_radio_for_board, load_config
 from repeater.engine import RepeaterHandler
-from repeater.http_server import HTTPStatsServer, _log_buffer
+from pyMC_Repeater.repeater.http.http_server import HTTPStatsServer, _log_buffer
 from pymc_core.node.handlers.trace import TraceHandler
 from pymc_core.protocol.constants import MAX_PATH_SIZE, ROUTE_TYPE_DIRECT
 

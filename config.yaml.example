@@ -96,6 +96,40 @@ duty_cycle:
   # Maximum airtime per minute in milliseconds
   max_airtime_per_minute: 3600
 
+
+# Storage Configuration
+storage:
+  # Directory for persistent storage files (SQLite, RRD)
+  storage_dir: "/var/lib/pymc_repeater"
+
+  # MQTT publishing configuration (optional)
+  mqtt:
+    # Enable/disable MQTT publishing
+    enabled: false
+    
+    # MQTT broker settings
+    broker: "localhost"
+    port: 1883
+    
+    # Authentication (optional)
+    username: null
+    password: null
+    
+    # Base topic for publishing
+    # Messages will be published to: {base_topic}/{node_name}/{packet|advert}
+    base_topic: "meshcore/repeater"
+
+  # Data retention settings
+  retention:
+    # Clean up SQLite records older than this many days
+    sqlite_cleanup_days: 31
+    
+    # RRD archives are managed automatically:
+    # - 1 minute resolution for 1 week
+    # - 5 minute resolution for 1 month  
+    # - 1 hour resolution for 1 year
+
+
 logging:
   # Log level: DEBUG, INFO, WARNING, ERROR
   level: INFO
