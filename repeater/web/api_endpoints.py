@@ -9,6 +9,49 @@ from .cad_calibration_engine import CADCalibrationEngine
 
 logger = logging.getLogger("HTTPServer")
 
+
+# # system stars
+# GET /api/stats
+# GET /api/logs
+
+# # Packets
+# GET /api/packet_stats?hours=24
+# GET /api/recent_packets?limit=100
+# GET /api/filtered_packets?type=4&route=1&start_timestamp=X&end_timestamp=Y&limit=1000
+# GET /api/packet_by_hash?packet_hash=abc123
+# GET /api/packet_type_stats?hours=24
+
+# # Charts & RRD
+# GET /api/rrd_data?start_time=X&end_time=Y&resolution=average
+# GET /api/packet_type_graph_data?hours=24&resolution=average&types=all
+# GET /api/metrics_graph_data?hours=24&resolution=average&metrics=all
+
+# # Noise Floor
+# GET /api/noise_floor_history?hours=24
+# GET /api/noise_floor_stats?hours=24  
+# GET /api/noise_floor_chart_data?hours=24
+
+# #   Repeater Control
+# POST /api/send_advert
+# POST /api/set_mode {"mode": "forward|monitor"}
+# POST /api/set_duty_cycle {"enabled": true|false}
+
+# # CAD Calibration
+# POST /api/cad_calibration_start {"samples": 8, "delay": 100}
+# POST /api/cad_calibration_stop
+# POST /api/save_cad_settings {"peak": 127, "min_val": 64}
+# GET  /api/cad_calibration_stream (SSE)
+
+
+# Common Parameters
+# hours - Time range (default: 24)
+# resolution - 'average', 'max', 'min' (default: 'average')
+# limit - Max results (default varies)
+# type - Packet type 0-15
+# route - Route type 1-3
+
+
+
 class APIEndpoints:
     def __init__(self, stats_getter: Optional[Callable] = None, send_advert_func: Optional[Callable] = None, config: Optional[dict] = None, event_loop=None, daemon_instance=None, config_path=None):
         self.stats_getter = stats_getter
