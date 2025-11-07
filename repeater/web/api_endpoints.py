@@ -214,9 +214,9 @@ class APIEndpoints:
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
-    def packet_stats(self):
+    def packet_stats(self, hours=24):
         try:
-            hours = int(cherrypy.request.params.get('hours', 24))
+            hours = int(hours)
             stats = self._get_storage().get_packet_stats(hours=hours)
             return self._success(stats)
         except Exception as e:
@@ -225,9 +225,9 @@ class APIEndpoints:
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
-    def recent_packets(self):
+    def recent_packets(self, limit=100):
         try:
-            limit = int(cherrypy.request.params.get('limit', 100))
+            limit = int(limit)
             packets = self._get_storage().get_recent_packets(limit=limit)
             return self._success(packets, count=len(packets))
         except Exception as e:
@@ -267,9 +267,9 @@ class APIEndpoints:
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
-    def packet_type_stats(self):
+    def packet_type_stats(self, hours=24):
         try:
-            hours = int(cherrypy.request.params.get('hours', 24))
+            hours = int(hours)
             stats = self._get_storage().get_packet_type_stats(hours=hours)
             return self._success(stats)
         except Exception as e:
