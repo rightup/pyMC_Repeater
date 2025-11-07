@@ -16,6 +16,427 @@ This document provides examples for using the pyMC_Repeater API endpoints to cre
 - `/api/packet_type_stats` - Get packet type distribution
 - `/api/rrd_data` - Get raw RRD time series data
 
+### Noise Floor Monitoring
+- `/api/noise_floor_history` - Get noise floor history (SQLite data)
+- `/api/noise_floor_stats` - Get noise floor statistics
+- `/api/noise_floor_chart_data` - Get noise floor RRD chart data
+
+## Noise Floor API Examples
+
+### Fetch Noise Floor History
+```javascript
+// Get last 24 hours of noise floor data from SQLite
+async function fetchNoiseFloorHistory() {
+  const response = await fetch('/api/noise_floor_history?hours=24');
+  const result = await response.json();
+  
+  if (result.success) {
+    const history = result.data.history;
+    console.log(`Found ${history.length} noise floor measurements`);
+    
+    // Each record: { timestamp: 1234567890.123, noise_floor_dbm: -95.5 }
+    history.forEach(record => {
+      console.log(`${new Date(record.timestamp * 1000).toISOString()}: ${record.noise_floor_dbm} dBm`);
+    });
+  } else {
+    console.error('Error:', result.error);
+  }
+}
+```
+
+### Fetch Noise Floor Statistics
+```javascript
+// Get statistical summary of noise floor data
+async function fetchNoiseFloorStats() {
+  const response = await fetch('/api/noise_floor_stats?hours=24');
+  const result = await response.json();
+  
+  if (result.success) {
+    const stats = result.data.stats;
+    console.log('Noise Floor Statistics:');
+    console.log(`Count: ${stats.count}`);
+    console.log(`Average: ${stats.average?.toFixed(1)} dBm`);
+    console.log(`Min: ${stats.min} dBm`);
+    console.log(`Max: ${stats.max} dBm`);
+    console.log(`Std Dev: ${stats.std_dev?.toFixed(2)}`);
+  }
+}
+```
+
+### Fetch Chart-Ready Noise Floor Data
+```javascript
+// Get RRD-based noise floor data optimized for charts
+async function fetchNoiseFloorChartData() {
+  const response = await fetch('/api/noise_floor_chart_data?hours=24');
+  const result = await response.json();
+  
+  if (result.success) {
+    const chartData = result.data.chart_data;
+    
+    // Data points: [[timestamp_ms, noise_floor_dbm], ...]
+    chartData.data_points.forEach(point => {
+      const [timestamp_ms, value] = point;
+      console.log(`${new Date(timestamp_ms).toISOString()}: ${value} dBm`);
+    });
+    
+    console.log('Statistics:', chartData.statistics);
+  }
+}
+```
+
+## Noise Floor Chart Examples
+
+### 1. Noise Floor Time Series (Chart.js)
+
+```html
+<!DOCTYPE html>
+<html>
+<head>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns"></script>
+</head>
+<body>
+    <canvas id="noiseFloorChart" width="800" height="400"></canvas>
+    
+    <script>
+        async function createNoiseFloorChart() {
+            const response = await fetch('/api/noise_floor_chart_data?hours=24');
+            const result = await response.json();
+            
+            if (!result.success) {
+                console.error('API Error:', result.error);
+                return;
+            }
+            
+            const chartData = result.data.chart_data;
+            const stats = chartData.statistics;
+            
+            const ctx = document.getElementById('noiseFloorChart').getContext('2d');
+            new Chart(ctx, {
+                type: 'line',
+                data: {
+                    datasets: [{
+                        label: 'Noise Floor',
+                        data: chartData.data_points,
+                        borderColor: '#FF6384',
+                        backgroundColor: '#FF638420',
+                        fill: true,
+                        tension: 0.1,
+                        pointRadius: 1,
+                        pointHoverRadius: 5
+                    }, {
+                        label: `Average (${stats.average.toFixed(1)} dBm)`,
+                        data: chartData.data_points.map(point => [point[0], stats.average]),
+                        borderColor: '#36A2EB',
+                        borderDash: [5, 5],
+                        pointRadius: 0,
+                        fill: false
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    plugins: {
+                        title: {
+                            display: true,
+                            text: 'Noise Floor Over Time (Last 24 Hours)'
+                        },
+                        subtitle: {
+                            display: true,
+                            text: `Min: ${stats.min} dBm | Max: ${stats.max} dBm | Std Dev: ${stats.std_dev.toFixed(2)}`
+                        }
+                    },
+                    scales: {
+                        x: {
+                            type: 'time',
+                            time: {
+                                displayFormats: {
+                                    hour: 'MMM dd HH:mm'
+                                }
+                            },
+                            title: {
+                                display: true,
+                                text: 'Time'
+                            }
+                        },
+                        y: {
+                            title: {
+                                display: true,
+                                text: 'Noise Floor (dBm)'
+                            },
+                            min: Math.min(stats.min - 5, -120),
+                            max: Math.max(stats.max + 5, -60)
+                        }
+                    }
+                }
+            });
+        }
+        
+        createNoiseFloorChart();
+    </script>
+</body>
+</html>
+```
+
+### 2. Noise Floor Distribution Histogram
+
+```html
+<!DOCTYPE html>
+<html>
+<head>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+    <canvas id="noiseDistributionChart" width="600" height="400"></canvas>
+    
+    <script>
+        async function createNoiseDistributionChart() {
+            const response = await fetch('/api/noise_floor_history?hours=168'); // 1 week
+            const result = await response.json();
+            
+            if (!result.success) {
+                console.error('API Error:', result.error);
+                return;
+            }
+            
+            const history = result.data.history;
+            const values = history.map(record => record.noise_floor_dbm);
+            
+            // Create histogram bins
+            const min = Math.min(...values);
+            const max = Math.max(...values);
+            const binCount = 20;
+            const binSize = (max - min) / binCount;
+            
+            const bins = Array(binCount).fill(0);
+            const binLabels = [];
+            
+            for (let i = 0; i < binCount; i++) {
+                const binStart = min + (i * binSize);
+                const binEnd = binStart + binSize;
+                binLabels.push(`${binStart.toFixed(1)} to ${binEnd.toFixed(1)}`);
+                
+                values.forEach(value => {
+                    if (value >= binStart && value < binEnd) {
+                        bins[i]++;
+                    }
+                });
+            }
+            
+            const ctx = document.getElementById('noiseDistributionChart').getContext('2d');
+            new Chart(ctx, {
+                type: 'bar',
+                data: {
+                    labels: binLabels,
+                    datasets: [{
+                        label: 'Frequency',
+                        data: bins,
+                        backgroundColor: '#4BC0C0',
+                        borderColor: '#36A2EB',
+                        borderWidth: 1
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    plugins: {
+                        title: {
+                            display: true,
+                            text: 'Noise Floor Distribution (Last Week)'
+                        }
+                    },
+                    scales: {
+                        x: {
+                            title: {
+                                display: true,
+                                text: 'Noise Floor Range (dBm)'
+                            }
+                        },
+                        y: {
+                            beginAtZero: true,
+                            title: {
+                                display: true,
+                                text: 'Count'
+                            }
+                        }
+                    }
+                }
+            });
+        }
+        
+        createNoiseDistributionChart();
+    </script>
+</body>
+</html>
+```
+
+### 3. Real-time Noise Floor Monitor
+
+```html
+<!DOCTYPE html>
+<html>
+<head>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns"></script>
+    <style>
+        .noise-monitor { padding: 20px; }
+        .current-stats { display: flex; gap: 20px; margin-bottom: 20px; }
+        .stat-card { padding: 15px; background: #f8f9fa; border-radius: 8px; text-align: center; }
+        .stat-value { font-size: 24px; font-weight: bold; }
+        .stat-label { font-size: 14px; color: #666; }
+    </style>
+</head>
+<body>
+    <div class="noise-monitor">
+        <h2>Real-time Noise Floor Monitor</h2>
+        
+        <div class="current-stats">
+            <div class="stat-card">
+                <div class="stat-value" id="currentNoise">-- dBm</div>
+                <div class="stat-label">Current</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value" id="avgNoise">-- dBm</div>
+                <div class="stat-label">1h Average</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value" id="minNoise">-- dBm</div>
+                <div class="stat-label">1h Min</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value" id="maxNoise">-- dBm</div>
+                <div class="stat-label">1h Max</div>
+            </div>
+        </div>
+        
+        <canvas id="realTimeChart" width="800" height="400"></canvas>
+    </div>
+    
+    <script>
+        let chart = null;
+        let lastUpdateTime = 0;
+        
+        async function updateNoiseFloorData() {
+            try {
+                // Get chart data for the last hour
+                const chartResponse = await fetch('/api/noise_floor_chart_data?hours=1');
+                const chartResult = await chartResponse.json();
+                
+                if (!chartResult.success) {
+                    console.error('Chart API Error:', chartResult.error);
+                    return;
+                }
+                
+                const chartData = chartResult.data.chart_data;
+                const stats = chartData.statistics;
+                
+                // Update current stats display
+                const currentValue = chartData.data_points.length > 0 
+                    ? chartData.data_points[chartData.data_points.length - 1][1] 
+                    : null;
+                
+                document.getElementById('currentNoise').textContent = 
+                    currentValue ? `${currentValue.toFixed(1)} dBm` : '-- dBm';
+                document.getElementById('avgNoise').textContent = `${stats.average.toFixed(1)} dBm`;
+                document.getElementById('minNoise').textContent = `${stats.min} dBm`;
+                document.getElementById('maxNoise').textContent = `${stats.max} dBm`;
+                
+                // Create or update chart
+                if (!chart) {
+                    createChart(chartData);
+                } else {
+                    // Check if we have new data
+                    const latestTimestamp = chartData.data_points.length > 0 
+                        ? chartData.data_points[chartData.data_points.length - 1][0] 
+                        : 0;
+                    
+                    if (latestTimestamp > lastUpdateTime) {
+                        chart.data.datasets[0].data = chartData.data_points;
+                        chart.data.datasets[1].data = chartData.data_points.map(point => [point[0], stats.average]);
+                        chart.update('none');
+                        lastUpdateTime = latestTimestamp;
+                    }
+                }
+                
+            } catch (error) {
+                console.error('Error updating noise floor data:', error);
+            }
+        }
+        
+        function createChart(chartData) {
+            const ctx = document.getElementById('realTimeChart').getContext('2d');
+            const stats = chartData.statistics;
+            
+            chart = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    datasets: [{
+                        label: 'Noise Floor',
+                        data: chartData.data_points,
+                        borderColor: '#FF6384',
+                        backgroundColor: '#FF638420',
+                        fill: true,
+                        tension: 0.4,
+                        pointRadius: 2,
+                        pointHoverRadius: 5
+                    }, {
+                        label: 'Average',
+                        data: chartData.data_points.map(point => [point[0], stats.average]),
+                        borderColor: '#36A2EB',
+                        borderDash: [5, 5],
+                        pointRadius: 0,
+                        fill: false
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    animation: {
+                        duration: 750
+                    },
+                    plugins: {
+                        title: {
+                            display: true,
+                            text: 'Noise Floor - Last Hour (Real-time)'
+                        }
+                    },
+                    scales: {
+                        x: {
+                            type: 'time',
+                            time: {
+                                displayFormats: {
+                                    minute: 'HH:mm'
+                                }
+                            },
+                            title: {
+                                display: true,
+                                text: 'Time'
+                            }
+                        },
+                        y: {
+                            title: {
+                                display: true,
+                                text: 'Noise Floor (dBm)'
+                            },
+                            min: Math.min(stats.min - 5, -120),
+                            max: Math.max(stats.max + 5, -60)
+                        }
+                    }
+                }
+            });
+            
+            lastUpdateTime = chartData.data_points.length > 0 
+                ? chartData.data_points[chartData.data_points.length - 1][0] 
+                : 0;
+        }
+        
+        // Initial load
+        updateNoiseFloorData();
+        
+        // Update every 30 seconds
+        setInterval(updateNoiseFloorData, 30000);
+    </script>
+</body>
+</html>
+```
+
 ## Chart.js Examples
 
 ### 1. Packet Type Distribution (Pie Chart)

@@ -20,6 +20,8 @@ from repeater.storage import StorageCollector
 
 logger = logging.getLogger("RepeaterHandler")
 
+NOISE_FLOOR_INTERVAL = 30.0  # seconds
+
 
 class RepeaterHandler(BaseHandler):
 
@@ -80,6 +82,12 @@ class RepeaterHandler(BaseHandler):
             logger.error(f"Failed to initialize StorageCollector: {e}")
             self.storage = None
 
+        # Initialize background timer tracking
+        self.last_noise_measurement = time.time()
+        self.noise_floor_interval = NOISE_FLOOR_INTERVAL    # 30 seconds
+        self._background_task = None
+        self._start_background_tasks()
+
     async def __call__(self, packet: Packet, metadata: Optional[dict] = None) -> None:
 
         if metadata is None:
@@ -87,9 +95,6 @@ class RepeaterHandler(BaseHandler):
 
         # Track incoming packet
         self.rx_count += 1
-
-        # Check if it's time to send a periodic advertisement
-        await self._check_and_send_periodic_advert()
 
         # Check if we're in monitor mode (receive only, no forwarding)
         mode = self.config.get("repeater", {}).get("mode", "forward")
@@ -565,32 +570,6 @@ class RepeaterHandler(BaseHandler):
 
         asyncio.create_task(delayed_send())
 
-    async def _check_and_send_periodic_advert(self):
-
-        if self.send_advert_interval_hours <= 0 or not self.send_advert_func:
-            return
-
-        current_time = time.time()
-        interval_seconds = self.send_advert_interval_hours * 3600  # Convert hours to seconds
-        time_since_last_advert = current_time - self.last_advert_time
-
-        # Check if interval has elapsed
-        if time_since_last_advert >= interval_seconds:
-            logger.info(
-                f"Periodic advert interval elapsed ({time_since_last_advert:.0f}s >= "
-                f"{interval_seconds:.0f}s). Sending advert..."
-            )
-            try:
-                # Call the send_advert function
-                success = await self.send_advert_func()
-                if success:
-                    self.last_advert_time = current_time
-                    logger.info("Periodic advert sent successfully")
-                else:
-                    logger.warning("Failed to send periodic advert")
-            except Exception as e:
-                logger.error(f"Error sending periodic advert: {e}", exc_info=True)
-
     def get_noise_floor(self) -> Optional[float]:
         try:
             radio = self.dispatcher.radio if self.dispatcher else None
@@ -672,7 +651,73 @@ class RepeaterHandler(BaseHandler):
         stats.update(self.airtime_mgr.get_stats())
         return stats
 
+    def _start_background_tasks(self):
+        if self._background_task is None:
+            self._background_task = asyncio.create_task(self._background_timer_loop())
+            logger.info("Background timer started for noise floor and adverts")
+
+    async def _background_timer_loop(self):
+        try:
+            while True:
+                current_time = time.time()
+                
+                # Check noise floor recording (every 30 seconds)
+                if current_time - self.last_noise_measurement >= self.noise_floor_interval:
+                    await self._record_noise_floor_async()
+                    self.last_noise_measurement = current_time
+                
+                # Check advert sending (every N hours)
+                if self.send_advert_interval_hours > 0 and self.send_advert_func:
+                    interval_seconds = self.send_advert_interval_hours * 3600
+                    if current_time - self.last_advert_time >= interval_seconds:
+                        await self._send_periodic_advert_async()
+                        self.last_advert_time = current_time
+                
+                # Sleep for 5 seconds before next check
+                await asyncio.sleep(5.0)
+                
+        except asyncio.CancelledError:
+            logger.info("Background timer loop cancelled")
+            raise
+        except Exception as e:
+            logger.error(f"Error in background timer loop: {e}")
+            # Restart the timer after a delay
+            await asyncio.sleep(30)
+            self._background_task = asyncio.create_task(self._background_timer_loop())
+
+    async def _record_noise_floor_async(self):
+        if not self.storage:
+            return
+            
+        try:
+            noise_floor = self.get_noise_floor()
+            if noise_floor is not None:
+                self.storage.record_noise_floor(noise_floor)
+                logger.debug(f"Recorded noise floor: {noise_floor} dBm")
+            else:
+                logger.debug("Unable to read noise floor from radio")
+        except Exception as e:
+            logger.error(f"Error recording noise floor: {e}")
+
+    async def _send_periodic_advert_async(self):
+        logger.info(f"Periodic advert timer triggered (interval: {self.send_advert_interval_hours}h)")
+        try:
+            if self.send_advert_func:
+                success = await self.send_advert_func()
+                if success:
+                    logger.info("Periodic advert sent successfully")
+                else:
+                    logger.warning("Failed to send periodic advert")
+            else:
+                logger.debug("No send_advert_func configured")
+        except Exception as e:
+            logger.error(f"Error sending periodic advert: {e}")
+
     def cleanup(self):
+        if self._background_task and not self._background_task.done():
+            self._background_task.cancel()
+            logger.info("Background timer task cancelled")
+            
         if self.storage:
             try:
                 self.storage.close()

@@ -90,6 +90,15 @@ class StorageCollector:
                     )
                 """)
                 
+                # Noise floor measurements table
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS noise_floor (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        timestamp REAL NOT NULL,
+                        noise_floor_dbm REAL NOT NULL
+                    )
+                """)
+                
                 # Create indexes for performance
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_packets_timestamp ON packets(timestamp)")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_packets_type ON packets(type)")
@@ -97,6 +106,7 @@ class StorageCollector:
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_packets_transmitted ON packets(transmitted)")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_adverts_timestamp ON adverts(timestamp)")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_adverts_pubkey ON adverts(pubkey)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_noise_timestamp ON noise_floor(timestamp)")
                 
                 conn.commit()
                 logger.info(f"SQLite database initialized: {self.sqlite_path}")
@@ -122,6 +132,7 @@ class StorageCollector:
                 "--step", "60",  # 1-minute steps
                 "--start", str(int(time.time() - 60)),
                 
+
                 # Data sources - Basic metrics
                 "DS:rx_count:COUNTER:120:0:U",        # Received packets
                 "DS:tx_count:COUNTER:120:0:U",        # Transmitted packets
@@ -131,6 +142,7 @@ class StorageCollector:
                 "DS:avg_length:GAUGE:120:0:256",      # Average packet length
                 "DS:avg_score:GAUGE:120:0:1",         # Average packet score
                 "DS:neighbor_count:GAUGE:120:0:U",    # Number of neighbors
+                "DS:noise_floor:GAUGE:120:-150:-50",  # Noise floor in dBm
                 
                 # Packet type counters (based on pyMC payload types)
                 "DS:type_0:COUNTER:120:0:U",          # Request (PAYLOAD_TYPE_REQ)
@@ -200,11 +212,20 @@ class StorageCollector:
         self._store_advert_sqlite(advert_record)
         self._publish_mqtt(advert_record, "advert")
 
+    def record_noise_floor(self, noise_floor_dbm: float):
+        """Record noise floor measurement every 30 seconds"""
+        noise_record = {
+            "timestamp": time.time(),
+            "noise_floor_dbm": noise_floor_dbm
+        }
+        self._store_noise_floor_sqlite(noise_record)
+        self._update_rrd_noise_metrics(noise_record)
+        self._publish_mqtt(noise_record, "noise_floor")
+
     def _store_packet_sqlite(self, record: dict):
 
         try:
             with sqlite3.connect(self.sqlite_path) as conn:
-                # Ensure fields that are non-sqlite-bindable are serialized
                 orig_path = record.get("original_path")
                 fwd_path = record.get("forwarded_path")
                 try:
@@ -308,6 +329,20 @@ class StorageCollector:
         except Exception as e:
             logger.error(f"Failed to store advert in SQLite: {e}")
 
+    def _store_noise_floor_sqlite(self, record: dict):
+       
+        try:
+            with sqlite3.connect(self.sqlite_path) as conn:
+                conn.execute("""
+                    INSERT INTO noise_floor (timestamp, noise_floor_dbm)
+                    VALUES (?, ?)
+                """, (
+                    record.get("timestamp", time.time()),
+                    record.get("noise_floor_dbm")
+                ))
+        except Exception as e:
+            logger.error(f"Failed to store noise floor in SQLite: {e}")
+
     def _update_rrd_packet_metrics(self, record: dict):
         if not RRDTOOL_AVAILABLE or not self.rrd_path.exists():
             return
@@ -352,8 +387,35 @@ class StorageCollector:
         except Exception as e:
             logger.error(f"Failed to update RRD packet metrics: {e}")
 
+    def _update_rrd_noise_metrics(self, record: dict):
+       
+        if not RRDTOOL_AVAILABLE or not self.rrd_path.exists():
+            return
+            
+        try:
+            timestamp = int(record.get("timestamp", time.time()))
+            noise_floor = record.get("noise_floor_dbm", "U")
+            
+            # Skip if trying to update with old data
+            try:
+                info = rrdtool.info(str(self.rrd_path))
+                last_update = int(info.get("last_update", timestamp - 60))
+                if timestamp <= last_update:
+                    return
+            except Exception:
+                pass
+            
+            # Update RRD with noise floor only, set other metrics to undefined
+            # Format: timestamp:rx:tx:drop:rssi:snr:length:score:neighbors:noise_floor:type_0:type_1:...
+            values = f"{timestamp}:0:0:0:U:U:U:U:U:{noise_floor}" + ":0" * 17  # 17 packet type counters
+            
+            rrdtool.update(str(self.rrd_path), values)
+            
+        except Exception as e:
+            logger.error(f"Failed to update RRD noise metrics: {e}")
+
     def _publish_mqtt(self, record: dict, record_type: str):
-        """Publish record to MQTT broker."""
+     
         if not self.mqtt_client:
             return
             
@@ -426,7 +488,7 @@ class StorageCollector:
             return {}
 
     def get_recent_packets(self, limit: int = 100) -> list:
-        """Get recent packets with all fields for debugging/analysis."""
+     
         try:
             with sqlite3.connect(self.sqlite_path) as conn:
                 conn.row_factory = sqlite3.Row
@@ -454,7 +516,7 @@ class StorageCollector:
                            start_timestamp: Optional[float] = None,
                            end_timestamp: Optional[float] = None,
                            limit: int = 1000) -> list:
-        """Get packets filtered by type, route, and timestamp range."""
+     
         try:
             with sqlite3.connect(self.sqlite_path) as conn:
                 conn.row_factory = sqlite3.Row
@@ -506,7 +568,7 @@ class StorageCollector:
             return []
 
     def get_packet_by_hash(self, packet_hash: str) -> Optional[dict]:
-        """Get a specific packet by its hash."""
+        
         try:
             with sqlite3.connect(self.sqlite_path) as conn:
                 conn.row_factory = sqlite3.Row
@@ -529,7 +591,7 @@ class StorageCollector:
 
     def get_rrd_data(self, start_time: Optional[int] = None, end_time: Optional[int] = None, 
                      resolution: str = "average") -> Optional[dict]:
-        """Get RRD time series data including packet type statistics."""
+      
         if not RRDTOOL_AVAILABLE or not self.rrd_path.exists():
             return None
             
@@ -597,7 +659,7 @@ class StorageCollector:
             return None
 
     def get_packet_type_stats(self, hours: int = 24) -> dict:
-        """Get packet type statistics for the specified time period."""
+
         try:
             # Get RRD data for packet types
             end_time = int(time.time())
@@ -652,7 +714,7 @@ class StorageCollector:
             return {"error": str(e)}
 
     def get_neighbors(self) -> dict:
-        """Get all neighbors from the database formatted like the in-memory neighbors dict."""
+       
         try:
             with sqlite3.connect(self.sqlite_path) as conn:
                 conn.row_factory = sqlite3.Row
@@ -706,16 +768,146 @@ class StorageCollector:
                 result = conn.execute("DELETE FROM adverts WHERE timestamp < ?", (cutoff,))
                 adverts_deleted = result.rowcount
                 
+                # Clean old noise floor measurements
+                result = conn.execute("DELETE FROM noise_floor WHERE timestamp < ?", (cutoff,))
+                noise_deleted = result.rowcount
+                
                 conn.commit()
                 
-                if packets_deleted > 0 or adverts_deleted > 0:
-                    logger.info(f"Cleaned up {packets_deleted} old packets and {adverts_deleted} old adverts")
+                if packets_deleted > 0 or adverts_deleted > 0 or noise_deleted > 0:
+                    logger.info(f"Cleaned up {packets_deleted} old packets, {adverts_deleted} old adverts, {noise_deleted} old noise measurements")
                     
         except Exception as e:
             logger.error(f"Failed to cleanup old data: {e}")
 
+    def get_noise_floor_history(self, hours: int = 24) -> list:
+        
+        try:
+            cutoff = time.time() - (hours * 3600)
+            
+            with sqlite3.connect(self.sqlite_path) as conn:
+                conn.row_factory = sqlite3.Row
+                
+                measurements = conn.execute("""
+                    SELECT timestamp, noise_floor_dbm
+                    FROM noise_floor 
+                    WHERE timestamp > ?
+                    ORDER BY timestamp ASC
+                """, (cutoff,)).fetchall()
+                
+                return [{"timestamp": row["timestamp"], "noise_floor_dbm": row["noise_floor_dbm"]} 
+                        for row in measurements]
+                
+        except Exception as e:
+            logger.error(f"Failed to get noise floor history: {e}")
+            return []
+
+    def get_noise_floor_stats(self, hours: int = 24) -> dict:
+   
+        try:
+            cutoff = time.time() - (hours * 3600)
+            
+            with sqlite3.connect(self.sqlite_path) as conn:
+                conn.row_factory = sqlite3.Row
+                
+                stats = conn.execute("""
+                    SELECT 
+                        COUNT(*) as measurement_count,
+                        AVG(noise_floor_dbm) as avg_noise_floor,
+                        MIN(noise_floor_dbm) as min_noise_floor,
+                        MAX(noise_floor_dbm) as max_noise_floor
+                    FROM noise_floor 
+                    WHERE timestamp > ?
+                """, (cutoff,)).fetchone()
+                
+                return {
+                    "measurement_count": stats["measurement_count"],
+                    "avg_noise_floor": round(stats["avg_noise_floor"] or 0, 1),
+                    "min_noise_floor": round(stats["min_noise_floor"] or 0, 1),
+                    "max_noise_floor": round(stats["max_noise_floor"] or 0, 1),
+                    "hours": hours
+                }
+                
+        except Exception as e:
+            logger.error(f"Failed to get noise floor stats: {e}")
+            return {}
+
+    def get_noise_floor_rrd(self, hours: int = 24, resolution: str = "average") -> dict:
+     
+        if not RRDTOOL_AVAILABLE or not self.rrd_path.exists():
+            return {"error": "RRD not available"}
+            
+        try:
+            end_time = int(time.time())
+            start_time = end_time - (hours * 3600)
+            
+            # Fetch data from RRD
+            fetch_result = rrdtool.fetch(
+                str(self.rrd_path),
+                resolution.upper(),
+                "--start", str(start_time),
+                "--end", str(end_time)
+            )
+            
+            if not fetch_result:
+                return {"error": "No data available"}
+                
+            (start, end, step), data_sources, data_points = fetch_result
+            
+            # Find noise_floor data source index
+            try:
+                noise_floor_index = data_sources.index('noise_floor')
+            except ValueError:
+                return {"error": "Noise floor data not found in RRD"}
+            
+            # Extract timestamps and noise floor values
+            timestamps = []
+            noise_values = []
+            
+            current_time = start
+            for point in data_points:
+                timestamps.append(current_time * 1000)  # Convert to milliseconds for JavaScript
+                noise_floor_value = point[noise_floor_index]
+                noise_values.append(noise_floor_value if noise_floor_value is not None else None)
+                current_time += step
+            
+            # Filter out None values and create chart data
+            chart_data = []
+            valid_values = []
+            
+            for i, (ts, value) in enumerate(zip(timestamps, noise_values)):
+                if value is not None:
+                    chart_data.append([ts, value])
+                    valid_values.append(value)
+            
+            # Calculate statistics
+            stats = {}
+            if valid_values:
+                stats = {
+                    "min": round(min(valid_values), 1),
+                    "max": round(max(valid_values), 1),
+                    "avg": round(sum(valid_values) / len(valid_values), 1),
+                    "count": len(valid_values)
+                }
+            
+            return {
+                "start_time": start,
+                "end_time": end,
+                "step": step,
+                "hours": hours,
+                "resolution": resolution,
+                "data": chart_data,  # Array of [timestamp_ms, value] pairs for charting
+                "timestamps": timestamps,
+                "values": noise_values,
+                "stats": stats
+            }
+            
+        except Exception as e:
+            logger.error(f"Failed to get noise floor RRD data: {e}")
+            return {"error": str(e)}
+
     def close(self):
-        """Clean shutdown of storage systems."""
+    
         if self.mqtt_client:
             self.mqtt_client.loop_stop()
             self.mqtt_client.disconnect()

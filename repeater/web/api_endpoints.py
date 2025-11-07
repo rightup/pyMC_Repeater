@@ -452,6 +452,55 @@ class APIEndpoints:
             raise
 
     @cherrypy.expose
+    @cherrypy.tools.json_out()
+    def noise_floor_history(self, hours: int = 24):
+        try:
+            storage = self._get_storage()
+            hours = int(hours)
+            history = storage.get_noise_floor_history(hours=hours)
+            
+            return self._success({
+                "history": history,
+                "hours": hours,
+                "count": len(history)
+            })
+        except Exception as e:
+            logger.error(f"Error fetching noise floor history: {e}")
+            return self._error(e)
+    
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    def noise_floor_stats(self, hours: int = 24):
+        try:
+            storage = self._get_storage()
+            hours = int(hours)
+            stats = storage.get_noise_floor_stats(hours=hours)
+            
+            return self._success({
+                "stats": stats,
+                "hours": hours
+            })
+        except Exception as e:
+            logger.error(f"Error fetching noise floor stats: {e}")
+            return self._error(e)
+    
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    def noise_floor_chart_data(self, hours: int = 24):
+        try:
+            storage = self._get_storage()
+            hours = int(hours)
+            chart_data = storage.get_noise_floor_rrd(hours=hours)
+            
+            return self._success({
+                "chart_data": chart_data,
+                "hours": hours
+            })
+        except Exception as e:
+            logger.error(f"Error fetching noise floor chart data: {e}")
+            return self._error(e)
+
+    @cherrypy.expose
     def cad_calibration_stream(self):
         cherrypy.response.headers['Content-Type'] = 'text/event-stream'
         cherrypy.response.headers['Cache-Control'] = 'no-cache'
