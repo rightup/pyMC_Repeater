@@ -207,6 +207,18 @@ class StorageCollector:
 
         try:
             with sqlite3.connect(self.sqlite_path) as conn:
+                # Ensure fields that are non-sqlite-bindable are serialized
+                orig_path = record.get("original_path")
+                fwd_path = record.get("forwarded_path")
+                try:
+                    orig_path_val = json.dumps(orig_path) if orig_path is not None else None
+                except Exception:
+                    orig_path_val = str(orig_path)
+                try:
+                    fwd_path_val = json.dumps(fwd_path) if fwd_path is not None else None
+                except Exception:
+                    fwd_path_val = str(fwd_path)
+
                 conn.execute("""
                     INSERT INTO packets (
                         timestamp, type, route, length, rssi, snr, score,
@@ -222,8 +234,8 @@ class StorageCollector:
                     record.get("rssi"),
                     record.get("snr"),
                     record.get("score"),
-                    record.get("transmitted", False),
-                    record.get("is_duplicate", False),
+                    int(bool(record.get("transmitted", False))),
+                    int(bool(record.get("is_duplicate", False))),
                     record.get("drop_reason"),
                     record.get("src_hash"),
                     record.get("dst_hash"),
@@ -233,8 +245,8 @@ class StorageCollector:
                     record.get("payload_length"),
                     record.get("tx_delay_ms"),
                     record.get("packet_hash"),
-                    record.get("original_path"),
-                    record.get("forwarded_path")
+                    orig_path_val,
+                    fwd_path_val
                 ))
                 
         except Exception as e:

@@ -20,9 +20,16 @@ class APIEndpoints:
         self.cad_calibration = CADCalibrationEngine(daemon_instance, event_loop)
 
     def _get_storage(self):
-        if not self.daemon_instance or not hasattr(self.daemon_instance, 'storage'):
-            raise Exception("Storage not available")
-        return self.daemon_instance.storage
+        if not self.daemon_instance:
+            raise Exception("Daemon not available")
+        
+        if not hasattr(self.daemon_instance, 'repeater_handler') or not self.daemon_instance.repeater_handler:
+            raise Exception("Repeater handler not initialized")
+            
+        if not hasattr(self.daemon_instance.repeater_handler, 'storage') or not self.daemon_instance.repeater_handler.storage:
+            raise Exception("Storage not initialized in repeater handler")
+            
+        return self.daemon_instance.repeater_handler.storage
 
     def _success(self, data, **kwargs):
         result = {"success": True, "data": data}
