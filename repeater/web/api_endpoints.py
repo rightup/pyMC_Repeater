@@ -10,7 +10,7 @@ from .cad_calibration_engine import CADCalibrationEngine
 logger = logging.getLogger("HTTPServer")
 
 
-# # system stars
+# system systems
 # GET /api/stats
 # GET /api/logs
 
@@ -21,22 +21,22 @@ logger = logging.getLogger("HTTPServer")
 # GET /api/packet_by_hash?packet_hash=abc123
 # GET /api/packet_type_stats?hours=24
 
-# # Charts & RRD
+# Charts & RRD
 # GET /api/rrd_data?start_time=X&end_time=Y&resolution=average
 # GET /api/packet_type_graph_data?hours=24&resolution=average&types=all
 # GET /api/metrics_graph_data?hours=24&resolution=average&metrics=all
 
-# # Noise Floor
+# Noise Floor
 # GET /api/noise_floor_history?hours=24
 # GET /api/noise_floor_stats?hours=24  
 # GET /api/noise_floor_chart_data?hours=24
 
-# #   Repeater Control
+# Repeater Control
 # POST /api/send_advert
 # POST /api/set_mode {"mode": "forward|monitor"}
 # POST /api/set_duty_cycle {"enabled": true|false}
 
-# # CAD Calibration
+# CAD Calibration
 # POST /api/cad_calibration_start {"samples": 8, "delay": 100}
 # POST /api/cad_calibration_stop
 # POST /api/save_cad_settings {"peak": 127, "min_val": 64}
