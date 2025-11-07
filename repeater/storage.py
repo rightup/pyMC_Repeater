@@ -406,8 +406,8 @@ class StorageCollector:
                 pass
             
             # Update RRD with noise floor only, set other metrics to undefined
-            # Format: timestamp:rx:tx:drop:rssi:snr:length:score:neighbors:noise_floor:type_0:type_1:...
-            values = f"{timestamp}:0:0:0:U:U:U:U:U:{noise_floor}" + ":0" * 17  # 17 packet type counters
+            # Format: timestamp:rx:tx:drop:rssi:snr:length:score:neighbors:noise_floor:type_0:...type_15:type_other
+            values = f"{timestamp}:U:U:U:U:U:U:U:U:{noise_floor}" + ":U" * 17  # 17 packet type counters
             
             rrdtool.update(str(self.rrd_path), values)
             
