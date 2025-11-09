@@ -60,12 +60,14 @@ class StorageCollector:
                         dst_hash TEXT,
                         path_hash TEXT,
                         header TEXT,
+                        transport_codes TEXT,
                         payload TEXT,
                         payload_length INTEGER,
                         tx_delay_ms REAL,
                         packet_hash TEXT,
                         original_path TEXT,
-                        forwarded_path TEXT
+                        forwarded_path TEXT,
+                        raw_packet TEXT
                     )
                 """)
                 
@@ -142,25 +144,23 @@ class StorageCollector:
                 "DS:avg_length:GAUGE:120:0:256",      # Average packet length
                 "DS:avg_score:GAUGE:120:0:1",         # Average packet score
                 "DS:neighbor_count:GAUGE:120:0:U",    # Number of neighbors
-                "DS:noise_floor:GAUGE:120:-150:-50",  # Noise floor in dBm
                 
-                # Packet type counters (based on pyMC payload types)
-                "DS:type_0:COUNTER:120:0:U",          # Request (PAYLOAD_TYPE_REQ)
-                "DS:type_1:COUNTER:120:0:U",          # Response (PAYLOAD_TYPE_RESPONSE)
-                "DS:type_2:COUNTER:120:0:U",          # Text Message (PAYLOAD_TYPE_TXT_MSG)
-                "DS:type_3:COUNTER:120:0:U",          # ACK (PAYLOAD_TYPE_ACK)
-                "DS:type_4:COUNTER:120:0:U",          # Advert (PAYLOAD_TYPE_ADVERT)
-                "DS:type_5:COUNTER:120:0:U",          # Group Text (PAYLOAD_TYPE_GRP_TXT)
-                "DS:type_6:COUNTER:120:0:U",          # Group Data (PAYLOAD_TYPE_GRP_DATA)
-                "DS:type_7:COUNTER:120:0:U",          # Anonymous Request (PAYLOAD_TYPE_ANON_REQ)
-                "DS:type_8:COUNTER:120:0:U",          # Path (PAYLOAD_TYPE_PATH)
-                "DS:type_9:COUNTER:120:0:U",          # Trace (PAYLOAD_TYPE_TRACE)
-                "DS:type_10:COUNTER:120:0:U",         # Reserved for future use
+                "DS:type_0:COUNTER:120:0:U",          # Request (REQ)
+                "DS:type_1:COUNTER:120:0:U",          # Response (RESPONSE)
+                "DS:type_2:COUNTER:120:0:U",          # Plain Text Message (TXT_MSG)
+                "DS:type_3:COUNTER:120:0:U",          # Acknowledgment (ACK)
+                "DS:type_4:COUNTER:120:0:U",          # Node Advertisement (ADVERT)
+                "DS:type_5:COUNTER:120:0:U",          # Group Text Message (GRP_TXT)
+                "DS:type_6:COUNTER:120:0:U",          # Group Datagram (GRP_DATA)
+                "DS:type_7:COUNTER:120:0:U",          # Anonymous Request (ANON_REQ)
+                "DS:type_8:COUNTER:120:0:U",          # Returned Path (PATH)
+                "DS:type_9:COUNTER:120:0:U",          # Trace (TRACE)
+                "DS:type_10:COUNTER:120:0:U",         # Multi-part Packet (reserved)
                 "DS:type_11:COUNTER:120:0:U",         # Reserved for future use
                 "DS:type_12:COUNTER:120:0:U",         # Reserved for future use
                 "DS:type_13:COUNTER:120:0:U",         # Reserved for future use
                 "DS:type_14:COUNTER:120:0:U",         # Reserved for future use
-                "DS:type_15:COUNTER:120:0:U",         # Reserved for future use
+                "DS:type_15:COUNTER:120:0:U",         # Custom Packet (RAW_CUSTOM)
                 "DS:type_other:COUNTER:120:0:U",      # Other packet types (>15)
                 
                 # Round Robin Archives (resolution:keep_time)
@@ -204,6 +204,7 @@ class StorageCollector:
             self.mqtt_client = None
 
     def record_packet(self, packet_record: dict):
+        logger.debug(f"Recording packet: type={packet_record.get('type')}, transmitted={packet_record.get('transmitted')}")
         self._store_packet_sqlite(packet_record)
         self._update_rrd_packet_metrics(packet_record)
         self._publish_mqtt(packet_record, "packet")
@@ -219,7 +220,8 @@ class StorageCollector:
             "noise_floor_dbm": noise_floor_dbm
         }
         self._store_noise_floor_sqlite(noise_record)
-        self._update_rrd_noise_metrics(noise_record)
+        # Note: Don't update RRD here - noise floor will be updated with packet data
+        # to avoid overwriting packet counters
         self._publish_mqtt(noise_record, "noise_floor")
 
     def _store_packet_sqlite(self, record: dict):
@@ -241,9 +243,9 @@ class StorageCollector:
                     INSERT INTO packets (
                         timestamp, type, route, length, rssi, snr, score,
                         transmitted, is_duplicate, drop_reason, src_hash, dst_hash, path_hash,
-                        header, payload, payload_length, tx_delay_ms, packet_hash,
-                        original_path, forwarded_path
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        header, transport_codes, payload, payload_length, 
+                        tx_delay_ms, packet_hash, original_path, forwarded_path, raw_packet
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     record.get("timestamp", time.time()),
                     record.get("type", 0),
@@ -259,12 +261,14 @@ class StorageCollector:
                     record.get("dst_hash"),
                     record.get("path_hash"),
                     record.get("header"),
+                    record.get("transport_codes"),
                     record.get("payload"),
                     record.get("payload_length"),
                     record.get("tx_delay_ms"),
                     record.get("packet_hash"),
                     orig_path_val,
-                    fwd_path_val
+                    fwd_path_val,
+                    record.get("raw_packet")
                 ))
                 
         except Exception as e:
@@ -345,6 +349,7 @@ class StorageCollector:
 
     def _update_rrd_packet_metrics(self, record: dict):
         if not RRDTOOL_AVAILABLE or not self.rrd_path.exists():
+            logger.debug("RRD not available or doesn't exist for packet metrics")
             return
             
         try:
@@ -354,65 +359,80 @@ class StorageCollector:
             try:
                 info = rrdtool.info(str(self.rrd_path))
                 last_update = int(info.get("last_update", timestamp - 60))
+                logger.debug(f"RRD packet update: timestamp={timestamp}, last_update={last_update}")
                 if timestamp <= last_update:
+                    logger.debug(f"Skipping RRD packet update: timestamp {timestamp} <= last_update {last_update}")
                     return
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"Failed to get RRD info for packet update: {e}")
             
-            # For packets, we update counters and gauges
+
             packet_type = record.get("type", 0)
             rx_inc = 1
             tx_inc = 1 if record.get("transmitted", False) else 0
             drop_inc = 0 if record.get("transmitted", False) else 1
             
-            # Initialize packet type counters (all start with 0)
-            type_counters = ["0"] * 17  # type_0 through type_15 plus type_other
+
+            try:
+                with sqlite3.connect(self.sqlite_path) as conn:
+                    # Get total counts for each packet type since RRD creation
+                    type_counts = {}
+                    for i in range(16):
+                        count = conn.execute("SELECT COUNT(*) FROM packets WHERE type = ?", (i,)).fetchone()[0]
+                        type_counts[f"type_{i}"] = count
+                    
+                    # Count for other types (>15)
+                    other_count = conn.execute("SELECT COUNT(*) FROM packets WHERE type > 15").fetchone()[0]
+                    type_counts["type_other"] = other_count
+                    
+                    # Get basic counts
+                    rx_total = conn.execute("SELECT COUNT(*) FROM packets").fetchone()[0]
+                    tx_total = conn.execute("SELECT COUNT(*) FROM packets WHERE transmitted = 1").fetchone()[0] 
+                    drop_total = conn.execute("SELECT COUNT(*) FROM packets WHERE transmitted = 0").fetchone()[0]
+                    
+            except Exception as e:
+                logger.warning(f"Failed to get cumulative counts from SQLite: {e}")
+                # Fallback to increment approach if SQLite fails
+                rx_total = rx_inc
+                tx_total = tx_inc 
+                drop_total = drop_inc
+                type_counts = {}
+                for i in range(16):
+                    type_counts[f"type_{i}"] = 1 if packet_type == i else 0
+                type_counts["type_other"] = 1 if packet_type > 15 else 0
             
-            # Increment the appropriate packet type counter
-            if 0 <= packet_type <= 15:
-                type_counters[packet_type] = "1"
-            else:
-                type_counters[16] = "1"  # type_other for packet types > 15
+            # Build packet type values in order: type_0 through type_15, then type_other
+            type_values = []
+            for i in range(16):
+                type_values.append(str(type_counts.get(f"type_{i}", 0)))
+            type_values.append(str(type_counts.get("type_other", 0)))
             
             # Build the values string: basic metrics + packet type counters
-            basic_values = f"{timestamp}:{rx_inc}:{tx_inc}:{drop_inc}:" \
+            # Format: timestamp:rx:tx:drop:rssi:snr:length:score:neighbors:type_0:...type_15:type_other
+            basic_values = f"{timestamp}:{rx_total}:{tx_total}:{drop_total}:" \
                           f"{record.get('rssi', 'U')}:{record.get('snr', 'U')}:" \
-                          f"{record.get('length', 'U')}:{record.get('score', 'U')}:U"
+                          f"{record.get('length', 'U')}:{record.get('score', 'U')}:" \
+                          f"U"  # neighbor_count only (noise_floor removed from RRD)
             
-            type_values = ":".join(type_counters)
-            values = f"{basic_values}:{type_values}"
+            type_values_str = ":".join(type_values)
+            values = f"{basic_values}:{type_values_str}"
             
+            logger.debug(f"Updating RRD with packet values: {values}")
             rrdtool.update(str(self.rrd_path), values)
+            logger.debug(f"RRD packet update successful for type={packet_type}, transmitted={record.get('transmitted', False)}")
             
         except Exception as e:
             logger.error(f"Failed to update RRD packet metrics: {e}")
+            logger.debug(f"RRD packet update failed - record: {record}")
 
     def _update_rrd_noise_metrics(self, record: dict):
-       
-        if not RRDTOOL_AVAILABLE or not self.rrd_path.exists():
-            return
-            
-        try:
-            timestamp = int(record.get("timestamp", time.time()))
-            noise_floor = record.get("noise_floor_dbm", "U")
-            
-            # Skip if trying to update with old data
-            try:
-                info = rrdtool.info(str(self.rrd_path))
-                last_update = int(info.get("last_update", timestamp - 60))
-                if timestamp <= last_update:
-                    return
-            except Exception:
-                pass
-            
-            # Update RRD with noise floor only, set other metrics to undefined
-            # Format: timestamp:rx:tx:drop:rssi:snr:length:score:neighbors:noise_floor:type_0:...type_15:type_other
-            values = f"{timestamp}:U:U:U:U:U:U:U:U:{noise_floor}" + ":U" * 17  # 17 packet type counters
-            
-            rrdtool.update(str(self.rrd_path), values)
-            
-        except Exception as e:
-            logger.error(f"Failed to update RRD noise metrics: {e}")
+        """
+        DEPRECATED: No longer used to avoid overwriting packet data.
+        Noise floor is now included in packet updates to prevent data loss.
+        """
+        # This function is no longer used - noise floor updates were overwriting
+        # all packet counter data. Noise floor is now updated along with packet data.
+        pass
 
     def _publish_mqtt(self, record: dict, record_type: str):
      
@@ -497,8 +517,8 @@ class StorageCollector:
                     SELECT 
                         timestamp, type, route, length, rssi, snr, score,
                         transmitted, is_duplicate, drop_reason, src_hash, dst_hash, path_hash,
-                        header, payload, payload_length, tx_delay_ms, packet_hash,
-                        original_path, forwarded_path
+                        header, transport_codes, payload, payload_length, 
+                        tx_delay_ms, packet_hash, original_path, forwarded_path, raw_packet
                     FROM packets 
                     ORDER BY timestamp DESC
                     LIMIT ?
@@ -546,8 +566,8 @@ class StorageCollector:
                     SELECT 
                         timestamp, type, route, length, rssi, snr, score,
                         transmitted, is_duplicate, drop_reason, src_hash, dst_hash, path_hash,
-                        header, payload, payload_length, tx_delay_ms, packet_hash,
-                        original_path, forwarded_path
+                        header, transport_codes, payload, payload_length, 
+                        tx_delay_ms, packet_hash, original_path, forwarded_path, raw_packet
                     FROM packets
                 """
                 
@@ -577,8 +597,8 @@ class StorageCollector:
                     SELECT 
                         timestamp, type, route, length, rssi, snr, score,
                         transmitted, is_duplicate, drop_reason, src_hash, dst_hash, path_hash,
-                        header, payload, payload_length, tx_delay_ms, packet_hash,
-                        original_path, forwarded_path
+                        header, transport_codes, payload, payload_length, 
+                        tx_delay_ms, packet_hash, original_path, forwarded_path, raw_packet
                     FROM packets 
                     WHERE packet_hash = ?
                 """, (packet_hash,)).fetchone()
@@ -593,6 +613,7 @@ class StorageCollector:
                      resolution: str = "average") -> Optional[dict]:
       
         if not RRDTOOL_AVAILABLE or not self.rrd_path.exists():
+            logger.error(f"RRD not available: RRDTOOL_AVAILABLE={RRDTOOL_AVAILABLE}, rrd_path exists={self.rrd_path.exists()}")
             return None
             
         try:
@@ -601,6 +622,8 @@ class StorageCollector:
                 end_time = int(time.time())
             if start_time is None:
                 start_time = end_time - (24 * 3600)  # 24 hours ago
+                
+            logger.debug(f"RRD fetch: start={start_time}, end={end_time}, resolution={resolution}")
                 
             # Fetch data from RRD
             fetch_result = rrdtool.fetch(
@@ -611,9 +634,19 @@ class StorageCollector:
             )
             
             if not fetch_result:
+                logger.error("RRD fetch returned None")
                 return None
                 
             (start, end, step), data_sources, data_points = fetch_result
+            logger.debug(f"RRD fetch result: start={start}, end={end}, step={step}, sources={len(data_sources)}, points={len(data_points)}")
+            logger.debug(f"Data sources: {data_sources}")
+            
+            # Log a few sample data points
+            if data_points:
+                logger.debug(f"First data point: {data_points[0]}")
+                logger.debug(f"Last data point: {data_points[-1]}")
+            else:
+                logger.warning("No data points returned from RRD fetch")
             
             # Create structured response
             result = {
@@ -652,6 +685,15 @@ class StorageCollector:
                 current_time += step
             
             result['timestamps'] = timestamps
+            logger.debug(f"RRD data processed successfully: {len(timestamps)} timestamps, packet_types keys: {list(result['packet_types'].keys())}")
+            
+            # Log some sample packet type data
+            for type_key in ['type_2', 'type_4', 'type_5']:
+                if type_key in result['packet_types']:
+                    values = result['packet_types'][type_key]
+                    non_none_values = [v for v in values if v is not None]
+                    logger.debug(f"{type_key} values: count={len(values)}, non-none={len(non_none_values)}, sample={values[:3] if values else 'empty'}")
+                    
             return result
             
         except Exception as e:
@@ -661,57 +703,149 @@ class StorageCollector:
     def get_packet_type_stats(self, hours: int = 24) -> dict:
 
         try:
-            # Get RRD data for packet types
+            # First try RRD data for packet types
             end_time = int(time.time())
             start_time = end_time - (hours * 3600)
             
+            logger.debug(f"Getting packet type stats for {hours} hours from {start_time} to {end_time}")
+            
             rrd_data = self.get_rrd_data(start_time, end_time)
             if not rrd_data or 'packet_types' not in rrd_data:
-                return {"error": "No RRD data available"}
+                logger.warning(f"No RRD data available, falling back to SQLite")
+                return self._get_packet_type_stats_sqlite(hours)
+            
+            logger.debug(f"RRD packet_types keys: {list(rrd_data['packet_types'].keys())}")
             
             # Calculate totals for each packet type
             type_totals = {}
             packet_type_names = {
                 'type_0': 'Request (REQ)',
                 'type_1': 'Response (RESPONSE)', 
-                'type_2': 'Text Message (TXT_MSG)',
-                'type_3': 'ACK (ACK)',
-                'type_4': 'Advert (ADVERT)',
-                'type_5': 'Group Text (GRP_TXT)',
-                'type_6': 'Group Data (GRP_DATA)',
+                'type_2': 'Plain Text Message (TXT_MSG)',
+                'type_3': 'Acknowledgment (ACK)',
+                'type_4': 'Node Advertisement (ADVERT)',
+                'type_5': 'Group Text Message (GRP_TXT)',
+                'type_6': 'Group Datagram (GRP_DATA)',
                 'type_7': 'Anonymous Request (ANON_REQ)',
-                'type_8': 'Path (PATH)',
+                'type_8': 'Returned Path (PATH)',
                 'type_9': 'Trace (TRACE)',
-                'type_10': 'Reserved Type 10',
+                'type_10': 'Multi-part Packet',
                 'type_11': 'Reserved Type 11',
                 'type_12': 'Reserved Type 12',
                 'type_13': 'Reserved Type 13',
                 'type_14': 'Reserved Type 14',
-                'type_15': 'Reserved Type 15',
+                'type_15': 'Custom Packet (RAW_CUSTOM)',
                 'type_other': 'Other Types (>15)'
             }
             
+            # Check if we have meaningful RRD data (more than just a few valid points)
+            total_valid_points = 0
             for type_key, data_points in rrd_data['packet_types'].items():
-                # Calculate total (last value minus first value for counter data)
                 valid_points = [p for p in data_points if p is not None]
+                total_valid_points += len(valid_points)
+            
+            # If we have very sparse RRD data, fall back to SQLite
+            if total_valid_points < 10:  # Arbitrary threshold
+                logger.warning(f"RRD data too sparse ({total_valid_points} valid points), falling back to SQLite")
+                return self._get_packet_type_stats_sqlite(hours)
+            
+            for type_key, data_points in rrd_data['packet_types'].items():
+                # For COUNTER data with mostly None values, we need to find the actual range of data
+                valid_points = [p for p in data_points if p is not None]
+                logger.debug(f"{type_key}: total_points={len(data_points)}, valid_points={len(valid_points)}")
+                
                 if len(valid_points) >= 2:
-                    total = valid_points[-1] - valid_points[0]
+                    # For counters, the total is the difference between max and min valid values
+                    # since RRD COUNTER data represents cumulative counts
+                    total = max(valid_points) - min(valid_points)
+                    logger.debug(f"{type_key}: min={min(valid_points)}, max={max(valid_points)}, total={total}")
+                elif len(valid_points) == 1:
+                    # Single value - this is likely the current cumulative total
+                    # For period stats, we can use this as the total if it's reasonable
+                    total = valid_points[0]
+                    logger.debug(f"{type_key}: single value={total}")
                 else:
-                    total = valid_points[0] if valid_points else 0
+                    total = 0
+                    logger.debug(f"{type_key}: no valid values, total=0")
                     
                 type_name = packet_type_names.get(type_key, type_key)
                 type_totals[type_name] = max(0, total or 0)
             
-            return {
+            logger.debug(f"Final type_totals: {type_totals}")
+            
+            result = {
                 "hours": hours,
                 "packet_type_totals": type_totals,
                 "total_packets": sum(type_totals.values()),
-                "period": f"{hours} hours"
+                "period": f"{hours} hours",
+                "data_source": "rrd"
             }
             
+            logger.debug(f"Returning packet type stats: {result}")
+            return result
+            
         except Exception as e:
-            logger.error(f"Failed to get packet type stats: {e}")
-            return {"error": str(e)}
+            logger.error(f"Failed to get packet type stats from RRD: {e}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            logger.warning("Falling back to SQLite for packet type stats")
+            return self._get_packet_type_stats_sqlite(hours)
+    
+    def _get_packet_type_stats_sqlite(self, hours: int = 24) -> dict:
+        """Fallback method to get packet type stats directly from SQLite"""
+        try:
+            cutoff = time.time() - (hours * 3600)
+            
+            with sqlite3.connect(self.sqlite_path) as conn:
+                conn.row_factory = sqlite3.Row
+                
+                # Get packet type counts directly from SQLite
+                type_counts = {}
+                packet_type_names = {
+                    0: 'Request (REQ)', 1: 'Response (RESPONSE)', 
+                    2: 'Plain Text Message (TXT_MSG)', 3: 'Acknowledgment (ACK)',
+                    4: 'Node Advertisement (ADVERT)', 5: 'Group Text Message (GRP_TXT)',
+                    6: 'Group Datagram (GRP_DATA)', 7: 'Anonymous Request (ANON_REQ)',
+                    8: 'Returned Path (PATH)', 9: 'Trace (TRACE)',
+                    10: 'Multi-part Packet', 11: 'Reserved Type 11',
+                    12: 'Reserved Type 12', 13: 'Reserved Type 13',
+                    14: 'Reserved Type 14', 15: 'Custom Packet (RAW_CUSTOM)'
+                }
+                
+                # Get counts for each packet type
+                for packet_type in range(16):
+                    count = conn.execute(
+                        "SELECT COUNT(*) FROM packets WHERE type = ? AND timestamp > ?", 
+                        (packet_type, cutoff)
+                    ).fetchone()[0]
+                    
+                    type_name = packet_type_names.get(packet_type, f'Type {packet_type}')
+                    if count > 0:
+                        type_counts[type_name] = count
+                
+                # Get count for other types (>15)
+                other_count = conn.execute(
+                    "SELECT COUNT(*) FROM packets WHERE type > 15 AND timestamp > ?", 
+                    (cutoff,)
+                ).fetchone()[0]
+                if other_count > 0:
+                    type_counts['Other Types (>15)'] = other_count
+                
+                logger.debug(f"SQLite packet type counts: {type_counts}")
+                
+                result = {
+                    "hours": hours,
+                    "packet_type_totals": type_counts,
+                    "total_packets": sum(type_counts.values()),
+                    "period": f"{hours} hours",
+                    "data_source": "sqlite"
+                }
+                
+                return result
+                
+        except Exception as e:
+            logger.error(f"Failed to get packet type stats from SQLite: {e}")
+            return {"error": str(e), "data_source": "error"}
 
     def get_neighbors(self) -> dict:
        
@@ -833,78 +967,17 @@ class StorageCollector:
             return {}
 
     def get_noise_floor_rrd(self, hours: int = 24, resolution: str = "average") -> dict:
-     
-        if not RRDTOOL_AVAILABLE or not self.rrd_path.exists():
-            return {"error": "RRD not available"}
-            
-        try:
-            end_time = int(time.time())
-            start_time = end_time - (hours * 3600)
-            
-            # Fetch data from RRD
-            fetch_result = rrdtool.fetch(
-                str(self.rrd_path),
-                resolution.upper(),
-                "--start", str(start_time),
-                "--end", str(end_time)
-            )
-            
-            if not fetch_result:
-                return {"error": "No data available"}
-                
-            (start, end, step), data_sources, data_points = fetch_result
-            
-            # Find noise_floor data source index
-            try:
-                noise_floor_index = data_sources.index('noise_floor')
-            except ValueError:
-                return {"error": "Noise floor data not found in RRD"}
-            
-            # Extract timestamps and noise floor values
-            timestamps = []
-            noise_values = []
-            
-            current_time = start
-            for point in data_points:
-                timestamps.append(current_time * 1000)  # Convert to milliseconds for JavaScript
-                noise_floor_value = point[noise_floor_index]
-                noise_values.append(noise_floor_value if noise_floor_value is not None else None)
-                current_time += step
-            
-            # Filter out None values and create chart data
-            chart_data = []
-            valid_values = []
-            
-            for i, (ts, value) in enumerate(zip(timestamps, noise_values)):
-                if value is not None:
-                    chart_data.append([ts, value])
-                    valid_values.append(value)
-            
-            # Calculate statistics
-            stats = {}
-            if valid_values:
-                stats = {
-                    "min": round(min(valid_values), 1),
-                    "max": round(max(valid_values), 1),
-                    "avg": round(sum(valid_values) / len(valid_values), 1),
-                    "count": len(valid_values)
-                }
-            
-            return {
-                "start_time": start,
-                "end_time": end,
-                "step": step,
-                "hours": hours,
-                "resolution": resolution,
-                "data": chart_data,  # Array of [timestamp_ms, value] pairs for charting
-                "timestamps": timestamps,
-                "values": noise_values,
-                "stats": stats
+        """
+        Noise floor data is no longer stored in RRD - use get_noise_floor_history() 
+        or get_noise_floor_stats() which use SQLite data instead.
+        """
+        return {
+            "error": "Noise floor data removed from RRD - use SQLite methods instead",
+            "alternatives": {
+                "history": "Use get_noise_floor_history() for time series data",
+                "stats": "Use get_noise_floor_stats() for statistical summary"
             }
-            
-        except Exception as e:
-            logger.error(f"Failed to get noise floor RRD data: {e}")
-            return {"error": str(e)}
+        }
 
     def close(self):
     

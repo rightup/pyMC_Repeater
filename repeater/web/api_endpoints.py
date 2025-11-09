@@ -10,6 +10,21 @@ from .cad_calibration_engine import CADCalibrationEngine
 logger = logging.getLogger("HTTPServer")
 
 
+def add_cors_headers():
+    """Add CORS headers to allow cross-origin requests"""
+    cherrypy.response.headers['Access-Control-Allow-Origin'] = '*'
+    cherrypy.response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
+    cherrypy.response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
+
+
+def cors_enabled(func):
+    """Decorator to enable CORS for API endpoints"""
+    def wrapper(*args, **kwargs):
+        add_cors_headers()
+        return func(*args, **kwargs)
+    return wrapper
+
+
 # system systems
 # GET /api/stats
 # GET /api/logs
@@ -61,6 +76,15 @@ class APIEndpoints:
         self.daemon_instance = daemon_instance
         self._config_path = config_path or '/etc/pymc_repeater/config.yaml'
         self.cad_calibration = CADCalibrationEngine(daemon_instance, event_loop)
+
+    @cherrypy.expose
+    def default(self, *args, **kwargs):
+        """Handle OPTIONS requests for CORS preflight"""
+        if cherrypy.request.method == "OPTIONS":
+            add_cors_headers()
+            return ""
+        # For non-OPTIONS requests, return 404
+        raise cherrypy.HTTPError(404)
 
     def _get_storage(self):
         if not self.daemon_instance:
@@ -122,6 +146,7 @@ class APIEndpoints:
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
+    @cors_enabled
     def stats(self):
         try:
             stats = self.stats_getter() if self.stats_getter else {}
@@ -138,6 +163,7 @@ class APIEndpoints:
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
+    @cors_enabled
     def send_advert(self):
         try:
             self._require_post()
@@ -156,6 +182,7 @@ class APIEndpoints:
     @cherrypy.expose
     @cherrypy.tools.json_out()
     @cherrypy.tools.json_in()
+    @cors_enabled
     def set_mode(self):
         try:
             self._require_post()
@@ -175,6 +202,7 @@ class APIEndpoints:
     @cherrypy.expose
     @cherrypy.tools.json_out()
     @cherrypy.tools.json_in()
+    @cors_enabled
     def set_duty_cycle(self):
         try:
             self._require_post()
@@ -191,6 +219,7 @@ class APIEndpoints:
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
+    @cors_enabled
     def logs(self):
         from .http_server import _log_buffer
         try:
@@ -214,6 +243,7 @@ class APIEndpoints:
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
+    @cors_enabled
     def packet_stats(self, hours=24):
         try:
             hours = int(hours)
@@ -225,6 +255,7 @@ class APIEndpoints:
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
+    @cors_enabled
     def recent_packets(self, limit=100):
         try:
             limit = int(limit)
@@ -295,55 +326,43 @@ class APIEndpoints:
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
+    @cors_enabled
     def packet_type_graph_data(self):
         try:
             params = self._get_params({'hours': 24, 'resolution': 'average', 'types': 'all'})
             start_time, end_time = self._get_time_range(params['hours'])
             
-            rrd_data = self._get_storage().get_rrd_data(
-                start_time=start_time, end_time=end_time, resolution=params['resolution']
-            )
+            # Use SQLite directly for packet type graph data since RRD data is too sparse
+            storage = self._get_storage()
             
-            if not rrd_data or 'packet_types' not in rrd_data:
-                return self._error("No RRD data available")
+            # Get packet type stats from SQLite
+            stats = storage._get_packet_type_stats_sqlite(params['hours'])
+            if 'error' in stats:
+                return self._error(stats['error'])
             
-            packet_type_names = {
-                'type_0': 'Request (REQ)', 'type_1': 'Response (RESPONSE)', 
-                'type_2': 'Text Message (TXT_MSG)', 'type_3': 'ACK (ACK)',
-                'type_4': 'Advert (ADVERT)', 'type_5': 'Group Text (GRP_TXT)',
-                'type_6': 'Group Data (GRP_DATA)', 'type_7': 'Anonymous Request (ANON_REQ)',
-                'type_8': 'Path (PATH)', 'type_9': 'Trace (TRACE)',
-                'type_10': 'Reserved Type 10', 'type_11': 'Reserved Type 11',
-                'type_12': 'Reserved Type 12', 'type_13': 'Reserved Type 13',
-                'type_14': 'Reserved Type 14', 'type_15': 'Reserved Type 15',
-                'type_other': 'Other Types (>15)'
-            }
+            packet_type_totals = stats.get('packet_type_totals', {})
             
-            if params['types'] != 'all':
-                requested_types = [f'type_{t.strip()}' for t in params['types'].split(',')]
-                if 'other' in params['types'].lower():
-                    requested_types.append('type_other')
-            else:
-                requested_types = list(rrd_data['packet_types'].keys())
-            
-            timestamps_ms = [ts * 1000 for ts in rrd_data['timestamps']]
+            # Create simple bar chart data format for packet types
             series = []
-            
-            for type_key in requested_types:
-                if type_key in rrd_data['packet_types']:
-                    chart_data = self._process_counter_data(rrd_data['packet_types'][type_key], timestamps_ms)
+            for type_name, count in packet_type_totals.items():
+                if count > 0:  # Only include types with actual data
                     series.append({
-                        "name": packet_type_names.get(type_key, type_key),
-                        "type": type_key,
-                        "data": chart_data
+                        "name": type_name,
+                        "type": type_name.lower().replace(' ', '_').replace('(', '').replace(')', ''),
+                        "data": [[end_time * 1000, count]]  # Single data point with total count
                     })
             
+            # Sort series by count (descending)
+            series.sort(key=lambda x: x['data'][0][1], reverse=True)
+            
             graph_data = {
-                "start_time": rrd_data['start_time'],
-                "end_time": rrd_data['end_time'],
-                "step": rrd_data['step'],
-                "timestamps": rrd_data['timestamps'],
-                "series": series
+                "start_time": start_time,
+                "end_time": end_time,
+                "step": 3600,  # 1 hour step for simple bar chart
+                "timestamps": [start_time, end_time],
+                "series": series,
+                "data_source": "sqlite",
+                "chart_type": "bar"  # Indicate this is bar chart data
             }
             
             return self._success(graph_data)
@@ -356,13 +375,14 @@ class APIEndpoints:
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
-    def metrics_graph_data(self):
+    @cors_enabled
+    def metrics_graph_data(self, hours=24, resolution='average', metrics='all'):
         try:
-            params = self._get_params({'hours': 24, 'resolution': 'average', 'metrics': 'all'})
-            start_time, end_time = self._get_time_range(params['hours'])
+            hours = int(hours)
+            start_time, end_time = self._get_time_range(hours)
             
             rrd_data = self._get_storage().get_rrd_data(
-                start_time=start_time, end_time=end_time, resolution=params['resolution']
+                start_time=start_time, end_time=end_time, resolution=resolution
             )
             
             if not rrd_data or 'metrics' not in rrd_data:
@@ -377,8 +397,8 @@ class APIEndpoints:
             
             counter_metrics = ['rx_count', 'tx_count', 'drop_count']
             
-            if params['metrics'] != 'all':
-                requested_metrics = [m.strip() for m in params['metrics'].split(',')]
+            if metrics != 'all':
+                requested_metrics = [m.strip() for m in metrics.split(',')]
             else:
                 requested_metrics = list(rrd_data['metrics'].keys())
             
@@ -496,6 +516,7 @@ class APIEndpoints:
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
+    @cors_enabled
     def noise_floor_history(self, hours: int = 24):
         try:
             storage = self._get_storage()
@@ -513,6 +534,7 @@ class APIEndpoints:
     
     @cherrypy.expose
     @cherrypy.tools.json_out()
+    @cors_enabled
     def noise_floor_stats(self, hours: int = 24):
         try:
             storage = self._get_storage()
@@ -529,6 +551,7 @@ class APIEndpoints:
     
     @cherrypy.expose
     @cherrypy.tools.json_out()
+    @cors_enabled
     def noise_floor_chart_data(self, hours: int = 24):
         try:
             storage = self._get_storage()
