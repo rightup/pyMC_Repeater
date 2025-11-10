@@ -16,7 +16,7 @@ from pymc_core.protocol.constants import (
 from pymc_core.protocol.packet_utils import PacketHeaderUtils, PacketTimingUtils
 
 from repeater.airtime import AirtimeManager
-from repeater.storage import StorageCollector
+from repeater.data_acquisition import StorageCollector
 
 logger = logging.getLogger("RepeaterHandler")
 
