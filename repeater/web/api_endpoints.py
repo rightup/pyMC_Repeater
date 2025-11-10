@@ -335,8 +335,8 @@ class APIEndpoints:
             # Use SQLite directly for packet type graph data since RRD data is too sparse
             storage = self._get_storage()
             
-            # Get packet type stats from SQLite
-            stats = storage._get_packet_type_stats_sqlite(params['hours'])
+            # Get packet type stats directly from SQLite handler to avoid RRD formatting issues
+            stats = storage.sqlite_handler.get_packet_type_stats(params['hours'])
             if 'error' in stats:
                 return self._error(stats['error'])
             
@@ -622,3 +622,37 @@ class APIEndpoints:
         return generate()
 
     cad_calibration_stream._cp_config = {'response.stream': True}
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    @cors_enabled
+    def adverts_by_contact_type(self, contact_type=None, limit=None, hours=None):
+
+        try:
+            if not contact_type:
+                return self._error("contact_type parameter is required")
+            
+            limit_int = int(limit) if limit is not None else None
+            hours_int = int(hours) if hours is not None else None
+            
+            storage = self._get_storage()
+            adverts = storage.sqlite_handler.get_adverts_by_contact_type(
+                contact_type=contact_type,
+                limit=limit_int,
+                hours=hours_int
+            )
+            
+            return self._success(adverts, 
+                                count=len(adverts),
+                                contact_type=contact_type,
+                                filters={
+                                    "contact_type": contact_type,
+                                    "limit": limit_int,
+                                    "hours": hours_int
+                                })
+            
+        except ValueError as e:
+            return self._error(f"Invalid parameter format: {e}")
+        except Exception as e:
+            logger.error(f"Error getting adverts by contact type: {e}")
+            return self._error(e)

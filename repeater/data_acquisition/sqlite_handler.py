@@ -545,3 +545,59 @@ class SQLiteHandler:
                 "drop_total": 0,
                 "type_counts": {}
             }
+
+    def get_adverts_by_contact_type(self, contact_type: str, limit: Optional[int] = None, hours: Optional[int] = None) -> List[dict]:
+  
+        try:
+            with sqlite3.connect(self.sqlite_path) as conn:
+                conn.row_factory = sqlite3.Row
+                
+                query = """
+                    SELECT id, timestamp, pubkey, node_name, is_repeater, route_type, 
+                           contact_type, latitude, longitude, first_seen, last_seen, 
+                           rssi, snr, advert_count, is_new_neighbor
+                    FROM adverts 
+                    WHERE contact_type = ?
+                """
+                params = [contact_type]
+                
+                if hours is not None:
+                    cutoff = time.time() - (hours * 3600)
+                    query += " AND timestamp > ?"
+                    params.append(cutoff)
+                
+                query += " ORDER BY timestamp DESC"
+                
+                if limit is not None:
+                    query += " LIMIT ?"
+                    params.append(limit)
+                
+                rows = conn.execute(query, params).fetchall()
+                
+                adverts = []
+                for row in rows:
+                    advert = {
+                        "id": row["id"],
+                        "timestamp": row["timestamp"],
+                        "pubkey": row["pubkey"],
+                        "node_name": row["node_name"],
+                        "is_repeater": bool(row["is_repeater"]),
+                        "route_type": row["route_type"],
+                        "contact_type": row["contact_type"],
+                        "latitude": row["latitude"],
+                        "longitude": row["longitude"],
+                        "first_seen": row["first_seen"],
+                        "last_seen": row["last_seen"],
+                        "rssi": row["rssi"],
+                        "snr": row["snr"],
+                        "advert_count": row["advert_count"],
+                        "is_new_neighbor": bool(row["is_new_neighbor"])
+                    }
+                    adverts.append(advert)
+                
+                logger.debug(f"Found {len(adverts)} adverts with contact_type '{contact_type}'")
+                return adverts
+                
+        except Exception as e:
+            logger.error(f"Failed to get adverts by contact_type '{contact_type}': {e}")
+            return []
