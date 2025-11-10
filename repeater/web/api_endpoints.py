@@ -327,16 +327,16 @@ class APIEndpoints:
     @cherrypy.expose
     @cherrypy.tools.json_out()
     @cors_enabled
-    def packet_type_graph_data(self):
+    def packet_type_graph_data(self, hours=24, resolution='average', types='all'):
         try:
-            params = self._get_params({'hours': 24, 'resolution': 'average', 'types': 'all'})
-            start_time, end_time = self._get_time_range(params['hours'])
+            hours = int(hours)
+            start_time, end_time = self._get_time_range(hours)
             
             # Use SQLite directly for packet type graph data since RRD data is too sparse
             storage = self._get_storage()
             
             # Get packet type stats directly from SQLite handler to avoid RRD formatting issues
-            stats = storage.sqlite_handler.get_packet_type_stats(params['hours'])
+            stats = storage.sqlite_handler.get_packet_type_stats(hours)
             if 'error' in stats:
                 return self._error(stats['error'])
             
