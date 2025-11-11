@@ -404,6 +404,52 @@ class SQLiteHandler:
             logger.error(f"Failed to get packet type stats from SQLite: {e}")
             return {"error": str(e), "data_source": "error"}
 
+    def get_route_stats(self, hours: int = 24) -> dict:
+
+        try:
+            cutoff = time.time() - (hours * 3600)
+            
+            with sqlite3.connect(self.sqlite_path) as conn:
+                conn.row_factory = sqlite3.Row
+                
+                route_counts = {}
+                route_names = {
+                    0: 'Transport Flood',
+                    1: 'Flood', 
+                    2: 'Direct',
+                    3: 'Transport Direct'
+                }
+
+                for route_type in range(4):
+                    count = conn.execute(
+                        "SELECT COUNT(*) FROM packets WHERE route = ? AND timestamp > ?", 
+                        (route_type, cutoff)
+                    ).fetchone()[0]
+                    
+                    route_name = route_names.get(route_type, f'Route {route_type}')
+                    if count > 0:
+                        route_counts[route_name] = count
+                
+                # Count any other route types > 3
+                other_count = conn.execute(
+                    "SELECT COUNT(*) FROM packets WHERE route > 3 AND timestamp > ?", 
+                    (cutoff,)
+                ).fetchone()[0]
+                if other_count > 0:
+                    route_counts['Other Routes (>3)'] = other_count
+                
+                return {
+                    "hours": hours,
+                    "route_totals": route_counts,
+                    "total_packets": sum(route_counts.values()),
+                    "period": f"{hours} hours",
+                    "data_source": "sqlite"
+                }
+                
+        except Exception as e:
+            logger.error(f"Failed to get route stats from SQLite: {e}")
+            return {"error": str(e), "data_source": "error"}
+
     def get_neighbors(self) -> dict:
         try:
             with sqlite3.connect(self.sqlite_path) as conn:

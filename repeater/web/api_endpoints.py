@@ -244,13 +244,25 @@ class APIEndpoints:
     @cherrypy.expose
     @cherrypy.tools.json_out()
     @cors_enabled
-    def packet_stats(self, hours=24):
+    def packet_type_stats(self, hours=24):
         try:
             hours = int(hours)
-            stats = self._get_storage().get_packet_stats(hours=hours)
+            stats = self._get_storage().get_packet_type_stats(hours=hours)
             return self._success(stats)
         except Exception as e:
-            logger.error(f"Error getting packet stats: {e}")
+            logger.error(f"Error getting packet type stats: {e}")
+            return self._error(e)
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    @cors_enabled
+    def route_stats(self, hours=24):
+        try:
+            hours = int(hours)
+            stats = self._get_storage().get_route_stats(hours=hours)
+            return self._success(stats)
+        except Exception as e:
+            logger.error(f"Error getting route stats: {e}")
             return self._error(e)
 
     @cherrypy.expose
@@ -332,10 +344,8 @@ class APIEndpoints:
             hours = int(hours)
             start_time, end_time = self._get_time_range(hours)
             
-            # Use SQLite directly for packet type graph data since RRD data is too sparse
             storage = self._get_storage()
             
-            # Get packet type stats directly from SQLite handler to avoid RRD formatting issues
             stats = storage.sqlite_handler.get_packet_type_stats(hours)
             if 'error' in stats:
                 return self._error(stats['error'])
