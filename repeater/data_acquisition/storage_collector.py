@@ -75,6 +75,9 @@ class StorageCollector:
         logger.warning("Falling back to SQLite for packet type stats")
         return self.sqlite_handler.get_packet_type_stats(hours)
 
+    def get_route_stats(self, hours: int = 24) -> dict:
+        return self.sqlite_handler.get_route_stats(hours)
+
     def get_neighbors(self) -> dict:
         return self.sqlite_handler.get_neighbors()
 

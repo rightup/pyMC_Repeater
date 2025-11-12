@@ -244,6 +244,18 @@ class APIEndpoints:
     @cherrypy.expose
     @cherrypy.tools.json_out()
     @cors_enabled
+    def packet_stats(self, hours=24):
+        try:
+            hours = int(hours)
+            stats = self._get_storage().get_packet_stats(hours=hours)
+            return self._success(stats)
+        except Exception as e:
+            logger.error(f"Error getting packet stats: {e}")
+            return self._error(e)
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    @cors_enabled
     def packet_type_stats(self, hours=24):
         try:
             hours = int(hours)
@@ -447,6 +459,7 @@ class APIEndpoints:
     @cherrypy.expose
     @cherrypy.tools.json_out()  
     @cherrypy.tools.json_in()
+    @cors_enabled
     def cad_calibration_start(self):
         try:
             self._require_post()
@@ -463,6 +476,7 @@ class APIEndpoints:
     
     @cherrypy.expose
     @cherrypy.tools.json_out()
+    @cors_enabled
     def cad_calibration_stop(self):
         try:
             self._require_post()
@@ -475,6 +489,7 @@ class APIEndpoints:
     @cherrypy.expose
     @cherrypy.tools.json_out()
     @cherrypy.tools.json_in()
+    @cors_enabled
     def save_cad_settings(self):
         try:
             self._require_post()
