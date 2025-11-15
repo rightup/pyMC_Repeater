@@ -78,6 +78,10 @@ sx1262:
   txen_pin: -1
   rxen_pin: -1
 
+  # LED pins for TX/RX indication (-1 to disable)
+  txled_pin: -1
+  rxled_pin: -1
+
   use_dio3_tcxo: false
 
   # Waveshare hardware flag
