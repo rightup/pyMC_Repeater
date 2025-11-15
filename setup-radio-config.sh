@@ -170,8 +170,8 @@ title=$(cat /tmp/radio_title_$selected 2>/dev/null)
 
 
 # Convert frequency from MHz to Hz (handle decimal values)
-freq_hz=$(echo "$freq * 1000000" | awk '{printf "%.0f", $1}')
-bw_hz=$(echo "$bw * 1000" | awk '{printf "%.0f", $1}')
+freq_hz=$(awk "BEGIN {printf \"%.0f\", $freq * 1000000}")
+bw_hz=$(awk "BEGIN {printf \"%.0f\", $bw * 1000}")
 
 
 echo ""
