@@ -60,7 +60,6 @@
       "rxled_pin": -1,
       "tx_power": 22,
       "use_dio3_tcxo": true,
-
       "preamble_length": 17
     }
   }
