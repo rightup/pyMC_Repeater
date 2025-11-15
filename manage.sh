@@ -9,6 +9,13 @@ LOG_DIR="/var/log/pymc_repeater"
 SERVICE_USER="repeater"
 SERVICE_NAME="pymc-repeater"
 
+# Check if we're running in an interactive terminal
+if [ ! -t 0 ] || [ -z "$TERM" ]; then
+    echo "Error: This script requires an interactive terminal."
+    echo "Please run from SSH or a local terminal, not via file manager."
+    exit 1
+fi
+
 # Check if whiptail is available, fallback to dialog
 if command -v whiptail &> /dev/null; then
     DIALOG="whiptail"
@@ -17,10 +24,18 @@ elif command -v dialog &> /dev/null; then
     DIALOG="dialog"
     DIALOG_OPTS="--backtitle 'pyMC Repeater Management'"
 else
-    echo "Installing whiptail for TUI interface..."
-    apt-get update -qq && apt-get install -y whiptail
-    DIALOG="whiptail"
-    DIALOG_OPTS="--backtitle 'pyMC Repeater Management'"
+    echo "TUI interface requires whiptail or dialog."
+    if [ "$EUID" -eq 0 ]; then
+        echo "Installing whiptail..."
+        apt-get update -qq && apt-get install -y whiptail
+        DIALOG="whiptail"
+        DIALOG_OPTS="--backtitle 'pyMC Repeater Management'"
+    else
+        echo ""
+        echo "Please install whiptail: sudo apt-get install -y whiptail"
+        echo "Then run this script again."
+        exit 1
+    fi
 fi
 
 # Function to show info box
@@ -437,8 +452,26 @@ if [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
     echo "  stop      - Stop the service"
     echo "  restart   - Restart the service"
     echo "  status    - Show status"
+    echo "  debug     - Show debug information"
     echo ""
     echo "Run without arguments for interactive menu."
+    exit 0
+fi
+
+# Debug mode
+if [ "$1" = "debug" ]; then
+    echo "=== Debug Information ==="
+    echo "DIALOG: $DIALOG"
+    echo "DIALOG_OPTS: $DIALOG_OPTS"
+    echo "TERM: $TERM"
+    echo "TTY: $(tty 2>/dev/null || echo 'not a tty')"
+    echo "EUID: $EUID"
+    echo "PWD: $PWD"
+    echo "Script: $0"
+    echo ""
+    echo "Testing dialog..."
+    $DIALOG $DIALOG_OPTS --title "Test" --msgbox "Dialog test successful!" 8 40
+    echo "Dialog test completed."
     exit 0
 fi
 
