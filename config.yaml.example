@@ -78,6 +78,8 @@ sx1262:
   txen_pin: -1
   rxen_pin: -1
 
+  use_dio3_tcxo: false
+
   # Waveshare hardware flag
   is_waveshare: false
 

@@ -51,6 +51,8 @@
       "txen_pin": 13,
       "rxen_pin": 12,
       "tx_power": 22,
+      "use_dio3_tcxo": true,
+
       "preamble_length": 17
     }
   }

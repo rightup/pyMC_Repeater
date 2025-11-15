@@ -217,6 +217,7 @@ else
     tx_power=$(echo "$hw_config" | jq -r '.tx_power // empty')
     preamble_length=$(echo "$hw_config" | jq -r '.preamble_length // empty')
     is_waveshare=$(echo "$hw_config" | jq -r '.is_waveshare // empty')
+    use_dio3_tcxo=$(echo "$hw_config" | jq -r '.use_dio3_tcxo // empty')
 
     # Update sx1262 section in config.yaml (2-space indentation)
     [ -n "$bus_id" ] && sed "${SED_OPTS[@]}" "s/^  bus_id:.*/  bus_id: $bus_id/" "$CONFIG_FILE"
@@ -235,6 +236,13 @@ else
         sed "${SED_OPTS[@]}" "s/^  is_waveshare:.*/  is_waveshare: true/" "$CONFIG_FILE"
     else
         sed "${SED_OPTS[@]}" "s/^  is_waveshare:.*/  is_waveshare: false/" "$CONFIG_FILE"
+    fi
+
+    # Update use_dio3_tcxo flag
+    if [ "$use_dio3_tcxo" == "true" ]; then
+        sed "${SED_OPTS[@]}" "s/^  use_dio3_tcxo:.*/  use_dio3_tcxo: true/" "$CONFIG_FILE"
+    elif [ "$use_dio3_tcxo" == "false" ]; then
+        sed "${SED_OPTS[@]}" "s/^  use_dio3_tcxo:.*/  use_dio3_tcxo: false/" "$CONFIG_FILE"
     fi
 fi
 
@@ -263,6 +271,7 @@ if [ -n "$bus_id" ]; then
     echo "  TX Power: $tx_power dBm"
     echo "  Preamble Length: $preamble_length"
     [ -n "$is_waveshare" ] && echo "  Waveshare: $is_waveshare"
+    [ -n "$use_dio3_tcxo" ] && echo "  Use DIO3 TCXO: $use_dio3_tcxo"
 fi
 
 # Enable and start the service

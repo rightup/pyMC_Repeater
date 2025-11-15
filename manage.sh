@@ -19,17 +19,14 @@ fi
 # Check if whiptail is available, fallback to dialog
 if command -v whiptail &> /dev/null; then
     DIALOG="whiptail"
-    DIALOG_OPTS="--backtitle 'pyMC Repeater Management'"
 elif command -v dialog &> /dev/null; then
     DIALOG="dialog"
-    DIALOG_OPTS="--backtitle 'pyMC Repeater Management'"
 else
     echo "TUI interface requires whiptail or dialog."
     if [ "$EUID" -eq 0 ]; then
         echo "Installing whiptail..."
         apt-get update -qq && apt-get install -y whiptail
         DIALOG="whiptail"
-        DIALOG_OPTS="--backtitle 'pyMC Repeater Management'"
     else
         echo ""
         echo "Please install whiptail: sudo apt-get install -y whiptail"
@@ -40,22 +37,22 @@ fi
 
 # Function to show info box
 show_info() {
-    $DIALOG $DIALOG_OPTS --title "$1" --msgbox "$2" 12 70
+    $DIALOG --backtitle "pyMC Repeater Management" --title "$1" --msgbox "$2" 12 70
 }
 
 # Function to show error box
 show_error() {
-    $DIALOG $DIALOG_OPTS --title "Error" --msgbox "$1" 8 60
+    $DIALOG --backtitle "pyMC Repeater Management" --title "Error" --msgbox "$1" 8 60
 }
 
 # Function to ask yes/no question
 ask_yes_no() {
-    $DIALOG $DIALOG_OPTS --title "$1" --yesno "$2" 10 70
+    $DIALOG --backtitle "pyMC Repeater Management" --title "$1" --yesno "$2" 10 70
 }
 
 # Function to show progress
 show_progress() {
-    echo "$2" | $DIALOG $DIALOG_OPTS --title "$1" --gauge "$3" 8 70 0
+    echo "$2" | $DIALOG --backtitle "pyMC Repeater Management" --title "$1" --gauge "$3" 8 70 0
 }
 
 # Function to check if service exists
@@ -97,10 +94,11 @@ get_status_display() {
 show_main_menu() {
     local status=$(get_status_display)
     
-    CHOICE=$($DIALOG $DIALOG_OPTS --title "pyMC Repeater Management" --menu "\nCurrent Status: $status\n\nChoose an action:" 18 70 8 \
+    CHOICE=$($DIALOG --backtitle "pyMC Repeater Management" --title "pyMC Repeater Management" --menu "\nCurrent Status: $status\n\nChoose an action:" 18 70 9 \
         "install" "Install pyMC Repeater" \
         "upgrade" "Upgrade existing installation" \
         "uninstall" "Remove pyMC Repeater completely" \
+        "config" "Configure radio settings" \
         "start" "Start the service" \
         "stop" "Stop the service" \
         "restart" "Restart the service" \
@@ -129,6 +127,9 @@ show_main_menu() {
             else
                 show_error "pyMC Repeater is not installed."
             fi
+            ;;
+        "config")
+            configure_radio
             ;;
         "start")
             manage_service "start"
@@ -163,7 +164,7 @@ install_repeater() {
     fi
     
     # Welcome screen
-    $DIALOG $DIALOG_OPTS --title "Welcome" --msgbox "\nWelcome to pyMC Repeater Setup\n\nThis installer will configure your Raspberry Pi as a LoRa mesh network repeater.\n\nPress OK to continue..." 12 70
+    $DIALOG --backtitle "pyMC Repeater Management" --title "Welcome" --msgbox "\nWelcome to pyMC Repeater Setup\n\nThis installer will configure your Raspberry Pi as a LoRa mesh network repeater.\n\nPress OK to continue..." 12 70
     
     # SPI Check
     if ! grep -q "dtparam=spi=on" /boot/config.txt 2>/dev/null && ! grep -q "spi_bcm2835" /proc/modules 2>/dev/null; then
@@ -178,7 +179,7 @@ install_repeater() {
     fi
     
     # Installation type
-    INSTALL_TYPE=$($DIALOG $DIALOG_OPTS --title "Installation Type" --menu "\nChoose installation type:" 15 70 3 \
+    INSTALL_TYPE=$($DIALOG --backtitle "pyMC Repeater Management" --title "Installation Type" --menu "\nChoose installation type:" 15 70 3 \
         "full" "Complete installation with web dashboard" \
         "minimal" "Core repeater only (no web interface)" \
         "custom" "Custom component selection" 3>&1 1>&2 2>&3)
@@ -192,7 +193,7 @@ install_repeater() {
     if ask_yes_no "Radio Configuration" "\nWould you like to configure radio settings from community presets?\n\nThis will download optimized settings for your region."; then
         SETUP_RADIO=true
         
-        REGION=$($DIALOG $DIALOG_OPTS --title "Select Region" --menu "\nSelect your region:" 15 70 5 \
+        REGION=$($DIALOG --backtitle "pyMC Repeater Management" --title "Select Region" --menu "\nSelect your region:" 15 70 5 \
             "EU868" "Europe (868 MHz)" \
             "US915" "United States (915 MHz)" \
             "AU915" "Australia (915 MHz)" \
@@ -257,7 +258,7 @@ install_repeater() {
     systemctl start "$SERVICE_NAME"
     
     echo "100"; echo "# Installation complete!"
-    ) | $DIALOG $DIALOG_OPTS --title "Installing" --gauge "Setting up pyMC Repeater..." 8 70
+    ) | $DIALOG --backtitle "pyMC Repeater Management" --title "Installing" --gauge "Setting up pyMC Repeater..." 8 70
     
     # Show results
     sleep 2
@@ -283,40 +284,120 @@ upgrade_repeater() {
     
     local current_version=$(get_version)
     
-    if ask_yes_no "Confirm Upgrade" "\nCurrent version: $current_version\n\nThis will upgrade pyMC Repeater while preserving your configuration.\n\nContinue?"; then
-        (
-        echo "0"; echo "# Stopping service..."
+    if ask_yes_no "Confirm Upgrade" "Current version: $current_version\n\nThis will upgrade pyMC Repeater while preserving your configuration.\n\nContinue?"; then
+        
+        # Show info that upgrade is starting
+        show_info "Upgrading" "Starting upgrade process...\n\nThis may take a few minutes.\nProgress will be shown in the terminal."
+        
+        echo "=== Upgrade Progress ==="
+        echo "[1/7] Stopping service..."
         systemctl stop "$SERVICE_NAME" 2>/dev/null || true
         
-        echo "20"; echo "# Backing up configuration..."
-        cp -r "$CONFIG_DIR" "$CONFIG_DIR.backup.$(date +%Y%m%d_%H%M%S)" 2>/dev/null || true
-        
-        echo "40"; echo "# Installing new files..."
-        cp -r repeater "$INSTALL_DIR/"
-        cp pyproject.toml "$INSTALL_DIR/"
-        cp README.md "$INSTALL_DIR/"
-        
-        echo "60"; echo "# Updating Python package..."
-        cd "$INSTALL_DIR"
-        pip install --break-system-packages -e . >/dev/null 2>&1
-        
-        echo "80"; echo "# Reloading systemd..."
-        cp pymc-repeater.service /etc/systemd/system/
-        systemctl daemon-reload
-        
-        echo "90"; echo "# Starting service..."
-        systemctl start "$SERVICE_NAME"
-        
-        echo "100"; echo "# Upgrade complete!"
-        ) | $DIALOG $DIALOG_OPTS --title "Upgrading" --gauge "Upgrading pyMC Repeater..." 8 70
-        
-        sleep 2
-        local new_version=$(get_version)
-        if is_running; then
-            show_info "Upgrade Complete" "\nUpgrade completed successfully!\n\nVersion: $current_version → $new_version\n\n✓ Service is running"
-        else
-            show_error "Upgrade completed but service failed to start!\n\nCheck logs from the main menu."
+        echo "[2/7] Backing up configuration..."
+        if [ -d "$CONFIG_DIR" ]; then
+            cp -r "$CONFIG_DIR" "$CONFIG_DIR.backup.$(date +%Y%m%d_%H%M%S)" 2>/dev/null || true
+            echo "    ✓ Configuration backed up"
         fi
+        
+        echo "[3/7] Installing new files..."
+        cp -r repeater "$INSTALL_DIR/" 2>/dev/null || true
+        cp pyproject.toml "$INSTALL_DIR/" 2>/dev/null || true
+        cp README.md "$INSTALL_DIR/" 2>/dev/null || true
+        cp pymc-repeater.service /etc/systemd/system/ 2>/dev/null || true
+        echo "    ✓ Files updated"
+        
+        echo "[4/7] Updating Python package..."
+        cd "$INSTALL_DIR"
+        # Use timeout to prevent hanging and show output
+        timeout 120 pip install --break-system-packages -e . || {
+            echo "    ⚠ Python package install timed out or failed, continuing..."
+        }
+        echo "    ✓ Python package updated"
+        
+        echo "[5/7] Reloading systemd..."
+        systemctl daemon-reload
+        echo "    ✓ Systemd reloaded"
+        
+        echo "[6/7] Starting service..."
+        systemctl start "$SERVICE_NAME"
+        echo "    ✓ Service started"
+        
+        echo "[7/7] Verifying installation..."
+        sleep 3  # Give service time to start
+        
+        local new_version=$(get_version)
+        
+        if is_running; then
+            echo "    ✓ Service is running"
+            show_info "Upgrade Complete" "Upgrade completed successfully!\n\nVersion: $current_version → $new_version\n\n✓ Service is running\n✓ Configuration preserved"
+        else
+            echo "    ✗ Service failed to start"
+            show_error "Upgrade completed but service failed to start!\n\nVersion updated: $current_version → $new_version\n\nCheck logs from the main menu for details."
+        fi
+        echo "=== Upgrade Complete ==="
+    fi
+}
+
+# Radio Configuration function
+configure_radio() {
+    # Check if config exists
+    if [ ! -f "$CONFIG_DIR/config.yaml" ]; then
+        show_error "Configuration file not found!\n\nPlease install pyMC Repeater first or ensure $CONFIG_DIR/config.yaml exists."
+        return
+    fi
+    
+    # Check if setup script exists
+    SCRIPT_DIR="$(dirname "$0")"
+    RADIO_SCRIPT="$SCRIPT_DIR/setup-radio-config.sh"
+    
+    if [ ! -f "$RADIO_SCRIPT" ]; then
+        show_error "Radio configuration script not found!\n\nExpected: $RADIO_SCRIPT"
+        return
+    fi
+    
+    # Ask for confirmation
+    if ask_yes_no "Configure Radio Settings" "This will update your radio configuration including:\n\n• Repeater name\n• Hardware settings\n• Frequency and LoRa parameters\n\nThe service will be restarted after configuration.\n\nContinue?"; then
+        
+        # Show info that configuration is starting
+        show_info "Radio Configuration" "Starting radio configuration...\n\nThe configuration script will now run in the terminal.\n\nFollow the prompts to configure your radio settings."
+        
+        # Clear screen and run the configuration script
+        clear
+        echo "=== pyMC Repeater Radio Configuration ==="
+        echo ""
+        
+        # Run the setup script with the config directory
+        if bash "$RADIO_SCRIPT" "$CONFIG_DIR"; then
+            echo ""
+            echo "=== Configuration Complete ==="
+            
+            # Restart service if it's installed and running
+            if is_installed; then
+                echo "Restarting service..."
+                if [ "$EUID" -eq 0 ]; then
+                    systemctl restart "$SERVICE_NAME" 2>/dev/null || true
+                    sleep 2
+                    
+                    if is_running; then
+                        echo "✓ Service restarted successfully"
+                        show_info "Configuration Complete" "Radio configuration updated successfully!\n\n✓ Service restarted\n✓ New settings applied\n\nPress OK to return to main menu."
+                    else
+                        echo "✗ Service failed to restart"
+                        show_error "Configuration updated but service failed to restart!\n\nCheck logs from the main menu for details."
+                    fi
+                else
+                    show_info "Configuration Complete" "Radio configuration updated successfully!\n\n⚠ Run as root to restart the service automatically\n\nPress OK to return to main menu."
+                fi
+            else
+                show_info "Configuration Complete" "Radio configuration updated successfully!\n\nPress OK to return to main menu."
+            fi
+        else
+            show_error "Configuration failed!\n\nThe radio configuration script encountered an error.\n\nPress OK to return to main menu."
+        fi
+        
+        # Pause to let user see any messages
+        echo ""
+        read -p "Press Enter to return to main menu..." || true
     fi
 }
 
@@ -354,7 +435,7 @@ uninstall_repeater() {
         fi
         
         echo "100"; echo "# Uninstall complete!"
-        ) | $DIALOG $DIALOG_OPTS --title "Uninstalling" --gauge "Removing pyMC Repeater..." 8 70
+        ) | $DIALOG --backtitle "pyMC Repeater Management" --title "Uninstalling" --gauge "Removing pyMC Repeater..." 8 70
         
         show_info "Uninstall Complete" "\npyMC Repeater has been completely removed.\n\nConfiguration backup saved to /tmp/\n\nThank you for using pyMC Repeater!"
     fi
@@ -448,6 +529,7 @@ if [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
     echo "  install   - Install pyMC Repeater"
     echo "  upgrade   - Upgrade existing installation"
     echo "  uninstall - Remove pyMC Repeater"
+    echo "  config    - Configure radio settings"
     echo "  start     - Start the service"
     echo "  stop      - Stop the service"
     echo "  restart   - Restart the service"
@@ -462,7 +544,6 @@ fi
 if [ "$1" = "debug" ]; then
     echo "=== Debug Information ==="
     echo "DIALOG: $DIALOG"
-    echo "DIALOG_OPTS: $DIALOG_OPTS"
     echo "TERM: $TERM"
     echo "TTY: $(tty 2>/dev/null || echo 'not a tty')"
     echo "EUID: $EUID"
@@ -470,7 +551,7 @@ if [ "$1" = "debug" ]; then
     echo "Script: $0"
     echo ""
     echo "Testing dialog..."
-    $DIALOG $DIALOG_OPTS --title "Test" --msgbox "Dialog test successful!" 8 40
+    $DIALOG --backtitle "pyMC Repeater Management" --title "Test" --msgbox "Dialog test successful!" 8 40
     echo "Dialog test completed."
     exit 0
 fi
@@ -487,6 +568,10 @@ case "$1" in
         ;;
     "uninstall")
         uninstall_repeater
+        exit 0
+        ;;
+    "config")
+        configure_radio
         exit 0
         ;;
     "start"|"stop"|"restart")
