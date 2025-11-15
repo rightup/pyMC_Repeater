@@ -167,42 +167,25 @@ install_repeater() {
     $DIALOG --backtitle "pyMC Repeater Management" --title "Welcome" --msgbox "\nWelcome to pyMC Repeater Setup\n\nThis installer will configure your Raspberry Pi as a LoRa mesh network repeater.\n\nPress OK to continue..." 12 70
     
     # SPI Check
-    if ! grep -q "dtparam=spi=on" /boot/config.txt 2>/dev/null && ! grep -q "spi_bcm2835" /proc/modules 2>/dev/null; then
+    CONFIG_FILE=""
+    if [ -f "/boot/firmware/config.txt" ]; then
+        CONFIG_FILE="/boot/firmware/config.txt"
+    elif [ -f "/boot/config.txt" ]; then
+        CONFIG_FILE="/boot/config.txt"
+    fi
+    
+    if [ -n "$CONFIG_FILE" ] && ! grep -q "dtparam=spi=on" "$CONFIG_FILE" 2>/dev/null && ! grep -q "spi_bcm2835" /proc/modules 2>/dev/null; then
         if ask_yes_no "SPI Not Enabled" "\nSPI interface is required but not enabled!\n\nWould you like to enable it now?\n(This will require a reboot)"; then
-            echo "dtparam=spi=on" >> /boot/config.txt
-            show_info "SPI Enabled" "\nSPI has been enabled in /boot/config.txt\n\nSystem will reboot now. Please run this script again after reboot."
+            echo "dtparam=spi=on" >> "$CONFIG_FILE"
+            show_info "SPI Enabled" "\nSPI has been enabled in $CONFIG_FILE\n\nSystem will reboot now. Please run this script again after reboot."
             reboot
         else
             show_error "SPI is required for LoRa radio operation.\n\nPlease enable SPI manually and run this script again."
             return
         fi
-    fi
-    
-    # Installation type
-    INSTALL_TYPE=$($DIALOG --backtitle "pyMC Repeater Management" --title "Installation Type" --menu "\nChoose installation type:" 15 70 3 \
-        "full" "Complete installation with web dashboard" \
-        "minimal" "Core repeater only (no web interface)" \
-        "custom" "Custom component selection" 3>&1 1>&2 2>&3)
-    
-    if [ $? -ne 0 ]; then
+    elif [ -z "$CONFIG_FILE" ]; then
+        show_error "Could not find config.txt file.\n\nPlease enable SPI manually:\nsudo raspi-config -> Interfacing Options -> SPI -> Enable"
         return
-    fi
-    
-    # Radio configuration
-    SETUP_RADIO=false
-    if ask_yes_no "Radio Configuration" "\nWould you like to configure radio settings from community presets?\n\nThis will download optimized settings for your region."; then
-        SETUP_RADIO=true
-        
-        REGION=$($DIALOG --backtitle "pyMC Repeater Management" --title "Select Region" --menu "\nSelect your region:" 15 70 5 \
-            "EU868" "Europe (868 MHz)" \
-            "US915" "United States (915 MHz)" \
-            "AU915" "Australia (915 MHz)" \
-            "AS923" "Asia (923 MHz)" \
-            "custom" "Custom configuration" 3>&1 1>&2 2>&3)
-        
-        if [ $? -ne 0 ]; then
-            SETUP_RADIO=false
-        fi
     fi
     
     # Installation progress
@@ -221,7 +204,7 @@ install_repeater() {
     
     echo "25"; echo "# Installing system dependencies..."
     apt-get update -qq
-    apt-get install -y libffi-dev
+    apt-get install -y libffi-dev jq
     
     echo "30"; echo "# Installing files..."
     cp -r repeater "$INSTALL_DIR/"
@@ -236,45 +219,60 @@ install_repeater() {
         cp config.yaml.example "$CONFIG_DIR/config.yaml"
     fi
     
-    echo "55"
-    if [ "$SETUP_RADIO" = true ] && [ "$REGION" != "custom" ]; then
-        echo "# Configuring radio settings..."
-        if ! command -v jq &> /dev/null; then
-            apt-get install -y jq
-        fi
-    fi
-    
-    echo "75"; echo "# Installing systemd service..."
+    echo "55"; echo "# Installing systemd service..."
     cp pymc-repeater.service /etc/systemd/system/
     systemctl daemon-reload
     
-    echo "85"; echo "# Setting permissions..."
+    echo "65"; echo "# Setting permissions..."
     chown -R "$SERVICE_USER:$SERVICE_USER" "$INSTALL_DIR" "$CONFIG_DIR" "$LOG_DIR" /var/lib/pymc_repeater
     chmod 750 "$CONFIG_DIR" "$LOG_DIR" /var/lib/pymc_repeater
     
-    echo "90"; echo "# Installing Python package..."
+    echo "75"; echo "# Installing Python package..."
     cd "$INSTALL_DIR"
     pip install --break-system-packages -e . >/dev/null 2>&1
     
-    echo "95"; echo "# Starting service..."
+    echo "85"; echo "# Starting service..."
     systemctl enable "$SERVICE_NAME"
     systemctl start "$SERVICE_NAME"
     
-    echo "100"; echo "# Installation complete!"
-    ) | $DIALOG --backtitle "pyMC Repeater Management" --title "Installing" --gauge "Setting up pyMC Repeater..." 8 70
+    echo "95"; echo "# Configuring radio..."
+    ) | $DIALOG --backtitle "pyMC Repeater Management" --title "Installing" --gauge "Setting up pyMC Repeater..." 8 70 0
     
-    # Show results
+    # Radio configuration
+    show_info "Radio Configuration" "Installation complete!\n\nNow let's configure your radio settings.\n\nPress OK to continue to radio configuration..."
+    
+    # Run radio configuration
+    SCRIPT_DIR="$(dirname "$0")"
+    RADIO_SCRIPT="$SCRIPT_DIR/setup-radio-config.sh"
+    
+    if [ -f "$RADIO_SCRIPT" ]; then
+        clear
+        echo "=== pyMC Repeater Radio Configuration ==="
+        echo ""
+        
+        if bash "$RADIO_SCRIPT" "$CONFIG_DIR"; then
+            echo ""
+            echo "=== Radio Configuration Complete ==="
+            echo "Restarting service with new configuration..."
+            systemctl restart "$SERVICE_NAME" 2>/dev/null || true
+            sleep 2
+        else
+            echo "⚠ Radio configuration failed, but installation is complete."
+            echo "You can run radio configuration later from the main menu."
+        fi
+    else
+        echo "⚠ Radio configuration script not found at $RADIO_SCRIPT"
+        echo "Installation complete, but you'll need to configure radio settings manually."
+    fi
+    
+    # Show final results
     sleep 2
     local ip_address=$(hostname -I | awk '{print $1}')
     if is_running; then
-        local msg="\nInstallation completed successfully!\n\n✓ Service is running\n"
-        if [ "$INSTALL_TYPE" = "full" ]; then
-            msg="${msg}\nWeb Dashboard: http://$ip_address:8000"
-        fi
-        msg="${msg}\n\nView logs: Select 'logs' from main menu"
+        local msg="\nInstallation and configuration completed successfully!\n\n✓ Service is running\n✓ Radio configured\n\nWeb Dashboard: http://$ip_address:8000\n\nView logs: Select 'logs' from main menu"
         show_info "Installation Complete" "$msg"
     else
-        show_error "Installation completed but service failed to start!\n\nCheck logs from the main menu."
+        show_error "Installation completed but service failed to start!\n\nCheck logs from the main menu for details."
     fi
 }
 
@@ -359,7 +357,7 @@ configure_radio() {
     fi
     
     # Ask for confirmation
-    if ask_yes_no "Configure Radio Settings" "This will update your radio configuration including:\n\n• Repeater name\n• Hardware settings\n• Frequency and LoRa parameters\n\nThe service will be restarted after configuration.\n\nContinue?"; then
+    if ask_yes_no "Configure Radio Settings" "This will update your radio configuration including:\n\n- Repeater name\n- Hardware settings\n- Frequency and LoRa parameters\n\nThe service will be restarted after configuration.\n\nContinue?"; then
         
         # Show info that configuration is starting
         show_info "Radio Configuration" "Starting radio configuration...\n\nThe configuration script will now run in the terminal.\n\nFollow the prompts to configure your radio settings."
@@ -411,7 +409,7 @@ uninstall_repeater() {
         return
     fi
     
-    if ask_yes_no "Confirm Uninstall" "\nThis will completely remove pyMC Repeater including:\n\n• Service and files\n• Configuration (backup will be created)\n• Logs and data\n\nThis action cannot be undone!\n\nContinue?"; then
+    if ask_yes_no "Confirm Uninstall" "This will completely remove pyMC Repeater including:\n\n- Service and files\n- Configuration (backup will be created)\n- Logs and data\n\nThis action cannot be undone!\n\nContinue?"; then
         (
         echo "0"; echo "# Stopping and disabling service..."
         systemctl stop "$SERVICE_NAME" 2>/dev/null || true
@@ -438,7 +436,7 @@ uninstall_repeater() {
         fi
         
         echo "100"; echo "# Uninstall complete!"
-        ) | $DIALOG --backtitle "pyMC Repeater Management" --title "Uninstalling" --gauge "Removing pyMC Repeater..." 8 70
+        ) | $DIALOG --backtitle "pyMC Repeater Management" --title "Uninstalling" --gauge "Removing pyMC Repeater..." 8 70 0
         
         show_info "Uninstall Complete" "\npyMC Repeater has been completely removed.\n\nConfiguration backup saved to /tmp/\n\nThank you for using pyMC Repeater!"
     fi
@@ -505,15 +503,15 @@ show_detailed_status() {
         
         # Add system info
         status_info="${status_info}System Info:\n"
-        status_info="${status_info}• SPI: "
+        status_info="${status_info}- SPI: "
         if grep -q "spi_bcm2835" /proc/modules 2>/dev/null; then
             status_info="${status_info}Enabled ✓\n"
         else
             status_info="${status_info}Disabled ✗\n"
         fi
         
-        status_info="${status_info}• IP Address: $ip_address\n"
-        status_info="${status_info}• Hostname: $(hostname)\n"
+        status_info="${status_info}- IP Address: $ip_address\n"
+        status_info="${status_info}- Hostname: $(hostname)\n"
         
     else
         status_info="${status_info}Not Installed"
