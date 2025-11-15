@@ -10,6 +10,8 @@
       "irq_pin": 16,
       "txen_pin": 13,
       "rxen_pin": 12,
+      "txled_pin": -1,
+      "rxled_pin": -1,
       "tx_power": 22,
       "preamble_length": 17,
       "is_waveshare": true
@@ -24,6 +26,8 @@
       "irq_pin": 26,
       "txen_pin": -1,
       "rxen_pin": -1,
+      "txled_pin": -1,
+      "rxled_pin": -1,
       "tx_power": 22,
       "preamble_length": 17
     },
@@ -37,6 +41,8 @@
       "irq_pin": 16,
       "txen_pin": -1,
       "rxen_pin": 12,
+      "txled_pin": -1,
+      "rxled_pin": -1,
       "tx_power": 22,
       "preamble_length": 17
     },
@@ -50,7 +56,10 @@
       "irq_pin": 16,
       "txen_pin": 13,
       "rxen_pin": 12,
+      "txled_pin": -1,
+      "rxled_pin": -1,
       "tx_power": 22,
+      "use_dio3_tcxo": true,
       "preamble_length": 17
     }
   }

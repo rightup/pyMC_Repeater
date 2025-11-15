@@ -170,8 +170,8 @@ title=$(cat /tmp/radio_title_$selected 2>/dev/null)
 
 
 # Convert frequency from MHz to Hz (handle decimal values)
-freq_hz=$(echo "$freq * 1000000" | bc -l | cut -d. -f1)
-bw_hz=$(echo "$bw * 1000" | bc -l | cut -d. -f1)
+freq_hz=$(awk "BEGIN {printf \"%.0f\", $freq * 1000000}")
+bw_hz=$(awk "BEGIN {printf \"%.0f\", $bw * 1000}")
 
 
 echo ""
@@ -214,9 +214,12 @@ else
     irq_pin=$(echo "$hw_config" | jq -r '.irq_pin // empty')
     txen_pin=$(echo "$hw_config" | jq -r '.txen_pin // empty')
     rxen_pin=$(echo "$hw_config" | jq -r '.rxen_pin // empty')
+    txled_pin=$(echo "$hw_config" | jq -r '.txled_pin // empty')
+    rxled_pin=$(echo "$hw_config" | jq -r '.rxled_pin // empty')
     tx_power=$(echo "$hw_config" | jq -r '.tx_power // empty')
     preamble_length=$(echo "$hw_config" | jq -r '.preamble_length // empty')
     is_waveshare=$(echo "$hw_config" | jq -r '.is_waveshare // empty')
+    use_dio3_tcxo=$(echo "$hw_config" | jq -r '.use_dio3_tcxo // empty')
 
     # Update sx1262 section in config.yaml (2-space indentation)
     [ -n "$bus_id" ] && sed "${SED_OPTS[@]}" "s/^  bus_id:.*/  bus_id: $bus_id/" "$CONFIG_FILE"
@@ -227,6 +230,26 @@ else
     [ -n "$irq_pin" ] && sed "${SED_OPTS[@]}" "s/^  irq_pin:.*/  irq_pin: $irq_pin/" "$CONFIG_FILE"
     [ -n "$txen_pin" ] && sed "${SED_OPTS[@]}" "s/^  txen_pin:.*/  txen_pin: $txen_pin/" "$CONFIG_FILE"
     [ -n "$rxen_pin" ] && sed "${SED_OPTS[@]}" "s/^  rxen_pin:.*/  rxen_pin: $rxen_pin/" "$CONFIG_FILE"
+    
+    # Handle LED pins - add if missing, update if present
+    if [ -n "$txled_pin" ]; then
+        if grep -q "^  txled_pin:" "$CONFIG_FILE"; then
+            sed "${SED_OPTS[@]}" "s/^  txled_pin:.*/  txled_pin: $txled_pin/" "$CONFIG_FILE"
+        else
+            # Add txled_pin after rxen_pin
+            sed "${SED_OPTS[@]}" "/^  rxen_pin:.*/a\\  txled_pin: $txled_pin" "$CONFIG_FILE"
+        fi
+    fi
+    
+    if [ -n "$rxled_pin" ]; then
+        if grep -q "^  rxled_pin:" "$CONFIG_FILE"; then
+            sed "${SED_OPTS[@]}" "s/^  rxled_pin:.*/  rxled_pin: $rxled_pin/" "$CONFIG_FILE"
+        else
+            # Add rxled_pin after txled_pin
+            sed "${SED_OPTS[@]}" "/^  txled_pin:.*/a\\  rxled_pin: $rxled_pin" "$CONFIG_FILE"
+        fi
+    fi
+    
     [ -n "$tx_power" ] && sed "${SED_OPTS[@]}" "s/^  tx_power:.*/  tx_power: $tx_power/" "$CONFIG_FILE"
     [ -n "$preamble_length" ] && sed "${SED_OPTS[@]}" "s/^  preamble_length:.*/  preamble_length: $preamble_length/" "$CONFIG_FILE"
 
@@ -235,6 +258,31 @@ else
         sed "${SED_OPTS[@]}" "s/^  is_waveshare:.*/  is_waveshare: true/" "$CONFIG_FILE"
     else
         sed "${SED_OPTS[@]}" "s/^  is_waveshare:.*/  is_waveshare: false/" "$CONFIG_FILE"
+    fi
+
+    # Update use_dio3_tcxo flag
+    if [ "$use_dio3_tcxo" == "true" ]; then
+        if grep -q "^  use_dio3_tcxo:" "$CONFIG_FILE"; then
+            sed "${SED_OPTS[@]}" "s/^  use_dio3_tcxo:.*/  use_dio3_tcxo: true/" "$CONFIG_FILE"
+        else
+            # Add use_dio3_tcxo after rxled_pin (or rxen_pin if no LED pins)
+            if grep -q "^  rxled_pin:" "$CONFIG_FILE"; then
+                sed "${SED_OPTS[@]}" "/^  rxled_pin:.*/a\\  use_dio3_tcxo: true" "$CONFIG_FILE"
+            else
+                sed "${SED_OPTS[@]}" "/^  rxen_pin:.*/a\\  use_dio3_tcxo: true" "$CONFIG_FILE"
+            fi
+        fi
+    elif [ "$use_dio3_tcxo" == "false" ]; then
+        if grep -q "^  use_dio3_tcxo:" "$CONFIG_FILE"; then
+            sed "${SED_OPTS[@]}" "s/^  use_dio3_tcxo:.*/  use_dio3_tcxo: false/" "$CONFIG_FILE"
+        else
+            # Add use_dio3_tcxo after rxled_pin (or rxen_pin if no LED pins)
+            if grep -q "^  rxled_pin:" "$CONFIG_FILE"; then
+                sed "${SED_OPTS[@]}" "/^  rxled_pin:.*/a\\  use_dio3_tcxo: false" "$CONFIG_FILE"
+            else
+                sed "${SED_OPTS[@]}" "/^  rxen_pin:.*/a\\  use_dio3_tcxo: false" "$CONFIG_FILE"
+            fi
+        fi
     fi
 fi
 
@@ -260,9 +308,12 @@ if [ -n "$bus_id" ]; then
     echo "  IRQ Pin: $irq_pin"
     [ "$txen_pin" != "-1" ] && echo "  TX Enable Pin: $txen_pin"
     [ "$rxen_pin" != "-1" ] && echo "  RX Enable Pin: $rxen_pin"
+    [ "$txled_pin" != "-1" ] && echo "  TX LED Pin: $txled_pin"
+    [ "$rxled_pin" != "-1" ] && echo "  RX LED Pin: $rxled_pin"
     echo "  TX Power: $tx_power dBm"
     echo "  Preamble Length: $preamble_length"
     [ -n "$is_waveshare" ] && echo "  Waveshare: $is_waveshare"
+    [ -n "$use_dio3_tcxo" ] && echo "  Use DIO3 TCXO: $use_dio3_tcxo"
 fi
 
 # Enable and start the service
