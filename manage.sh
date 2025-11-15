@@ -219,6 +219,10 @@ install_repeater() {
     echo "20"; echo "# Creating directories..."
     mkdir -p "$INSTALL_DIR" "$CONFIG_DIR" "$LOG_DIR" /var/lib/pymc_repeater
     
+    echo "25"; echo "# Installing system dependencies..."
+    apt-get update -qq
+    apt-get install -y libffi-dev
+    
     echo "30"; echo "# Installing files..."
     cp -r repeater "$INSTALL_DIR/"
     cp pyproject.toml "$INSTALL_DIR/"
@@ -226,26 +230,25 @@ install_repeater() {
     cp setup-radio-config.sh "$INSTALL_DIR/" 2>/dev/null || true
     cp radio-settings.json "$INSTALL_DIR/" 2>/dev/null || true
     
-    echo "40"; echo "# Installing configuration..."
+    echo "45"; echo "# Installing configuration..."
     cp config.yaml.example "$CONFIG_DIR/config.yaml.example"
     if [ ! -f "$CONFIG_DIR/config.yaml" ]; then
         cp config.yaml.example "$CONFIG_DIR/config.yaml"
     fi
     
-    echo "50"
+    echo "55"
     if [ "$SETUP_RADIO" = true ] && [ "$REGION" != "custom" ]; then
         echo "# Configuring radio settings..."
         if ! command -v jq &> /dev/null; then
-            apt-get update -qq
             apt-get install -y jq
         fi
     fi
     
-    echo "70"; echo "# Installing systemd service..."
+    echo "75"; echo "# Installing systemd service..."
     cp pymc-repeater.service /etc/systemd/system/
     systemctl daemon-reload
     
-    echo "80"; echo "# Setting permissions..."
+    echo "85"; echo "# Setting permissions..."
     chown -R "$SERVICE_USER:$SERVICE_USER" "$INSTALL_DIR" "$CONFIG_DIR" "$LOG_DIR" /var/lib/pymc_repeater
     chmod 750 "$CONFIG_DIR" "$LOG_DIR" /var/lib/pymc_repeater
     

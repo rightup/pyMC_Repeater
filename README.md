@@ -87,7 +87,8 @@ Before You Begin
 
 Make sure SPI is switched on using raspi-config:
 
-```sudo raspi-config
+```bash 
+sudo raspi-config
 ```
 
 1. Go to Interface Options
@@ -95,17 +96,19 @@ Make sure SPI is switched on using raspi-config:
 3. Choose Enable
 4. Reboot when prompted:
 
-```sudo reboot
-```
-After reboot, you can confirm SPI is active:
-```
-ls /dev/spi*
-```
-You should see something like:
-```
-/dev/spidev0.0  /dev/spidev0.1
+```bash
+sudo reboot
 ```
 
+After reboot, you can confirm SPI is active:
+```bash 
+ls /dev/spi*
+```
+
+You should see something like:
+```bash 
+/dev/spidev0.0  /dev/spidev0.1
+```
 
 **Clone the Repository:**
 ```bash
