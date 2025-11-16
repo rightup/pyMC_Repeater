@@ -684,6 +684,7 @@ class APIEndpoints:
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
+    @cherrypy.tools.json_in()
     @cors_enabled
     def transport_keys(self):
         if cherrypy.request.method == "GET":
@@ -700,15 +701,27 @@ class APIEndpoints:
                 data = cherrypy.request.json or {}
                 name = data.get("name")
                 flood_policy = data.get("flood_policy")
-                transport_key = data.get("transport_key")
+                transport_key = data.get("transport_key")  # Optional now
                 parent_id = data.get("parent_id")
                 last_used = data.get("last_used")
                 
-                if not name or not flood_policy or not transport_key:
-                    return self._error("Missing required fields: name, flood_policy, transport_key")
+                if not name or not flood_policy:
+                    return self._error("Missing required fields: name, flood_policy")
                 
                 if flood_policy not in ["allow", "deny"]:
                     return self._error("flood_policy must be 'allow' or 'deny'")
+                
+                # Convert ISO timestamp string to float if provided
+                if last_used:
+                    try:
+                        from datetime import datetime
+                        dt = datetime.fromisoformat(last_used.replace('Z', '+00:00'))
+                        last_used = dt.timestamp()
+                    except (ValueError, AttributeError):
+                        # If conversion fails, use current time
+                        last_used = time.time()
+                else:
+                    last_used = time.time()
                 
                 storage = self._get_storage()
                 key_id = storage.create_transport_key(name, flood_policy, transport_key, parent_id, last_used)
@@ -723,6 +736,7 @@ class APIEndpoints:
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
+    @cherrypy.tools.json_in()
     @cors_enabled
     def transport_key(self, key_id):
         if cherrypy.request.method == "GET":
@@ -753,6 +767,15 @@ class APIEndpoints:
                 
                 if flood_policy and flood_policy not in ["allow", "deny"]:
                     return self._error("flood_policy must be 'allow' or 'deny'")
+                
+                # Convert ISO timestamp string to float if provided
+                if last_used:
+                    try:
+                        dt = datetime.fromisoformat(last_used.replace('Z', '+00:00'))
+                        last_used = dt.timestamp()
+                    except (ValueError, AttributeError):
+                        # If conversion fails, leave as None to not update
+                        last_used = None
                 
                 storage = self._get_storage()
                 success = storage.update_transport_key(key_id, name, flood_policy, transport_key, parent_id, last_used)

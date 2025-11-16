@@ -2,6 +2,8 @@ import json
 import logging
 import sqlite3
 import time
+import secrets
+import base64
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 
@@ -664,8 +666,41 @@ class SQLiteHandler:
             logger.error(f"Failed to get adverts by contact_type '{contact_type}': {e}")
             return []
 
-    def create_transport_key(self, name: str, flood_policy: str, transport_key: str, parent_id: Optional[int] = None, last_used: Optional[float] = None) -> Optional[int]:
+    def generate_transport_key(self, key_length_bytes: int = 32) -> str:
+        """
+        Generate a cryptographically secure transport key.
+        
+        Args:
+            key_length_bytes: Length of the key in bytes (default: 32 bytes = 256 bits)
+            
+        Returns:
+            A base64-encoded secure random key
+        """
         try:
+            # Generate cryptographically secure random bytes
+            random_bytes = secrets.token_bytes(key_length_bytes)
+            
+            # Encode to base64 for safe storage and transmission
+            key = base64.b64encode(random_bytes).decode('utf-8')
+            
+            logger.debug(f"Generated transport key with {key_length_bytes} bytes ({len(key)} base64 chars)")
+            return key
+            
+        except Exception as e:
+            logger.error(f"Failed to generate transport key: {e}")
+            # Fallback to a simpler method if crypto fails
+            import random
+            import string
+            fallback_key = ''.join(random.choices(string.ascii_letters + string.digits, k=key_length_bytes))
+            logger.warning(f"Using fallback key generation method")
+            return base64.b64encode(fallback_key.encode()).decode('utf-8')
+
+    def create_transport_key(self, name: str, flood_policy: str, transport_key: Optional[str] = None, parent_id: Optional[int] = None, last_used: Optional[float] = None) -> Optional[int]:
+        try:
+            # Generate key if not provided
+            if transport_key is None:
+                transport_key = self.generate_transport_key()
+                
             current_time = time.time()
             with sqlite3.connect(self.sqlite_path) as conn:
                 cursor = conn.execute("""
