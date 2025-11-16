@@ -681,3 +681,104 @@ class APIEndpoints:
         except Exception as e:
             logger.error(f"Error getting adverts by contact type: {e}")
             return self._error(e)
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    @cors_enabled
+    def transport_keys(self):
+        if cherrypy.request.method == "GET":
+            try:
+                storage = self._get_storage()
+                keys = storage.get_transport_keys()
+                return self._success(keys, count=len(keys))
+            except Exception as e:
+                logger.error(f"Error getting transport keys: {e}")
+                return self._error(e)
+        
+        elif cherrypy.request.method == "POST":
+            try:
+                data = cherrypy.request.json or {}
+                name = data.get("name")
+                flood_policy = data.get("flood_policy")
+                transport_key = data.get("transport_key")
+                parent_id = data.get("parent_id")
+                last_used = data.get("last_used")
+                
+                if not name or not flood_policy or not transport_key:
+                    return self._error("Missing required fields: name, flood_policy, transport_key")
+                
+                if flood_policy not in ["allow", "deny"]:
+                    return self._error("flood_policy must be 'allow' or 'deny'")
+                
+                storage = self._get_storage()
+                key_id = storage.create_transport_key(name, flood_policy, transport_key, parent_id, last_used)
+                
+                if key_id:
+                    return self._success({"id": key_id}, message="Transport key created successfully")
+                else:
+                    return self._error("Failed to create transport key")
+            except Exception as e:
+                logger.error(f"Error creating transport key: {e}")
+                return self._error(e)
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    @cors_enabled
+    def transport_key(self, key_id):
+        if cherrypy.request.method == "GET":
+            try:
+                key_id = int(key_id)
+                storage = self._get_storage()
+                key = storage.get_transport_key_by_id(key_id)
+                if key:
+                    return self._success(key)
+                else:
+                    return self._error("Transport key not found")
+            except ValueError:
+                return self._error("Invalid key_id format")
+            except Exception as e:
+                logger.error(f"Error getting transport key: {e}")
+                return self._error(e)
+        
+        elif cherrypy.request.method == "PUT":
+            try:
+                key_id = int(key_id)
+                data = cherrypy.request.json or {}
+                
+                name = data.get("name")
+                flood_policy = data.get("flood_policy")
+                transport_key = data.get("transport_key")
+                parent_id = data.get("parent_id")
+                last_used = data.get("last_used")
+                
+                if flood_policy and flood_policy not in ["allow", "deny"]:
+                    return self._error("flood_policy must be 'allow' or 'deny'")
+                
+                storage = self._get_storage()
+                success = storage.update_transport_key(key_id, name, flood_policy, transport_key, parent_id, last_used)
+                
+                if success:
+                    return self._success({"id": key_id}, message="Transport key updated successfully")
+                else:
+                    return self._error("Failed to update transport key or key not found")
+            except ValueError:
+                return self._error("Invalid key_id format")
+            except Exception as e:
+                logger.error(f"Error updating transport key: {e}")
+                return self._error(e)
+        
+        elif cherrypy.request.method == "DELETE":
+            try:
+                key_id = int(key_id)
+                storage = self._get_storage()
+                success = storage.delete_transport_key(key_id)
+                
+                if success:
+                    return self._success({"id": key_id}, message="Transport key deleted successfully")
+                else:
+                    return self._error("Failed to delete transport key or key not found")
+            except ValueError:
+                return self._error("Invalid key_id format")
+            except Exception as e:
+                logger.error(f"Error deleting transport key: {e}")
+                return self._error(e)

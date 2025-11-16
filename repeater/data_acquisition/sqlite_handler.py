@@ -73,6 +73,20 @@ class SQLiteHandler:
                     )
                 """)
                 
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS transport_keys (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        name TEXT NOT NULL UNIQUE,
+                        flood_policy TEXT NOT NULL CHECK (flood_policy IN ('allow', 'deny')),
+                        transport_key TEXT NOT NULL,
+                        last_used REAL,
+                        parent_id INTEGER,
+                        created_at REAL NOT NULL,
+                        updated_at REAL NOT NULL,
+                        FOREIGN KEY (parent_id) REFERENCES transport_keys(id)
+                    )
+                """)
+                
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_packets_timestamp ON packets(timestamp)")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_packets_type ON packets(type)")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_packets_hash ON packets(packet_hash)")
@@ -80,6 +94,8 @@ class SQLiteHandler:
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_adverts_timestamp ON adverts(timestamp)")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_adverts_pubkey ON adverts(pubkey)")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_noise_timestamp ON noise_floor(timestamp)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_transport_keys_name ON transport_keys(name)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_transport_keys_parent ON transport_keys(parent_id)")
                 
                 conn.commit()
                 logger.info(f"SQLite database initialized: {self.sqlite_path}")
@@ -647,3 +663,112 @@ class SQLiteHandler:
         except Exception as e:
             logger.error(f"Failed to get adverts by contact_type '{contact_type}': {e}")
             return []
+
+    def create_transport_key(self, name: str, flood_policy: str, transport_key: str, parent_id: Optional[int] = None, last_used: Optional[float] = None) -> Optional[int]:
+        try:
+            current_time = time.time()
+            with sqlite3.connect(self.sqlite_path) as conn:
+                cursor = conn.execute("""
+                    INSERT INTO transport_keys (name, flood_policy, transport_key, parent_id, last_used, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (name, flood_policy, transport_key, parent_id, last_used, current_time, current_time))
+                return cursor.lastrowid
+        except Exception as e:
+            logger.error(f"Failed to create transport key: {e}")
+            return None
+
+    def get_transport_keys(self) -> List[dict]:
+        try:
+            with sqlite3.connect(self.sqlite_path) as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute("""
+                    SELECT id, name, flood_policy, transport_key, parent_id, last_used, created_at, updated_at
+                    FROM transport_keys
+                    ORDER BY created_at ASC
+                """).fetchall()
+                
+                return [{
+                    "id": row["id"],
+                    "name": row["name"],
+                    "flood_policy": row["flood_policy"],
+                    "transport_key": row["transport_key"],
+                    "parent_id": row["parent_id"],
+                    "last_used": row["last_used"],
+                    "created_at": row["created_at"],
+                    "updated_at": row["updated_at"]
+                } for row in rows]
+        except Exception as e:
+            logger.error(f"Failed to get transport keys: {e}")
+            return []
+
+    def get_transport_key_by_id(self, key_id: int) -> Optional[dict]:
+        try:
+            with sqlite3.connect(self.sqlite_path) as conn:
+                conn.row_factory = sqlite3.Row
+                row = conn.execute("""
+                    SELECT id, name, flood_policy, transport_key, parent_id, last_used, created_at, updated_at
+                    FROM transport_keys WHERE id = ?
+                """, (key_id,)).fetchone()
+                
+                if row:
+                    return {
+                        "id": row["id"],
+                        "name": row["name"],
+                        "flood_policy": row["flood_policy"],
+                        "transport_key": row["transport_key"],
+                        "parent_id": row["parent_id"],
+                        "last_used": row["last_used"],
+                        "created_at": row["created_at"],
+                        "updated_at": row["updated_at"]
+                    }
+                return None
+        except Exception as e:
+            logger.error(f"Failed to get transport key by id: {e}")
+            return None
+
+    def update_transport_key(self, key_id: int, name: Optional[str] = None, flood_policy: Optional[str] = None, transport_key: Optional[str] = None, parent_id: Optional[int] = None, last_used: Optional[float] = None) -> bool:
+        try:
+            updates = []
+            params = []
+            
+            if name is not None:
+                updates.append("name = ?")
+                params.append(name)
+            if flood_policy is not None:
+                updates.append("flood_policy = ?")
+                params.append(flood_policy)
+            if transport_key is not None:
+                updates.append("transport_key = ?")
+                params.append(transport_key)
+            if parent_id is not None:
+                updates.append("parent_id = ?")
+                params.append(parent_id)
+            if last_used is not None:
+                updates.append("last_used = ?")
+                params.append(last_used)
+            
+            if not updates:
+                return False
+            
+            updates.append("updated_at = ?")
+            params.append(time.time())
+            params.append(key_id)
+            
+            with sqlite3.connect(self.sqlite_path) as conn:
+                cursor = conn.execute(f"""
+                    UPDATE transport_keys SET {', '.join(updates)}
+                    WHERE id = ?
+                """, params)
+                return cursor.rowcount > 0
+        except Exception as e:
+            logger.error(f"Failed to update transport key: {e}")
+            return False
+
+    def delete_transport_key(self, key_id: int) -> bool:
+        try:
+            with sqlite3.connect(self.sqlite_path) as conn:
+                cursor = conn.execute("DELETE FROM transport_keys WHERE id = ?", (key_id,))
+                return cursor.rowcount > 0
+        except Exception as e:
+            logger.error(f"Failed to delete transport key: {e}")
+            return False

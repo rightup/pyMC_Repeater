@@ -92,3 +92,18 @@ class StorageCollector:
 
     def close(self):
         self.mqtt_handler.close()
+
+    def create_transport_key(self, name: str, flood_policy: str, transport_key: str, parent_id: Optional[int] = None, last_used: Optional[float] = None) -> Optional[int]:
+        return self.sqlite_handler.create_transport_key(name, flood_policy, transport_key, parent_id, last_used)
+
+    def get_transport_keys(self) -> list:
+        return self.sqlite_handler.get_transport_keys()
+
+    def get_transport_key_by_id(self, key_id: int) -> Optional[dict]:
+        return self.sqlite_handler.get_transport_key_by_id(key_id)
+
+    def update_transport_key(self, key_id: int, name: Optional[str] = None, flood_policy: Optional[str] = None, transport_key: Optional[str] = None, parent_id: Optional[int] = None, last_used: Optional[float] = None) -> bool:
+        return self.sqlite_handler.update_transport_key(key_id, name, flood_policy, transport_key, parent_id, last_used)
+
+    def delete_transport_key(self, key_id: int) -> bool:
+        return self.sqlite_handler.delete_transport_key(key_id)
