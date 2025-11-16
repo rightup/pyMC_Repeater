@@ -808,8 +808,9 @@ class APIEndpoints:
                 return self._error(e)
 
     @cherrypy.expose
-    @cors_enabled
+    @cherrypy.tools.json_out()
     @cherrypy.tools.json_in()
+    @cors_enabled
     def global_flood_policy(self):
         """
         Update global flood policy configuration
@@ -828,16 +829,30 @@ class APIEndpoints:
                 if not isinstance(global_flood_allow, bool):
                     return self._error("global_flood_allow must be a boolean value")
                 
-                # Update the configuration
-                success = update_global_flood_policy(global_flood_allow)
+                # Update the running configuration first (like CAD settings)
+                if "mesh" not in self.config:
+                    self.config["mesh"] = {}
+                self.config["mesh"]["global_flood_allow"] = global_flood_allow
                 
-                if success:
-                    return self._success(
-                        {"global_flood_allow": global_flood_allow},
-                        message=f"Global flood policy updated to {'allow' if global_flood_allow else 'deny'}"
-                    )
-                else:
-                    return self._error("Failed to update global flood policy configuration")
+                # Get the actual config path from daemon instance (same as CAD settings)
+                config_path = getattr(self, '_config_path', '/etc/pymc_repeater/config.yaml')
+                if self.daemon_instance and hasattr(self.daemon_instance, 'config_path'):
+                    config_path = self.daemon_instance.config_path
+                
+                logger.info(f"Using config path for global flood policy: {config_path}")
+                
+                # Update the configuration file using the same method as CAD
+                try:
+                    self._save_config_to_file(config_path)
+                    logger.info(f"Updated running config and saved global flood policy to file: {'allow' if global_flood_allow else 'deny'}")
+                except Exception as e:
+                    logger.error(f"Failed to save global flood policy to file: {e}")
+                    return self._error(f"Failed to save configuration to file: {e}")
+                
+                return self._success(
+                    {"global_flood_allow": global_flood_allow},
+                    message=f"Global flood policy updated to {'allow' if global_flood_allow else 'deny'} (live and saved)"
+                )
                     
             except Exception as e:
                 logger.error(f"Error updating global flood policy: {e}")
