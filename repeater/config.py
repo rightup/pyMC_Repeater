@@ -45,6 +45,70 @@ def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
     return config
 
 
+def save_config(config_data: Dict[str, Any], config_path: Optional[str] = None) -> bool:
+    """
+    Save configuration to YAML file.
+    
+    Args:
+        config_data: Configuration dictionary to save
+        config_path: Path to config file (uses default if None)
+        
+    Returns:
+        True if successful, False otherwise
+    """
+    if config_path is None:
+        config_path = os.getenv("PYMC_REPEATER_CONFIG", "/etc/pymc_repeater/config.yaml")
+    
+    try:
+        # Create backup of existing config
+        config_file = Path(config_path)
+        if config_file.exists():
+            backup_path = config_file.with_suffix('.yaml.backup')
+            config_file.rename(backup_path)
+            logger.info(f"Created backup at {backup_path}")
+        
+        # Save new config
+        with open(config_path, 'w') as f:
+            yaml.safe_dump(config_data, f, default_flow_style=False, sort_keys=False)
+        
+        logger.info(f"Saved configuration to {config_path}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Failed to save configuration: {e}")
+        return False
+
+
+def update_global_flood_policy(allow: bool, config_path: Optional[str] = None) -> bool:
+    """
+    Update the global flood policy in the configuration.
+    
+    Args:
+        allow: True to allow flooding globally, False to deny
+        config_path: Path to config file (uses default if None)
+        
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        # Load current config
+        config = load_config(config_path)
+        
+        # Ensure mesh section exists
+        if "mesh" not in config:
+            config["mesh"] = {}
+        
+        # Set global flood policy
+        config["mesh"]["global_flood_allow"] = allow
+        
+        # Save updated config
+        return save_config(config, config_path)
+        
+    except Exception as e:
+        logger.error(f"Failed to update global flood policy: {e}")
+        return False
+
+
 def _load_or_create_identity_key(path: Optional[str] = None) -> bytes:
 
     if path is None:

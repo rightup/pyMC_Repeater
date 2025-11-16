@@ -34,6 +34,13 @@ repeater:
   # Recommended: 10 hours for typical deployments
   send_advert_interval_hours: 10
 
+# Mesh Network Configuration
+mesh:
+  # Global flood policy - controls whether the repeater allows or denies flooding by default
+  # true = allow flooding globally, false = deny flooding globally
+  # Individual transport keys can override this setting
+  global_flood_allow: false
+
 radio:
   # Frequency in Hz (869.618 MHz for EU)
   frequency: 869618000

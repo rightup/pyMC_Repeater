@@ -5,6 +5,7 @@ from datetime import datetime
 from typing import Callable, Optional
 import cherrypy
 from repeater import __version__
+from repeater.config import update_global_flood_policy
 from .cad_calibration_engine import CADCalibrationEngine
 
 logger = logging.getLogger("HTTPServer")
@@ -805,3 +806,41 @@ class APIEndpoints:
             except Exception as e:
                 logger.error(f"Error deleting transport key: {e}")
                 return self._error(e)
+
+    @cherrypy.expose
+    @cors_enabled
+    @cherrypy.tools.json_in()
+    def global_flood_policy(self):
+        """
+        Update global flood policy configuration
+        
+        POST /global_flood_policy
+        Body: {"global_flood_allow": true/false}
+        """
+        if cherrypy.request.method == "POST":
+            try:
+                data = cherrypy.request.json or {}
+                global_flood_allow = data.get("global_flood_allow")
+                
+                if global_flood_allow is None:
+                    return self._error("Missing required field: global_flood_allow")
+                
+                if not isinstance(global_flood_allow, bool):
+                    return self._error("global_flood_allow must be a boolean value")
+                
+                # Update the configuration
+                success = update_global_flood_policy(global_flood_allow)
+                
+                if success:
+                    return self._success(
+                        {"global_flood_allow": global_flood_allow},
+                        message=f"Global flood policy updated to {'allow' if global_flood_allow else 'deny'}"
+                    )
+                else:
+                    return self._error("Failed to update global flood policy configuration")
+                    
+            except Exception as e:
+                logger.error(f"Error updating global flood policy: {e}")
+                return self._error(e)
+        else:
+            return self._error("Method not supported")
