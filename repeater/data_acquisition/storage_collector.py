@@ -7,12 +7,14 @@ from typing import Optional, Dict, Any
 from .sqlite_handler import SQLiteHandler
 from .rrdtool_handler import RRDToolHandler
 from .mqtt_handler import MQTTHandler
+from .letsmesh_handler import MeshCoreToMqttJwtPusher
+from .. import __version__
 
 logger = logging.getLogger("StorageCollector")
 
 
 class StorageCollector:
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, local_identity=None):
         self.config = config
         self.storage_dir = Path(config.get("storage_dir", "/var/lib/pymc_repeater"))
         self.storage_dir.mkdir(parents=True, exist_ok=True)
@@ -22,6 +24,31 @@ class StorageCollector:
         self.sqlite_handler = SQLiteHandler(self.storage_dir)
         self.rrd_handler = RRDToolHandler(self.storage_dir)
         self.mqtt_handler = MQTTHandler(config.get("mqtt", {}), node_name)
+        
+        # Initialize LetsMesh handler if configured
+        self.letsmesh_handler = None
+        letsmesh_config = config.get("letsmesh", {})
+        if letsmesh_config.get("enabled", False):
+            try:
+                if not local_identity:
+                    logger.error("Cannot initialize LetsMesh: No local_identity provided")
+                else:
+                    private_key_hex = local_identity.seed.hex()
+                    public_key_hex = local_identity.get_public_key().hex()
+                    
+                    self.letsmesh_handler = MeshCoreToMqttJwtPusher(
+                        private_key=private_key_hex,
+                        public_key=public_key_hex,
+                        iata_code=letsmesh_config.get("iata_code", "test"),
+                        broker_index=letsmesh_config.get("broker_index", 0),
+                        status_interval=letsmesh_config.get("status_interval", 60),
+                        firmware_version=__version__
+                    )
+                    self.letsmesh_handler.connect()
+                    logger.info(f"LetsMesh handler initialized (v{__version__}) with public key: {public_key_hex[:16]}...")
+            except Exception as e:
+                logger.error(f"Failed to initialize LetsMesh handler: {e}")
+                self.letsmesh_handler = None
 
     def record_packet(self, packet_record: dict):
         logger.debug(f"Recording packet: type={packet_record.get('type')}, transmitted={packet_record.get('transmitted')}")
@@ -31,6 +58,17 @@ class StorageCollector:
         cumulative_counts = self.sqlite_handler.get_cumulative_counts()
         self.rrd_handler.update_packet_metrics(packet_record, cumulative_counts)
         self.mqtt_handler.publish(packet_record, "packet")
+        
+        # Publish to LetsMesh if enabled
+        if self.letsmesh_handler:
+            try:
+                # If packet has raw_data, publish as raw hex, otherwise publish as structured packet
+                if "raw_data" in packet_record and packet_record["raw_data"]:
+                    self.letsmesh_handler.publish_raw_data(packet_record["raw_data"])
+                else:
+                    self.letsmesh_handler.publish_packet(packet_record)
+            except Exception as e:
+                logger.error(f"Failed to publish packet to LetsMesh: {e}")
 
     def record_advert(self, advert_record: dict):
         self.sqlite_handler.store_advert(advert_record)
@@ -92,6 +130,12 @@ class StorageCollector:
 
     def close(self):
         self.mqtt_handler.close()
+        if self.letsmesh_handler:
+            try:
+                self.letsmesh_handler.disconnect()
+                logger.info("LetsMesh handler disconnected")
+            except Exception as e:
+                logger.error(f"Error disconnecting LetsMesh handler: {e}")
 
     def create_transport_key(self, name: str, flood_policy: str, transport_key: Optional[str] = None, parent_id: Optional[int] = None, last_used: Optional[float] = None) -> Optional[int]:
         return self.sqlite_handler.create_transport_key(name, flood_policy, transport_key, parent_id, last_used)

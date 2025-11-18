@@ -225,7 +225,7 @@ class RRDToolHandler:
                 'type_8': 'Returned Path (PATH)',
                 'type_9': 'Trace (TRACE)',
                 'type_10': 'Multi-part Packet',
-                'type_11': 'Reserved Type 11',
+                'type_11': 'Control Packet Data',
                 'type_12': 'Reserved Type 12',
                 'type_13': 'Reserved Type 13',
                 'type_14': 'Reserved Type 14',

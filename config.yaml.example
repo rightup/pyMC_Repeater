@@ -137,6 +137,15 @@ storage:
     # - 1 hour resolution for 1 year
 
 
+
+
+
+letsmesh:
+  enabled: true
+  iata_code: "test"  # e.g., "SFO", "LHR", "test"
+  broker_index: 0                  # Which LetsMesh broker (0=EU, 1=US West)
+  status_interval: 60  
+
 logging:
   # Log level: DEBUG, INFO, WARNING, ERROR
   level: INFO

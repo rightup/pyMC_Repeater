@@ -76,7 +76,9 @@ class RepeaterHandler(BaseHandler):
 
         # Storage collector for persistent packet logging
         try:
-            self.storage = StorageCollector(config)
+    
+            local_identity = dispatcher.local_identity if dispatcher else None
+            self.storage = StorageCollector(config, local_identity)
             logger.info("StorageCollector initialized successfully")
         except Exception as e:
             logger.error(f"Failed to initialize StorageCollector: {e}")

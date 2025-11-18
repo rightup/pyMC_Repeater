@@ -19,12 +19,12 @@ def b64url(x: bytes) -> str:
 # Let's Mesh MQTT Broker List (WebSocket Secure)
 # --------------------------------------------------------------------
 LETSMESH_BROKERS = [
-    {
-        "name": "test",
-        "host": "localhost",
-        "port": 8883,
-        "audience": "mqtt.yourdomain.com"
-    },
+    # {
+    #     "name": "test",
+    #     "host": "localhost",
+    #     "port": 8883,
+    #     "audience": "mqtt.yourdomain.com"
+    # },
     {
         "name": "Europe (LetsMesh v1)",
         "host": "mqtt-eu-v1.letsmesh.net",
@@ -63,12 +63,12 @@ class MeshCoreToMqttJwtPusher:
         public_key: str,
         iata_code: str,
         broker_index: int = 0,
-        topic_prefix: str = "meshcore",
+        topic_prefix: str = "pymc-repeater",
         jwt_expiry_minutes: int = 10,
-        use_tls: bool = False,
+        use_tls: bool = True,
         status_interval: int = 60,  # Heartbeat interval in seconds
-        model: str = "PyMC-Gateway",
-        firmware_version: str = "1.0.0",
+        model: str = "PyMC-Repeater",
+        firmware_version: str = "0.0.0",
     ):
 
         if broker_index >= len(LETSMESH_BROKERS):
