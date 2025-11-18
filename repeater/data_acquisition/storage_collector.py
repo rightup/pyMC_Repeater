@@ -69,11 +69,9 @@ class StorageCollector:
         # Publish to LetsMesh if enabled
         if self.letsmesh_handler:
             try:
-                # If packet has raw_data, publish as raw hex, otherwise publish as structured packet
-                if "raw_data" in packet_record and packet_record["raw_data"]:
-                    self.letsmesh_handler.publish_raw_data(packet_record["raw_data"])
-                else:
-                    self.letsmesh_handler.publish_packet(packet_record)
+                # Only publish raw packet data if raw_packet exists
+                if "raw_packet" in packet_record and packet_record["raw_packet"]:
+                    self.letsmesh_handler.publish_raw_data(packet_record["raw_packet"])
             except Exception as e:
                 logger.error(f"Failed to publish packet to LetsMesh: {e}")
 
