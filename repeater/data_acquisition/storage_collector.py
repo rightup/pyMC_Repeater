@@ -33,22 +33,27 @@ class StorageCollector:
                 if not local_identity:
                     logger.error("Cannot initialize LetsMesh: No local_identity provided")
                 else:
- 
-{                   private_key_hex = identity_key
-                    public_key_hex = local_identity.get_public_key().hex()
-                    
-                    self.letsmesh_handler = MeshCoreToMqttJwtPusher(
-                        private_key=private_key_hex,
-                        public_key=public_key_hex,
-                        iata_code=letsmesh_config.get("iata_code", "test"),
-                        broker_index=letsmesh_config.get("broker_index", 0),
-                        status_interval=letsmesh_config.get("status_interval", 60),
-                        model=letsmesh_config.get("model", "PyMC-Repeater"),
-                        firmware_version=__version__
-                    )
-                    self.letsmesh_handler.connect()
-                    logger.info(f"LetsMesh handler initialized (v{__version__}) with public key: {public_key_hex[:16]}...")
-}         except Exception as e:
+                    # Get the identity_key (private key seed) from config
+                    identity_key = config.get("mesh", {}).get("identity_key")
+                    if not identity_key:
+                        logger.error("Cannot initialize LetsMesh: No identity_key found in mesh config")
+                    else:
+                        # Use identity_key as private key and get public key from local_identity
+                        private_key_hex = identity_key
+                        public_key_hex = local_identity.get_public_key().hex()
+                        
+                        self.letsmesh_handler = MeshCoreToMqttJwtPusher(
+                            private_key=private_key_hex,
+                            public_key=public_key_hex,
+                            iata_code=letsmesh_config.get("iata_code", "test"),
+                            broker_index=letsmesh_config.get("broker_index", 0),
+                            status_interval=letsmesh_config.get("status_interval", 60),
+                            model=letsmesh_config.get("model", "PyMC-Repeater"),
+                            firmware_version=__version__
+                        )
+                        self.letsmesh_handler.connect()
+                        logger.info(f"LetsMesh handler initialized (v{__version__}) with public key: {public_key_hex[:16]}...")
+            except Exception as e:
                 logger.error(f"Failed to initialize LetsMesh handler: {e}")
                 self.letsmesh_handler = None
 
