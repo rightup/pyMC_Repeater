@@ -63,12 +63,14 @@ class MeshCoreToMqttJwtPusher:
         public_key: str,
         iata_code: str,
         broker_index: int = 0,
-        topic_prefix: str = "pymc-repeater",
+        topic_prefix: str = "meshcore",
         jwt_expiry_minutes: int = 10,
         use_tls: bool = True,
         status_interval: int = 60,  # Heartbeat interval in seconds
         model: str = "PyMC-Repeater",
-        firmware_version: str = "0.0.0",
+        app_version: str = "0.0.0",
+        node_name: str = None,
+        radio_config: str = None,
     ):
 
         if broker_index >= len(LETSMESH_BROKERS):
@@ -83,7 +85,9 @@ class MeshCoreToMqttJwtPusher:
         self.use_tls = use_tls
         self.status_interval = status_interval
         self.model = model
-        self.firmware_version = firmware_version
+        self.app_version = app_version
+        self.node_name = node_name or "PyMC-Repeater"
+        self.radio_config = radio_config or "915.0,125.0,7,5"
         self._status_task = None
         self._running = False
         self._packet_stats = {
@@ -150,7 +154,11 @@ class MeshCoreToMqttJwtPusher:
             logging.info(f"Connected to {self.broker['name']}")
             self._running = True
             # Publish initial status on connect
-            self.publish_status(state="online")
+            self.publish_status(
+                state="online",
+                origin=self.node_name,
+                radio_config=self.radio_config
+            )
         else:
             logging.error(f"Failed with code {rc}")
 
@@ -194,7 +202,11 @@ class MeshCoreToMqttJwtPusher:
     def disconnect(self):
         self._running = False
         # Publish offline status before disconnecting
-        self.publish_status(state="offline")
+        self.publish_status(
+            state="offline",
+            origin=self.node_name,
+            radio_config=self.radio_config
+        )
         import time
         time.sleep(0.5)  # Give time for the message to be sent
         
@@ -207,7 +219,11 @@ class MeshCoreToMqttJwtPusher:
         import time
         while self._running:
             try:
-                self.publish_status(state="online")
+                self.publish_status(
+                    state="online", 
+                    origin=self.node_name,
+                    radio_config=self.radio_config
+                )
                 time.sleep(self.status_interval)
             except Exception as e:
                 logging.error(f"Status heartbeat error: {e}")
@@ -238,7 +254,8 @@ class MeshCoreToMqttJwtPusher:
         self._packet_stats["packets_sent"] += 1
         return self.publish_packet(pkt, subtopic, retain)
     
-    def publish_status(self, state: str = "online", location: dict = None, extra_stats: dict = None):
+    def publish_status(self, state: str = "online", location: dict = None, extra_stats: dict = None, 
+                      origin: str = None, radio_config: str = None):
         """
         Publish device status/heartbeat message
         
@@ -246,21 +263,28 @@ class MeshCoreToMqttJwtPusher:
             state: Device state (online/offline)
             location: Optional dict with latitude/longitude
             extra_stats: Optional additional statistics to include
+            origin: Node name/description
+            radio_config: Radio configuration string (freq,bw,sf,cr)
         """
-        uptime = (datetime.now(UTC) - self._packet_stats["start_time"]).total_seconds()
+        uptime_secs = int((datetime.now(UTC) - self._packet_stats["start_time"]).total_seconds())
         
         status = {
-            "origin_id": self.public_key,
+            "status": state,
             "timestamp": datetime.now(UTC).isoformat(),
-            "state": state,
+            "origin": origin or "PyMC-Repeater",
+            "origin_id": self.public_key,
+            "model": self.model,
+            "firmware_version": self.app_version,
+            "radio": radio_config or "0.0,0.0,0,0",
+            "client_version": f"pyMC_repeater_{self.app_version}",
             "stats": {
-                "uptime": int(uptime),
+                "uptime_secs": uptime_secs,
                 "packets_sent": self._packet_stats["packets_sent"],
                 "packets_received": self._packet_stats["packets_received"],
+                "errors": 0,
+                "queue_len": 0,
                 **(extra_stats or {})
-            },
-            "model": self.model,
-            "firmware_version": self.firmware_version
+            }
         }
         
         if location:
@@ -331,7 +355,7 @@ if __name__ == "__main__":
         broker_index=0,
         status_interval=30 if mode == "live" else 0,  # 30s heartbeat in live mode
         model="PyMC-Gateway",
-        firmware_version="1.0.0"
+        app_version="1.0.0"
     )
 
     pusher.connect()

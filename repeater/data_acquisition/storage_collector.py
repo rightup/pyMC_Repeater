@@ -1,6 +1,7 @@
 import json
 import logging
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict, Any
 
@@ -42,6 +43,15 @@ class StorageCollector:
                         private_key_hex = identity_key.hex()
                         public_key_hex = local_identity.get_public_key().hex()
                         
+                        # Get node name and radio config from config
+                        node_name = self.config.get("repeater", {}).get("node_name", "PyMC-Repeater")
+                        radio_config = self.config.get("radio", {})
+                        radio_freq = radio_config.get("frequency", 915.0)
+                        radio_bw = radio_config.get("bandwidth", 125.0)
+                        radio_sf = radio_config.get("spreading_factor", 7)
+                        radio_cr = radio_config.get("coding_rate", 5)
+                        radio_config_str = f"{radio_freq},{radio_bw},{radio_sf},{radio_cr}"
+                        
                         self.letsmesh_handler = MeshCoreToMqttJwtPusher(
                             private_key=private_key_hex,
                             public_key=public_key_hex,
@@ -49,7 +59,9 @@ class StorageCollector:
                             broker_index=letsmesh_config.get("broker_index", 0),
                             status_interval=letsmesh_config.get("status_interval", 60),
                             model=letsmesh_config.get("model", "PyMC-Repeater"),
-                            firmware_version=__version__
+                            app_version=__version__,
+                            node_name=node_name,
+                            radio_config=radio_config_str
                         )
                         self.letsmesh_handler.connect()
                         logger.info(f"LetsMesh handler initialized (v{__version__}) with public key: {public_key_hex[:16]}...")
@@ -69,9 +81,40 @@ class StorageCollector:
         # Publish to LetsMesh if enabled
         if self.letsmesh_handler:
             try:
-                # Publish raw packet data if available
+                # Format packet data for LetsMesh publish_packet
                 if "raw_packet" in packet_record and packet_record["raw_packet"]:
-                    self.letsmesh_handler.publish_raw_data(packet_record["raw_packet"])
+                    # Extract timestamp and format date/time
+                    timestamp = packet_record.get("timestamp", time.time())
+                    dt = datetime.fromtimestamp(timestamp)
+                    
+                    # Get node name from config
+                    node_name = self.config.get("repeater", {}).get("node_name", "Unknown")
+                    
+                    # Format route type (1=Flood->F, 2=Direct->D, etc)
+                    route_map = {1: "F", 2: "D"}
+                    route = route_map.get(packet_record.get("route", 0), str(packet_record.get("route", 0)))
+                    
+                    letsmesh_packet = {
+                        "origin": node_name,
+                        "origin_id": self.letsmesh_handler.public_key,
+                        "timestamp": dt.isoformat(),
+                        "type": "PACKET", 
+                        "direction": "rx",
+                        "time": dt.strftime("%H:%M:%S"),
+                        "date": dt.strftime("%-d/%-m/%Y"),
+                        "len": str(len(packet_record["raw_packet"]) // 2),  # Raw packet length in bytes
+                        "packet_type": str(packet_record.get("type", 0)),
+                        "route": route,
+                        "payload_len": str(packet_record.get("payload_length", 0)),
+                        "raw": packet_record["raw_packet"],
+                        "SNR": str(packet_record.get("snr", 0)),
+                        "RSSI": str(packet_record.get("rssi", 0)), 
+                        "score": str(int(packet_record.get("score", 0) * 1000)),  # Convert to integer score
+                        "duration": "0",  # Not available in our packet record
+                        "hash": packet_record.get("packet_hash", "")
+                    }
+                    
+                    self.letsmesh_handler.publish_packet(letsmesh_packet)
             except Exception as e:
                 logger.error(f"Failed to publish packet to LetsMesh: {e}")
 
