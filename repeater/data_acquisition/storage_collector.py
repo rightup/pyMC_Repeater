@@ -25,7 +25,7 @@ class StorageCollector:
         self.rrd_handler = RRDToolHandler(self.storage_dir)
         self.mqtt_handler = MQTTHandler(config.get("mqtt", {}), node_name)
         
-                # Initialize LetsMesh handler if configured
+        # Initialize LetsMesh handler if configured
         self.letsmesh_handler = None
         letsmesh_config = config.get("letsmesh", {})
         if letsmesh_config.get("enabled", False):
@@ -33,13 +33,13 @@ class StorageCollector:
                 if not local_identity:
                     logger.error("Cannot initialize LetsMesh: No local_identity provided")
                 else:
-                    # Get the identity_key (private key seed) from config
+
                     identity_key = config.get("mesh", {}).get("identity_key")
                     if not identity_key:
                         logger.error("Cannot initialize LetsMesh: No identity_key found in mesh config")
                     else:
-                        # Use identity_key as private key and get public key from local_identity
-                        private_key_hex = identity_key
+
+                        private_key_hex = identity_key.hex()
                         public_key_hex = local_identity.get_public_key().hex()
                         
                         self.letsmesh_handler = MeshCoreToMqttJwtPusher(
