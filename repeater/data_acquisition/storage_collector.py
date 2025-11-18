@@ -69,7 +69,7 @@ class StorageCollector:
         # Publish to LetsMesh if enabled
         if self.letsmesh_handler:
             try:
-                # Only publish raw packet data if raw_packet exists
+                # Publish raw packet data if available
                 if "raw_packet" in packet_record and packet_record["raw_packet"]:
                     self.letsmesh_handler.publish_raw_data(packet_record["raw_packet"])
             except Exception as e:

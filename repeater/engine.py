@@ -231,7 +231,7 @@ class RepeaterHandler(BaseHandler):
             "forwarded_path": (
                 [f"{b:02X}" for b in forwarded_path] if forwarded_path is not None else None
             ),
-
+            "raw_packet": packet.write_to().hex() if hasattr(packet, "write_to") else None,
         }
 
         # Store packet record to persistent storage
