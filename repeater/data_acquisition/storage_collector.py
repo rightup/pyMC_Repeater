@@ -25,7 +25,7 @@ class StorageCollector:
         self.rrd_handler = RRDToolHandler(self.storage_dir)
         self.mqtt_handler = MQTTHandler(config.get("mqtt", {}), node_name)
         
-        # Initialize LetsMesh handler if configured
+                # Initialize LetsMesh handler if configured
         self.letsmesh_handler = None
         letsmesh_config = config.get("letsmesh", {})
         if letsmesh_config.get("enabled", False):
@@ -33,7 +33,8 @@ class StorageCollector:
                 if not local_identity:
                     logger.error("Cannot initialize LetsMesh: No local_identity provided")
                 else:
-                    private_key_hex = local_identity.seed.hex()
+ 
+{                   private_key_hex = identity_key
                     public_key_hex = local_identity.get_public_key().hex()
                     
                     self.letsmesh_handler = MeshCoreToMqttJwtPusher(
@@ -42,11 +43,12 @@ class StorageCollector:
                         iata_code=letsmesh_config.get("iata_code", "test"),
                         broker_index=letsmesh_config.get("broker_index", 0),
                         status_interval=letsmesh_config.get("status_interval", 60),
+                        model=letsmesh_config.get("model", "PyMC-Repeater"),
                         firmware_version=__version__
                     )
                     self.letsmesh_handler.connect()
                     logger.info(f"LetsMesh handler initialized (v{__version__}) with public key: {public_key_hex[:16]}...")
-            except Exception as e:
+}         except Exception as e:
                 logger.error(f"Failed to initialize LetsMesh handler: {e}")
                 self.letsmesh_handler = None
 
