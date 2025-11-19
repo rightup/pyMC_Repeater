@@ -115,7 +115,7 @@ cd pyMC_Repeater
 
 **Quick Install:**
 ```bash
-sudo bash manage.sh
+sudo ./manage.sh
 ```
 
 This script will:
@@ -149,7 +149,7 @@ The configuration file is created and configured during installation at:
 
 To reconfigure radio and hardware settings after installation, run:
 ```bash
-sudo bash setup-radio-config.sh /etc/pymc_repeater or sudo bash manage.sh
+sudo ./setup-radio-config.sh /etc/pymc_repeater or sudo ./manage.sh
 sudo systemctl restart pymc-repeater
 
 ```
@@ -162,7 +162,7 @@ To upgrade an existing installation to the latest version:
 cd pyMC_Repeater
 
 # Run the upgrade script
-sudo bash manage.sh
+sudo ./manage.sh
 ```
 
 The upgrade script will:
