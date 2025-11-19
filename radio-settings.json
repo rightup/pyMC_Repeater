@@ -31,6 +31,38 @@
       "tx_power": 22,
       "preamble_length": 17
     },
+    "pimesh-1w-usa": {
+      "name": "PiMesh-1W (USA)",
+      "bus_id": 0,
+      "cs_id": 0,
+      "cs_pin": 21,
+      "reset_pin": 18,
+      "busy_pin": 20,
+      "irq_pin": 16,
+      "txen_pin": 13,
+      "rxen_pin": 12,
+      "txled_pin": -1,
+      "rxled_pin": -1,
+      "tx_power": 30,
+      "use_dio3_tcxo": true,
+      "preamble_length": 17
+    },
+    "pimesh-1w-uk": {
+      "name": "PiMesh-1W (UK)",
+      "bus_id": 0,
+      "cs_id": 0,
+      "cs_pin": 21,
+      "reset_pin": 18,
+      "busy_pin": 20,
+      "irq_pin": 16,
+      "txen_pin": 13,
+      "rxen_pin": 12,
+      "txled_pin": -1,
+      "rxled_pin": -1,
+      "tx_power": 22,
+      "use_dio3_tcxo": true,
+      "preamble_length": 17
+    },
     "meshadv-mini": {
       "name": "MeshAdv Mini",
       "bus_id": 0,
