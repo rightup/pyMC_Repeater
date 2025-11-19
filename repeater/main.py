@@ -205,6 +205,7 @@ class RepeaterDaemon:
                     "path_snrs": path_snrs,  # ["58(14.5dB)", "19(4.8dB)"]
                     "path_snr_details": path_snr_details,  # [{"hash": "29", "snr_raw": 58, "snr_db": 14.5}]
                     "is_trace": True,  
+                    "raw_packet": packet.write_to().hex() if hasattr(packet, "write_to") else None,
                 }
                 self.repeater_handler.log_trace_record(packet_record)
     

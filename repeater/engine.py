@@ -266,6 +266,7 @@ class RepeaterHandler(BaseHandler):
             self.recent_packets.pop(0)
 
     def log_trace_record(self, packet_record: dict) -> None:
+        """Manually log a packet trace record (used by external callers)"""
         self.recent_packets.append(packet_record)
         
         self.rx_count += 1
@@ -273,6 +274,13 @@ class RepeaterHandler(BaseHandler):
             self.forwarded_count += 1
         else:
             self.dropped_count += 1
+        
+        # Store to persistent storage (same as __call__ does)
+        if self.storage:
+            try:
+                self.storage.record_packet(packet_record)
+            except Exception as e:
+                logger.error(f"Failed to store packet record: {e}")
         
         if len(self.recent_packets) > self.max_recent_packets:
             self.recent_packets.pop(0)
