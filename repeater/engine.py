@@ -78,7 +78,7 @@ class RepeaterHandler(BaseHandler):
         try:
     
             local_identity = dispatcher.local_identity if dispatcher else None
-            self.storage = StorageCollector(config, local_identity)
+            self.storage = StorageCollector(config, local_identity, repeater_handler=self)
             logger.info("StorageCollector initialized successfully")
         except Exception as e:
             logger.error(f"Failed to initialize StorageCollector: {e}")

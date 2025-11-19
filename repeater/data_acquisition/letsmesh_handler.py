@@ -6,6 +6,7 @@ import paho.mqtt.client as mqtt
 
 from datetime import datetime, timedelta, UTC
 from nacl.signing import SigningKey
+from typing import Callable, Optional
 from .. import __version__
 
 # --------------------------------------------------------------------
@@ -19,12 +20,6 @@ def b64url(x: bytes) -> str:
 # Let's Mesh MQTT Broker List (WebSocket Secure)
 # --------------------------------------------------------------------
 LETSMESH_BROKERS = [
-    # {
-    #     "name": "test",
-    #     "host": "localhost",
-    #     "port": 8883,
-    #     "audience": "mqtt.yourdomain.com"
-    # },
     {
         "name": "Europe (LetsMesh v1)",
         "host": "mqtt-eu-v1.letsmesh.net",
@@ -61,15 +56,20 @@ class MeshCoreToMqttJwtPusher:
         self,
         private_key: str,
         public_key: str,
-        iata_code: str,
-        broker_index: int = 0,
-        topic_prefix: str = "meshcore",
+        config: dict,
         jwt_expiry_minutes: int = 10,
         use_tls: bool = True,
-        status_interval: int = 60,  # Heartbeat interval in seconds
-        node_name: str = None,
-        radio_config: str = None,
+        stats_provider: Optional[Callable[[], dict]] = None,
     ):
+        # Extract values from config
+        from ..config import get_node_info
+        node_info = get_node_info(config)
+        
+        iata_code = node_info["iata_code"]
+        broker_index = node_info["broker_index"]
+        status_interval = node_info["status_interval"]
+        node_name = node_info["node_name"]
+        radio_config = node_info["radio_config"]
 
         if broker_index >= len(LETSMESH_BROKERS):
             raise ValueError(f"Invalid broker_index {broker_index}")
@@ -78,20 +78,15 @@ class MeshCoreToMqttJwtPusher:
         self.private_key_hex = private_key
         self.public_key = public_key.upper()
         self.iata_code = iata_code
-        self.topic_prefix = topic_prefix
         self.jwt_expiry_minutes = jwt_expiry_minutes
         self.use_tls = use_tls
         self.status_interval = status_interval
         self.app_version = __version__
-        self.node_name = node_name or "PyMC-Repeater"
-        self.radio_config = radio_config or "0.0,0.0,0,0"
+        self.node_name = node_name
+        self.radio_config = radio_config
+        self.stats_provider = stats_provider
         self._status_task = None
         self._running = False
-        self._packet_stats = {
-            "packets_sent": 0,
-            "packets_received": 0,
-            "start_time": datetime.now(UTC)
-        }
 
         # MQTT WebSocket client
         self.client = mqtt.Client(
@@ -237,7 +232,7 @@ class MeshCoreToMqttJwtPusher:
         }
 
     def _topic(self, subtopic: str) -> str:
-        return f"{self.topic_prefix}/{self.iata_code}/{self.public_key}/{subtopic}"
+        return f"meshcore/{self.iata_code}/{self.public_key}/{subtopic}"
 
     def publish_packet(self, pkt: dict, subtopic="packets", retain=False):
         return self.publish(subtopic, self._process_packet(pkt), retain)
@@ -248,11 +243,16 @@ class MeshCoreToMqttJwtPusher:
             "data": raw_hex,
             "bytes": len(raw_hex) // 2
         }
-        self._packet_stats["packets_sent"] += 1
         return self.publish_packet(pkt, subtopic, retain)
     
-    def publish_status(self, state: str = "online", location: dict = None, extra_stats: dict = None, 
-                      origin: str = None, radio_config: str = None):
+    def publish_status(
+        self,
+        state: str = "online",
+        location: Optional[dict] = None,
+        extra_stats: Optional[dict] = None,
+        origin: Optional[str] = None,
+        radio_config: Optional[str] = None,
+    ):
         """
         Publish device status/heartbeat message
         
@@ -263,21 +263,26 @@ class MeshCoreToMqttJwtPusher:
             origin: Node name/description
             radio_config: Radio configuration string (freq,bw,sf,cr)
         """
-        uptime_secs = int((datetime.now(UTC) - self._packet_stats["start_time"]).total_seconds())
+        # Get live stats from provider if available
+        if self.stats_provider:
+            live_stats = self.stats_provider()
+        else:
+            live_stats = {
+                "uptime_secs": 0,
+                "packets_sent": 0,
+                "packets_received": 0
+            }
         
         status = {
             "status": state,
             "timestamp": datetime.now(UTC).isoformat(),
-            "origin": origin or "PyMC-Repeater",
+            "origin": origin or self.node_name,
             "origin_id": self.public_key,
-            # "model": self.model,
             "firmware_version": self.app_version,
-            "radio": radio_config or "0.0,0.0,0,0",
+            "radio": radio_config or self.radio_config,
             "client_version": f"pyMC_repeater_{self.app_version}",
             "stats": {
-                "uptime_secs": uptime_secs,
-                "packets_sent": self._packet_stats["packets_sent"],
-                "packets_received": self._packet_stats["packets_received"],
+                **live_stats,
                 "errors": 0,
                 "queue_len": 0,
                 **(extra_stats or {})

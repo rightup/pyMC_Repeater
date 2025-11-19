@@ -15,8 +15,9 @@ logger = logging.getLogger("StorageCollector")
 
 
 class StorageCollector:
-    def __init__(self, config: dict, local_identity=None):
+    def __init__(self, config: dict, local_identity=None, repeater_handler=None):
         self.config = config
+        self.repeater_handler = repeater_handler
         self.storage_dir = Path(config.get("storage_dir", "/var/lib/pymc_repeater"))
         self.storage_dir.mkdir(parents=True, exist_ok=True)
         
@@ -28,40 +29,39 @@ class StorageCollector:
         
         # Initialize LetsMesh handler if configured
         self.letsmesh_handler = None
-        letsmesh_config = config.get("letsmesh", {})
-        if letsmesh_config.get("enabled", False):
+        if config.get("letsmesh", {}).get("enabled", False) and local_identity:
             try:
-                if not local_identity:
-                    logger.error("Cannot initialize LetsMesh: No local_identity provided")
-                else:
-
-                    identity_key = config.get("mesh", {}).get("identity_key")
-                    if not identity_key:
-                        logger.error("Cannot initialize LetsMesh: No identity_key found in mesh config")
-                    else:
-
-                        from ..config import get_node_info
-                        
-                        private_key_hex = identity_key.hex()
-                        public_key_hex = local_identity.get_public_key().hex()
-                        
-                        # Get all config from config module
-                        node_info = get_node_info(self.config)
-                        
-                        self.letsmesh_handler = MeshCoreToMqttJwtPusher(
-                            private_key=private_key_hex,
-                            public_key=public_key_hex,
-                            iata_code=node_info["iata_code"],
-                            broker_index=node_info["broker_index"],
-                            status_interval=node_info["status_interval"],
-                            node_name=node_info["node_name"],
-                            radio_config=node_info["radio_config"]
-                        )
-                        self.letsmesh_handler.connect()
-                        logger.info(f"LetsMesh handler initialized with public key: {public_key_hex[:16]}...")
+                # Get keys from local_identity (signing_key.encode() is the private key seed)
+                private_key_hex = local_identity.signing_key.encode().hex()
+                public_key_hex = local_identity.get_public_key().hex()
+                
+                self.letsmesh_handler = MeshCoreToMqttJwtPusher(
+                    private_key=private_key_hex,
+                    public_key=public_key_hex,
+                    config=config,
+                    stats_provider=self._get_live_stats
+                )
+                self.letsmesh_handler.connect()
+                logger.info(f"LetsMesh handler initialized with public key: {public_key_hex[:16]}...")
             except Exception as e:
                 logger.error(f"Failed to initialize LetsMesh handler: {e}")
                 self.letsmesh_handler = None
+
+    def _get_live_stats(self) -> dict:
+        """Get live stats from RepeaterHandler"""
+        if not self.repeater_handler:
+            return {
+                "uptime_secs": 0,
+                "packets_sent": 0,
+                "packets_received": 0
+            }
+        
+        uptime_secs = int(time.time() - self.repeater_handler.start_time)
+        return {
+            "uptime_secs": uptime_secs,
+            "packets_sent": self.repeater_handler.forwarded_count,
+            "packets_received": self.repeater_handler.rx_count
+        }
 
     def record_packet(self, packet_record: dict):
         logger.debug(f"Recording packet: type={packet_record.get('type')}, transmitted={packet_record.get('transmitted')}")
