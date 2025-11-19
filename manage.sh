@@ -204,7 +204,7 @@ install_repeater() {
     
     echo "25"; echo "# Installing system dependencies..."
     apt-get update -qq
-    apt-get install -y libffi-dev jq
+    apt-get install -y libffi-dev jq pip
     
     echo "30"; echo "# Installing files..."
     cp -r repeater "$INSTALL_DIR/"
