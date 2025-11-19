@@ -9,7 +9,7 @@ from .sqlite_handler import SQLiteHandler
 from .rrdtool_handler import RRDToolHandler
 from .mqtt_handler import MQTTHandler
 from .letsmesh_handler import MeshCoreToMqttJwtPusher
-from .. import __version__
+
 
 logger = logging.getLogger("StorageCollector")
 
@@ -40,31 +40,25 @@ class StorageCollector:
                         logger.error("Cannot initialize LetsMesh: No identity_key found in mesh config")
                     else:
 
+                        from ..config import get_node_info
+                        
                         private_key_hex = identity_key.hex()
                         public_key_hex = local_identity.get_public_key().hex()
                         
-                        # Get node name and radio config from config
-                        node_name = self.config.get("repeater", {}).get("node_name", "PyMC-Repeater")
-                        radio_config = self.config.get("radio", {})
-                        radio_freq = radio_config.get("frequency", 915.0)
-                        radio_bw = radio_config.get("bandwidth", 125.0)
-                        radio_sf = radio_config.get("spreading_factor", 7)
-                        radio_cr = radio_config.get("coding_rate", 5)
-                        radio_config_str = f"{radio_freq},{radio_bw},{radio_sf},{radio_cr}"
+                        # Get all config from config module
+                        node_info = get_node_info(self.config)
                         
                         self.letsmesh_handler = MeshCoreToMqttJwtPusher(
                             private_key=private_key_hex,
                             public_key=public_key_hex,
-                            iata_code=letsmesh_config.get("iata_code", "test"),
-                            broker_index=letsmesh_config.get("broker_index", 0),
-                            status_interval=letsmesh_config.get("status_interval", 60),
-                            model=letsmesh_config.get("model", "PyMC-Repeater"),
-                            app_version=__version__,
-                            node_name=node_name,
-                            radio_config=radio_config_str
+                            iata_code=node_info["iata_code"],
+                            broker_index=node_info["broker_index"],
+                            status_interval=node_info["status_interval"],
+                            node_name=node_info["node_name"],
+                            radio_config=node_info["radio_config"]
                         )
                         self.letsmesh_handler.connect()
-                        logger.info(f"LetsMesh handler initialized (v{__version__}) with public key: {public_key_hex[:16]}...")
+                        logger.info(f"LetsMesh handler initialized with public key: {public_key_hex[:16]}...")
             except Exception as e:
                 logger.error(f"Failed to initialize LetsMesh handler: {e}")
                 self.letsmesh_handler = None

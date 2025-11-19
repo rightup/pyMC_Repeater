@@ -9,6 +9,36 @@ import yaml
 logger = logging.getLogger("Config")
 
 
+def get_node_info(config: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Extract node name, radio configuration, and LetsMesh settings from config.
+    
+    Args:
+        config: Configuration dictionary
+        
+    Returns:
+        Dictionary with node_name, radio_config, and LetsMesh configuration
+    """
+    node_name = config.get("repeater", {}).get("node_name", "PyMC-Repeater")
+    radio_config = config.get("radio", {})
+    radio_freq = radio_config.get("frequency", 0.0)
+    radio_bw = radio_config.get("bandwidth", 0.0)
+    radio_sf = radio_config.get("spreading_factor", 7)
+    radio_cr = radio_config.get("coding_rate", 5)
+    radio_config_str = f"{radio_freq},{radio_bw},{radio_sf},{radio_cr}"
+    
+    letsmesh_config = config.get("letsmesh", {})
+    
+    return {
+        "node_name": node_name,
+        "radio_config": radio_config_str,
+        "iata_code": letsmesh_config.get("iata_code", "TEST"),
+        "broker_index": letsmesh_config.get("broker_index", 0),
+        "status_interval": letsmesh_config.get("status_interval", 60),
+        "model": letsmesh_config.get("model", "PyMC-Repeater")
+    }
+
+
 def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
     if config_path is None:
         config_path = os.getenv("PYMC_REPEATER_CONFIG", "/etc/pymc_repeater/config.yaml")
