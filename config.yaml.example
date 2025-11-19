@@ -144,7 +144,24 @@ letsmesh:
   enabled: true
   iata_code: "test"  # e.g., "SFO", "LHR", "test"
   broker_index: 0                  # Which LetsMesh broker (0=EU, 1=US West)
-  status_interval: 60  
+  status_interval: 60
+  
+  # Block specific packet types from being published to LetsMesh
+  # If not specified or empty list, all types are published
+  # Available types: REQ, RESPONSE, TXT_MSG, ACK, ADVERT, GRP_TXT, 
+  #                  GRP_DATA, ANON_REQ, PATH, TRACE, RAW_CUSTOM
+  disallowed_packet_types: []
+    # - REQ           # Don't publish requests
+    # - RESPONSE      # Don't publish responses
+    # - TXT_MSG       # Don't publish text messages
+    # - ACK           # Don't publish acknowledgments
+    # - ADVERT        # Don't publish advertisements
+    # - GRP_TXT       # Don't publish group text messages
+    # - GRP_DATA      # Don't publish group data
+    # - ANON_REQ      # Don't publish anonymous requests
+    # - PATH          # Don't publish path packets
+    # - TRACE         # Don't publish trace packets
+    # - RAW_CUSTOM    # Don't publish custom raw packets
 
 logging:
   # Log level: DEBUG, INFO, WARNING, ERROR

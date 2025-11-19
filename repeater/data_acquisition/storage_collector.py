@@ -8,7 +8,7 @@ from typing import Optional, Dict, Any
 from .sqlite_handler import SQLiteHandler
 from .rrdtool_handler import RRDToolHandler
 from .mqtt_handler import MQTTHandler
-from .letsmesh_handler import MeshCoreToMqttJwtPusher
+from .letsmesh_handler import MeshCoreToMqttJwtPusher, LetsMeshPacket
 
 
 logger = logging.getLogger("StorageCollector")
@@ -42,10 +42,23 @@ class StorageCollector:
                     stats_provider=self._get_live_stats
                 )
                 self.letsmesh_handler.connect()
+                
+                # Get disallowed packet types from config
+                from ..config import get_node_info
+                node_info = get_node_info(config)
+                self.disallowed_packet_types = set(node_info["disallowed_packet_types"])
+                
                 logger.info(f"LetsMesh handler initialized with public key: {public_key_hex[:16]}...")
+                if self.disallowed_packet_types:
+                    logger.info(f"Disallowed packet types: {sorted(self.disallowed_packet_types)}")
+                else:
+                    logger.info("All packet types allowed")
             except Exception as e:
                 logger.error(f"Failed to initialize LetsMesh handler: {e}")
                 self.letsmesh_handler = None
+                self.disallowed_packet_types = set()
+        else:
+            self.disallowed_packet_types = set()
 
     def _get_live_stats(self) -> dict:
         """Get live stats from RepeaterHandler"""
@@ -75,40 +88,28 @@ class StorageCollector:
         # Publish to LetsMesh if enabled
         if self.letsmesh_handler:
             try:
-                # Format packet data for LetsMesh publish_packet
-                if "raw_packet" in packet_record and packet_record["raw_packet"]:
-                    # Extract timestamp and format date/time
-                    timestamp = packet_record.get("timestamp", time.time())
-                    dt = datetime.fromtimestamp(timestamp)
+                # Check if packet has type field
+                if "type" not in packet_record:
+                    logger.error("Cannot publish to LetsMesh: packet_record missing 'type' field")
+                    return
+                
+                packet_type = packet_record["type"]
+
+                if packet_type in self.disallowed_packet_types:
+                    logger.debug(f"Skipped publishing packet type 0x{packet_type:02X} (in disallowed types)")
+                    return
+                
+                # Create LetsMesh packet from record
+                node_name = self.config.get("repeater", {}).get("node_name", "Unknown")
+                letsmesh_packet = LetsMeshPacket.from_packet_record(
+                    packet_record,
+                    origin=node_name,
+                    origin_id=self.letsmesh_handler.public_key
+                )
+                
+                if letsmesh_packet:
+                    self.letsmesh_handler.publish_packet(letsmesh_packet.to_dict())
                     
-                    # Get node name from config
-                    node_name = self.config.get("repeater", {}).get("node_name", "Unknown")
-                    
-                    # Format route type (1=Flood->F, 2=Direct->D, etc)
-                    route_map = {1: "F", 2: "D"}
-                    route = route_map.get(packet_record.get("route", 0), str(packet_record.get("route", 0)))
-                    
-                    letsmesh_packet = {
-                        "origin": node_name,
-                        "origin_id": self.letsmesh_handler.public_key,
-                        "timestamp": dt.isoformat(),
-                        "type": "PACKET", 
-                        "direction": "rx",
-                        "time": dt.strftime("%H:%M:%S"),
-                        "date": dt.strftime("%-d/%-m/%Y"),
-                        "len": str(len(packet_record["raw_packet"]) // 2),  # Raw packet length in bytes
-                        "packet_type": str(packet_record.get("type", 0)),
-                        "route": route,
-                        "payload_len": str(packet_record.get("payload_length", 0)),
-                        "raw": packet_record["raw_packet"],
-                        "SNR": str(packet_record.get("snr", 0)),
-                        "RSSI": str(packet_record.get("rssi", 0)), 
-                        "score": str(int(packet_record.get("score", 0) * 1000)),  # Convert to integer score
-                        "duration": "0",  # Not available in our packet record
-                        "hash": packet_record.get("packet_hash", "")
-                    }
-                    
-                    self.letsmesh_handler.publish_packet(letsmesh_packet)
             except Exception as e:
                 logger.error(f"Failed to publish packet to LetsMesh: {e}")
 

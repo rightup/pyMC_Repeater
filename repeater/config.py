@@ -29,13 +29,22 @@ def get_node_info(config: Dict[str, Any]) -> Dict[str, Any]:
     
     letsmesh_config = config.get("letsmesh", {})
     
+    from pymc_core.protocol.utils import PAYLOAD_TYPES
+    
+    disallowed_types = letsmesh_config.get("disallowed_packet_types", [])
+    type_name_map = {name: code for code, name in PAYLOAD_TYPES.items()}
+    
+    disallowed_hex = [type_name_map.get(name.upper(), None) for name in disallowed_types]
+    disallowed_hex = [val for val in disallowed_hex if val is not None]  # Filter out invalid names
+    
     return {
         "node_name": node_name,
         "radio_config": radio_config_str,
         "iata_code": letsmesh_config.get("iata_code", "TEST"),
         "broker_index": letsmesh_config.get("broker_index", 0),
         "status_interval": letsmesh_config.get("status_interval", 60),
-        "model": letsmesh_config.get("model", "PyMC-Repeater")
+        "model": letsmesh_config.get("model", "PyMC-Repeater"),
+        "disallowed_packet_types": disallowed_hex
     }
 
 
