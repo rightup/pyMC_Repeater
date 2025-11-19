@@ -278,9 +278,10 @@ class MeshCoreToMqttJwtPusher:
             "timestamp": datetime.now(UTC).isoformat(),
             "origin": origin or self.node_name,
             "origin_id": self.public_key,
+            "model": "PyMC-Repeater",
             "firmware_version": self.app_version,
             "radio": radio_config or self.radio_config,
-            "client_version": f"pyMC_repeater_{self.app_version}",
+            "client_version": f"pyMC_repeater/{self.app_version}",
             "stats": {
                 **live_stats,
                 "errors": 0,
