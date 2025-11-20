@@ -76,7 +76,7 @@ class RepeaterHandler(BaseHandler):
 
         # Storage collector for persistent packet logging
         try:
-    
+
             local_identity = dispatcher.local_identity if dispatcher else None
             self.storage = StorageCollector(config, local_identity, repeater_handler=self)
             logger.info("StorageCollector initialized successfully")
@@ -86,7 +86,7 @@ class RepeaterHandler(BaseHandler):
 
         # Initialize background timer tracking
         self.last_noise_measurement = time.time()
-        self.noise_floor_interval = NOISE_FLOOR_INTERVAL    # 30 seconds
+        self.noise_floor_interval = NOISE_FLOOR_INTERVAL  # 30 seconds
         self._background_task = None
         self._start_background_tasks()
 
@@ -208,9 +208,17 @@ class RepeaterHandler(BaseHandler):
         # Record packet for charts
         packet_record = {
             "timestamp": time.time(),
-            "header": f"0x{packet.header:02X}" if hasattr(packet, "header") and packet.header is not None else None,
-            "payload": packet.payload.hex() if hasattr(packet, "payload") and packet.payload else None,
-            "payload_length": len(packet.payload) if hasattr(packet, "payload") and packet.payload else 0,
+            "header": (
+                f"0x{packet.header:02X}"
+                if hasattr(packet, "header") and packet.header is not None
+                else None
+            ),
+            "payload": (
+                packet.payload.hex() if hasattr(packet, "payload") and packet.payload else None
+            ),
+            "payload_length": (
+                len(packet.payload) if hasattr(packet, "payload") and packet.payload else 0
+            ),
             "type": payload_type,
             "route": route_type,
             "length": len(packet.payload or b""),
@@ -241,8 +249,6 @@ class RepeaterHandler(BaseHandler):
             except Exception as e:
                 logger.error(f"Failed to store packet record: {e}")
 
-
-
         # If this is a duplicate, try to attach it to the original packet
         if is_dupe and len(self.recent_packets) > 0:
             # Find the original packet with same hash
@@ -268,20 +274,20 @@ class RepeaterHandler(BaseHandler):
     def log_trace_record(self, packet_record: dict) -> None:
         """Manually log a packet trace record (used by external callers)"""
         self.recent_packets.append(packet_record)
-        
+
         self.rx_count += 1
         if packet_record.get("transmitted", False):
             self.forwarded_count += 1
         else:
             self.dropped_count += 1
-        
+
         # Store to persistent storage (same as __call__ does)
         if self.storage:
             try:
                 self.storage.record_packet(packet_record)
             except Exception as e:
                 logger.error(f"Failed to store packet record: {e}")
-        
+
         if len(self.recent_packets) > self.max_recent_packets:
             self.recent_packets.pop(0)
 
@@ -291,8 +297,6 @@ class RepeaterHandler(BaseHandler):
         expired = [k for k, ts in self.seen_packets.items() if now - ts > self.cache_ttl]
         for k in expired:
             del self.seen_packets[k]
-
-
 
     def _get_drop_reason(self, packet: Packet) -> str:
 
@@ -359,7 +363,7 @@ class RepeaterHandler(BaseHandler):
             longitude = appdata_decoded.get("longitude")
 
             current_time = time.time()
-            
+
             # Check if this is a new neighbor
             current_neighbors = self.storage.get_neighbors() if self.storage else {}
             is_new_neighbor = pubkey not in current_neighbors
@@ -451,9 +455,7 @@ class RepeaterHandler(BaseHandler):
 
         next_hop = packet.path[0]
         if next_hop != self.local_hash:
-            logger.debug(
-                f"Direct: not our hop (next={next_hop:02X}, local={self.local_hash:02X})"
-            )
+            logger.debug(f"Direct: not our hop (next={next_hop:02X}, local={self.local_hash:02X})")
             return None
 
         original_path = list(packet.path)
@@ -583,7 +585,7 @@ class RepeaterHandler(BaseHandler):
     def get_noise_floor(self) -> Optional[float]:
         try:
             radio = self.dispatcher.radio if self.dispatcher else None
-            if radio and hasattr(radio, 'get_noise_floor'):
+            if radio and hasattr(radio, "get_noise_floor"):
                 return radio.get_noise_floor()
             return None
         except Exception as e:
@@ -670,22 +672,22 @@ class RepeaterHandler(BaseHandler):
         try:
             while True:
                 current_time = time.time()
-                
+
                 # Check noise floor recording (every 30 seconds)
                 if current_time - self.last_noise_measurement >= self.noise_floor_interval:
                     await self._record_noise_floor_async()
                     self.last_noise_measurement = current_time
-                
+
                 # Check advert sending (every N hours)
                 if self.send_advert_interval_hours > 0 and self.send_advert_func:
                     interval_seconds = self.send_advert_interval_hours * 3600
                     if current_time - self.last_advert_time >= interval_seconds:
                         await self._send_periodic_advert_async()
                         self.last_advert_time = current_time
-                
+
                 # Sleep for 5 seconds before next check
                 await asyncio.sleep(5.0)
-                
+
         except asyncio.CancelledError:
             logger.info("Background timer loop cancelled")
             raise
@@ -698,7 +700,7 @@ class RepeaterHandler(BaseHandler):
     async def _record_noise_floor_async(self):
         if not self.storage:
             return
-            
+
         try:
             noise_floor = self.get_noise_floor()
             if noise_floor is not None:
@@ -710,7 +712,9 @@ class RepeaterHandler(BaseHandler):
             logger.error(f"Error recording noise floor: {e}")
 
     async def _send_periodic_advert_async(self):
-        logger.info(f"Periodic advert timer triggered (interval: {self.send_advert_interval_hours}h)")
+        logger.info(
+            f"Periodic advert timer triggered (interval: {self.send_advert_interval_hours}h)"
+        )
         try:
             if self.send_advert_func:
                 success = await self.send_advert_func()
@@ -727,7 +731,7 @@ class RepeaterHandler(BaseHandler):
         if self._background_task and not self._background_task.done():
             self._background_task.cancel()
             logger.info("Background timer task cancelled")
-            
+
         if self.storage:
             try:
                 self.storage.close()

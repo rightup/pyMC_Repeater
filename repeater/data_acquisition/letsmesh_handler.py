@@ -10,8 +10,9 @@ from nacl.signing import SigningKey
 from typing import Callable, Optional
 from .. import __version__
 
+
 # --------------------------------------------------------------------
-# Helper: Base64URL without padding (required by MeshCore broker)
+# Helper: Base64URL without padding
 # --------------------------------------------------------------------
 def b64url(x: bytes) -> str:
     return base64.urlsafe_b64encode(x).rstrip(b"=").decode()
@@ -25,22 +26,21 @@ LETSMESH_BROKERS = [
         "name": "Europe (LetsMesh v1)",
         "host": "mqtt-eu-v1.letsmesh.net",
         "port": 443,
-        "audience": "mqtt-eu-v1.letsmesh.net"
+        "audience": "mqtt-eu-v1.letsmesh.net",
     },
     {
         "name": "US West (LetsMesh v1)",
         "host": "mqtt-us-v1.letsmesh.net",
         "port": 443,
-        "audience": "mqtt-us-v1.letsmesh.net"
+        "audience": "mqtt-us-v1.letsmesh.net",
     },
     {
         "name": "Europe (LetsMesh v1)",
         "host": "mqtt-eu-v1.letsmesh.net",
         "port": 443,
-        "audience": "mqtt-eu-v1.letsmesh.net"
-    }
+        "audience": "mqtt-eu-v1.letsmesh.net",
+    },
 ]
-
 
 
 # ====================================================================
@@ -64,8 +64,9 @@ class MeshCoreToMqttJwtPusher:
     ):
         # Extract values from config
         from ..config import get_node_info
+
         node_info = get_node_info(config)
-        
+
         iata_code = node_info["iata_code"]
         broker_index = node_info["broker_index"]
         status_interval = node_info["status_interval"]
@@ -90,10 +91,7 @@ class MeshCoreToMqttJwtPusher:
         self._running = False
 
         # MQTT WebSocket client
-        self.client = mqtt.Client(
-            client_id=f"meshcore_{self.public_key}",
-            transport="websockets"
-        )
+        self.client = mqtt.Client(client_id=f"meshcore_{self.public_key}", transport="websockets")
         self.client.on_connect = self._on_connect
         self.client.on_disconnect = self._on_disconnect
 
@@ -103,34 +101,30 @@ class MeshCoreToMqttJwtPusher:
     def _generate_jwt(self) -> str:
         now = datetime.now(UTC)
 
-        header = {
-            "alg": "Ed25519",
-            "typ": "JWT"
-        }
+        header = {"alg": "Ed25519", "typ": "JWT"}
 
         payload = {
             "publicKey": self.public_key,
             "aud": self.broker["audience"],
             "iat": int(now.timestamp()),
-            "exp": int((now + timedelta(minutes=self.jwt_expiry_minutes)).timestamp())
+            "exp": int((now + timedelta(minutes=self.jwt_expiry_minutes)).timestamp()),
         }
 
         # Encode header and payload (compact JSON - no spaces)
-        header_b64 = b64url(json.dumps(header, separators=(',', ':')).encode())
-        payload_b64 = b64url(json.dumps(payload, separators=(',', ':')).encode())
+        header_b64 = b64url(json.dumps(header, separators=(",", ":")).encode())
+        payload_b64 = b64url(json.dumps(payload, separators=(",", ":")).encode())
 
         signing_input = f"{header_b64}.{payload_b64}".encode()
         seed32 = binascii.unhexlify(self.private_key_hex)
         signer = SigningKey(seed32)
-        
+
         # Verify the public key matches what we expect
         derived_public = binascii.hexlify(bytes(signer.verify_key)).decode()
         if derived_public.upper() != self.public_key.upper():
             raise ValueError(
-                f"Public key mismatch! "
-                f"Derived: {derived_public}, Expected: {self.public_key}"
+                f"Public key mismatch! " f"Derived: {derived_public}, Expected: {self.public_key}"
             )
-        
+
         # Sign the message
         signature = signer.sign(signing_input).signature
         signature_hex = binascii.hexlify(signature).decode()
@@ -148,9 +142,7 @@ class MeshCoreToMqttJwtPusher:
             self._running = True
             # Publish initial status on connect
             self.publish_status(
-                state="online",
-                origin=self.node_name,
-                radio_config=self.radio_config
+                state="online", origin=self.node_name, radio_config=self.radio_config
             )
         else:
             logging.error(f"Failed with code {rc}")
@@ -168,7 +160,7 @@ class MeshCoreToMqttJwtPusher:
         username = f"v1_{self.public_key}"
 
         self.client.username_pw_set(username=username, password=token)
-        
+
         # Conditional TLS setup
         if self.use_tls:
             self.client.tls_set()
@@ -184,10 +176,11 @@ class MeshCoreToMqttJwtPusher:
         # Must use raw hostname without wss://
         self.client.connect(self.broker["host"], self.broker["port"], keepalive=60)
         self.client.loop_start()
-        
+
         # Start status heartbeat if interval is set
         if self.status_interval > 0:
             import threading
+
             self._status_task = threading.Thread(target=self._status_heartbeat_loop, daemon=True)
             self._status_task.start()
             logging.info(f"Started status heartbeat (interval: {self.status_interval}s)")
@@ -195,27 +188,23 @@ class MeshCoreToMqttJwtPusher:
     def disconnect(self):
         self._running = False
         # Publish offline status before disconnecting
-        self.publish_status(
-            state="offline",
-            origin=self.node_name,
-            radio_config=self.radio_config
-        )
+        self.publish_status(state="offline", origin=self.node_name, radio_config=self.radio_config)
         import time
+
         time.sleep(0.5)  # Give time for the message to be sent
-        
+
         self.client.loop_stop()
         self.client.disconnect()
         logging.info("Disconnected")
-    
+
     def _status_heartbeat_loop(self):
         """Background thread that publishes periodic status updates"""
         import time
+
         while self._running:
             try:
                 self.publish_status(
-                    state="online", 
-                    origin=self.node_name,
-                    radio_config=self.radio_config
+                    state="online", origin=self.node_name, radio_config=self.radio_config
                 )
                 time.sleep(self.status_interval)
             except Exception as e:
@@ -226,11 +215,7 @@ class MeshCoreToMqttJwtPusher:
     # Packet helpers
     # ----------------------------------------------------------------
     def _process_packet(self, pkt: dict) -> dict:
-        return {
-            "timestamp": datetime.now(UTC).isoformat(),
-            "origin_id": self.public_key,
-            **pkt
-        }
+        return {"timestamp": datetime.now(UTC).isoformat(), "origin_id": self.public_key, **pkt}
 
     def _topic(self, subtopic: str) -> str:
         return f"meshcore/{self.iata_code}/{self.public_key}/{subtopic}"
@@ -239,13 +224,9 @@ class MeshCoreToMqttJwtPusher:
         return self.publish(subtopic, self._process_packet(pkt), retain)
 
     def publish_raw_data(self, raw_hex: str, subtopic="raw", retain=False):
-        pkt = {
-            "type": "raw",
-            "data": raw_hex,
-            "bytes": len(raw_hex) // 2
-        }
+        pkt = {"type": "raw", "data": raw_hex, "bytes": len(raw_hex) // 2}
         return self.publish_packet(pkt, subtopic, retain)
-    
+
     def publish_status(
         self,
         state: str = "online",
@@ -256,7 +237,7 @@ class MeshCoreToMqttJwtPusher:
     ):
         """
         Publish device status/heartbeat message
-        
+
         Args:
             state: Device state (online/offline)
             location: Optional dict with latitude/longitude
@@ -268,12 +249,8 @@ class MeshCoreToMqttJwtPusher:
         if self.stats_provider:
             live_stats = self.stats_provider()
         else:
-            live_stats = {
-                "uptime_secs": 0,
-                "packets_sent": 0,
-                "packets_received": 0
-            }
-        
+            live_stats = {"uptime_secs": 0, "packets_sent": 0, "packets_received": 0}
+
         status = {
             "status": state,
             "timestamp": datetime.now(UTC).isoformat(),
@@ -283,17 +260,12 @@ class MeshCoreToMqttJwtPusher:
             "firmware_version": self.app_version,
             "radio": radio_config or self.radio_config,
             "client_version": f"pyMC_repeater/{self.app_version}",
-            "stats": {
-                **live_stats,
-                "errors": 0,
-                "queue_len": 0,
-                **(extra_stats or {})
-            }
+            "stats": {**live_stats, "errors": 0, "queue_len": 0, **(extra_stats or {})},
         }
-        
+
         if location:
             status["location"] = location
-        
+
         return self.publish("status", status, retain=False)
 
     def publish(self, subtopic: str, payload: dict, retain: bool = False):
@@ -308,12 +280,14 @@ class MeshCoreToMqttJwtPusher:
 # LetsMesh Packet Data Class
 # ====================================================================
 
+
 @dataclass
 class LetsMeshPacket:
     """
     Data class for LetsMesh packet format.
     Converts internal packet_record format to LetsMesh publish format.
     """
+
     origin: str
     origin_id: str
     timestamp: str
@@ -333,29 +307,31 @@ class LetsMeshPacket:
     hash: str
 
     @classmethod
-    def from_packet_record(cls, packet_record: dict, origin: str, origin_id: str) -> Optional['LetsMeshPacket']:
+    def from_packet_record(
+        cls, packet_record: dict, origin: str, origin_id: str
+    ) -> Optional["LetsMeshPacket"]:
         """
         Create LetsMeshPacket from internal packet_record format.
-        
+
         Args:
             packet_record: Internal packet record dictionary
             origin: Node name
             origin_id: Public key of the node
-            
+
         Returns:
             LetsMeshPacket instance or None if raw_packet is missing
         """
         if "raw_packet" not in packet_record or not packet_record["raw_packet"]:
             return None
-        
+
         # Extract timestamp and format date/time
         timestamp = packet_record.get("timestamp", 0)
         dt = datetime.fromtimestamp(timestamp)
-        
+
         # Format route type (1=Flood->F, 2=Direct->D, etc)
         route_map = {1: "F", 2: "D"}
         route = route_map.get(packet_record.get("route", 0), str(packet_record.get("route", 0)))
-        
+
         return cls(
             origin=origin,
             origin_id=origin_id,
@@ -373,9 +349,9 @@ class LetsMeshPacket:
             RSSI=str(packet_record.get("rssi", 0)),
             score=str(int(packet_record.get("score", 0) * 1000)),
             duration="0",
-            hash=packet_record.get("packet_hash", "")
+            hash=packet_record.get("packet_hash", ""),
         )
-    
+
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization"""
         return asdict(self)
