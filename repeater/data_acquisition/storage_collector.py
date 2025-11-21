@@ -8,7 +8,8 @@ from typing import Optional, Dict, Any
 from .sqlite_handler import SQLiteHandler
 from .rrdtool_handler import RRDToolHandler
 from .mqtt_handler import MQTTHandler
-from .letsmesh_handler import MeshCoreToMqttJwtPusher, LetsMeshPacket
+from .letsmesh_handler import MeshCoreToMqttJwtPusher
+from .storage_utils import PacketRecord
 
 
 logger = logging.getLogger("StorageCollector")
@@ -22,10 +23,11 @@ class StorageCollector:
         self.storage_dir.mkdir(parents=True, exist_ok=True)
 
         node_name = config.get("repeater", {}).get("node_name", "unknown")
+        node_id = local_identity.get_public_key().hex() if local_identity else "unknown"
 
         self.sqlite_handler = SQLiteHandler(self.storage_dir)
         self.rrd_handler = RRDToolHandler(self.storage_dir)
-        self.mqtt_handler = MQTTHandler(config.get("mqtt", {}), node_name)
+        self.mqtt_handler = MQTTHandler(config.get("mqtt", {}), node_name, node_id)
 
         # Initialize LetsMesh handler if configured
         self.letsmesh_handler = None
@@ -107,12 +109,12 @@ class StorageCollector:
                 return
 
             node_name = self.config.get("repeater", {}).get("node_name", "Unknown")
-            letsmesh_packet = LetsMeshPacket.from_packet_record(
+            packet = PacketRecord.from_packet_record(
                 packet_record, origin=node_name, origin_id=self.letsmesh_handler.public_key
             )
 
-            if letsmesh_packet:
-                self.letsmesh_handler.publish_packet(letsmesh_packet.to_dict())
+            if packet:
+                self.letsmesh_handler.publish_packet(packet.to_dict())
                 logger.debug(f"Published packet type 0x{packet_type:02X} to LetsMesh")
             else:
                 logger.debug("Skipped LetsMesh publish: packet missing raw_packet data")
