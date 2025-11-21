@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import struct
 import time
 from collections import OrderedDict
 from typing import Optional, Tuple
@@ -88,6 +89,12 @@ class RepeaterHandler(BaseHandler):
         self.last_noise_measurement = time.time()
         self.noise_floor_interval = NOISE_FLOOR_INTERVAL  # 30 seconds
         self._background_task = None
+        
+        # Cache transport keys for efficient lookup
+        self._transport_keys_cache = None
+        self._transport_keys_cache_time = 0
+        self._transport_keys_cache_ttl = 60  # Cache for 60 seconds
+        
         self._start_background_tasks()
 
     async def __call__(self, packet: Packet, metadata: Optional[dict] = None) -> None:
@@ -95,7 +102,6 @@ class RepeaterHandler(BaseHandler):
         if metadata is None:
             metadata = {}
 
-        # Track incoming packet
         self.rx_count += 1
 
         # Check if we're in monitor mode (receive only, no forwarding)
@@ -311,6 +317,14 @@ class RepeaterHandler(BaseHandler):
 
         route_type = packet.header & PH_ROUTE_MASK
 
+        if route_type == ROUTE_TYPE_FLOOD:
+            # Check if global flood policy blocked it
+            global_flood_allow = self.config.get("mesh", {}).get("global_flood_allow", True)
+            if not global_flood_allow:
+                allowed, reason = self._check_transport_codes(packet)
+                if not allowed:
+                    return reason or "Not allowed by global flood policy"
+
         if route_type == ROUTE_TYPE_DIRECT:
             if not packet.path or len(packet.path) == 0:
                 return "Direct: no path"
@@ -421,6 +435,83 @@ class RepeaterHandler(BaseHandler):
 
         return True, ""
 
+    def _check_transport_codes(self, packet: Packet) -> Tuple[bool, str]:
+        """
+        Check if packet has valid transport codes for forwarding.
+        Validates packet against all transport keys in database.
+        Uses caching to avoid repeated database queries.
+        
+        Args:
+            packet: The packet to check
+            
+        Returns:
+            Tuple of (is_valid, reason)
+        """
+        if not self.storage:
+            logger.warning("Transport code check failed: no storage available")
+            return False, "No storage available for transport key validation"
+        
+        try:
+            from pymc_core.protocol.transport_keys import calc_transport_code
+            
+            # Check cache validity
+            current_time = time.time()
+            if (self._transport_keys_cache is None or 
+                current_time - self._transport_keys_cache_time > self._transport_keys_cache_ttl):
+                # Refresh cache
+                self._transport_keys_cache = self.storage.get_transport_keys()
+                self._transport_keys_cache_time = current_time
+                logger.debug(f"Refreshed transport keys cache: {len(self._transport_keys_cache or [])} keys")
+            
+            transport_keys = self._transport_keys_cache
+            
+            if not transport_keys:
+                logger.debug("No transport keys configured - denying packet")
+                return False, "No matching transport code"
+            
+            # Get payload once for efficiency
+            payload = packet.get_payload()
+            if len(payload) < 2:
+                logger.debug("Packet payload too short for transport code")
+                return False, "No matching transport code"
+            
+            # Extract packet's transport code (first 2 bytes)
+            packet_code = struct.unpack('<H', payload[:2])[0]
+            
+            # Check packet against each transport key
+            for key_record in transport_keys:
+                transport_key_hex = key_record.get("transport_key")
+                
+                if not transport_key_hex:
+                    continue
+                
+                try:
+                    # Convert hex string to bytes and calculate expected code
+                    transport_key = bytes.fromhex(transport_key_hex)
+                    expected_code = calc_transport_code(transport_key, packet)
+                    
+                    # Check if codes match
+                    if packet_code == expected_code:
+                        key_name = key_record.get("name", "unknown")
+                        logger.debug(
+                            f"Transport code validated: key='{key_name}', "
+                            f"code=0x{packet_code:04X}"
+                        )
+                        return True, ""
+                    
+                except Exception as e:
+                    key_name = key_record.get("name", "unknown")
+                    logger.debug(f"Error checking transport key '{key_name}': {e}")
+                    continue
+            
+            # No matching transport code found
+            logger.debug(f"Packet denied: no matching transport code (checked {len(transport_keys)} keys)")
+            return False, "No matching transport code"
+            
+        except Exception as e:
+            logger.error(f"Transport code validation error: {e}")
+            return False, f"Transport code validation error: {e}"
+
     def flood_forward(self, packet: Packet) -> Optional[Packet]:
 
         # Validate
@@ -428,6 +519,18 @@ class RepeaterHandler(BaseHandler):
         if not valid:
             logger.debug(f"Flood validation failed: {reason}")
             return None
+
+        # Check global flood policy
+        global_flood_allow = self.config.get("mesh", {}).get("global_flood_allow", True)
+        if not global_flood_allow:
+            # Global flood disabled - check transport codes
+            allowed, check_reason = self._check_transport_codes(packet)
+            if not allowed:
+                logger.debug(f"Flood denied: {check_reason or 'no matching transport code'}")
+                return None
+            logger.debug("Flood allowed by transport code validation")
+        else:
+            logger.debug("Global flood policy enabled - allowing packet")
 
         # Suppress duplicates
         if self.is_duplicate(packet):
