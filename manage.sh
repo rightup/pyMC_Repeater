@@ -204,7 +204,7 @@ install_repeater() {
     
     echo "25"; echo "# Installing system dependencies..."
     apt-get update -qq
-    apt-get install -y libffi-dev jq pip
+    apt-get install -y libffi-dev jq pip rrdtool librrd-dev
     
     echo "30"; echo "# Installing files..."
     cp -r repeater "$INSTALL_DIR/"
@@ -291,23 +291,28 @@ upgrade_repeater() {
         show_info "Upgrading" "Starting upgrade process...\n\nThis may take a few minutes.\nProgress will be shown in the terminal."
         
         echo "=== Upgrade Progress ==="
-        echo "[1/7] Stopping service..."
+        echo "[1/8] Stopping service..."
         systemctl stop "$SERVICE_NAME" 2>/dev/null || true
         
-        echo "[2/7] Backing up configuration..."
+        echo "[2/8] Backing up configuration..."
         if [ -d "$CONFIG_DIR" ]; then
             cp -r "$CONFIG_DIR" "$CONFIG_DIR.backup.$(date +%Y%m%d_%H%M%S)" 2>/dev/null || true
             echo "    ✓ Configuration backed up"
         fi
         
-        echo "[3/7] Installing new files..."
+        echo "[3/8] Updating system dependencies..."
+        apt-get update -qq
+        apt-get install -y libffi-dev jq pip rrdtool librrd-dev
+        echo "    ✓ Dependencies updated"
+        
+        echo "[4/8] Installing new files..."
         cp -r repeater "$INSTALL_DIR/" 2>/dev/null || true
         cp pyproject.toml "$INSTALL_DIR/" 2>/dev/null || true
         cp README.md "$INSTALL_DIR/" 2>/dev/null || true
         cp pymc-repeater.service /etc/systemd/system/ 2>/dev/null || true
         echo "    ✓ Files updated"
         
-        echo "[4/7] Updating Python package..."
+        echo "[5/8] Updating Python package..."
         cd "$INSTALL_DIR"
         # Use timeout to prevent hanging and show output
         timeout 120 pip install --break-system-packages -e . || {
@@ -315,15 +320,15 @@ upgrade_repeater() {
         }
         echo "    ✓ Python package updated"
         
-        echo "[5/7] Reloading systemd..."
+        echo "[6/8] Reloading systemd..."
         systemctl daemon-reload
         echo "    ✓ Systemd reloaded"
         
-        echo "[6/7] Starting service..."
+        echo "[7/7] Starting service..."
         systemctl start "$SERVICE_NAME"
         echo "    ✓ Service started"
         
-        echo "[7/7] Verifying installation..."
+        echo "[8/8] Verifying installation..."
         sleep 3  # Give service time to start
         
         local new_version=$(get_version)
