@@ -666,40 +666,46 @@ class SQLiteHandler:
             logger.error(f"Failed to get adverts by contact_type '{contact_type}': {e}")
             return []
 
-    def generate_transport_key(self, key_length_bytes: int = 32) -> str:
+    def generate_transport_key(self, name: str, key_length_bytes: int = 32) -> str:
         """
-        Generate a cryptographically secure transport key.
+        Generate a transport key using the proper MeshCore key derivation.
         
         Args:
+            name: The key name to derive the key from
             key_length_bytes: Length of the key in bytes (default: 32 bytes = 256 bits)
             
         Returns:
-            A base64-encoded secure random key
+            A base64-encoded transport key derived from the name
         """
         try:
-            # Generate cryptographically secure random bytes
-            random_bytes = secrets.token_bytes(key_length_bytes)
+            from pymc_core.protocol.transport_keys import get_auto_key_for
+            
+            # Use the proper MeshCore key derivation function
+            key_bytes = get_auto_key_for(name)
             
             # Encode to base64 for safe storage and transmission
-            key = base64.b64encode(random_bytes).decode('utf-8')
+            key = base64.b64encode(key_bytes).decode('utf-8')
             
-            logger.debug(f"Generated transport key with {key_length_bytes} bytes ({len(key)} base64 chars)")
+            logger.debug(f"Generated transport key for '{name}' with {len(key_bytes)} bytes ({len(key)} base64 chars)")
             return key
             
         except Exception as e:
-            logger.error(f"Failed to generate transport key: {e}")
-            # Fallback to a simpler method if crypto fails
-            import random
-            import string
-            fallback_key = ''.join(random.choices(string.ascii_letters + string.digits, k=key_length_bytes))
-            logger.warning(f"Using fallback key generation method")
-            return base64.b64encode(fallback_key.encode()).decode('utf-8')
+            logger.error(f"Failed to generate transport key using get_auto_key_for: {e}")
+            # Fallback to secure random if MeshCore function fails
+            try:
+                random_bytes = secrets.token_bytes(key_length_bytes)
+                key = base64.b64encode(random_bytes).decode('utf-8')
+                logger.warning(f"Using fallback random key generation for '{name}'")
+                return key
+            except Exception as fallback_e:
+                logger.error(f"Fallback key generation also failed: {fallback_e}")
+                raise
 
     def create_transport_key(self, name: str, flood_policy: str, transport_key: Optional[str] = None, parent_id: Optional[int] = None, last_used: Optional[float] = None) -> Optional[int]:
         try:
             # Generate key if not provided
             if transport_key is None:
-                transport_key = self.generate_transport_key()
+                transport_key = self.generate_transport_key(name)
                 
             current_time = time.time()
             with sqlite3.connect(self.sqlite_path) as conn:

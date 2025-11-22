@@ -13,6 +13,9 @@ from pymc_core.protocol.constants import (
     PH_ROUTE_MASK,
     ROUTE_TYPE_DIRECT,
     ROUTE_TYPE_FLOOD,
+    ROUTE_TYPE_TRANSPORT_FLOOD,
+    ROUTE_TYPE_TRANSPORT_DIRECT,
+
 )
 from pymc_core.protocol.packet_utils import PacketHeaderUtils, PacketTimingUtils
 
@@ -95,6 +98,9 @@ class RepeaterHandler(BaseHandler):
         self._transport_keys_cache_time = 0
         self._transport_keys_cache_ttl = 60  # Cache for 60 seconds
         
+        # Track last drop reason for better logging
+        self._last_drop_reason = None
+        
         self._start_background_tasks()
 
     async def __call__(self, packet: Packet, metadata: Optional[dict] = None) -> None:
@@ -103,6 +109,9 @@ class RepeaterHandler(BaseHandler):
             metadata = {}
 
         self.rx_count += 1
+
+        # Reset drop reason for this packet processing
+        self._last_drop_reason = None
 
         # Check if we're in monitor mode (receive only, no forwarding)
         mode = self.config.get("repeater", {}).get("mode", "forward")
@@ -158,7 +167,7 @@ class RepeaterHandler(BaseHandler):
             if monitor_mode:
                 drop_reason = "Monitor mode"
             else:
-                drop_reason = self._get_drop_reason(packet)
+                drop_reason = self._last_drop_reason or self._get_drop_reason(packet)
             logger.debug(f"Packet not forwarded: {drop_reason}")
 
         # Extract packet type and route from header
@@ -321,9 +330,7 @@ class RepeaterHandler(BaseHandler):
             # Check if global flood policy blocked it
             global_flood_allow = self.config.get("mesh", {}).get("global_flood_allow", True)
             if not global_flood_allow:
-                allowed, reason = self._check_transport_codes(packet)
-                if not allowed:
-                    return reason or "Not allowed by global flood policy"
+                return "Global flood policy disabled"
 
         if route_type == ROUTE_TYPE_DIRECT:
             if not packet.path or len(packet.path) == 0:
@@ -413,7 +420,6 @@ class RepeaterHandler(BaseHandler):
 
         pkt_hash = packet.calculate_packet_hash().hex()
         if pkt_hash in self.seen_packets:
-            logger.debug(f"Duplicate suppressed: {pkt_hash[:16]}")
             return True
         return False
 
@@ -436,17 +442,7 @@ class RepeaterHandler(BaseHandler):
         return True, ""
 
     def _check_transport_codes(self, packet: Packet) -> Tuple[bool, str]:
-        """
-        Check if packet has valid transport codes for forwarding.
-        Validates packet against all transport keys in database.
-        Uses caching to avoid repeated database queries.
-        
-        Args:
-            packet: The packet to check
-            
-        Returns:
-            Tuple of (is_valid, reason)
-        """
+
         if not self.storage:
             logger.warning("Transport code check failed: no storage available")
             return False, "No storage available for transport key validation"
@@ -461,51 +457,45 @@ class RepeaterHandler(BaseHandler):
                 # Refresh cache
                 self._transport_keys_cache = self.storage.get_transport_keys()
                 self._transport_keys_cache_time = current_time
-                logger.debug(f"Refreshed transport keys cache: {len(self._transport_keys_cache or [])} keys")
             
             transport_keys = self._transport_keys_cache
             
             if not transport_keys:
-                logger.debug("No transport keys configured - denying packet")
-                return False, "No matching transport code"
+                return False, "No transport keys configured"
             
-            # Get payload once for efficiency
+            # Check if packet has transport codes
+            if not packet.has_transport_codes():
+                return False, "No transport codes present"
+            
+
+            transport_code_0 = packet.transport_codes[0]  # First transport code
+            
+
             payload = packet.get_payload()
-            if len(payload) < 2:
-                logger.debug("Packet payload too short for transport code")
-                return False, "No matching transport code"
-            
-            # Extract packet's transport code (first 2 bytes)
-            packet_code = struct.unpack('<H', payload[:2])[0]
+            payload_type = packet.get_payload_type() if hasattr(packet, 'get_payload_type') else ((packet.header & 0x3C) >> 2)
             
             # Check packet against each transport key
             for key_record in transport_keys:
-                transport_key_hex = key_record.get("transport_key")
+                transport_key_encoded = key_record.get("transport_key")
+                key_name = key_record.get("name", "unknown")
                 
-                if not transport_key_hex:
+                if not transport_key_encoded:
                     continue
                 
                 try:
-                    # Convert hex string to bytes and calculate expected code
-                    transport_key = bytes.fromhex(transport_key_hex)
+                    import base64
+                    transport_key = base64.b64decode(transport_key_encoded)
                     expected_code = calc_transport_code(transport_key, packet)
-                    
-                    # Check if codes match
-                    if packet_code == expected_code:
-                        key_name = key_record.get("name", "unknown")
-                        logger.debug(
-                            f"Transport code validated: key='{key_name}', "
-                            f"code=0x{packet_code:04X}"
-                        )
+                    if transport_code_0 == expected_code:
+                        logger.debug(f"Transport code validated for key '{key_name}'")
                         return True, ""
                     
                 except Exception as e:
-                    key_name = key_record.get("name", "unknown")
-                    logger.debug(f"Error checking transport key '{key_name}': {e}")
+                    logger.warning(f"Error checking transport key '{key_name}': {e}")
                     continue
             
             # No matching transport code found
-            logger.debug(f"Packet denied: no matching transport code (checked {len(transport_keys)} keys)")
+            logger.debug(f"Transport code 0x{transport_code_0:04X} denied (checked {len(transport_keys)} keys)")
             return False, "No matching transport code"
             
         except Exception as e:
@@ -517,23 +507,26 @@ class RepeaterHandler(BaseHandler):
         # Validate
         valid, reason = self.validate_packet(packet)
         if not valid:
-            logger.debug(f"Flood validation failed: {reason}")
+            self._last_drop_reason = reason
             return None
 
         # Check global flood policy
         global_flood_allow = self.config.get("mesh", {}).get("global_flood_allow", True)
         if not global_flood_allow:
-            # Global flood disabled - check transport codes
-            allowed, check_reason = self._check_transport_codes(packet)
-            if not allowed:
-                logger.debug(f"Flood denied: {check_reason or 'no matching transport code'}")
+            route_type = packet.header & PH_ROUTE_MASK
+            if route_type == ROUTE_TYPE_FLOOD or route_type == ROUTE_TYPE_TRANSPORT_FLOOD:
+             
+                allowed, check_reason = self._check_transport_codes(packet)
+                if not allowed:
+                    self._last_drop_reason = check_reason
+                    return None
+            else:
+                self._last_drop_reason = "Global flood policy disabled"
                 return None
-            logger.debug("Flood allowed by transport code validation")
-        else:
-            logger.debug("Global flood policy enabled - allowing packet")
 
         # Suppress duplicates
         if self.is_duplicate(packet):
+            self._last_drop_reason = "Duplicate"
             return None
 
         if packet.path is None:
@@ -545,7 +538,6 @@ class RepeaterHandler(BaseHandler):
         packet.path_len = len(packet.path)
 
         self.mark_seen(packet)
-        logger.debug(f"Flood: forwarding with path len {packet.path_len}")
 
         return packet
 
@@ -553,21 +545,17 @@ class RepeaterHandler(BaseHandler):
 
         # Check if we're the next hop
         if not packet.path or len(packet.path) == 0:
-            logger.debug("Direct: no path")
+            self._last_drop_reason = "Direct: no path"
             return None
 
         next_hop = packet.path[0]
         if next_hop != self.local_hash:
-            logger.debug(f"Direct: not our hop (next={next_hop:02X}, local={self.local_hash:02X})")
+            self._last_drop_reason = "Direct: not for us"
             return None
 
         original_path = list(packet.path)
         packet.path = bytearray(packet.path[1:])
         packet.path_len = len(packet.path)
-
-        old_path = [f"{b:02X}" for b in original_path]
-        new_path = [f"{b:02X}" for b in packet.path]
-        logger.debug(f"Direct: forwarding, path {old_path} -> {new_path}")
 
         return packet
 
@@ -649,14 +637,14 @@ class RepeaterHandler(BaseHandler):
 
         route_type = packet.header & PH_ROUTE_MASK
 
-        if route_type == ROUTE_TYPE_FLOOD:
+        if route_type == ROUTE_TYPE_FLOOD or route_type == ROUTE_TYPE_TRANSPORT_FLOOD:
             fwd_pkt = self.flood_forward(packet)
             if fwd_pkt is None:
                 return None
             delay = self._calculate_tx_delay(fwd_pkt, snr)
             return fwd_pkt, delay
 
-        elif route_type == ROUTE_TYPE_DIRECT:
+        elif route_type == ROUTE_TYPE_DIRECT or route_type == ROUTE_TYPE_TRANSPORT_DIRECT:
             fwd_pkt = self.direct_forward(packet)
             if fwd_pkt is None:
                 return None
@@ -664,7 +652,7 @@ class RepeaterHandler(BaseHandler):
             return fwd_pkt, delay
 
         else:
-            logger.debug(f"Unknown route type: {route_type}")
+            self._last_drop_reason = f"Unknown route type: {route_type}"
             return None
 
     async def schedule_retransmit(self, fwd_pkt: Packet, delay: float, airtime_ms: float = 0.0):
