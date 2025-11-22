@@ -169,3 +169,9 @@ logging:
 
   # Log format
   format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+
+# Web interface configuration
+web:
+  # Enable Cross-Origin Resource Sharing (CORS) headers
+  # Allows web frontends from different origins to access the API
+  cors_enabled: false

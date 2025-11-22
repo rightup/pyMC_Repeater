@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import time
 from datetime import datetime
 from typing import Callable, Optional
@@ -11,19 +12,16 @@ from .cad_calibration_engine import CADCalibrationEngine
 logger = logging.getLogger("HTTPServer")
 
 
+def is_cors_enabled(config: dict) -> bool:
+    """Check if CORS is enabled in the configuration"""
+    return config.get("web", {}).get("cors_enabled", False)
+
+
 def add_cors_headers():
     """Add CORS headers to allow cross-origin requests"""
     cherrypy.response.headers['Access-Control-Allow-Origin'] = '*'
     cherrypy.response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
     cherrypy.response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
-
-
-def cors_enabled(func):
-    """Decorator to enable CORS for API endpoints"""
-    def wrapper(*args, **kwargs):
-        add_cors_headers()
-        return func(*args, **kwargs)
-    return wrapper
 
 
 # system systems
@@ -77,12 +75,25 @@ class APIEndpoints:
         self.daemon_instance = daemon_instance
         self._config_path = config_path or '/etc/pymc_repeater/config.yaml'
         self.cad_calibration = CADCalibrationEngine(daemon_instance, event_loop)
+        
+        # CORS check from config
+        self._cors_enabled = is_cors_enabled(self.config)
+        
+        # Log the CORS status
+        logger.info(f"CORS {'enabled' if self._cors_enabled else 'disabled'} (config: web.cors_enabled={self._cors_enabled})")
+        
+        # Set up automatic CORS for all responses if enabled
+        if self._cors_enabled:
+            cherrypy.engine.subscribe('before_finalize', self._add_cors_headers)
+
+    def _add_cors_headers(self):
+        """Automatically add CORS headers to all responses"""
+        add_cors_headers()
 
     @cherrypy.expose
     def default(self, *args, **kwargs):
         """Handle OPTIONS requests for CORS preflight"""
         if cherrypy.request.method == "OPTIONS":
-            add_cors_headers()
             return ""
         # For non-OPTIONS requests, return 404
         raise cherrypy.HTTPError(404)
@@ -122,7 +133,9 @@ class APIEndpoints:
 
     def _require_post(self):
         if cherrypy.request.method != "POST":
-            raise Exception("Method not allowed")
+            cherrypy.response.status = 405  # Method Not Allowed
+            cherrypy.response.headers['Allow'] = 'POST'
+            raise cherrypy.HTTPError(405, "Method not allowed. This endpoint requires POST.")
 
     def _get_time_range(self, hours):
         end_time = int(time.time())
@@ -147,7 +160,6 @@ class APIEndpoints:
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
-    @cors_enabled
     def stats(self):
         try:
             stats = self.stats_getter() if self.stats_getter else {}
@@ -164,7 +176,6 @@ class APIEndpoints:
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
-    @cors_enabled
     def send_advert(self):
         try:
             self._require_post()
@@ -176,6 +187,9 @@ class APIEndpoints:
             future = asyncio.run_coroutine_threadsafe(self.send_advert_func(), self.event_loop)
             result = future.result(timeout=10)
             return self._success("Advert sent successfully") if result else self._error("Failed to send advert")
+        except cherrypy.HTTPError:
+            # Re-raise HTTP errors (like 405 Method Not Allowed) without logging
+            raise
         except Exception as e:
             logger.error(f"Error sending advert: {e}", exc_info=True)
             return self._error(e)
@@ -183,7 +197,6 @@ class APIEndpoints:
     @cherrypy.expose
     @cherrypy.tools.json_out()
     @cherrypy.tools.json_in()
-    @cors_enabled
     def set_mode(self):
         try:
             self._require_post()
@@ -196,6 +209,9 @@ class APIEndpoints:
             self.config["repeater"]["mode"] = new_mode
             logger.info(f"Mode changed to: {new_mode}")
             return {"success": True, "mode": new_mode}
+        except cherrypy.HTTPError:
+            # Re-raise HTTP errors (like 405 Method Not Allowed) without logging
+            raise
         except Exception as e:
             logger.error(f"Error setting mode: {e}", exc_info=True)
             return self._error(e)
@@ -203,7 +219,6 @@ class APIEndpoints:
     @cherrypy.expose
     @cherrypy.tools.json_out()
     @cherrypy.tools.json_in()
-    @cors_enabled
     def set_duty_cycle(self):
         try:
             self._require_post()
@@ -214,13 +229,15 @@ class APIEndpoints:
             self.config["duty_cycle"]["enforcement_enabled"] = enabled
             logger.info(f"Duty cycle enforcement {'enabled' if enabled else 'disabled'}")
             return {"success": True, "enabled": enabled}
+        except cherrypy.HTTPError:
+            # Re-raise HTTP errors (like 405 Method Not Allowed) without logging
+            raise
         except Exception as e:
             logger.error(f"Error setting duty cycle: {e}", exc_info=True)
             return self._error(e)
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
-    @cors_enabled
     def logs(self):
         from .http_server import _log_buffer
         try:
@@ -244,8 +261,8 @@ class APIEndpoints:
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
-    @cors_enabled
     def packet_stats(self, hours=24):
+        
         try:
             hours = int(hours)
             stats = self._get_storage().get_packet_stats(hours=hours)
@@ -256,8 +273,8 @@ class APIEndpoints:
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
-    @cors_enabled
     def packet_type_stats(self, hours=24):
+        
         try:
             hours = int(hours)
             stats = self._get_storage().get_packet_type_stats(hours=hours)
@@ -268,8 +285,8 @@ class APIEndpoints:
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
-    @cors_enabled
     def route_stats(self, hours=24):
+        
         try:
             hours = int(hours)
             stats = self._get_storage().get_route_stats(hours=hours)
@@ -280,8 +297,8 @@ class APIEndpoints:
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
-    @cors_enabled
     def recent_packets(self, limit=100):
+        
         try:
             limit = int(limit)
             packets = self._get_storage().get_recent_packets(limit=limit)
@@ -351,8 +368,8 @@ class APIEndpoints:
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
-    @cors_enabled
     def packet_type_graph_data(self, hours=24, resolution='average', types='all'):
+        
         try:
             hours = int(hours)
             start_time, end_time = self._get_time_range(hours)
@@ -398,8 +415,8 @@ class APIEndpoints:
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
-    @cors_enabled
     def metrics_graph_data(self, hours=24, resolution='average', metrics='all'):
+        
         try:
             hours = int(hours)
             start_time, end_time = self._get_time_range(hours)
@@ -460,8 +477,8 @@ class APIEndpoints:
     @cherrypy.expose
     @cherrypy.tools.json_out()  
     @cherrypy.tools.json_in()
-    @cors_enabled
     def cad_calibration_start(self):
+        
         try:
             self._require_post()
             data = cherrypy.request.json or {}
@@ -471,18 +488,24 @@ class APIEndpoints:
                 return self._success("Calibration started")
             else:
                 return self._error("Calibration already running")
+        except cherrypy.HTTPError:
+            # Re-raise HTTP errors (like 405 Method Not Allowed) without logging
+            raise
         except Exception as e:
             logger.error(f"Error starting CAD calibration: {e}")
             return self._error(e)
     
     @cherrypy.expose
     @cherrypy.tools.json_out()
-    @cors_enabled
     def cad_calibration_stop(self):
+        
         try:
             self._require_post()
             self.cad_calibration.stop_calibration()
             return self._success("Calibration stopped")
+        except cherrypy.HTTPError:
+            # Re-raise HTTP errors (like 405 Method Not Allowed) without logging
+            raise
         except Exception as e:
             logger.error(f"Error stopping CAD calibration: {e}")
             return self._error(e)
@@ -490,8 +513,8 @@ class APIEndpoints:
     @cherrypy.expose
     @cherrypy.tools.json_out()
     @cherrypy.tools.json_in()
-    @cors_enabled
     def save_cad_settings(self):
+        
         try:
             self._require_post()
             data = cherrypy.request.json or {}
@@ -524,6 +547,9 @@ class APIEndpoints:
                 "message": f"CAD settings saved: peak={peak}, min={min_val}",
                 "settings": {"peak": peak, "min_val": min_val, "detection_rate": detection_rate}
             }
+        except cherrypy.HTTPError:
+            # Re-raise HTTP errors (like 405 Method Not Allowed) without logging
+            raise
         except Exception as e:
             logger.error(f"Error saving CAD settings: {e}")
             return self._error(e)
@@ -542,8 +568,8 @@ class APIEndpoints:
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
-    @cors_enabled
     def noise_floor_history(self, hours: int = 24):
+        
         try:
             storage = self._get_storage()
             hours = int(hours)
@@ -560,8 +586,8 @@ class APIEndpoints:
     
     @cherrypy.expose
     @cherrypy.tools.json_out()
-    @cors_enabled
     def noise_floor_stats(self, hours: int = 24):
+        
         try:
             storage = self._get_storage()
             hours = int(hours)
@@ -577,8 +603,8 @@ class APIEndpoints:
     
     @cherrypy.expose
     @cherrypy.tools.json_out()
-    @cors_enabled
     def noise_floor_chart_data(self, hours: int = 24):
+        
         try:
             storage = self._get_storage()
             hours = int(hours)
@@ -597,7 +623,10 @@ class APIEndpoints:
         cherrypy.response.headers['Content-Type'] = 'text/event-stream'
         cherrypy.response.headers['Cache-Control'] = 'no-cache'
         cherrypy.response.headers['Connection'] = 'keep-alive'
-        cherrypy.response.headers['Access-Control-Allow-Origin'] = '*'
+        
+        # Add CORS headers conditionally for SSE endpoint
+        if self._cors_enabled:
+            cherrypy.response.headers['Access-Control-Allow-Origin'] = '*'
         
         if not hasattr(self.cad_calibration, 'message_queue'):
             self.cad_calibration.message_queue = []
@@ -651,9 +680,8 @@ class APIEndpoints:
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
-    @cors_enabled
     def adverts_by_contact_type(self, contact_type=None, limit=None, hours=None):
-
+        
         try:
             if not contact_type:
                 return self._error("contact_type parameter is required")
@@ -686,8 +714,8 @@ class APIEndpoints:
     @cherrypy.expose
     @cherrypy.tools.json_out()
     @cherrypy.tools.json_in()
-    @cors_enabled
     def transport_keys(self):
+        
         if cherrypy.request.method == "GET":
             try:
                 storage = self._get_storage()
@@ -738,8 +766,8 @@ class APIEndpoints:
     @cherrypy.expose
     @cherrypy.tools.json_out()
     @cherrypy.tools.json_in()
-    @cors_enabled
     def transport_key(self, key_id):
+        
         if cherrypy.request.method == "GET":
             try:
                 key_id = int(key_id)
@@ -810,8 +838,8 @@ class APIEndpoints:
     @cherrypy.expose
     @cherrypy.tools.json_out()
     @cherrypy.tools.json_in()
-    @cors_enabled
     def global_flood_policy(self):
+        
         """
         Update global flood policy configuration
         

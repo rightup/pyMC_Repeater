@@ -351,7 +351,6 @@ class RepeaterDaemon:
         http_port = self.config.get("http", {}).get("port", 8000)
         http_host = self.config.get("http", {}).get("host", "0.0.0.0")
 
-        template_dir = os.path.join(os.path.dirname(__file__), "templates")
         node_name = self.config.get("repeater", {}).get("node_name", "Repeater")
 
         # Format public key for display
@@ -370,7 +369,6 @@ class RepeaterDaemon:
             host=http_host,
             port=http_port,
             stats_getter=self.get_stats,
-            template_dir=template_dir,
             node_name=node_name,
             pub_key=pub_key_formatted,
             send_advert_func=self.send_advert,

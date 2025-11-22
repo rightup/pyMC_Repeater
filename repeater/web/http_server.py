@@ -46,7 +46,6 @@ class StatsApp:
     def __init__(
         self,
         stats_getter: Optional[Callable] = None,
-        template_dir: Optional[str] = None,
         node_name: str = "Repeater",
         pub_key: str = "",
         send_advert_func: Optional[Callable] = None,
@@ -57,20 +56,39 @@ class StatsApp:
     ):
 
         self.stats_getter = stats_getter
-        self.template_dir = template_dir
         self.node_name = node_name
         self.pub_key = pub_key
         self.dashboard_template = None
         self.config = config or {}
+        
+        # Path to the compiled Vue.js application
+        self.html_dir = os.path.join(os.path.dirname(__file__), "html")
 
         # Create nested API object for routing
         self.api = APIEndpoints(stats_getter, send_advert_func, self.config, event_loop, daemon_instance, config_path)
 
+    @cherrypy.expose
+    def index(self):
+        """Serve the Vue.js application index.html."""
+        index_path = os.path.join(self.html_dir, "index.html")
+        try:
+            with open(index_path, 'r', encoding='utf-8') as f:
+                return f.read()
+        except FileNotFoundError:
+            raise cherrypy.HTTPError(404, "Application not found. Please build the frontend first.")
+        except Exception as e:
+            logger.error(f"Error serving index.html: {e}")
+            raise cherrypy.HTTPError(500, "Internal server error")
 
-    # @cherrypy.expose
-    # def index(self):
-    #     """Serve dashboard HTML."""
-    #     return self._serve_template("dashboard.html")
+    @cherrypy.expose
+    def default(self, *args, **kwargs):
+        """Handle client-side routing - serve index.html for all non-API routes."""
+        # Let API routes pass through
+        if args and args[0] == 'api':
+            raise cherrypy.NotFound()
+        
+        # For all other routes, serve the Vue.js app (client-side routing)
+        return self.index()
 
 
 class HTTPStatsServer:
@@ -80,7 +98,6 @@ class HTTPStatsServer:
         host: str = "0.0.0.0",
         port: int = 8000,
         stats_getter: Optional[Callable] = None,
-        template_dir: Optional[str] = None,
         node_name: str = "Repeater",
         pub_key: str = "",
         send_advert_func: Optional[Callable] = None,
@@ -93,24 +110,39 @@ class HTTPStatsServer:
         self.host = host
         self.port = port
         self.app = StatsApp(
-            stats_getter, template_dir, node_name, pub_key, send_advert_func, config, event_loop, daemon_instance, config_path
+            stats_getter, node_name, pub_key, send_advert_func, config, event_loop, daemon_instance, config_path
         )
 
     def start(self):
 
         try:
-            # Serve static files from templates directory
-            static_dir = (
-                self.app.template_dir if self.app.template_dir else os.path.dirname(__file__)
-            )
+            # Serve static files from the html directory (compiled Vue.js app)
+            html_dir = os.path.join(os.path.dirname(__file__), "html")
+            assets_dir = os.path.join(html_dir, "assets")
 
             config = {
                 "/": {
                     "tools.sessions.on": False,
+                    # Ensure proper content types for Vue.js files
+                    "tools.staticfile.content_types": {
+                        'js': 'application/javascript',
+                        'css': 'text/css',
+                        'html': 'text/html; charset=utf-8'
+                    },
                 },
-                "/static": {
+                "/assets": {
                     "tools.staticdir.on": True,
-                    "tools.staticdir.dir": static_dir,
+                    "tools.staticdir.dir": assets_dir,
+                    # Set proper content types for assets
+                    "tools.staticdir.content_types": {
+                        'js': 'application/javascript',
+                        'css': 'text/css',
+                        'map': 'application/json'
+                    },
+                },
+                "/favicon.ico": {
+                    "tools.staticfile.on": True,
+                    "tools.staticfile.filename": os.path.join(html_dir, "favicon.ico"),
                 },
             }
 

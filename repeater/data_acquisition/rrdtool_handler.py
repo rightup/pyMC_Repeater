@@ -74,7 +74,6 @@ class RRDToolHandler:
 
     def update_packet_metrics(self, record: dict, cumulative_counts: dict):
         if not self.available or not self.rrd_path.exists():
-            logger.debug("RRD not available or doesn't exist for packet metrics")
             return
             
         try:
@@ -83,9 +82,7 @@ class RRDToolHandler:
             try:
                 info = rrdtool.info(str(self.rrd_path))
                 last_update = int(info.get("last_update", timestamp - 60))
-                logger.debug(f"RRD packet update: timestamp={timestamp}, last_update={last_update}")
                 if timestamp <= last_update:
-                    logger.debug(f"Skipping RRD packet update: timestamp {timestamp} <= last_update {last_update}")
                     return
             except Exception as e:
                 logger.debug(f"Failed to get RRD info for packet update: {e}")
@@ -108,9 +105,7 @@ class RRDToolHandler:
             type_values_str = ":".join(type_values)
             values = f"{basic_values}:{type_values_str}"
             
-            logger.debug(f"Updating RRD with packet values: {values}")
             rrdtool.update(str(self.rrd_path), values)
-            logger.debug(f"RRD packet update successful")
             
         except Exception as e:
             logger.error(f"Failed to update RRD packet metrics: {e}")
@@ -128,8 +123,6 @@ class RRDToolHandler:
             if start_time is None:
                 start_time = end_time - (24 * 3600)
                 
-            logger.debug(f"RRD fetch: start={start_time}, end={end_time}, resolution={resolution}")
-                
             fetch_result = rrdtool.fetch(
                 str(self.rrd_path),
                 resolution.upper(),
@@ -142,13 +135,8 @@ class RRDToolHandler:
                 return None
                 
             (start, end, step), data_sources, data_points = fetch_result
-            logger.debug(f"RRD fetch result: start={start}, end={end}, step={step}, sources={len(data_sources)}, points={len(data_points)}")
-            logger.debug(f"Data sources: {data_sources}")
             
-            if data_points:
-                logger.debug(f"First data point: {data_points[0]}")
-                logger.debug(f"Last data point: {data_points[-1]}")
-            else:
+            if not data_points:
                 logger.warning("No data points returned from RRD fetch")
             
             result = {
@@ -184,13 +172,6 @@ class RRDToolHandler:
                 current_time += step
             
             result['timestamps'] = timestamps
-            logger.debug(f"RRD data processed successfully: {len(timestamps)} timestamps, packet_types keys: {list(result['packet_types'].keys())}")
-            
-            for type_key in ['type_2', 'type_4', 'type_5']:
-                if type_key in result['packet_types']:
-                    values = result['packet_types'][type_key]
-                    non_none_values = [v for v in values if v is not None]
-                    logger.debug(f"{type_key} values: count={len(values)}, non-none={len(non_none_values)}, sample={values[:3] if values else 'empty'}")
                     
             return result
             
@@ -203,14 +184,10 @@ class RRDToolHandler:
             end_time = int(time.time())
             start_time = end_time - (hours * 3600)
             
-            logger.debug(f"Getting packet type stats for {hours} hours from {start_time} to {end_time}")
-            
             rrd_data = self.get_data(start_time, end_time)
             if not rrd_data or 'packet_types' not in rrd_data:
                 logger.warning(f"No RRD data available")
                 return None
-            
-            logger.debug(f"RRD packet_types keys: {list(rrd_data['packet_types'].keys())}")
             
             type_totals = {}
             packet_type_names = {
@@ -244,22 +221,16 @@ class RRDToolHandler:
             
             for type_key, data_points in rrd_data['packet_types'].items():
                 valid_points = [p for p in data_points if p is not None]
-                logger.debug(f"{type_key}: total_points={len(data_points)}, valid_points={len(valid_points)}")
                 
                 if len(valid_points) >= 2:
                     total = max(valid_points) - min(valid_points)
-                    logger.debug(f"{type_key}: min={min(valid_points)}, max={max(valid_points)}, total={total}")
                 elif len(valid_points) == 1:
                     total = valid_points[0]
-                    logger.debug(f"{type_key}: single value={total}")
                 else:
                     total = 0
-                    logger.debug(f"{type_key}: no valid values, total=0")
                     
                 type_name = packet_type_names.get(type_key, type_key)
                 type_totals[type_name] = max(0, total or 0)
-            
-            logger.debug(f"Final type_totals: {type_totals}")
             
             result = {
                 "hours": hours,
@@ -269,7 +240,6 @@ class RRDToolHandler:
                 "data_source": "rrd"
             }
             
-            logger.debug(f"Returning packet type stats: {result}")
             return result
             
         except Exception as e:

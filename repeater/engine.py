@@ -478,6 +478,7 @@ class RepeaterHandler(BaseHandler):
             for key_record in transport_keys:
                 transport_key_encoded = key_record.get("transport_key")
                 key_name = key_record.get("name", "unknown")
+                flood_policy = key_record.get("flood_policy", "deny")
                 
                 if not transport_key_encoded:
                     continue
@@ -487,8 +488,26 @@ class RepeaterHandler(BaseHandler):
                     transport_key = base64.b64decode(transport_key_encoded)
                     expected_code = calc_transport_code(transport_key, packet)
                     if transport_code_0 == expected_code:
-                        logger.debug(f"Transport code validated for key '{key_name}'")
-                        return True, ""
+                        logger.debug(f"Transport code validated for key '{key_name}' with policy '{flood_policy}'")
+                        
+                        # Update last_used timestamp for this key
+                        try:
+                            key_id = key_record.get("id")
+                            if key_id:
+                                self.storage.update_transport_key(
+                                    key_id=key_id,
+                                    last_used=time.time()
+                                )
+                                logger.debug(f"Updated last_used timestamp for transport key '{key_name}'")
+                        except Exception as e:
+                            logger.warning(f"Failed to update last_used for transport key '{key_name}': {e}")
+                        
+                        # Check flood policy for this key
+                        if flood_policy == "allow":
+                            return True, ""
+                        else:
+                            return False, f"Transport key '{key_name}' flood policy denied"
+
                     
                 except Exception as e:
                     logger.warning(f"Error checking transport key '{key_name}': {e}")
