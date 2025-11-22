@@ -291,28 +291,35 @@ upgrade_repeater() {
         show_info "Upgrading" "Starting upgrade process...\n\nThis may take a few minutes.\nProgress will be shown in the terminal."
         
         echo "=== Upgrade Progress ==="
-        echo "[1/8] Stopping service..."
+        echo "[1/9] Stopping service..."
         systemctl stop "$SERVICE_NAME" 2>/dev/null || true
         
-        echo "[2/8] Backing up configuration..."
+        echo "[2/9] Backing up configuration..."
         if [ -d "$CONFIG_DIR" ]; then
             cp -r "$CONFIG_DIR" "$CONFIG_DIR.backup.$(date +%Y%m%d_%H%M%S)" 2>/dev/null || true
             echo "    ✓ Configuration backed up"
         fi
         
-        echo "[3/8] Updating system dependencies..."
+        echo "[3/9] Updating system dependencies..."
         apt-get update -qq
-        apt-get install -y libffi-dev jq pip rrdtool librrd-dev
+        apt-get install -y libffi-dev jq pip python3-rrdtool python3-yaml
         echo "    ✓ Dependencies updated"
         
-        echo "[4/8] Installing new files..."
+        echo "[4/9] Installing new files..."
         cp -r repeater "$INSTALL_DIR/" 2>/dev/null || true
         cp pyproject.toml "$INSTALL_DIR/" 2>/dev/null || true
         cp README.md "$INSTALL_DIR/" 2>/dev/null || true
         cp pymc-repeater.service /etc/systemd/system/ 2>/dev/null || true
         echo "    ✓ Files updated"
         
-        echo "[5/8] Updating Python package..."
+        echo "[5/9] Validating and updating configuration..."
+        if validate_and_update_config; then
+            echo "    ✓ Configuration validated and updated"
+        else
+            echo "    ⚠ Configuration validation failed, keeping existing config"
+        fi
+        
+        echo "[6/9] Updating Python package..."
         cd "$INSTALL_DIR"
         # Use timeout to prevent hanging and show output
         timeout 120 pip install --break-system-packages -e . || {
@@ -320,15 +327,15 @@ upgrade_repeater() {
         }
         echo "    ✓ Python package updated"
         
-        echo "[6/8] Reloading systemd..."
+        echo "[7/9] Reloading systemd..."
         systemctl daemon-reload
         echo "    ✓ Systemd reloaded"
         
-        echo "[7/7] Starting service..."
+        echo "[8/9] Starting service..."
         systemctl start "$SERVICE_NAME"
         echo "    ✓ Service started"
         
-        echo "[8/8] Verifying installation..."
+        echo "[9/9] Verifying installation..."
         sleep 3  # Give service time to start
         
         local new_version=$(get_version)
@@ -523,6 +530,90 @@ show_detailed_status() {
     fi
     
     show_info "System Status" "$status_info"
+}
+
+# Function to validate and update configuration
+validate_and_update_config() {
+    local config_file="$CONFIG_DIR/config.yaml"
+    local example_file="config.yaml.example"
+    local updated_example="$CONFIG_DIR/config.yaml.example"
+    
+    # Copy the new example file
+    if [ -f "$example_file" ]; then
+        cp "$example_file" "$updated_example"
+    else
+        echo "    ⚠ config.yaml.example not found in source directory"
+        return 1
+    fi
+    
+    # Check if user config exists
+    if [ ! -f "$config_file" ]; then
+        echo "    ⚠ No existing config.yaml found, copying example"
+        cp "$updated_example" "$config_file"
+        return 0
+    fi
+    
+    # Check if we have python3 and pyyaml for proper YAML processing
+    if ! command -v python3 &> /dev/null; then
+        echo "    ⚠ Python3 not found, skipping advanced config validation"
+        return 0
+    fi
+    
+    # Create a Python script to merge configs intelligently
+    python3 << 'EOF'
+import sys
+import os
+import yaml
+from collections import OrderedDict
+
+def merge_yaml_configs(user_config_path, example_config_path, output_path):
+    """Merge user config with new example config, preserving user values"""
+    try:
+        # Load user config
+        with open(user_config_path, 'r') as f:
+            user_config = yaml.safe_load(f) or {}
+        
+        # Load example config
+        with open(example_config_path, 'r') as f:
+            example_config = yaml.safe_load(f) or {}
+        
+        # Deep merge function
+        def deep_merge(base, overlay):
+            for key, value in overlay.items():
+                if key in base and isinstance(base[key], dict) and isinstance(value, dict):
+                    deep_merge(base[key], value)
+                elif key not in base:
+                    base[key] = value
+            return base
+        
+        # Start with example config as base (gets all new sections)
+        merged = deep_merge(dict(example_config), user_config)
+        
+        # Write merged config
+        with open(output_path, 'w') as f:
+            yaml.dump(merged, f, default_flow_style=False, indent=2)
+        
+        return True
+    except Exception as e:
+        print(f"Error merging configs: {e}")
+        return False
+
+# Run the merge
+config_dir = os.environ.get('CONFIG_DIR', '/etc/pymc_repeater')
+user_config = os.path.join(config_dir, 'config.yaml')
+example_config = os.path.join(config_dir, 'config.yaml.example')
+temp_config = os.path.join(config_dir, 'config.yaml.merged')
+
+if merge_yaml_configs(user_config, example_config, temp_config):
+    # Replace original with merged version
+    os.rename(temp_config, user_config)
+    print("    ✓ Configuration updated with new settings")
+else:
+    print("    ⚠ Config merge failed, keeping original")
+    sys.exit(1)
+EOF
+    
+    return $?
 }
 
 # Main script logic
