@@ -34,7 +34,6 @@ dependencies = [
     "pymc_core[hardware] @ git+https://github.com/rightup/pyMC_core.git@dev",
     "pyyaml>=6.0.0",
     "cherrypy>=18.0.0",
-    "rrdtool>=0.1.16",
     "paho-mqtt>=1.6.0",
 ]
 
