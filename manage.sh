@@ -204,7 +204,7 @@ install_repeater() {
     
     echo "25"; echo "# Installing system dependencies..."
     apt-get update -qq
-    apt-get install -y libffi-dev jq pip rrdtool librrd-dev
+    apt-get install -y libffi-dev jq pip python3-rrdtool
     
     echo "30"; echo "# Installing files..."
     cp -r repeater "$INSTALL_DIR/"
