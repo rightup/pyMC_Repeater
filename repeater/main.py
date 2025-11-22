@@ -5,7 +5,7 @@ import sys
 
 from repeater.config import get_radio_for_board, load_config
 from repeater.engine import RepeaterHandler
-from repeater.http_server import HTTPStatsServer, _log_buffer
+from repeater.web.http_server import HTTPStatsServer, _log_buffer
 from pymc_core.node.handlers.trace import TraceHandler
 from pymc_core.protocol.constants import MAX_PATH_SIZE, ROUTE_TYPE_DIRECT
 
@@ -205,6 +205,7 @@ class RepeaterDaemon:
                     "path_snrs": path_snrs,  # ["58(14.5dB)", "19(4.8dB)"]
                     "path_snr_details": path_snr_details,  # [{"hash": "29", "snr_raw": 58, "snr_db": 14.5}]
                     "is_trace": True,  
+                    "raw_packet": packet.write_to().hex() if hasattr(packet, "write_to") else None,
                 }
                 self.repeater_handler.log_trace_record(packet_record)
     
@@ -350,7 +351,6 @@ class RepeaterDaemon:
         http_port = self.config.get("http", {}).get("port", 8000)
         http_host = self.config.get("http", {}).get("host", "0.0.0.0")
 
-        template_dir = os.path.join(os.path.dirname(__file__), "templates")
         node_name = self.config.get("repeater", {}).get("node_name", "Repeater")
 
         # Format public key for display
@@ -369,7 +369,6 @@ class RepeaterDaemon:
             host=http_host,
             port=http_port,
             stats_getter=self.get_stats,
-            template_dir=template_dir,
             node_name=node_name,
             pub_key=pub_key_formatted,
             send_advert_func=self.send_advert,

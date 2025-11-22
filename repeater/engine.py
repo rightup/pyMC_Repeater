@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import struct
 import time
 from collections import OrderedDict
 from typing import Optional, Tuple
@@ -12,12 +13,18 @@ from pymc_core.protocol.constants import (
     PH_ROUTE_MASK,
     ROUTE_TYPE_DIRECT,
     ROUTE_TYPE_FLOOD,
+    ROUTE_TYPE_TRANSPORT_FLOOD,
+    ROUTE_TYPE_TRANSPORT_DIRECT,
+
 )
 from pymc_core.protocol.packet_utils import PacketHeaderUtils, PacketTimingUtils
 
 from repeater.airtime import AirtimeManager
+from repeater.data_acquisition import StorageCollector
 
 logger = logging.getLogger("RepeaterHandler")
+
+NOISE_FLOOR_INTERVAL = 30.0  # seconds
 
 
 class RepeaterHandler(BaseHandler):
@@ -69,21 +76,42 @@ class RepeaterHandler(BaseHandler):
         self.dropped_count = 0
         self.recent_packets = []
         self.max_recent_packets = 50
-        self.start_time = time.time()  # For uptime calculation
+        self.start_time = time.time()
 
-        # Neighbor tracking (repeaters discovered via adverts)
-        self.neighbors = {}
+        # Storage collector for persistent packet logging
+        try:
+
+            local_identity = dispatcher.local_identity if dispatcher else None
+            self.storage = StorageCollector(config, local_identity, repeater_handler=self)
+            logger.info("StorageCollector initialized successfully")
+        except Exception as e:
+            logger.error(f"Failed to initialize StorageCollector: {e}")
+            self.storage = None
+
+        # Initialize background timer tracking
+        self.last_noise_measurement = time.time()
+        self.noise_floor_interval = NOISE_FLOOR_INTERVAL  # 30 seconds
+        self._background_task = None
+        
+        # Cache transport keys for efficient lookup
+        self._transport_keys_cache = None
+        self._transport_keys_cache_time = 0
+        self._transport_keys_cache_ttl = 60  # Cache for 60 seconds
+        
+        # Track last drop reason for better logging
+        self._last_drop_reason = None
+        
+        self._start_background_tasks()
 
     async def __call__(self, packet: Packet, metadata: Optional[dict] = None) -> None:
 
         if metadata is None:
             metadata = {}
 
-        # Track incoming packet
         self.rx_count += 1
 
-        # Check if it's time to send a periodic advertisement
-        await self._check_and_send_periodic_advert()
+        # Reset drop reason for this packet processing
+        self._last_drop_reason = None
 
         # Check if we're in monitor mode (receive only, no forwarding)
         mode = self.config.get("repeater", {}).get("mode", "forward")
@@ -139,7 +167,7 @@ class RepeaterHandler(BaseHandler):
             if monitor_mode:
                 drop_reason = "Monitor mode"
             else:
-                drop_reason = self._get_drop_reason(packet)
+                drop_reason = self._last_drop_reason or self._get_drop_reason(packet)
             logger.debug(f"Packet not forwarded: {drop_reason}")
 
         # Extract packet type and route from header
@@ -195,9 +223,17 @@ class RepeaterHandler(BaseHandler):
         # Record packet for charts
         packet_record = {
             "timestamp": time.time(),
-            "header": f"0x{packet.header:02X}" if hasattr(packet, "header") and packet.header is not None else None,
-            "payload": packet.payload.hex() if hasattr(packet, "payload") and packet.payload else None,
-            "payload_length": len(packet.payload) if hasattr(packet, "payload") and packet.payload else 0,
+            "header": (
+                f"0x{packet.header:02X}"
+                if hasattr(packet, "header") and packet.header is not None
+                else None
+            ),
+            "payload": (
+                packet.payload.hex() if hasattr(packet, "payload") and packet.payload else None
+            ),
+            "payload_length": (
+                len(packet.payload) if hasattr(packet, "payload") and packet.payload else 0
+            ),
             "type": payload_type,
             "route": route_type,
             "length": len(packet.payload or b""),
@@ -218,8 +254,15 @@ class RepeaterHandler(BaseHandler):
             "forwarded_path": (
                 [f"{b:02X}" for b in forwarded_path] if forwarded_path is not None else None
             ),
-
+            "raw_packet": packet.write_to().hex() if hasattr(packet, "write_to") else None,
         }
+
+        # Store packet record to persistent storage
+        if self.storage:
+            try:
+                self.storage.record_packet(packet_record)
+            except Exception as e:
+                logger.error(f"Failed to store packet record: {e}")
 
         # If this is a duplicate, try to attach it to the original packet
         if is_dupe and len(self.recent_packets) > 0:
@@ -244,14 +287,22 @@ class RepeaterHandler(BaseHandler):
             self.recent_packets.pop(0)
 
     def log_trace_record(self, packet_record: dict) -> None:
+        """Manually log a packet trace record (used by external callers)"""
         self.recent_packets.append(packet_record)
-        
+
         self.rx_count += 1
         if packet_record.get("transmitted", False):
             self.forwarded_count += 1
         else:
             self.dropped_count += 1
-        
+
+        # Store to persistent storage (same as __call__ does)
+        if self.storage:
+            try:
+                self.storage.record_packet(packet_record)
+            except Exception as e:
+                logger.error(f"Failed to store packet record: {e}")
+
         if len(self.recent_packets) > self.max_recent_packets:
             self.recent_packets.pop(0)
 
@@ -261,8 +312,6 @@ class RepeaterHandler(BaseHandler):
         expired = [k for k, ts in self.seen_packets.items() if now - ts > self.cache_ttl]
         for k in expired:
             del self.seen_packets[k]
-
-
 
     def _get_drop_reason(self, packet: Packet) -> str:
 
@@ -276,6 +325,12 @@ class RepeaterHandler(BaseHandler):
             return "Path too long"
 
         route_type = packet.header & PH_ROUTE_MASK
+
+        if route_type == ROUTE_TYPE_FLOOD:
+            # Check if global flood policy blocked it
+            global_flood_allow = self.config.get("mesh", {}).get("global_flood_allow", True)
+            if not global_flood_allow:
+                return "Global flood policy disabled"
 
         if route_type == ROUTE_TYPE_DIRECT:
             if not packet.path or len(packet.path) == 0:
@@ -295,6 +350,7 @@ class RepeaterHandler(BaseHandler):
                 decode_appdata,
                 get_contact_type_name,
                 parse_advert_payload,
+                determine_contact_type_from_flags,
             )
 
             # Parse advert payload
@@ -317,14 +373,8 @@ class RepeaterHandler(BaseHandler):
 
             appdata_decoded = decode_appdata(appdata)
             flags = appdata_decoded.get("flags", 0)
-
             is_repeater = bool(flags & ADVERT_FLAG_IS_REPEATER)
-
-            if not is_repeater:
-                return  # Not a repeater, skip
-
-            from pymc_core.protocol.utils import determine_contact_type_from_flags
-
+            route_type = packet.header & PH_ROUTE_MASK
             contact_type_id = determine_contact_type_from_flags(flags)
             contact_type = get_contact_type_name(contact_type_id)
 
@@ -335,31 +385,33 @@ class RepeaterHandler(BaseHandler):
 
             current_time = time.time()
 
-            # Update or create neighbor entry
-            if pubkey not in self.neighbors:
-                self.neighbors[pubkey] = {
-                    "node_name": node_name,
-                    "contact_type": contact_type,
-                    "latitude": latitude,
-                    "longitude": longitude,
-                    "first_seen": current_time,
-                    "last_seen": current_time,
-                    "rssi": rssi,
-                    "snr": snr,
-                    "advert_count": 1,
-                }
-                logger.info(f"Discovered new repeater: {node_name} ({pubkey[:16]}...)")
-            else:
-                # Update existing neighbor
-                neighbor = self.neighbors[pubkey]
-                neighbor["node_name"] = node_name  # Update name in case it changed
-                neighbor["contact_type"] = contact_type
-                neighbor["latitude"] = latitude
-                neighbor["longitude"] = longitude
-                neighbor["last_seen"] = current_time
-                neighbor["rssi"] = rssi
-                neighbor["snr"] = snr
-                neighbor["advert_count"] = neighbor.get("advert_count", 0) + 1
+            # Check if this is a new neighbor
+            current_neighbors = self.storage.get_neighbors() if self.storage else {}
+            is_new_neighbor = pubkey not in current_neighbors
+
+            # Create advert record for storage
+            advert_record = {
+                "timestamp": current_time,
+                "pubkey": pubkey,
+                "node_name": node_name,
+                "is_repeater": is_repeater,
+                "route_type": route_type,
+                "contact_type": contact_type,
+                "latitude": latitude,
+                "longitude": longitude,
+                "rssi": rssi,
+                "snr": snr,
+                "is_new_neighbor": is_new_neighbor,
+            }
+
+            # Store to database
+            if self.storage:
+                try:
+                    self.storage.record_advert(advert_record)
+                    if is_new_neighbor:
+                        logger.info(f"Discovered new neighbor: {node_name} ({pubkey[:16]}...)")
+                except Exception as e:
+                    logger.error(f"Failed to store advert record: {e}")
 
         except Exception as e:
             logger.debug(f"Error processing advert for neighbor tracking: {e}")
@@ -368,7 +420,6 @@ class RepeaterHandler(BaseHandler):
 
         pkt_hash = packet.calculate_packet_hash().hex()
         if pkt_hash in self.seen_packets:
-            logger.debug(f"Duplicate suppressed: {pkt_hash[:16]}")
             return True
         return False
 
@@ -390,16 +441,111 @@ class RepeaterHandler(BaseHandler):
 
         return True, ""
 
+    def _check_transport_codes(self, packet: Packet) -> Tuple[bool, str]:
+
+        if not self.storage:
+            logger.warning("Transport code check failed: no storage available")
+            return False, "No storage available for transport key validation"
+        
+        try:
+            from pymc_core.protocol.transport_keys import calc_transport_code
+            
+            # Check cache validity
+            current_time = time.time()
+            if (self._transport_keys_cache is None or 
+                current_time - self._transport_keys_cache_time > self._transport_keys_cache_ttl):
+                # Refresh cache
+                self._transport_keys_cache = self.storage.get_transport_keys()
+                self._transport_keys_cache_time = current_time
+            
+            transport_keys = self._transport_keys_cache
+            
+            if not transport_keys:
+                return False, "No transport keys configured"
+            
+            # Check if packet has transport codes
+            if not packet.has_transport_codes():
+                return False, "No transport codes present"
+            
+
+            transport_code_0 = packet.transport_codes[0]  # First transport code
+            
+
+            payload = packet.get_payload()
+            payload_type = packet.get_payload_type() if hasattr(packet, 'get_payload_type') else ((packet.header & 0x3C) >> 2)
+            
+            # Check packet against each transport key
+            for key_record in transport_keys:
+                transport_key_encoded = key_record.get("transport_key")
+                key_name = key_record.get("name", "unknown")
+                flood_policy = key_record.get("flood_policy", "deny")
+                
+                if not transport_key_encoded:
+                    continue
+                
+                try:
+                    import base64
+                    transport_key = base64.b64decode(transport_key_encoded)
+                    expected_code = calc_transport_code(transport_key, packet)
+                    if transport_code_0 == expected_code:
+                        logger.debug(f"Transport code validated for key '{key_name}' with policy '{flood_policy}'")
+                        
+                        # Update last_used timestamp for this key
+                        try:
+                            key_id = key_record.get("id")
+                            if key_id:
+                                self.storage.update_transport_key(
+                                    key_id=key_id,
+                                    last_used=time.time()
+                                )
+                                logger.debug(f"Updated last_used timestamp for transport key '{key_name}'")
+                        except Exception as e:
+                            logger.warning(f"Failed to update last_used for transport key '{key_name}': {e}")
+                        
+                        # Check flood policy for this key
+                        if flood_policy == "allow":
+                            return True, ""
+                        else:
+                            return False, f"Transport key '{key_name}' flood policy denied"
+
+                    
+                except Exception as e:
+                    logger.warning(f"Error checking transport key '{key_name}': {e}")
+                    continue
+            
+            # No matching transport code found
+            logger.debug(f"Transport code 0x{transport_code_0:04X} denied (checked {len(transport_keys)} keys)")
+            return False, "No matching transport code"
+            
+        except Exception as e:
+            logger.error(f"Transport code validation error: {e}")
+            return False, f"Transport code validation error: {e}"
+
     def flood_forward(self, packet: Packet) -> Optional[Packet]:
 
         # Validate
         valid, reason = self.validate_packet(packet)
         if not valid:
-            logger.debug(f"Flood validation failed: {reason}")
+            self._last_drop_reason = reason
             return None
+
+        # Check global flood policy
+        global_flood_allow = self.config.get("mesh", {}).get("global_flood_allow", True)
+        if not global_flood_allow:
+            route_type = packet.header & PH_ROUTE_MASK
+            if route_type == ROUTE_TYPE_FLOOD or route_type == ROUTE_TYPE_TRANSPORT_FLOOD:
+             
+                allowed, check_reason = self._check_transport_codes(packet)
+                if not allowed:
+                    self._last_drop_reason = check_reason
+                    return None
+            else:
+                self._last_drop_reason = "Global flood policy disabled"
+                return None
 
         # Suppress duplicates
         if self.is_duplicate(packet):
+            self._last_drop_reason = "Duplicate"
             return None
 
         if packet.path is None:
@@ -411,7 +557,6 @@ class RepeaterHandler(BaseHandler):
         packet.path_len = len(packet.path)
 
         self.mark_seen(packet)
-        logger.debug(f"Flood: forwarding with path len {packet.path_len}")
 
         return packet
 
@@ -419,23 +564,17 @@ class RepeaterHandler(BaseHandler):
 
         # Check if we're the next hop
         if not packet.path or len(packet.path) == 0:
-            logger.debug("Direct: no path")
+            self._last_drop_reason = "Direct: no path"
             return None
 
         next_hop = packet.path[0]
         if next_hop != self.local_hash:
-            logger.debug(
-                f"Direct: not our hop (next={next_hop:02X}, local={self.local_hash:02X})"
-            )
+            self._last_drop_reason = "Direct: not for us"
             return None
 
         original_path = list(packet.path)
         packet.path = bytearray(packet.path[1:])
         packet.path_len = len(packet.path)
-
-        old_path = [f"{b:02X}" for b in original_path]
-        new_path = [f"{b:02X}" for b in packet.path]
-        logger.debug(f"Direct: forwarding, path {old_path} -> {new_path}")
 
         return packet
 
@@ -517,14 +656,14 @@ class RepeaterHandler(BaseHandler):
 
         route_type = packet.header & PH_ROUTE_MASK
 
-        if route_type == ROUTE_TYPE_FLOOD:
+        if route_type == ROUTE_TYPE_FLOOD or route_type == ROUTE_TYPE_TRANSPORT_FLOOD:
             fwd_pkt = self.flood_forward(packet)
             if fwd_pkt is None:
                 return None
             delay = self._calculate_tx_delay(fwd_pkt, snr)
             return fwd_pkt, delay
 
-        elif route_type == ROUTE_TYPE_DIRECT:
+        elif route_type == ROUTE_TYPE_DIRECT or route_type == ROUTE_TYPE_TRANSPORT_DIRECT:
             fwd_pkt = self.direct_forward(packet)
             if fwd_pkt is None:
                 return None
@@ -532,7 +671,7 @@ class RepeaterHandler(BaseHandler):
             return fwd_pkt, delay
 
         else:
-            logger.debug(f"Unknown route type: {route_type}")
+            self._last_drop_reason = f"Unknown route type: {route_type}"
             return None
 
     async def schedule_retransmit(self, fwd_pkt: Packet, delay: float, airtime_ms: float = 0.0):
@@ -553,36 +692,10 @@ class RepeaterHandler(BaseHandler):
 
         asyncio.create_task(delayed_send())
 
-    async def _check_and_send_periodic_advert(self):
-
-        if self.send_advert_interval_hours <= 0 or not self.send_advert_func:
-            return
-
-        current_time = time.time()
-        interval_seconds = self.send_advert_interval_hours * 3600  # Convert hours to seconds
-        time_since_last_advert = current_time - self.last_advert_time
-
-        # Check if interval has elapsed
-        if time_since_last_advert >= interval_seconds:
-            logger.info(
-                f"Periodic advert interval elapsed ({time_since_last_advert:.0f}s >= "
-                f"{interval_seconds:.0f}s). Sending advert..."
-            )
-            try:
-                # Call the send_advert function
-                success = await self.send_advert_func()
-                if success:
-                    self.last_advert_time = current_time
-                    logger.info("Periodic advert sent successfully")
-                else:
-                    logger.warning("Failed to send periodic advert")
-            except Exception as e:
-                logger.error(f"Error sending periodic advert: {e}", exc_info=True)
-
     def get_noise_floor(self) -> Optional[float]:
         try:
             radio = self.dispatcher.radio if self.dispatcher else None
-            if radio and hasattr(radio, 'get_noise_floor'):
+            if radio and hasattr(radio, "get_noise_floor"):
                 return radio.get_noise_floor()
             return None
         except Exception as e:
@@ -610,6 +723,9 @@ class RepeaterHandler(BaseHandler):
         # Get current noise floor from radio
         noise_floor_dbm = self.get_noise_floor()
 
+        # Get neighbors from database
+        neighbors = self.storage.get_neighbors() if self.storage else {}
+
         stats = {
             "local_hash": f"0x{self.local_hash:02x}",
             "duplicate_cache_size": len(self.seen_packets),
@@ -620,7 +736,7 @@ class RepeaterHandler(BaseHandler):
             "rx_per_hour": rx_per_hour,
             "forwarded_per_hour": forwarded_per_hour,
             "recent_packets": self.recent_packets,
-            "neighbors": self.neighbors,
+            "neighbors": neighbors,
             "uptime_seconds": uptime_seconds,
             "noise_floor_dbm": noise_floor_dbm,
             # Add configuration data
@@ -656,3 +772,85 @@ class RepeaterHandler(BaseHandler):
         # Add airtime stats
         stats.update(self.airtime_mgr.get_stats())
         return stats
+
+    def _start_background_tasks(self):
+        if self._background_task is None:
+            self._background_task = asyncio.create_task(self._background_timer_loop())
+            logger.info("Background timer started for noise floor and adverts")
+
+    async def _background_timer_loop(self):
+        try:
+            while True:
+                current_time = time.time()
+
+                # Check noise floor recording (every 30 seconds)
+                if current_time - self.last_noise_measurement >= self.noise_floor_interval:
+                    await self._record_noise_floor_async()
+                    self.last_noise_measurement = current_time
+
+                # Check advert sending (every N hours)
+                if self.send_advert_interval_hours > 0 and self.send_advert_func:
+                    interval_seconds = self.send_advert_interval_hours * 3600
+                    if current_time - self.last_advert_time >= interval_seconds:
+                        await self._send_periodic_advert_async()
+                        self.last_advert_time = current_time
+
+                # Sleep for 5 seconds before next check
+                await asyncio.sleep(5.0)
+
+        except asyncio.CancelledError:
+            logger.info("Background timer loop cancelled")
+            raise
+        except Exception as e:
+            logger.error(f"Error in background timer loop: {e}")
+            # Restart the timer after a delay
+            await asyncio.sleep(30)
+            self._background_task = asyncio.create_task(self._background_timer_loop())
+
+    async def _record_noise_floor_async(self):
+        if not self.storage:
+            return
+
+        try:
+            noise_floor = self.get_noise_floor()
+            if noise_floor is not None:
+                self.storage.record_noise_floor(noise_floor)
+                logger.debug(f"Recorded noise floor: {noise_floor} dBm")
+            else:
+                logger.debug("Unable to read noise floor from radio")
+        except Exception as e:
+            logger.error(f"Error recording noise floor: {e}")
+
+    async def _send_periodic_advert_async(self):
+        logger.info(
+            f"Periodic advert timer triggered (interval: {self.send_advert_interval_hours}h)"
+        )
+        try:
+            if self.send_advert_func:
+                success = await self.send_advert_func()
+                if success:
+                    logger.info("Periodic advert sent successfully")
+                else:
+                    logger.warning("Failed to send periodic advert")
+            else:
+                logger.debug("No send_advert_func configured")
+        except Exception as e:
+            logger.error(f"Error sending periodic advert: {e}")
+
+    def cleanup(self):
+        if self._background_task and not self._background_task.done():
+            self._background_task.cancel()
+            logger.info("Background timer task cancelled")
+
+        if self.storage:
+            try:
+                self.storage.close()
+                logger.info("StorageCollector closed successfully")
+            except Exception as e:
+                logger.error(f"Error closing StorageCollector: {e}")
+
+    def __del__(self):
+        try:
+            self.cleanup()
+        except Exception:
+            pass

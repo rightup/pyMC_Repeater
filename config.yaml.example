@@ -34,6 +34,13 @@ repeater:
   # Recommended: 10 hours for typical deployments
   send_advert_interval_hours: 10
 
+# Mesh Network Configuration
+mesh:
+  # Global flood policy - controls whether the repeater allows or denies flooding by default
+  # true = allow flooding globally, false = deny flooding globally
+  # Individual transport keys can override this setting
+  global_flood_allow: false
+
 radio:
   # Frequency in Hz (869.618 MHz for EU)
   frequency: 869618000
@@ -102,9 +109,75 @@ duty_cycle:
   # Maximum airtime per minute in milliseconds
   max_airtime_per_minute: 3600
 
+
+# Storage Configuration
+storage:
+  # Directory for persistent storage files (SQLite, RRD)
+  storage_dir: "/var/lib/pymc_repeater"
+
+  # MQTT publishing configuration (optional)
+  mqtt:
+    # Enable/disable MQTT publishing
+    enabled: false
+    
+    # MQTT broker settings
+    broker: "localhost"
+    port: 1883
+    
+    # Authentication (optional)
+    username: null
+    password: null
+    
+    # Base topic for publishing
+    # Messages will be published to: {base_topic}/{node_name}/{packet|advert}
+    base_topic: "meshcore/repeater"
+
+  # Data retention settings
+  retention:
+    # Clean up SQLite records older than this many days
+    sqlite_cleanup_days: 31
+    
+    # RRD archives are managed automatically:
+    # - 1 minute resolution for 1 week
+    # - 5 minute resolution for 1 month  
+    # - 1 hour resolution for 1 year
+
+
+
+
+
+letsmesh:
+  enabled: true
+  iata_code: "test"  # e.g., "SFO", "LHR", "test"
+  broker_index: 0                  # Which LetsMesh broker (0=EU, 1=US West)
+  status_interval: 60
+  
+  # Block specific packet types from being published to LetsMesh
+  # If not specified or empty list, all types are published
+  # Available types: REQ, RESPONSE, TXT_MSG, ACK, ADVERT, GRP_TXT, 
+  #                  GRP_DATA, ANON_REQ, PATH, TRACE, RAW_CUSTOM
+  disallowed_packet_types: []
+    # - REQ           # Don't publish requests
+    # - RESPONSE      # Don't publish responses
+    # - TXT_MSG       # Don't publish text messages
+    # - ACK           # Don't publish acknowledgments
+    # - ADVERT        # Don't publish advertisements
+    # - GRP_TXT       # Don't publish group text messages
+    # - GRP_DATA      # Don't publish group data
+    # - ANON_REQ      # Don't publish anonymous requests
+    # - PATH          # Don't publish path packets
+    # - TRACE         # Don't publish trace packets
+    # - RAW_CUSTOM    # Don't publish custom raw packets
+
 logging:
   # Log level: DEBUG, INFO, WARNING, ERROR
   level: INFO
 
   # Log format
   format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+
+# Web interface configuration
+web:
+  # Enable Cross-Origin Resource Sharing (CORS) headers
+  # Allows web frontends from different origins to access the API
+  cors_enabled: false
