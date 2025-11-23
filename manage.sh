@@ -577,30 +577,32 @@ def merge_yaml_configs(user_config_path, example_config_path, output_path):
         with open(example_config_path, 'r') as f:
             example_config = yaml.safe_load(f) or {}
         
-        # Sections to preserve completely from user config (don't overwrite with example)
-        protected_sections = ['radio', 'sx1262']
+        # Add missing keys function - preserves ALL user values, only adds new ones
+        def add_missing_keys(user_dict, example_dict):
+            """Add missing keys from example to user config, preserving all user values"""
+            if not isinstance(user_dict, dict) or not isinstance(example_dict, dict):
+                return user_dict
+            
+            # Start with user config to preserve all existing settings
+            result = dict(user_dict)
+            
+            # Add only missing keys from example
+            for key, value in example_dict.items():
+                if key not in result:
+                    # Add completely new keys
+                    result[key] = value
+                    print(f"    + Added new config section: {key}")
+                elif isinstance(result[key], dict) and isinstance(value, dict):
+                    # Recursively merge dictionaries, preserving user settings
+                    result[key] = add_missing_keys(result[key], value)
+                # If key exists in user config, always keep the user's value
+            
+            return result
         
-        # Deep merge function
-        def deep_merge(base, overlay):
-            for key, value in overlay.items():
-                # Skip protected sections - keep user's version completely
-                if key in protected_sections:
-                    continue
-                    
-                if key in base and isinstance(base[key], dict) and isinstance(value, dict):
-                    deep_merge(base[key], value)
-                elif key not in base:
-                    base[key] = value
-            return base
+        # Start with user config as base - preserves ALL user settings
+        merged = add_missing_keys(user_config, example_config)
         
-        # Start with example config as base (gets all new sections)
-        merged = deep_merge(dict(example_config), user_config)
-        
-        # Explicitly preserve protected sections from user config
-        for section in protected_sections:
-            if section in user_config:
-                merged[section] = user_config[section]
-                print(f"    ✓ Preserved user {section} configuration")
+        print("    ✓ All user settings preserved, new options added")
         
         # Write merged config
         with open(output_path, 'w') as f:
