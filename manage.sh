@@ -567,7 +567,7 @@ import yaml
 from collections import OrderedDict
 
 def merge_yaml_configs(user_config_path, example_config_path, output_path):
-    """Merge user config with new example config, preserving user values"""
+    """Merge user config with new example config, preserving user values and protecting critical sections"""
     try:
         # Load user config
         with open(user_config_path, 'r') as f:
@@ -577,9 +577,16 @@ def merge_yaml_configs(user_config_path, example_config_path, output_path):
         with open(example_config_path, 'r') as f:
             example_config = yaml.safe_load(f) or {}
         
+        # Sections to preserve completely from user config (don't overwrite with example)
+        protected_sections = ['radio', 'sx1262']
+        
         # Deep merge function
         def deep_merge(base, overlay):
             for key, value in overlay.items():
+                # Skip protected sections - keep user's version completely
+                if key in protected_sections:
+                    continue
+                    
                 if key in base and isinstance(base[key], dict) and isinstance(value, dict):
                     deep_merge(base[key], value)
                 elif key not in base:
@@ -588,6 +595,12 @@ def merge_yaml_configs(user_config_path, example_config_path, output_path):
         
         # Start with example config as base (gets all new sections)
         merged = deep_merge(dict(example_config), user_config)
+        
+        # Explicitly preserve protected sections from user config
+        for section in protected_sections:
+            if section in user_config:
+                merged[section] = user_config[section]
+                print(f"    ✓ Preserved user {section} configuration")
         
         # Write merged config
         with open(output_path, 'w') as f:

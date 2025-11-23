@@ -39,7 +39,7 @@ mesh:
   # Global flood policy - controls whether the repeater allows or denies flooding by default
   # true = allow flooding globally, false = deny flooding globally
   # Individual transport keys can override this setting
-  global_flood_allow: false
+  global_flood_allow: true
 
 radio:
   # Frequency in Hz (869.618 MHz for EU)
@@ -147,8 +147,8 @@ storage:
 
 
 letsmesh:
-  enabled: true
-  iata_code: "test"  # e.g., "SFO", "LHR", "test"
+  enabled: false
+  iata_code: "Test"  # e.g., "SFO", "LHR", "Test"
   broker_index: 0                  # Which LetsMesh broker (0=EU, 1=US West)
   status_interval: 60
   
