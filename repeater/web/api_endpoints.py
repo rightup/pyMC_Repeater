@@ -24,6 +24,24 @@ def add_cors_headers():
     cherrypy.response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
 
 
+def cors_tool():
+    """CherryPy tool to add CORS headers"""
+    if cherrypy.request.method == 'OPTIONS':
+        # Handle preflight requests
+        cherrypy.response.headers['Access-Control-Allow-Origin'] = '*'
+        cherrypy.response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
+        cherrypy.response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
+        cherrypy.response.headers['Access-Control-Max-Age'] = '86400'
+        return ''
+    else:
+        # Add CORS headers to actual requests
+        add_cors_headers()
+
+
+# Register the CORS tool
+cherrypy.tools.cors = cherrypy.Tool('before_handler', cors_tool)
+
+
 # system systems
 # GET /api/stats
 # GET /api/logs
@@ -67,6 +85,7 @@ def add_cors_headers():
 
 
 class APIEndpoints:
+    
     def __init__(self, stats_getter: Optional[Callable] = None, send_advert_func: Optional[Callable] = None, config: Optional[dict] = None, event_loop=None, daemon_instance=None, config_path=None):
         self.stats_getter = stats_getter
         self.send_advert_func = send_advert_func
@@ -76,19 +95,16 @@ class APIEndpoints:
         self._config_path = config_path or '/etc/pymc_repeater/config.yaml'
         self.cad_calibration = CADCalibrationEngine(daemon_instance, event_loop)
         
-        # CORS check from config
+      
         self._cors_enabled = is_cors_enabled(self.config)
-        
-        # Log the CORS status
+
         logger.info(f"CORS {'enabled' if self._cors_enabled else 'disabled'} (config: web.cors_enabled={self._cors_enabled})")
         
-        # Set up automatic CORS for all responses if enabled
+        # Configure CORS tool for this class if enabled
         if self._cors_enabled:
-            cherrypy.engine.subscribe('before_finalize', self._add_cors_headers)
-
-    def _add_cors_headers(self):
-        """Automatically add CORS headers to all responses"""
-        add_cors_headers()
+            self._cp_config = {'tools.cors.on': True}
+        else:
+            self._cp_config = {'tools.cors.on': False}
 
     @cherrypy.expose
     def default(self, *args, **kwargs):
