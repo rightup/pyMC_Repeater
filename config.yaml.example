@@ -41,6 +41,11 @@ mesh:
   # Individual transport keys can override this setting
   global_flood_allow: true
 
+  # Identity key for mesh network (auto-generated if not provided)
+  # This is automatically managed - leave as null for automatic generation
+  identity_key: null
+
+
 radio:
   # Frequency in Hz (869.618 MHz for EU)
   frequency: 869618000
