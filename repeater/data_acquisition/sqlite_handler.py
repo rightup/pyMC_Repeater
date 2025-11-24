@@ -813,3 +813,12 @@ class SQLiteHandler:
         except Exception as e:
             logger.error(f"Failed to delete transport key: {e}")
             return False
+
+    def delete_advert(self, advert_id: int) -> bool:
+        try:
+            with sqlite3.connect(self.sqlite_path) as conn:
+                cursor = conn.execute("DELETE FROM adverts WHERE id = ?", (advert_id,))
+                return cursor.rowcount > 0
+        except Exception as e:
+            logger.error(f"Failed to delete advert: {e}")
+            return False

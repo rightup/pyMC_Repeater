@@ -225,3 +225,6 @@ class StorageCollector:
 
     def delete_transport_key(self, key_id: int) -> bool:
         return self.sqlite_handler.delete_transport_key(key_id)
+
+    def delete_advert(self, advert_id: int) -> bool:
+        return self.sqlite_handler.delete_advert(advert_id)

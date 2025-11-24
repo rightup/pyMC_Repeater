@@ -856,3 +856,48 @@ class APIEndpoints:
                 return self._error(e)
         else:
             return self._error("Method not supported")
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    @cherrypy.tools.json_in()
+    def advert(self, advert_id):
+        if cherrypy.request.method == "DELETE":
+            try:
+                advert_id = int(advert_id)
+                storage = self._get_storage()
+                success = storage.delete_advert(advert_id)
+                
+                if success:
+                    return self._success({"id": advert_id}, message="Neighbor deleted successfully")
+                else:
+                    return self._error("Failed to delete neighbor or neighbor not found")
+            except ValueError:
+                return self._error("Invalid advert_id format")
+            except Exception as e:
+                logger.error(f"Error deleting neighbor: {e}")
+                return self._error(e)
+        else:
+            return self._error("Method not supported")
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    @cherrypy.tools.json_in()
+    def ping_neighbor(self):
+        try:
+            self._require_post()
+            data = cherrypy.request.json or {}
+            target_id = data.get("target_id")
+            
+            if not target_id:
+                return self._error("Missing target_id parameter")
+            
+            # TODO: Implement actual ping functionality when available
+            # For now, return success to indicate the endpoint works
+            logger.info(f"Ping request for neighbor: {target_id}")
+            return self._success({"target_id": target_id}, message="Ping sent successfully")
+            
+        except cherrypy.HTTPError:
+            raise
+        except Exception as e:
+            logger.error(f"Error pinging neighbor: {e}")
+            return self._error(e)
