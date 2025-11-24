@@ -194,7 +194,7 @@ class RepeaterDaemon:
                     "tx_delay_ms": 0,  
                     "transmitted": False,  
                     "is_duplicate": False,  
-                    "packet_hash": packet.calculate_packet_hash().hex()[:16],
+                    "packet_hash": packet.calculate_packet_hash().hex().upper()[:16],
                     "drop_reason": "trace_received",
                     "path_hash": path_hash,
                     "src_hash": None,  
@@ -235,7 +235,7 @@ class RepeaterDaemon:
                 self.repeater_handler and not self.repeater_handler.is_duplicate(packet)):
                 
                 if self.repeater_handler and hasattr(self.repeater_handler, 'recent_packets'):
-                    packet_hash = packet.calculate_packet_hash().hex()[:16]
+                    packet_hash = packet.calculate_packet_hash().hex().upper()[:16]
                     for record in reversed(self.repeater_handler.recent_packets):
                         if record.get("packet_hash") == packet_hash:
                             record["transmitted"] = True

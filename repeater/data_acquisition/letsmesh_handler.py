@@ -33,12 +33,6 @@ LETSMESH_BROKERS = [
         "port": 443,
         "audience": "mqtt-us-v1.letsmesh.net",
     },
-    {
-        "name": "Europe (LetsMesh v1)",
-        "host": "mqtt-eu-v1.letsmesh.net",
-        "port": 443,
-        "audience": "mqtt-eu-v1.letsmesh.net",
-    },
 ]
 
 
