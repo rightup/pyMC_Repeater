@@ -204,7 +204,19 @@ install_repeater() {
     
     echo "25"; echo "# Installing system dependencies..."
     apt-get update -qq
-    apt-get install -y libffi-dev jq pip python3-rrdtool yq
+    apt-get install -y libffi-dev jq pip python3-rrdtool wget
+    
+    # Install mikefarah yq v4 if not already installed
+    if ! command -v yq &> /dev/null || [[ "$(yq --version 2>&1)" != *"mikefarah/yq"* ]]; then
+        YQ_VERSION="v4.40.5"
+        YQ_BINARY="yq_linux_arm64"
+        if [[ "$(uname -m)" == "x86_64" ]]; then
+            YQ_BINARY="yq_linux_amd64"
+        elif [[ "$(uname -m)" == "armv7"* ]]; then
+            YQ_BINARY="yq_linux_arm"
+        fi
+        wget -qO /usr/local/bin/yq "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/${YQ_BINARY}" && chmod +x /usr/local/bin/yq
+    fi
     
     echo "30"; echo "# Installing files..."
     cp -r repeater "$INSTALL_DIR/"
@@ -302,7 +314,19 @@ upgrade_repeater() {
         
         echo "[3/9] Updating system dependencies..."
         apt-get update -qq
-        apt-get install -y libffi-dev jq pip python3-rrdtool yq
+        apt-get install -y libffi-dev jq pip python3-rrdtool wget
+        
+        # Install mikefarah yq v4 if not already installed
+        if ! command -v yq &> /dev/null || [[ "$(yq --version 2>&1)" != *"mikefarah/yq"* ]]; then
+            YQ_VERSION="v4.40.5"
+            YQ_BINARY="yq_linux_arm64"
+            if [[ "$(uname -m)" == "x86_64" ]]; then
+                YQ_BINARY="yq_linux_amd64"
+            elif [[ "$(uname -m)" == "armv7"* ]]; then
+                YQ_BINARY="yq_linux_arm"
+            fi
+            wget -qO /usr/local/bin/yq "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/${YQ_BINARY}" && chmod +x /usr/local/bin/yq
+        fi
         echo "    ✓ Dependencies updated"
         
         echo "[4/9] Installing new files..."
