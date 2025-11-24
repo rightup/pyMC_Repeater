@@ -204,7 +204,7 @@ install_repeater() {
     
     echo "25"; echo "# Installing system dependencies..."
     apt-get update -qq
-    apt-get install -y libffi-dev jq pip python3-rrdtool
+    apt-get install -y libffi-dev jq pip python3-rrdtool yq
     
     echo "30"; echo "# Installing files..."
     cp -r repeater "$INSTALL_DIR/"
@@ -302,7 +302,7 @@ upgrade_repeater() {
         
         echo "[3/9] Updating system dependencies..."
         apt-get update -qq
-        apt-get install -y libffi-dev jq pip python3-rrdtool python3-yaml
+        apt-get install -y libffi-dev jq pip python3-rrdtool yq
         echo "    ✓ Dependencies updated"
         
         echo "[4/9] Installing new files..."
@@ -553,82 +553,49 @@ validate_and_update_config() {
         return 0
     fi
     
-    # Check if we have python3 and pyyaml for proper YAML processing
-    if ! command -v python3 &> /dev/null; then
-        echo "    ⚠ Python3 not found, skipping advanced config validation"
+    # Check if yq is available
+    if ! command -v yq &> /dev/null; then
+        echo "    ⚠ yq not found, skipping config merge"
         return 0
     fi
     
-    # Create a Python script to merge configs intelligently
-    python3 << 'EOF'
-import sys
-import os
-import yaml
-from collections import OrderedDict
-
-def merge_yaml_configs(user_config_path, example_config_path, output_path):
-    """Merge user config with new example config, preserving user values and protecting critical sections"""
-    try:
-        # Load user config
-        with open(user_config_path, 'r') as f:
-            user_config = yaml.safe_load(f) or {}
-        
-        # Load example config
-        with open(example_config_path, 'r') as f:
-            example_config = yaml.safe_load(f) or {}
-        
-        # Add missing keys function - preserves ALL user values, only adds new ones
-        def add_missing_keys(user_dict, example_dict):
-            """Add missing keys from example to user config, preserving all user values"""
-            if not isinstance(user_dict, dict) or not isinstance(example_dict, dict):
-                return user_dict
-            
-            # Start with user config to preserve all existing settings
-            result = dict(user_dict)
-            
-            # Add only missing keys from example
-            for key, value in example_dict.items():
-                if key not in result:
-                    # Add completely new keys
-                    result[key] = value
-                    print(f"    + Added new config section: {key}")
-                elif isinstance(result[key], dict) and isinstance(value, dict):
-                    # Recursively merge dictionaries, preserving user settings
-                    result[key] = add_missing_keys(result[key], value)
-                # If key exists in user config, always keep the user's value
-            
-            return result
-        
-        # Start with user config as base - preserves ALL user settings
-        merged = add_missing_keys(user_config, example_config)
-        
-        print("    ✓ All user settings preserved, new options added")
-        
-        # Write merged config
-        with open(output_path, 'w') as f:
-            yaml.dump(merged, f, default_flow_style=False, indent=2)
-        
-        return True
-    except Exception as e:
-        print(f"Error merging configs: {e}")
-        return False
-
-# Run the merge
-config_dir = os.environ.get('CONFIG_DIR', '/etc/pymc_repeater')
-user_config = os.path.join(config_dir, 'config.yaml')
-example_config = os.path.join(config_dir, 'config.yaml.example')
-temp_config = os.path.join(config_dir, 'config.yaml.merged')
-
-if merge_yaml_configs(user_config, example_config, temp_config):
-    # Replace original with merged version
-    os.rename(temp_config, user_config)
-    print("    ✓ Configuration updated with new settings")
-else:
-    print("    ⚠ Config merge failed, keeping original")
-    sys.exit(1)
-EOF
+    # Verify it's yq
+    if [[ "$(yq --version 2>&1)" != *"mikefarah/yq"* ]]; then
+        echo "    ⚠ Wrong yq version detected, skipping config merge"
+        return 0
+    fi
     
-    return $?
+    echo "    Merging configuration..."
+    
+    # Create backup of user config
+    local backup_file="${config_file}.backup.$(date +%Y%m%d_%H%M%S)"
+    cp "$config_file" "$backup_file"
+    echo "    ✓ Backup created: $backup_file"
+    
+    # Merge strategy: user config takes precedence, add missing keys from example
+    # This uses yq's multiply merge operator (*) which:
+    # - Keeps all values from the right operand (user config)
+    # - Adds missing keys from the left operand (example config)
+    local temp_merged="${config_file}.merged"
+    
+    if yq eval-all '. as $item ireduce ({}; . * $item)' "$updated_example" "$config_file" > "$temp_merged" 2>/dev/null; then
+        # Verify the merged file is valid YAML
+        if yq eval '.' "$temp_merged" > /dev/null 2>&1; then
+            mv "$temp_merged" "$config_file"
+            echo "    ✓ Configuration merged successfully"
+            echo "    ✓ User settings preserved, new options added"
+            return 0
+        else
+            echo "    ✗ Merged config is invalid, restoring backup"
+            rm -f "$temp_merged"
+            cp "$backup_file" "$config_file"
+            return 1
+        fi
+    else
+        echo "    ✗ Config merge failed, keeping original"
+        rm -f "$temp_merged"
+        return 1
+    fi
 }
 
 # Main script logic
