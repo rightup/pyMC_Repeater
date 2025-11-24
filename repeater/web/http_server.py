@@ -7,6 +7,7 @@ from datetime import datetime
 from typing import Callable, Optional
 
 import cherrypy
+import cherrypy_cors
 from pymc_core.protocol.utils import PAYLOAD_TYPES, ROUTE_TYPES
 
 from repeater import __version__
@@ -83,6 +84,10 @@ class StatsApp:
     @cherrypy.expose
     def default(self, *args, **kwargs):
         """Handle client-side routing - serve index.html for all non-API routes."""
+        # Handle OPTIONS requests for any path
+        if cherrypy.request.method == "OPTIONS":
+            return ""
+        
         # Let API routes pass through
         if args and args[0] == 'api':
             raise cherrypy.NotFound()
@@ -109,13 +114,27 @@ class HTTPStatsServer:
 
         self.host = host
         self.port = port
+        self.config = config or {}
         self.app = StatsApp(
             stats_getter, node_name, pub_key, send_advert_func, config, event_loop, daemon_instance, config_path
         )
+        
+        # Set up CORS at the server level if enabled
+        self._cors_enabled = self.config.get("web", {}).get("cors_enabled", False)
+        logger.info(f"CORS enabled: {self._cors_enabled}")
+
+    def _setup_server_cors(self):
+        """Set up CORS using cherrypy_cors.install()"""
+        cherrypy_cors.install()
+        logger.info("CORS support enabled")
 
     def start(self):
 
         try:
+   
+            if self._cors_enabled:
+                self._setup_server_cors()
+            
             # Serve static files from the html directory (compiled Vue.js app)
             html_dir = os.path.join(os.path.dirname(__file__), "html")
             assets_dir = os.path.join(html_dir, "assets")
@@ -123,6 +142,7 @@ class HTTPStatsServer:
             config = {
                 "/": {
                     "tools.sessions.on": False,
+                    "cors.expose.on": self._cors_enabled,
                     # Ensure proper content types for Vue.js files
                     "tools.staticfile.content_types": {
                         'js': 'application/javascript',
@@ -133,6 +153,7 @@ class HTTPStatsServer:
                 "/assets": {
                     "tools.staticdir.on": True,
                     "tools.staticdir.dir": assets_dir,
+                    "cors.expose.on": self._cors_enabled,
                     # Set proper content types for assets
                     "tools.staticdir.content_types": {
                         'js': 'application/javascript',
@@ -143,6 +164,7 @@ class HTTPStatsServer:
                 "/favicon.ico": {
                     "tools.staticfile.on": True,
                     "tools.staticfile.filename": os.path.join(html_dir, "favicon.ico"),
+                    "cors.expose.on": self._cors_enabled,
                 },
             }
 

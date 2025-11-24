@@ -12,36 +12,6 @@ from .cad_calibration_engine import CADCalibrationEngine
 logger = logging.getLogger("HTTPServer")
 
 
-def is_cors_enabled(config: dict) -> bool:
-    """Check if CORS is enabled in the configuration"""
-    return config.get("web", {}).get("cors_enabled", False)
-
-
-def add_cors_headers():
-    """Add CORS headers to allow cross-origin requests"""
-    cherrypy.response.headers['Access-Control-Allow-Origin'] = '*'
-    cherrypy.response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
-    cherrypy.response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
-
-
-def cors_tool():
-    """CherryPy tool to add CORS headers"""
-    if cherrypy.request.method == 'OPTIONS':
-        # Handle preflight requests
-        cherrypy.response.headers['Access-Control-Allow-Origin'] = '*'
-        cherrypy.response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
-        cherrypy.response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
-        cherrypy.response.headers['Access-Control-Max-Age'] = '86400'
-        return ''
-    else:
-        # Add CORS headers to actual requests
-        add_cors_headers()
-
-
-# Register the CORS tool
-cherrypy.tools.cors = cherrypy.Tool('before_handler', cors_tool)
-
-
 # system systems
 # GET /api/stats
 # GET /api/logs
@@ -94,23 +64,14 @@ class APIEndpoints:
         self.daemon_instance = daemon_instance
         self._config_path = config_path or '/etc/pymc_repeater/config.yaml'
         self.cad_calibration = CADCalibrationEngine(daemon_instance, event_loop)
-        
-      
-        self._cors_enabled = is_cors_enabled(self.config)
-
-        logger.info(f"CORS {'enabled' if self._cors_enabled else 'disabled'} (config: web.cors_enabled={self._cors_enabled})")
-        
-        # Configure CORS tool for this class if enabled
-        if self._cors_enabled:
-            self._cp_config = {'tools.cors.on': True}
-        else:
-            self._cp_config = {'tools.cors.on': False}
 
     @cherrypy.expose
     def default(self, *args, **kwargs):
-        """Handle OPTIONS requests for CORS preflight"""
+        """Handle default requests"""
         if cherrypy.request.method == "OPTIONS":
+            # OPTIONS handled by server-level CORS middleware
             return ""
+        
         # For non-OPTIONS requests, return 404
         raise cherrypy.HTTPError(404)
 
@@ -278,7 +239,6 @@ class APIEndpoints:
     @cherrypy.expose
     @cherrypy.tools.json_out()
     def packet_stats(self, hours=24):
-        
         try:
             hours = int(hours)
             stats = self._get_storage().get_packet_stats(hours=hours)
@@ -290,7 +250,6 @@ class APIEndpoints:
     @cherrypy.expose
     @cherrypy.tools.json_out()
     def packet_type_stats(self, hours=24):
-        
         try:
             hours = int(hours)
             stats = self._get_storage().get_packet_type_stats(hours=hours)
@@ -302,7 +261,6 @@ class APIEndpoints:
     @cherrypy.expose
     @cherrypy.tools.json_out()
     def route_stats(self, hours=24):
-        
         try:
             hours = int(hours)
             stats = self._get_storage().get_route_stats(hours=hours)
@@ -314,7 +272,6 @@ class APIEndpoints:
     @cherrypy.expose
     @cherrypy.tools.json_out()
     def recent_packets(self, limit=100):
-        
         try:
             limit = int(limit)
             packets = self._get_storage().get_recent_packets(limit=limit)
@@ -639,10 +596,6 @@ class APIEndpoints:
         cherrypy.response.headers['Content-Type'] = 'text/event-stream'
         cherrypy.response.headers['Cache-Control'] = 'no-cache'
         cherrypy.response.headers['Connection'] = 'keep-alive'
-        
-        # Add CORS headers conditionally for SSE endpoint
-        if self._cors_enabled:
-            cherrypy.response.headers['Access-Control-Allow-Origin'] = '*'
         
         if not hasattr(self.cad_calibration, 'message_queue'):
             self.cad_calibration.message_queue = []
