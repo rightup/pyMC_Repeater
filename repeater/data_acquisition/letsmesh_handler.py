@@ -138,6 +138,13 @@ class MeshCoreToMqttJwtPusher:
             self.publish_status(
                 state="online", origin=self.node_name, radio_config=self.radio_config
             )
+            
+            # connected start heartbeat thread
+            if self.status_interval > 0 and not self._status_task:
+                import threading
+                self._status_task = threading.Thread(target=self._status_heartbeat_loop, daemon=True)
+                self._status_task.start()
+                logging.info(f"Started status heartbeat (interval: {self.status_interval}s)")
         else:
             logging.error(f"Failed with code {rc}")
 
@@ -171,14 +178,6 @@ class MeshCoreToMqttJwtPusher:
         self.client.connect(self.broker["host"], self.broker["port"], keepalive=60)
         self.client.loop_start()
         self._connect_time = datetime.now(UTC)
-
-        # Start status heartbeat if interval is set
-        if self.status_interval > 0:
-            import threading
-
-            self._status_task = threading.Thread(target=self._status_heartbeat_loop, daemon=True)
-            self._status_task.start()
-            logging.info(f"Started status heartbeat (interval: {self.status_interval}s)")
 
     def disconnect(self):
         self._running = False
