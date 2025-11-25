@@ -151,6 +151,8 @@ letsmesh:
   iata_code: "Test"  # e.g., "SFO", "LHR", "Test"
   broker_index: 0                  # Which LetsMesh broker (0=EU, 1=US West)
   status_interval: 300
+  owner: ""
+  email: ""
   
   # Block specific packet types from being published to LetsMesh
   # If not specified or empty list, all types are published
