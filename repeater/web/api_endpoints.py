@@ -65,14 +65,21 @@ class APIEndpoints:
         self._config_path = config_path or '/etc/pymc_repeater/config.yaml'
         self.cad_calibration = CADCalibrationEngine(daemon_instance, event_loop)
 
+    def _is_cors_enabled(self):
+        return self.config.get("web", {}).get("cors_enabled", False)
+
+    def _set_cors_headers(self):
+        if self._is_cors_enabled():
+            cherrypy.response.headers['Access-Control-Allow-Origin'] = '*'
+            cherrypy.response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
+            cherrypy.response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
+
     @cherrypy.expose
     def default(self, *args, **kwargs):
         """Handle default requests"""
         if cherrypy.request.method == "OPTIONS":
-            # OPTIONS handled by server-level CORS middleware
             return ""
         
-        # For non-OPTIONS requests, return 404
         raise cherrypy.HTTPError(404)
 
     def _get_storage(self):
@@ -861,7 +868,12 @@ class APIEndpoints:
     @cherrypy.tools.json_out()
     @cherrypy.tools.json_in()
     def advert(self, advert_id):
-        if cherrypy.request.method == "DELETE":
+        # Enable CORS for this endpoint only if configured
+        self._set_cors_headers()
+        
+        if cherrypy.request.method == "OPTIONS":
+            return ""
+        elif cherrypy.request.method == "DELETE":
             try:
                 advert_id = int(advert_id)
                 storage = self._get_storage()
@@ -883,6 +895,9 @@ class APIEndpoints:
     @cherrypy.tools.json_out()
     @cherrypy.tools.json_in()
     def ping_neighbor(self):
+        # Enable CORS for this endpoint only if configured
+        self._set_cors_headers()
+        
         try:
             self._require_post()
             data = cherrypy.request.json or {}
