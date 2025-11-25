@@ -82,6 +82,7 @@ class MeshCoreToMqttJwtPusher:
         self.stats_provider = stats_provider
         self._status_task = None
         self._running = False
+        self._connect_time = None
 
         # MQTT WebSocket client
         self.client = mqtt.Client(client_id=f"meshcore_{self.public_key}", transport="websockets")
@@ -169,6 +170,7 @@ class MeshCoreToMqttJwtPusher:
         # Must use raw hostname without wss://
         self.client.connect(self.broker["host"], self.broker["port"], keepalive=60)
         self.client.loop_start()
+        self._connect_time = datetime.now(UTC)
 
         # Start status heartbeat if interval is set
         if self.status_interval > 0:
@@ -196,9 +198,21 @@ class MeshCoreToMqttJwtPusher:
 
         while self._running:
             try:
+                # Reconnect before JWT expires (at 80% of expiry time)
+                if self._connect_time:
+                    elapsed = (datetime.now(UTC) - self._connect_time).total_seconds()
+                    expiry_seconds = self.jwt_expiry_minutes * 60
+                    if elapsed >= expiry_seconds * 0.8:
+                        logging.info("Reconnecting to refresh JWT token...")
+                        self.client.disconnect()
+                        time.sleep(1)
+                        self.connect()
+                        continue
+                
                 self.publish_status(
                     state="online", origin=self.node_name, radio_config=self.radio_config
                 )
+                logging.debug(f"Status heartbeat sent (next in {self.status_interval}s)")
                 time.sleep(self.status_interval)
             except Exception as e:
                 logging.error(f"Status heartbeat error: {e}")
