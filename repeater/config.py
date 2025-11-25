@@ -47,7 +47,9 @@ def get_node_info(config: Dict[str, Any]) -> Dict[str, Any]:
         "broker_index": letsmesh_config.get("broker_index", 0),
         "status_interval": letsmesh_config.get("status_interval", 60),
         "model": letsmesh_config.get("model", "PyMC-Repeater"),
-        "disallowed_packet_types": disallowed_hex
+        "disallowed_packet_types": disallowed_hex,
+        "email": letsmesh_config.get("email", ""),
+        "owner": letsmesh_config.get("owner", "")
     }
 
 
