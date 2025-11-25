@@ -152,6 +152,14 @@ class MeshCoreToMqttJwtPusher:
         logging.warning(f"Disconnected (rc={rc})")
         self._running = False
 
+    def _refresh_jwt_token(self):
+        """Refresh JWT token for MQTT authentication"""
+        token = self._generate_jwt()
+        username = f"v1_{self.public_key}"
+        self.client.username_pw_set(username=username, password=token)
+        self._connect_time = datetime.now(UTC)
+        logging.info("JWT token refreshed")
+
     # ----------------------------------------------------------------
     # Connect using WebSockets + TLS + MeshCore token auth
     # ----------------------------------------------------------------
@@ -197,16 +205,12 @@ class MeshCoreToMqttJwtPusher:
 
         while self._running:
             try:
-                # Reconnect before JWT expires (at 80% of expiry time)
+                # Refresh JWT token before it expires (at 80% of expiry time)
                 if self._connect_time:
                     elapsed = (datetime.now(UTC) - self._connect_time).total_seconds()
                     expiry_seconds = self.jwt_expiry_minutes * 60
                     if elapsed >= expiry_seconds * 0.8:
-                        logging.info("Reconnecting to refresh JWT token...")
-                        self.client.disconnect()
-                        time.sleep(1)
-                        self.connect()
-                        continue
+                        self._refresh_jwt_token()
                 
                 self.publish_status(
                     state="online", origin=self.node_name, radio_config=self.radio_config
