@@ -62,6 +62,8 @@ class MeshCoreToMqttJwtPusher:
 
         iata_code = node_info["iata_code"]
         broker_index = node_info["broker_index"]
+        self.email = node_info.get("email", "")
+        self.owner = node_info.get("owner", "")
         status_interval = node_info["status_interval"]
         node_name = node_info["node_name"]
         radio_config = node_info["radio_config"]
@@ -83,6 +85,7 @@ class MeshCoreToMqttJwtPusher:
         self._status_task = None
         self._running = False
         self._connect_time = None
+        self._tls_verified = False
 
         # MQTT WebSocket client
         self.client = mqtt.Client(client_id=f"meshcore_{self.public_key}", transport="websockets")
@@ -98,11 +101,26 @@ class MeshCoreToMqttJwtPusher:
         header = {"alg": "Ed25519", "typ": "JWT"}
 
         payload = {
-            "publicKey": self.public_key,
+            "publicKey": self.public_key.upper(),
             "aud": self.broker["audience"],
             "iat": int(now.timestamp()),
             "exp": int((now + timedelta(minutes=self.jwt_expiry_minutes)).timestamp()),
         }
+        
+        # Only include email/owner for verified TLS connections
+        if self.use_tls and self._tls_verified and (self.email or self.owner):
+            payload["email"] = self.email
+            payload["owner"] = self.owner
+            logging.debug("JWT includes email/owner (TLS verified)")
+        else:
+            payload["email"] = ""
+            payload["owner"] = ""
+            if not self.use_tls:
+                logging.debug("JWT excludes email/owner (TLS disabled)")
+            elif not self._tls_verified:
+                logging.debug("JWT excludes email/owner (TLS not verified yet)")
+            else:
+                logging.debug("JWT excludes email/owner (email/owner not configured)")
 
         # Encode header and payload (compact JSON - no spaces)
         header_b64 = b64url(json.dumps(header, separators=(",", ":")).encode())
@@ -134,6 +152,7 @@ class MeshCoreToMqttJwtPusher:
         if rc == 0:
             logging.info(f"Connected to {self.broker['name']}")
             self._running = True
+            
             # Publish initial status on connect
             self.publish_status(
                 state="online", origin=self.node_name, radio_config=self.radio_config
@@ -164,18 +183,27 @@ class MeshCoreToMqttJwtPusher:
     # Connect using WebSockets + TLS + MeshCore token auth
     # ----------------------------------------------------------------
     def connect(self):
-
-        token = self._generate_jwt()
-        username = f"v1_{self.public_key}"
-
-        self.client.username_pw_set(username=username, password=token)
-
         # Conditional TLS setup
         if self.use_tls:
-            self.client.tls_set()
+            import ssl
+            # Enable TLS with certificate verification
+            self.client.tls_set(
+                cert_reqs=ssl.CERT_REQUIRED,
+                tls_version=ssl.PROTOCOL_TLS_CLIENT
+            )
+            self.client.tls_insecure_set(False)  # Enforce hostname verification
+            # Mark as verified - if connection fails, we won't connect anyway
+            self._tls_verified = True
+            if self.email or self.owner:
+                logging.info("TLS enabled with certificate verification - email/owner will be included")
             protocol = "wss"
         else:
             protocol = "ws"
+
+        # Generate JWT token (will include email/owner if TLS verified)
+        token = self._generate_jwt()
+        username = f"v1_{self.public_key}"
+        self.client.username_pw_set(username=username, password=token)
 
         logging.info(
             f"Connecting to {self.broker['name']} "
