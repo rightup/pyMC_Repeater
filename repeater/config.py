@@ -25,7 +25,10 @@ def get_node_info(config: Dict[str, Any]) -> Dict[str, Any]:
     radio_bw = radio_config.get("bandwidth", 0.0)
     radio_sf = radio_config.get("spreading_factor", 7)
     radio_cr = radio_config.get("coding_rate", 5)
-    radio_config_str = f"{radio_freq},{radio_bw},{radio_sf},{radio_cr}"
+    # Format frequency in MHz and bandwidth in kHz
+    radio_freq_mhz = radio_freq / 1_000_000
+    radio_bw_khz = radio_bw / 1_000
+    radio_config_str = f"{radio_freq_mhz},{radio_bw_khz},{radio_sf},{radio_cr}"
     
     letsmesh_config = config.get("letsmesh", {})
     
