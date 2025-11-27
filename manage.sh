@@ -241,7 +241,7 @@ install_repeater() {
     
     echo "75"; echo "# Installing Python package..."
     cd "$INSTALL_DIR"
-    pip install --break-system-packages -e . >/dev/null 2>&1
+    pip install --break-system-packages --force-reinstall --no-cache-dir -e . >/dev/null 2>&1
     
     echo "85"; echo "# Starting service..."
     systemctl enable "$SERVICE_NAME"
@@ -346,7 +346,7 @@ upgrade_repeater() {
         echo "[6/9] Updating Python package..."
         cd "$INSTALL_DIR"
         # Use timeout to prevent hanging and show output
-        timeout 120 pip install --break-system-packages -e . || {
+        timeout 120 pip install --break-system-packages --force-reinstall --no-cache-dir -e . || {
             echo "    ⚠ Python package install timed out or failed, continuing..."
         }
         echo "    ✓ Python package updated"
