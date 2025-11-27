@@ -116,6 +116,14 @@ class RepeaterDaemon:
             )
             logger.info("Trace handler registered for network diagnostics")
 
+            # Register discovery response handler if enabled
+            allow_discovery = self.config.get("repeater", {}).get("allow_discovery", True)
+            if allow_discovery:
+                self._setup_discovery_handler()
+                logger.info("Discovery response handler enabled")
+            else:
+                logger.info("Discovery response handler disabled")
+
             
 
         except Exception as e:
@@ -280,6 +288,74 @@ class RepeaterDaemon:
 
         except Exception as e:
             logger.error(f"[TraceHandler] Error processing trace packet: {e}")
+
+    def _setup_discovery_handler(self):
+        """Set up discovery request/response handling."""
+        try:
+            control_handler = self.dispatcher.control_handler
+            if not control_handler:
+                logger.warning("Control handler not available for discovery")
+                return
+
+            # Node type 2 = Repeater
+            node_type = 2
+            
+            def on_discovery_request(request_data: dict):
+                """Handle incoming discovery request."""
+                try:
+                    tag = request_data.get("tag", 0)
+                    filter_byte = request_data.get("filter", 0)
+                    prefix_only = request_data.get("prefix_only", False)
+                    snr = request_data.get("snr", 0.0)
+                    rssi = request_data.get("rssi", 0)
+
+                    logger.info(f"[Discovery] Request: tag=0x{tag:08X}, filter=0x{filter_byte:02X}, SNR={snr:+.1f}dB, RSSI={rssi}dBm")
+
+                    # Check if filter matches our node type (repeater = 2, filter_mask = 0x04)
+                    filter_mask = 1 << node_type  # 1 << 2 = 0x04
+                    if (filter_byte & filter_mask) == 0:
+                        logger.debug("[Discovery] Filter doesn't match, ignoring")
+                        return
+
+                    # Create and send discovery response
+                    logger.info("[Discovery] Sending response...")
+                    
+                    if self.local_identity:
+                        our_pub_key = self.local_identity.get_public_key()
+                        
+                        from pymc_core.protocol.packet_builder import PacketBuilder
+                        response_packet = PacketBuilder.create_discovery_response(
+                            tag=tag,
+                            node_type=node_type,
+                            inbound_snr=snr,
+                            pub_key=our_pub_key,
+                            prefix_only=prefix_only,
+                        )
+
+                        # Send response asynchronously
+                        asyncio.create_task(self._send_discovery_response(response_packet, tag))
+                    else:
+                        logger.warning("[Discovery] No local identity available for response")
+
+                except Exception as e:
+                    logger.error(f"[Discovery] Error handling request: {e}")
+
+            control_handler.set_request_callback(on_discovery_request)
+            logger.debug("[Discovery] Handler registered")
+
+        except Exception as e:
+            logger.error(f"Failed to setup discovery handler: {e}")
+
+    async def _send_discovery_response(self, packet, tag):
+        """Send discovery response packet."""
+        try:
+            success = await self.dispatcher.send_packet(packet, wait_for_ack=False)
+            if success:
+                logger.info(f"[Discovery] Response sent for tag 0x{tag:08X}")
+            else:
+                logger.warning(f"[Discovery] Failed to send response for tag 0x{tag:08X}")
+        except Exception as e:
+            logger.error(f"[Discovery] Error sending response: {e}")
 
 
 
