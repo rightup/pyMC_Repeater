@@ -437,7 +437,7 @@ class RepeaterHandler(BaseHandler):
             return False, "Empty payload"
 
         if len(packet.path or []) >= MAX_PATH_SIZE:
-            return False, "Path at max size"
+            return False, f"Path length {len(packet.path or [])} exceeds MAX_PATH_SIZE ({MAX_PATH_SIZE})"
 
         return True, ""
 
@@ -527,6 +527,11 @@ class RepeaterHandler(BaseHandler):
         valid, reason = self.validate_packet(packet)
         if not valid:
             self._last_drop_reason = reason
+            return None
+
+        # Check if packet is marked do-not-retransmit
+        if packet.is_marked_do_not_retransmit():
+            self._last_drop_reason = "Marked do not retransmit"
             return None
 
         # Check global flood policy
