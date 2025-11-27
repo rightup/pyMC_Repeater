@@ -34,6 +34,11 @@ repeater:
   # Recommended: 10 hours for typical deployments
   send_advert_interval_hours: 10
 
+  # Respond to discovery requests from other nodes
+  # When enabled, the repeater will automatically respond to discovery packets
+  # with its node information (node type 2 - repeater)
+  allow_discovery: true
+
 # Mesh Network Configuration
 mesh:
   # Global flood policy - controls whether the repeater allows or denies flooding by default
