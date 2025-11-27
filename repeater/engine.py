@@ -98,8 +98,8 @@ class RepeaterHandler(BaseHandler):
         self._transport_keys_cache_time = 0
         self._transport_keys_cache_ttl = 60  # Cache for 60 seconds
         
-        # Track last drop reason for better logging
         self._last_drop_reason = None
+        self._known_neighbors = set()
         
         self._start_background_tasks()
 
@@ -385,11 +385,16 @@ class RepeaterHandler(BaseHandler):
 
             current_time = time.time()
 
-            # Check if this is a new neighbor
-            current_neighbors = self.storage.get_neighbors() if self.storage else {}
-            is_new_neighbor = pubkey not in current_neighbors
-
-            # Create advert record for storage
+            if pubkey not in self._known_neighbors:
+                # Only check database if not in cache
+                current_neighbors = self.storage.get_neighbors() if self.storage else {}
+                is_new_neighbor = pubkey not in current_neighbors
+                
+                if is_new_neighbor:
+                    self._known_neighbors.add(pubkey)
+            else:
+                is_new_neighbor = False
+                
             advert_record = {
                 "timestamp": current_time,
                 "pubkey": pubkey,
