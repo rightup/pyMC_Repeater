@@ -116,7 +116,6 @@ class RepeaterDaemon:
             )
             logger.info("Trace handler registered for network diagnostics")
 
-            # Register discovery response handler if enabled
             allow_discovery = self.config.get("repeater", {}).get("allow_discovery", True)
             if allow_discovery:
                 self._setup_discovery_handler()
@@ -292,10 +291,13 @@ class RepeaterDaemon:
     def _setup_discovery_handler(self):
         """Set up discovery request/response handling."""
         try:
-            control_handler = self.dispatcher.control_handler
-            if not control_handler:
-                logger.warning("Control handler not available for discovery")
-                return
+            from pymc_core.node.handlers.control import ControlHandler
+            
+            self.control_handler = ControlHandler(log_fn=logger.info)
+            self.dispatcher.register_handler(
+                ControlHandler.payload_type(),
+                self._control_callback,
+            )
 
             # Node type 2 = Repeater
             node_type = 2
@@ -317,7 +319,6 @@ class RepeaterDaemon:
                         logger.debug("[Discovery] Filter doesn't match, ignoring")
                         return
 
-                    # Create and send discovery response
                     logger.info("[Discovery] Sending response...")
                     
                     if self.local_identity:
@@ -340,14 +341,17 @@ class RepeaterDaemon:
                 except Exception as e:
                     logger.error(f"[Discovery] Error handling request: {e}")
 
-            control_handler.set_request_callback(on_discovery_request)
+            self.control_handler.set_request_callback(on_discovery_request)
             logger.debug("[Discovery] Handler registered")
 
         except Exception as e:
             logger.error(f"Failed to setup discovery handler: {e}")
 
+    async def _control_callback(self, packet):
+        if self.control_handler:
+            await self.control_handler(packet)
+
     async def _send_discovery_response(self, packet, tag):
-        """Send discovery response packet."""
         try:
             success = await self.dispatcher.send_packet(packet, wait_for_ack=False)
             if success:
