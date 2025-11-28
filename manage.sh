@@ -204,6 +204,8 @@ install_repeater() {
     
     echo "25"; echo "# Installing system dependencies..."
     apt-get update -qq
+    # Remove problematic system packages that conflict with pip versions
+    apt-get remove -y python3-yaml 2>/dev/null || true
     apt-get install -y libffi-dev jq pip python3-rrdtool wget swig build-essential python3-dev
     
     # Install mikefarah yq v4 if not already installed
@@ -241,7 +243,7 @@ install_repeater() {
     
     echo "75"; echo "# Installing Python package..."
     cd "$INSTALL_DIR"
-    pip install --break-system-packages --force-reinstall --no-cache-dir -e . >/dev/null 2>&1
+    pip install --break-system-packages --force-reinstall --no-cache-dir . >/dev/null 2>&1
     
     echo "85"; echo "# Starting service..."
     systemctl enable "$SERVICE_NAME"
@@ -314,6 +316,8 @@ upgrade_repeater() {
         
         echo "[3/9] Updating system dependencies..."
         apt-get update -qq
+        # Remove problematic system packages that conflict with pip versions
+        apt-get remove -y python3-yaml 2>/dev/null || true
         apt-get install -y libffi-dev jq pip python3-rrdtool wget swig build-essential python3-dev
         
         # Install mikefarah yq v4 if not already installed
@@ -346,7 +350,7 @@ upgrade_repeater() {
         echo "[6/9] Updating Python package..."
         cd "$INSTALL_DIR"
         # Use timeout to prevent hanging and show output
-        timeout 120 pip install --break-system-packages --force-reinstall --no-cache-dir -e . || {
+        timeout 600 pip install --break-system-packages --force-reinstall --no-cache-dir . || {
             echo "    ⚠ Python package install timed out or failed, continuing..."
         }
         echo "    ✓ Python package updated"
@@ -578,14 +582,15 @@ validate_and_update_config() {
     fi
     
     # Check if yq is available
-    if ! command -v yq &> /dev/null; then
-        echo "    ⚠ yq not found, skipping config merge"
+    YQ_CMD="/usr/local/bin/yq"
+    if ! command -v "$YQ_CMD" &> /dev/null; then
+        echo "    ⚠ mikefarah yq not found at $YQ_CMD, skipping config merge"
         return 0
     fi
     
-    # Verify it's yq
-    if [[ "$(yq --version 2>&1)" != *"mikefarah/yq"* ]]; then
-        echo "    ⚠ Wrong yq version detected, skipping config merge"
+    # Verify it's the correct yq version
+    if [[ "$($YQ_CMD --version 2>&1)" != *"mikefarah/yq"* ]]; then
+        echo "    ⚠ Wrong yq version detected at $YQ_CMD, skipping config merge"
         return 0
     fi
     
@@ -602,9 +607,9 @@ validate_and_update_config() {
     # - Adds missing keys from the left operand (example config)
     local temp_merged="${config_file}.merged"
     
-    if yq eval-all '. as $item ireduce ({}; . * $item)' "$updated_example" "$config_file" > "$temp_merged" 2>/dev/null; then
+    if "$YQ_CMD" eval-all '. as $item ireduce ({}; . * $item)' "$updated_example" "$config_file" > "$temp_merged" 2>/dev/null; then
         # Verify the merged file is valid YAML
-        if yq eval '.' "$temp_merged" > /dev/null 2>&1; then
+        if "$YQ_CMD" eval '.' "$temp_merged" > /dev/null 2>&1; then
             mv "$temp_merged" "$config_file"
             echo "    ✓ Configuration merged successfully"
             echo "    ✓ User settings preserved, new options added"
