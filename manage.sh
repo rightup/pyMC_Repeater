@@ -204,7 +204,7 @@ install_repeater() {
     
     echo "25"; echo "# Installing system dependencies..."
     apt-get update -qq
-    apt-get install -y libffi-dev jq pip python3-rrdtool wget
+    apt-get install -y libffi-dev jq pip python3-rrdtool wget swig build-essential python3-dev
     
     # Install mikefarah yq v4 if not already installed
     if ! command -v yq &> /dev/null || [[ "$(yq --version 2>&1)" != *"mikefarah/yq"* ]]; then
@@ -314,7 +314,7 @@ upgrade_repeater() {
         
         echo "[3/9] Updating system dependencies..."
         apt-get update -qq
-        apt-get install -y libffi-dev jq pip python3-rrdtool wget
+        apt-get install -y libffi-dev jq pip python3-rrdtool wget swig build-essential python3-dev
         
         # Install mikefarah yq v4 if not already installed
         if ! command -v yq &> /dev/null || [[ "$(yq --version 2>&1)" != *"mikefarah/yq"* ]]; then
