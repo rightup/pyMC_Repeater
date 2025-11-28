@@ -139,10 +139,10 @@ class HTTPStatsServer:
             html_dir = os.path.join(os.path.dirname(__file__), "html")
             assets_dir = os.path.join(html_dir, "assets")
 
+            # Build config with conditional CORS settings
             config = {
                 "/": {
                     "tools.sessions.on": False,
-                    "cors.expose.on": self._cors_enabled,
                     # Ensure proper content types for Vue.js files
                     "tools.staticfile.content_types": {
                         'js': 'application/javascript',
@@ -153,7 +153,6 @@ class HTTPStatsServer:
                 "/assets": {
                     "tools.staticdir.on": True,
                     "tools.staticdir.dir": assets_dir,
-                    "cors.expose.on": self._cors_enabled,
                     # Set proper content types for assets
                     "tools.staticdir.content_types": {
                         'js': 'application/javascript',
@@ -164,9 +163,14 @@ class HTTPStatsServer:
                 "/favicon.ico": {
                     "tools.staticfile.on": True,
                     "tools.staticfile.filename": os.path.join(html_dir, "favicon.ico"),
-                    "cors.expose.on": self._cors_enabled,
                 },
             }
+
+            # Only add CORS config entries if CORS is enabled
+            if self._cors_enabled:
+                config["/"]["cors.expose.on"] = True
+                config["/assets"]["cors.expose.on"] = True
+                config["/favicon.ico"]["cors.expose.on"] = True
 
             cherrypy.config.update(
                 {

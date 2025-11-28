@@ -204,9 +204,7 @@ install_repeater() {
     
     echo "25"; echo "# Installing system dependencies..."
     apt-get update -qq
-    # Remove problematic system packages that conflict with pip versions
-    apt-get remove -y python3-yaml 2>/dev/null || true
-    apt-get install -y libffi-dev jq pip python3-rrdtool wget swig build-essential python3-dev
+    apt-get install -y libffi-dev jq pip python3-rrdtool wget swig build-essential python3-dev liblgpio-dev
     
     # Install mikefarah yq v4 if not already installed
     if ! command -v yq &> /dev/null || [[ "$(yq --version 2>&1)" != *"mikefarah/yq"* ]]; then
@@ -240,20 +238,45 @@ install_repeater() {
     echo "65"; echo "# Setting permissions..."
     chown -R "$SERVICE_USER:$SERVICE_USER" "$INSTALL_DIR" "$CONFIG_DIR" "$LOG_DIR" /var/lib/pymc_repeater
     chmod 750 "$CONFIG_DIR" "$LOG_DIR" /var/lib/pymc_repeater
+    # Ensure the service user can create subdirectories in their home directory
+    chmod 755 /var/lib/pymc_repeater
+    # Pre-create the .config directory that the service will need
+    mkdir -p /var/lib/pymc_repeater/.config/pymc_repeater
+    chown -R "$SERVICE_USER:$SERVICE_USER" /var/lib/pymc_repeater/.config
     
-    echo "75"; echo "# Installing Python package..."
-    cd "$INSTALL_DIR"
-    pip install --break-system-packages --force-reinstall --no-cache-dir . >/dev/null 2>&1
-    
-    echo "85"; echo "# Starting service..."
+    echo "75"; echo "# Starting service..."
     systemctl enable "$SERVICE_NAME"
-    systemctl start "$SERVICE_NAME"
     
-    echo "95"; echo "# Configuring radio..."
+    echo "90"; echo "# Installation files complete..."
     ) | $DIALOG --backtitle "pyMC Repeater Management" --title "Installing" --gauge "Setting up pyMC Repeater..." 8 70 0
     
+    # Install Python package outside of progress gauge for better error handling
+    clear
+    echo "=== Installing Python Dependencies ==="
+    echo ""
+    echo "Installing pymc_repeater and dependencies (including pymc_core from GitHub)..."
+    echo "This may take a few minutes..."
+    echo ""
+    
+    SCRIPT_DIR="$(dirname "$0")"
+    cd "$SCRIPT_DIR"
+    
+    if pip install --break-system-packages --force-reinstall --no-cache-dir --ignore-installed .; then
+        echo ""
+        echo "✓ Python package installation completed successfully!"
+        
+        # Start the service
+        systemctl start "$SERVICE_NAME"
+    else
+        echo ""
+        echo "✗ Python package installation failed!"
+        echo "Please check the error messages above and try again."
+        read -p "Press Enter to continue..." || true
+    fi
+    
     # Radio configuration
-    show_info "Radio Configuration" "Installation complete!\n\nNow let's configure your radio settings.\n\nPress OK to continue to radio configuration..."
+    echo ""
+    echo "=== Radio Configuration ==="
     
     # Run radio configuration
     SCRIPT_DIR="$(dirname "$0")"
@@ -316,9 +339,8 @@ upgrade_repeater() {
         
         echo "[3/9] Updating system dependencies..."
         apt-get update -qq
-        # Remove problematic system packages that conflict with pip versions
-        apt-get remove -y python3-yaml 2>/dev/null || true
-        apt-get install -y libffi-dev jq pip python3-rrdtool wget swig build-essential python3-dev
+
+        apt-get install -y libffi-dev jq pip python3-rrdtool wget swig build-essential python3-dev liblgpio-dev
         
         # Install mikefarah yq v4 if not already installed
         if ! command -v yq &> /dev/null || [[ "$(yq --version 2>&1)" != *"mikefarah/yq"* ]]; then
@@ -347,17 +369,36 @@ upgrade_repeater() {
             echo "    ⚠ Configuration validation failed, keeping existing config"
         fi
         
-        echo "[6/9] Updating Python package..."
-        cd "$INSTALL_DIR"
-        # Use timeout to prevent hanging and show output
-        timeout 600 pip install --break-system-packages --force-reinstall --no-cache-dir . || {
-            echo "    ⚠ Python package install timed out or failed, continuing..."
-        }
-        echo "    ✓ Python package updated"
+        echo "[6/9] Fixing permissions..."
+        chown -R "$SERVICE_USER:$SERVICE_USER" "$INSTALL_DIR" "$CONFIG_DIR" "$LOG_DIR" /var/lib/pymc_repeater 2>/dev/null || true
+        chmod 750 "$CONFIG_DIR" "$LOG_DIR" 2>/dev/null || true
+        chmod 755 /var/lib/pymc_repeater 2>/dev/null || true
+        # Pre-create the .config directory that the service will need
+        mkdir -p /var/lib/pymc_repeater/.config/pymc_repeater 2>/dev/null || true
+        chown -R "$SERVICE_USER:$SERVICE_USER" /var/lib/pymc_repeater/.config 2>/dev/null || true
+        echo "    ✓ Permissions updated"
         
         echo "[7/9] Reloading systemd..."
         systemctl daemon-reload
         echo "    ✓ Systemd reloaded"
+        
+        echo "=== Installing Python Dependencies ==="
+        echo ""
+        echo "Updating pymc_repeater and dependencies (including pymc_core from GitHub)..."
+        echo "This may take a few minutes..."
+        echo ""
+        
+        # Install from source directory to properly resolve Git dependencies
+        SCRIPT_DIR="$(dirname "$0")"
+        cd "$SCRIPT_DIR"
+        
+        if pip install --break-system-packages --force-reinstall --no-cache-dir --ignore-installed .; then
+            echo ""
+            echo "✓ Python package update completed successfully!"
+        else
+            echo ""
+            echo "⚠ Python package update failed, but continuing..."
+        fi
         
         echo "[8/9] Starting service..."
         systemctl start "$SERVICE_NAME"
