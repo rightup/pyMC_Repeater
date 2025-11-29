@@ -8,7 +8,6 @@ import cherrypy
 from repeater import __version__
 from repeater.config import update_global_flood_policy
 from .cad_calibration_engine import CADCalibrationEngine
-from repeater.data_acquisition.hardware_stats import HardwareStatsCollector
 
 logger = logging.getLogger("HTTPServer")
 
@@ -65,7 +64,6 @@ class APIEndpoints:
         self.daemon_instance = daemon_instance
         self._config_path = config_path or '/etc/pymc_repeater/config.yaml'
         self.cad_calibration = CADCalibrationEngine(daemon_instance, event_loop)
-        self.hardware_stats = HardwareStatsCollector()
 
     def _is_cors_enabled(self):
         return self.config.get("web", {}).get("cors_enabled", False)
@@ -250,8 +248,15 @@ class APIEndpoints:
     def hardware_stats(self):
         """Get comprehensive hardware statistics"""
         try:
-            stats = self.hardware_stats.get_stats()
-            return self._success(stats)
+            # Get hardware stats from storage collector
+            if hasattr(self.daemon_instance, 'storage_collector') and self.daemon_instance.storage_collector:
+                stats = self.daemon_instance.storage_collector.get_hardware_stats()
+                if stats:
+                    return self._success(stats)
+                else:
+                    return self._error("Hardware stats not available (psutil may not be installed)")
+            else:
+                return self._error("Storage collector not available")
         except Exception as e:
             logger.error(f"Error getting hardware stats: {e}")
             return self._error(e)
@@ -261,8 +266,15 @@ class APIEndpoints:
     def hardware_processes(self):
         """Get summary of top processes"""
         try:
-            processes = self.hardware_stats.get_processes_summary()
-            return self._success(processes)
+            # Get process stats from storage collector
+            if hasattr(self.daemon_instance, 'storage_collector') and self.daemon_instance.storage_collector:
+                processes = self.daemon_instance.storage_collector.get_hardware_processes()
+                if processes:
+                    return self._success(processes)
+                else:
+                    return self._error("Process information not available (psutil may not be installed)")
+            else:
+                return self._error("Storage collector not available")
         except Exception as e:
             logger.error(f"Error getting process stats: {e}")
             return self._error(e)

@@ -3,7 +3,13 @@ Hardware statistics collection using psutil.
 KISS - Keep It Simple Stupid approach.
 """
 
-import psutil
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
+    psutil = None
+
 import time
 import logging
 
@@ -11,17 +17,19 @@ logger = logging.getLogger("HardwareStats")
 
 
 class HardwareStatsCollector:
-    """Simple hardware statistics collector using psutil."""
     
     def __init__(self):
-        """Initialize the hardware stats collector."""
+
         self.start_time = time.time()
     
     def get_stats(self):
-        """
-        Get current hardware statistics.
-        Returns a dictionary with system stats.
-        """
+
+        if not PSUTIL_AVAILABLE:
+            logger.error("psutil not available - cannot collect hardware stats")
+            return {
+                "error": "psutil library not available - cannot collect hardware statistics"
+            }
+        
         try:
             # Get current timestamp
             now = time.time()
@@ -34,7 +42,6 @@ class HardwareStatsCollector:
             
             # Memory stats
             memory = psutil.virtual_memory()
-            swap = psutil.swap_memory()
             
             # Disk stats
             disk = psutil.disk_usage('/')
@@ -42,123 +49,126 @@ class HardwareStatsCollector:
             # Network stats (total across all interfaces)
             net_io = psutil.net_io_counters()
             
-            # Temperature (if available)
-            temperature = None
-            try:
-                temps = psutil.sensors_temperatures()
-                if 'cpu_thermal' in temps and len(temps['cpu_thermal']) > 0:
-                    temperature = temps['cpu_thermal'][0].current
-                elif temps:
-                    # Fallback to first available temperature sensor
-                    first_sensor = next(iter(temps.values()))
-                    if first_sensor:
-                        temperature = first_sensor[0].current
-            except (AttributeError, OSError):
-                # Temperature sensors not available
-                pass
-            
             # Load average (Unix only)
             load_avg = None
             try:
                 load_avg = psutil.getloadavg()
             except (AttributeError, OSError):
-                # Not available on all systems
-                pass
+                # Not available on all systems - use zeros
+                load_avg = (0.0, 0.0, 0.0)
             
             # System boot time
             boot_time = psutil.boot_time()
             system_uptime = now - boot_time
             
+            # Temperature (if available)
+            temperatures = {}
+            try:
+                temps = psutil.sensors_temperatures()
+                for name, entries in temps.items():
+                    for i, entry in enumerate(entries):
+                        temp_name = f"{name}_{i}" if len(entries) > 1 else name
+                        temperatures[temp_name] = entry.current
+            except (AttributeError, OSError):
+                # Temperature sensors not available
+                pass
+            
+            # Format data structure to match Vue component expectations
             stats = {
-                "timestamp": now,
-                "uptime_seconds": uptime,
-                "system_uptime_seconds": system_uptime,
-                
-                # CPU
                 "cpu": {
-                    "percent": cpu_percent,
+                    "usage_percent": cpu_percent,
                     "count": cpu_count,
-                    "frequency_mhz": cpu_freq.current if cpu_freq else None,
-                    "load_average": list(load_avg) if load_avg else None
+                    "frequency": cpu_freq.current if cpu_freq else 0,
+                    "load_avg": {
+                        "1min": load_avg[0],
+                        "5min": load_avg[1], 
+                        "15min": load_avg[2]
+                    }
                 },
-                
-                # Memory
                 "memory": {
-                    "total_mb": round(memory.total / 1024 / 1024, 1),
-                    "available_mb": round(memory.available / 1024 / 1024, 1),
-                    "used_mb": round(memory.used / 1024 / 1024, 1),
-                    "percent": memory.percent
+                    "total": memory.total,
+                    "available": memory.available,
+                    "used": memory.used,
+                    "usage_percent": memory.percent
                 },
-                
-                # Swap
-                "swap": {
-                    "total_mb": round(swap.total / 1024 / 1024, 1),
-                    "used_mb": round(swap.used / 1024 / 1024, 1),
-                    "percent": swap.percent
-                },
-                
-                # Disk
                 "disk": {
-                    "total_gb": round(disk.total / 1024 / 1024 / 1024, 1),
-                    "used_gb": round(disk.used / 1024 / 1024 / 1024, 1),
-                    "free_gb": round(disk.free / 1024 / 1024 / 1024, 1),
-                    "percent": round((disk.used / disk.total) * 100, 1)
+                    "total": disk.total,
+                    "used": disk.used,
+                    "free": disk.free,
+                    "usage_percent": round((disk.used / disk.total) * 100, 1)
                 },
-                
-                # Network
                 "network": {
                     "bytes_sent": net_io.bytes_sent,
                     "bytes_recv": net_io.bytes_recv,
                     "packets_sent": net_io.packets_sent,
-                    "packets_recv": net_io.packets_recv,
-                    "errors_in": net_io.errin,
-                    "errors_out": net_io.errout,
-                    "drops_in": net_io.dropin,
-                    "drops_out": net_io.dropout
+                    "packets_recv": net_io.packets_recv
                 },
-                
-                # Temperature
-                "temperature_celsius": temperature
+                "system": {
+                    "uptime": system_uptime,
+                    "boot_time": boot_time
+                }
             }
+            
+            # Add temperatures if available
+            if temperatures:
+                stats["temperatures"] = temperatures
             
             return stats
             
         except Exception as e:
             logger.error(f"Error collecting hardware stats: {e}")
             return {
-                "timestamp": time.time(),
                 "error": str(e)
             }
     
     def get_processes_summary(self, limit=10):
         """
         Get top processes by CPU and memory usage.
-        Returns a dictionary with process information.
+        Returns a dictionary with process information in the format expected by the UI.
         """
+        if not PSUTIL_AVAILABLE:
+            logger.error("psutil not available - cannot collect process stats")
+            return {
+                "processes": [],
+                "total_processes": 0,
+                "error": "psutil library not available - cannot collect process statistics"
+            }
+        
         try:
             processes = []
             
             # Get all processes
-            for proc in psutil.process_iter(['pid', 'name', 'cpu_percent', 'memory_percent']):
+            for proc in psutil.process_iter(['pid', 'name', 'cpu_percent', 'memory_percent', 'memory_info']):
                 try:
-                    processes.append(proc.info)
+                    pinfo = proc.info
+                    # Calculate memory in MB
+                    memory_mb = 0
+                    if pinfo['memory_info']:
+                        memory_mb = pinfo['memory_info'].rss / 1024 / 1024  # RSS in MB
+                    
+                    process_data = {
+                        "pid": pinfo['pid'],
+                        "name": pinfo['name'] or 'Unknown',
+                        "cpu_percent": pinfo['cpu_percent'] or 0.0,
+                        "memory_percent": pinfo['memory_percent'] or 0.0,
+                        "memory_mb": round(memory_mb, 1)
+                    }
+                    processes.append(process_data)
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     pass
             
-            # Sort by CPU usage
-            top_cpu = sorted(processes, key=lambda x: x['cpu_percent'] or 0, reverse=True)[:limit]
-            
-            # Sort by memory usage  
-            top_memory = sorted(processes, key=lambda x: x['memory_percent'] or 0, reverse=True)[:limit]
+            # Sort by CPU usage and get top processes
+            top_processes = sorted(processes, key=lambda x: x['cpu_percent'], reverse=True)[:limit]
             
             return {
-                "top_cpu": top_cpu,
-                "top_memory": top_memory,
+                "processes": top_processes,
                 "total_processes": len(processes)
             }
             
         except Exception as e:
             logger.error(f"Error collecting process stats: {e}")
             return {
+                "processes": [],
+                "total_processes": 0,
                 "error": str(e)
             }
