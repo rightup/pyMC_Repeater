@@ -64,6 +64,11 @@ class StorageCollector:
                 self.disallowed_packet_types = set()
         else:
             self.disallowed_packet_types = set()
+            
+        # Initialize hardware stats collector
+        from .hardware_stats import HardwareStatsCollector
+        self.hardware_stats = HardwareStatsCollector()
+        logger.info("Hardware stats collector initialized")
 
     def _get_live_stats(self) -> dict:
         """Get live stats from RepeaterHandler"""
@@ -228,3 +233,19 @@ class StorageCollector:
 
     def delete_advert(self, advert_id: int) -> bool:
         return self.sqlite_handler.delete_advert(advert_id)
+
+    def get_hardware_stats(self) -> Optional[dict]:
+        """Get current hardware statistics"""
+        try:
+            return self.hardware_stats.get_stats()
+        except Exception as e:
+            logger.error(f"Error getting hardware stats: {e}")
+            return None
+
+    def get_hardware_processes(self) -> Optional[list]:
+        """Get current process summary"""
+        try:
+            return self.hardware_stats.get_processes_summary()
+        except Exception as e:
+            logger.error(f"Error getting hardware processes: {e}")
+            return None

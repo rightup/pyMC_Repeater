@@ -249,8 +249,9 @@ class APIEndpoints:
         """Get comprehensive hardware statistics"""
         try:
             # Get hardware stats from storage collector
-            if hasattr(self.daemon_instance, 'storage_collector') and self.daemon_instance.storage_collector:
-                stats = self.daemon_instance.storage_collector.get_hardware_stats()
+            storage = self._get_storage()
+            if storage:
+                stats = storage.get_hardware_stats()
                 if stats:
                     return self._success(stats)
                 else:
@@ -267,8 +268,9 @@ class APIEndpoints:
         """Get summary of top processes"""
         try:
             # Get process stats from storage collector
-            if hasattr(self.daemon_instance, 'storage_collector') and self.daemon_instance.storage_collector:
-                processes = self.daemon_instance.storage_collector.get_hardware_processes()
+            storage = self._get_storage()
+            if storage:
+                processes = storage.get_hardware_processes()
                 if processes:
                     return self._success(processes)
                 else:
