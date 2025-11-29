@@ -8,6 +8,7 @@ import cherrypy
 from repeater import __version__
 from repeater.config import update_global_flood_policy
 from .cad_calibration_engine import CADCalibrationEngine
+from repeater.data_acquisition.hardware_stats import HardwareStatsCollector
 
 logger = logging.getLogger("HTTPServer")
 
@@ -64,6 +65,7 @@ class APIEndpoints:
         self.daemon_instance = daemon_instance
         self._config_path = config_path or '/etc/pymc_repeater/config.yaml'
         self.cad_calibration = CADCalibrationEngine(daemon_instance, event_loop)
+        self.hardware_stats = HardwareStatsCollector()
 
     def _is_cors_enabled(self):
         return self.config.get("web", {}).get("cors_enabled", False)
@@ -242,6 +244,28 @@ class APIEndpoints:
         except Exception as e:
             logger.error(f"Error fetching logs: {e}")
             return {"error": str(e), "logs": []}
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    def hardware_stats(self):
+        """Get comprehensive hardware statistics"""
+        try:
+            stats = self.hardware_stats.get_stats()
+            return self._success(stats)
+        except Exception as e:
+            logger.error(f"Error getting hardware stats: {e}")
+            return self._error(e)
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    def hardware_processes(self):
+        """Get summary of top processes"""
+        try:
+            processes = self.hardware_stats.get_processes_summary()
+            return self._success(processes)
+        except Exception as e:
+            logger.error(f"Error getting process stats: {e}")
+            return self._error(e)
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
