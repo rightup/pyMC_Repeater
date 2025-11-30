@@ -245,6 +245,44 @@ class APIEndpoints:
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
+    def hardware_stats(self):
+        """Get comprehensive hardware statistics"""
+        try:
+            # Get hardware stats from storage collector
+            storage = self._get_storage()
+            if storage:
+                stats = storage.get_hardware_stats()
+                if stats:
+                    return self._success(stats)
+                else:
+                    return self._error("Hardware stats not available (psutil may not be installed)")
+            else:
+                return self._error("Storage collector not available")
+        except Exception as e:
+            logger.error(f"Error getting hardware stats: {e}")
+            return self._error(e)
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    def hardware_processes(self):
+        """Get summary of top processes"""
+        try:
+            # Get process stats from storage collector
+            storage = self._get_storage()
+            if storage:
+                processes = storage.get_hardware_processes()
+                if processes:
+                    return self._success(processes)
+                else:
+                    return self._error("Process information not available (psutil may not be installed)")
+            else:
+                return self._error("Storage collector not available")
+        except Exception as e:
+            logger.error(f"Error getting process stats: {e}")
+            return self._error(e)
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
     def packet_stats(self, hours=24):
         try:
             hours = int(hours)

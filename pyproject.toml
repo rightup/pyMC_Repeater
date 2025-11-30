@@ -36,6 +36,7 @@ dependencies = [
     "cherrypy>=18.0.0",
     "paho-mqtt>=1.6.0",
     "cherrypy-cors==1.7.0",
+    "psutil>=5.9.0",
 ]
 
 
