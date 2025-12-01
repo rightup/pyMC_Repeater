@@ -217,7 +217,7 @@ class TraceHelper:
 
     async def _forward_trace_packet(self, packet, trace_path_len: int) -> None:
         """
-        Forward a trace packet by appending SNR and sending it.
+        Forward a trace packet by appending SNR and setting up correct routing.
 
         Args:
             packet: The trace packet to forward
@@ -257,13 +257,27 @@ class TraceHelper:
             f"Forwarding trace, stored SNR {current_snr:.1f}dB at position {packet.path_len - 1}"
         )
 
-        # Mark as seen - packet will flow to repeater handler via pipeline
-        # which will apply all forwarding rules and validation
-        if self.repeater_handler:
-            self.repeater_handler.mark_seen(packet)
-        
-        # Don't send directly - let packet flow to repeater handler through pipeline
-        # The pipeline will pass this modified packet to the repeater for validation and forwarding
+        # For direct trace packets, we need to update the routing path to point to next hop
+        # Parse the trace payload to get the trace route
+        parsed_data = self.trace_handler._parse_trace_payload(packet.payload)
+        if parsed_data.get("valid", False):
+            trace_path = parsed_data["trace_path"]
+            
+            # Check if there's a next hop after current position
+            if packet.path_len < len(trace_path):
+                next_hop = trace_path[packet.path_len]
+                
+                # Set up direct routing to next hop by putting it at front of path
+                # The SNR data stays in the path, but we prepend the next hop for routing
+                packet.path = bytearray([next_hop] + list(packet.path))
+                packet.path_len = len(packet.path)
+                
+                logger.debug(f"Set next trace hop to 0x{next_hop:02X}")
+            else:
+                logger.info("Trace reached end of route")
+
+        # Don't mark as seen - let the packet flow to repeater handler for normal processing
+        # The repeater handler will handle duplicate detection and forwarding logic
 
     def _log_no_forward_reason(self, packet, trace_path: list, trace_path_len: int) -> None:
         """
