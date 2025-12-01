@@ -51,13 +51,10 @@ class PacketRouter:
 
     async def inject_packet(self, packet, wait_for_ack: bool = False):
         """
-        Inject a new packet into the system for direct transmission.
+        Inject a new packet into the system for transmission through the engine.
         
-        This method bypasses the normal routing and sends packets directly
-        via the dispatcher. Used by helpers to send response packets.
-        
-        IMPORTANT: Pre-marks packet as seen to prevent processing our own
-        transmitted packets as duplicates when they're received back.
+        This method uses the engine's main packet handler but marks the packet
+        as originated locally to bypass forwarding logic.
         
         Args:
             packet: The packet to send
@@ -67,28 +64,23 @@ class PacketRouter:
             True if packet was sent successfully, False otherwise
         """
         try:
-            # Pre-mark the packet as seen BEFORE transmission to prevent
-            # our own radio from processing it as an incoming duplicate
-            if hasattr(self.daemon, 'repeater_handler') and self.daemon.repeater_handler:
-                self.daemon.repeater_handler.mark_seen(packet)
-                logger.debug("Pre-marked injected packet as seen to prevent duplicate processing")
+            # Mark this packet as locally originated to bypass forwarding checks
+            packet._locally_injected = True
             
-            if hasattr(self.daemon, 'dispatcher') and self.daemon.dispatcher:
-                success = await self.daemon.dispatcher.send_packet(packet, wait_for_ack=wait_for_ack)
-                
-                if success:
-                    packet_len = len(packet.payload) if packet.payload else 0
-                    logger.debug(f"Injected packet sent successfully ({packet_len} bytes)")
-                else:
-                    logger.warning("Failed to send injected packet")
-                
-                return success
-            else:
-                logger.error("No dispatcher available for packet injection")
-                return False
+            metadata = {
+                "rssi": getattr(packet, "rssi", 0),
+                "snr": getattr(packet, "snr", 0.0), 
+                "timestamp": getattr(packet, "timestamp", 0),
+            }
+            
+            await self.daemon.repeater_handler(packet, metadata)
+            
+            packet_len = len(packet.payload) if packet.payload else 0
+            logger.debug(f"Injected packet processed by engine ({packet_len} bytes)")
+            return True
                 
         except Exception as e:
-            logger.error(f"Error injecting packet: {e}")
+            logger.error(f"Error injecting packet through engine: {e}")
             return False
     
     async def _process_queue(self):

@@ -211,7 +211,8 @@ class TraceHelper:
 
     async def _forward_trace_packet(self, packet, trace_path_len: int) -> None:
         """
-        Forward a trace packet by appending SNR and sending directly.
+        Forward a trace packet by appending SNR and sending via injection.
+        
         Args:
             packet: The trace packet to forward
             trace_path_len: The length of the trace path
@@ -251,7 +252,6 @@ class TraceHelper:
         )
 
         # Inject packet into router for proper routing and transmission
-        # Router will handle marking as seen to prevent duplicate processing
         if self.packet_injector:
             await self.packet_injector(packet, wait_for_ack=False)
         else:

@@ -488,15 +488,24 @@ class RepeaterHandler(BaseHandler):
 
     def direct_forward(self, packet: Packet) -> Optional[Packet]:
 
-        # Check if we're the next hop
+        # Check if we're the next hop (skip for locally injected packets)
         if not packet.path or len(packet.path) == 0:
-            self._last_drop_reason = "Direct: no path"
-            return None
+            # For locally injected packets, this is expected - they don't have paths yet
+            if hasattr(packet, '_locally_injected') and packet._locally_injected:
+                pass
+            else:
+                self._last_drop_reason = "Direct: no path"
+                return None
 
-        next_hop = packet.path[0]
-        if next_hop != self.local_hash:
-            self._last_drop_reason = "Direct: not for us"
-            return None
+        elif len(packet.path) > 0:
+            next_hop = packet.path[0] 
+            if next_hop != self.local_hash:
+                # Skip this check for locally injected packets
+                if hasattr(packet, '_locally_injected') and packet._locally_injected:
+                    pass
+                else:
+                    self._last_drop_reason = "Direct: not for us"
+                    return None
 
         original_path = list(packet.path)
         packet.path = bytearray(packet.path[1:])
