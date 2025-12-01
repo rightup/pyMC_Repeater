@@ -659,7 +659,6 @@ class SQLiteHandler:
                     }
                     adverts.append(advert)
                 
-                logger.debug(f"Found {len(adverts)} adverts with contact_type '{contact_type}'")
                 return adverts
                 
         except Exception as e:
