@@ -99,7 +99,6 @@ class RepeaterHandler(BaseHandler):
         self._transport_keys_cache_ttl = 60  # Cache for 60 seconds
         
         self._last_drop_reason = None
-        self._known_neighbors = set()
         
         self._start_background_tasks()
 
@@ -190,10 +189,6 @@ class RepeaterHandler(BaseHandler):
         # Set drop reason for duplicates
         if is_dupe and drop_reason is None:
             drop_reason = "Duplicate"
-
-        # Process adverts for neighbor tracking
-        if payload_type == PAYLOAD_TYPE_ADVERT:
-            self._process_advert(packet, rssi, snr)
 
         path_hash = None
         display_path = (
@@ -341,85 +336,6 @@ class RepeaterHandler(BaseHandler):
 
         # Default reason
         return "Unknown"
-
-    def _process_advert(self, packet: Packet, rssi: int, snr: float):
-
-        try:
-            from pymc_core.protocol.constants import ADVERT_FLAG_IS_REPEATER
-            from pymc_core.protocol.utils import (
-                decode_appdata,
-                get_contact_type_name,
-                parse_advert_payload,
-                determine_contact_type_from_flags,
-            )
-
-            # Parse advert payload
-            if not packet.payload or len(packet.payload) < 40:
-                return
-
-            advert_data = parse_advert_payload(packet.payload)
-            pubkey = advert_data.get("pubkey", "")
-
-            # Skip our own adverts
-            if self.dispatcher and hasattr(self.dispatcher, "local_identity"):
-                local_pubkey = self.dispatcher.local_identity.get_public_key().hex()
-                if pubkey == local_pubkey:
-                    logger.debug("Ignoring own advert in neighbor tracking")
-                    return
-
-            appdata = advert_data.get("appdata", b"")
-            if not appdata:
-                return
-
-            appdata_decoded = decode_appdata(appdata)
-            flags = appdata_decoded.get("flags", 0)
-            is_repeater = bool(flags & ADVERT_FLAG_IS_REPEATER)
-            route_type = packet.header & PH_ROUTE_MASK
-            contact_type_id = determine_contact_type_from_flags(flags)
-            contact_type = get_contact_type_name(contact_type_id)
-
-            # Extract neighbor info
-            node_name = appdata_decoded.get("node_name", "Unknown")
-            latitude = appdata_decoded.get("latitude")
-            longitude = appdata_decoded.get("longitude")
-
-            current_time = time.time()
-
-            if pubkey not in self._known_neighbors:
-                # Only check database if not in cache
-                current_neighbors = self.storage.get_neighbors() if self.storage else {}
-                is_new_neighbor = pubkey not in current_neighbors
-                
-                if is_new_neighbor:
-                    self._known_neighbors.add(pubkey)
-            else:
-                is_new_neighbor = False
-                
-            advert_record = {
-                "timestamp": current_time,
-                "pubkey": pubkey,
-                "node_name": node_name,
-                "is_repeater": is_repeater,
-                "route_type": route_type,
-                "contact_type": contact_type,
-                "latitude": latitude,
-                "longitude": longitude,
-                "rssi": rssi,
-                "snr": snr,
-                "is_new_neighbor": is_new_neighbor,
-            }
-
-            # Store to database
-            if self.storage:
-                try:
-                    self.storage.record_advert(advert_record)
-                    if is_new_neighbor:
-                        logger.info(f"Discovered new neighbor: {node_name} ({pubkey[:16]}...)")
-                except Exception as e:
-                    logger.error(f"Failed to store advert record: {e}")
-
-        except Exception as e:
-            logger.debug(f"Error processing advert for neighbor tracking: {e}")
 
     def is_duplicate(self, packet: Packet) -> bool:
 

@@ -6,8 +6,8 @@ import sys
 from repeater.config import get_radio_for_board, load_config
 from repeater.engine import RepeaterHandler
 from repeater.web.http_server import HTTPStatsServer, _log_buffer
-from pymc_core.node.handlers.trace import TraceHandler
-from pymc_core.protocol.constants import MAX_PATH_SIZE, ROUTE_TYPE_DIRECT
+from repeater.handler_helpers import TraceHelper, DiscoveryHelper, AdvertHelper
+from repeater.packet_pipeline import PacketPipeline
 
 logger = logging.getLogger("RepeaterDaemon")
 
@@ -23,7 +23,10 @@ class RepeaterDaemon:
         self.local_hash = None
         self.local_identity = None
         self.http_server = None
-        self.trace_handler = None
+        self.trace_helper = None
+        self.advert_helper = None
+        self.discovery_helper = None
+        self.pipeline = None
 
 
         log_level = config.get("logging", {}).get("level", "INFO")
@@ -45,7 +48,6 @@ class RepeaterDaemon:
             try:
                 self.radio = get_radio_for_board(self.config)
                 
-
                 if hasattr(self.radio, 'set_custom_cad_thresholds'):
                     # Load CAD settings from config, with defaults
                     cad_config = self.config.get("radio", {}).get("cad", {})
@@ -91,7 +93,6 @@ class RepeaterDaemon:
             self.local_identity = local_identity
             self.dispatcher.local_identity = local_identity
 
-
             pubkey = local_identity.get_public_key()
             self.local_hash = pubkey[0]
             logger.info(f"Local identity set: {local_identity.get_address_bytes().hex()}")
@@ -105,266 +106,60 @@ class RepeaterDaemon:
                 self.config, self.dispatcher, self.local_hash, send_advert_func=self.send_advert
             )
 
-            self.dispatcher.register_fallback_handler(self._repeater_callback)
-            logger.info("Repeater handler registered (forwarder mode)")
-
-            self.trace_handler = TraceHandler(log_fn=logger.info)
+            # Create pipeline
+            self.pipeline = PacketPipeline(self)
+            await self.pipeline.start()
             
-            self.dispatcher.register_handler(
-                TraceHandler.payload_type(),
-                self._trace_callback,
-            )
-            logger.info("Trace handler registered for network diagnostics")
+            # Register pipeline as entry point for ALL packets via fallback handler
+            # All received packets flow through pipeline → helpers → repeater validation
+            self.dispatcher.register_fallback_handler(self._pipeline_callback)
+            logger.info("Pipeline registered as fallback (catches all packets)")
 
+            # Create processing helpers (handlers created internally)
+            self.trace_helper = TraceHelper(
+                local_hash=self.local_hash,
+                repeater_handler=self.repeater_handler,
+                dispatcher=self.dispatcher,
+                log_fn=logger.info,
+            )
+            logger.info("Trace processing helper initialized")
+            
+            # Create advert helper for neighbor tracking
+            self.advert_helper = AdvertHelper(
+                local_identity=self.local_identity,
+                storage=self.repeater_handler.storage if self.repeater_handler else None,
+                log_fn=logger.info,
+            )
+            logger.info("Advert processing helper initialized")
+
+            # Set up discovery handler if enabled
             allow_discovery = self.config.get("repeater", {}).get("allow_discovery", True)
             if allow_discovery:
-                self._setup_discovery_handler()
-                logger.info("Discovery response handler enabled")
+                self.discovery_helper = DiscoveryHelper(
+                    local_identity=self.local_identity,
+                    dispatcher=self.dispatcher,
+                    node_type=2,
+                    log_fn=logger.info,
+                )
+                logger.info("Discovery processing helper initialized")
             else:
                 logger.info("Discovery response handler disabled")
-
-            
 
         except Exception as e:
             logger.error(f"Failed to initialize dispatcher: {e}")
             raise
 
-    async def _repeater_callback(self, packet):
-
-        if self.repeater_handler:
-
-            metadata = {
-                "rssi": getattr(packet, "rssi", 0),
-                "snr": getattr(packet, "snr", 0.0),
-                "timestamp": getattr(packet, "timestamp", 0),
-            }
-            await self.repeater_handler(packet, metadata)
-
-    async def _trace_callback(self, packet):
-
-        try:
-            # Only process direct route trace packets
-            if packet.get_route_type() != ROUTE_TYPE_DIRECT or packet.path_len >= MAX_PATH_SIZE:
-                return
-
-         
-            parsed_data = self.trace_handler._parse_trace_payload(packet.payload)
-            
-            if not parsed_data.get("valid", False):
-                logger.warning(f"[TraceHandler] Invalid trace packet: {parsed_data.get('error', 'Unknown error')}")
-                return
-            
-            trace_path = parsed_data["trace_path"]
-            trace_path_len = len(trace_path)
-            
-          
-            if self.repeater_handler:
-                import time
-                
-                trace_path_bytes = [f"{h:02X}" for h in trace_path[:8]]
-                if len(trace_path) > 8:
-                    trace_path_bytes.append("...")
-                path_hash = "[" + ", ".join(trace_path_bytes) + "]"
-                
-                path_snrs = []
-                path_snr_details = []
-                for i in range(packet.path_len):
-                    if i < len(packet.path):
-                        snr_val = packet.path[i]
-                   
-                        snr_signed = snr_val if snr_val < 128 else snr_val - 256
-                        snr_db = snr_signed / 4.0
-                        path_snrs.append(f"{snr_val}({snr_db:.1f}dB)")
-                 
-                        if i < len(trace_path):
-                            path_snr_details.append({
-                                "hash": f"{trace_path[i]:02X}",
-                                "snr_raw": snr_val,
-                                "snr_db": snr_db
-                            })
-                
-                packet_record = {
-                    "timestamp": time.time(),
-                    "header": f"0x{packet.header:02X}" if hasattr(packet, "header") and packet.header is not None else None,
-                    "payload": packet.payload.hex() if hasattr(packet, "payload") and packet.payload else None,
-                    "payload_length": len(packet.payload) if hasattr(packet, "payload") and packet.payload else 0,
-                    "type": packet.get_payload_type(),  # 0x09 for trace
-                    "route": packet.get_route_type(),   # Should be direct (1)
-                    "length": len(packet.payload or b""),
-                    "rssi": getattr(packet, "rssi", 0),
-                    "snr": getattr(packet, "snr", 0.0),
-                    "score": self.repeater_handler.calculate_packet_score(
-                        getattr(packet, "snr", 0.0), 
-                        len(packet.payload or b""), 
-                        self.repeater_handler.radio_config.get("spreading_factor", 8)
-                    ),
-                    "tx_delay_ms": 0,  
-                    "transmitted": False,  
-                    "is_duplicate": False,  
-                    "packet_hash": packet.calculate_packet_hash().hex().upper()[:16],
-                    "drop_reason": "trace_received",
-                    "path_hash": path_hash,
-                    "src_hash": None,  
-                    "dst_hash": None,
-                    "original_path": [f"{h:02X}" for h in trace_path],  
-                    "forwarded_path": None,
-                    # Add trace-specific SNR path information
-                    "path_snrs": path_snrs,  # ["58(14.5dB)", "19(4.8dB)"]
-                    "path_snr_details": path_snr_details,  # [{"hash": "29", "snr_raw": 58, "snr_db": 14.5}]
-                    "is_trace": True,  
-                    "raw_packet": packet.write_to().hex() if hasattr(packet, "write_to") else None,
-                }
-                self.repeater_handler.log_trace_record(packet_record)
-    
-            path_snrs = []
-            path_hashes = []
-            for i in range(packet.path_len):
-                if i < len(packet.path):
-                    snr_val = packet.path[i]
-                    snr_signed = snr_val if snr_val < 128 else snr_val - 256
-                    snr_db = snr_signed / 4.0
-                    path_snrs.append(f"{snr_val}({snr_db:.1f}dB)")
-                if i < len(trace_path):
-                    path_hashes.append(f"0x{trace_path[i]:02x}")
-            
-       
-            parsed_data["snr"] = packet.get_snr()
-            parsed_data["rssi"] = getattr(packet, "rssi", 0)
-            formatted_response = self.trace_handler._format_trace_response(parsed_data)
-            
-            logger.info(f"[TraceHandler] {formatted_response}")
-            logger.info(f"[TraceHandler] Path SNRs: [{', '.join(path_snrs)}], Hashes: [{', '.join(path_hashes)}]")
-            
-     
-            if (packet.path_len < trace_path_len and 
-                len(trace_path) > packet.path_len and
-                trace_path[packet.path_len] == self.local_hash and
-                self.repeater_handler and not self.repeater_handler.is_duplicate(packet)):
-                
-                if self.repeater_handler and hasattr(self.repeater_handler, 'recent_packets'):
-                    packet_hash = packet.calculate_packet_hash().hex().upper()[:16]
-                    for record in reversed(self.repeater_handler.recent_packets):
-                        if record.get("packet_hash") == packet_hash:
-                            record["transmitted"] = True
-                            record["drop_reason"] = "trace_forwarded"
-                            break
-   
-                current_snr = packet.get_snr()
-                
-    
-                snr_scaled = int(current_snr * 4)
-       
-                if snr_scaled > 127:
-                    snr_scaled = 127
-                elif snr_scaled < -128:
-                    snr_scaled = -128
-
-                snr_byte = snr_scaled if snr_scaled >= 0 else (256 + snr_scaled)
-        
-                while len(packet.path) <= packet.path_len:
-                    packet.path.append(0)
-                    
-                packet.path[packet.path_len] = snr_byte
-                packet.path_len += 1
-                
-                logger.info(f"[TraceHandler] Forwarding trace, stored SNR {current_snr:.1f}dB at position {packet.path_len-1}")
-                
-                # Mark as seen and forward directly (bypass normal routing, no ACK required)
-                self.repeater_handler.mark_seen(packet)
-                if self.dispatcher:
-                    await self.dispatcher.send_packet(packet, wait_for_ack=False)
-            else:
-                # Show why we didn't forward
-                if packet.path_len >= trace_path_len:
-                    logger.info(f"[TraceHandler] Trace completed (reached end of path)")
-                elif len(trace_path) <= packet.path_len:
-                    logger.info(f"[TraceHandler] Path index out of bounds")
-                elif trace_path[packet.path_len] != self.local_hash:
-                    expected_hash = trace_path[packet.path_len] if packet.path_len < len(trace_path) else None
-                    logger.info(f"[TraceHandler] Not our turn (next hop: 0x{expected_hash:02x})")
-                elif self.repeater_handler and self.repeater_handler.is_duplicate(packet):
-                    logger.info(f"[TraceHandler] Duplicate packet, ignoring")
-
-        except Exception as e:
-            logger.error(f"[TraceHandler] Error processing trace packet: {e}")
-
-    def _setup_discovery_handler(self):
-        """Set up discovery request/response handling."""
-        try:
-            from pymc_core.node.handlers.control import ControlHandler
-            
-            self.control_handler = ControlHandler(log_fn=logger.info)
-            self.dispatcher.register_handler(
-                ControlHandler.payload_type(),
-                self._control_callback,
-            )
-
-            # Node type 2 = Repeater
-            node_type = 2
-            
-            def on_discovery_request(request_data: dict):
-                """Handle incoming discovery request."""
-                try:
-                    tag = request_data.get("tag", 0)
-                    filter_byte = request_data.get("filter", 0)
-                    prefix_only = request_data.get("prefix_only", False)
-                    snr = request_data.get("snr", 0.0)
-                    rssi = request_data.get("rssi", 0)
-
-                    logger.info(f"[Discovery] Request: tag=0x{tag:08X}, filter=0x{filter_byte:02X}, SNR={snr:+.1f}dB, RSSI={rssi}dBm")
-
-                    # Check if filter matches our node type (repeater = 2, filter_mask = 0x04)
-                    filter_mask = 1 << node_type  # 1 << 2 = 0x04
-                    if (filter_byte & filter_mask) == 0:
-                        logger.debug("[Discovery] Filter doesn't match, ignoring")
-                        return
-
-                    logger.info("[Discovery] Sending response...")
-                    
-                    if self.local_identity:
-                        our_pub_key = self.local_identity.get_public_key()
-                        
-                        from pymc_core.protocol.packet_builder import PacketBuilder
-                        response_packet = PacketBuilder.create_discovery_response(
-                            tag=tag,
-                            node_type=node_type,
-                            inbound_snr=snr,
-                            pub_key=our_pub_key,
-                            prefix_only=prefix_only,
-                        )
-
-                        # Send response asynchronously
-                        asyncio.create_task(self._send_discovery_response(response_packet, tag))
-                    else:
-                        logger.warning("[Discovery] No local identity available for response")
-
-                except Exception as e:
-                    logger.error(f"[Discovery] Error handling request: {e}")
-
-            self.control_handler.set_request_callback(on_discovery_request)
-            logger.debug("[Discovery] Handler registered")
-
-        except Exception as e:
-            logger.error(f"Failed to setup discovery handler: {e}")
-
-    async def _control_callback(self, packet):
-        if self.control_handler:
-            await self.control_handler(packet)
-
-    async def _send_discovery_response(self, packet, tag):
-        try:
-            success = await self.dispatcher.send_packet(packet, wait_for_ack=False)
-            if success:
-                logger.info(f"[Discovery] Response sent for tag 0x{tag:08X}")
-            else:
-                logger.warning(f"[Discovery] Failed to send response for tag 0x{tag:08X}")
-        except Exception as e:
-            logger.error(f"[Discovery] Error sending response: {e}")
-
-
+    async def _pipeline_callback(self, packet):
+        """
+        Single entry point for ALL packets.
+        Enqueues packets for pipeline processing.
+        """
+        if self.pipeline:
+            await self.pipeline.enqueue(packet)
 
     def get_stats(self) -> dict:
-
+        stats = {}
+        
         if self.repeater_handler:
             stats = self.repeater_handler.get_stats()
             # Add public key if available
@@ -374,8 +169,12 @@ class RepeaterDaemon:
                     stats["public_key"] = pubkey.hex()
                 except Exception:
                     stats["public_key"] = None
-            return stats
-        return {}
+        
+        # Add pipeline statistics
+        if self.pipeline:
+            stats["pipeline"] = self.pipeline.get_stats()
+        
+        return stats
 
     async def send_advert(self) -> bool:
 
@@ -468,6 +267,8 @@ class RepeaterDaemon:
             await self.dispatcher.run_forever()
         except KeyboardInterrupt:
             logger.info("Shutting down...")
+            if self.pipeline:
+                await self.pipeline.stop()
             if self.http_server:
                 self.http_server.stop()
 
