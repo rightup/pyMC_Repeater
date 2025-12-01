@@ -84,13 +84,9 @@ class TraceHelper:
 
             if should_forward:
                 await self._forward_trace_packet(packet, trace_path_len)
-                # Packet was sent directly, but let it flow back to engine for standard logging
-                # The engine will see do_not_retransmit flag and won't try to send it again
             else:
                 # This is the final destination or can't forward - just log and record
                 self._log_no_forward_reason(packet, trace_path, trace_path_len)
-                # Mark packet to not be retransmitted since we're not forwarding
-                packet.mark_do_not_retransmit()
 
         except Exception as e:
             logger.error(f"Error processing trace packet: {e}")
@@ -256,10 +252,6 @@ class TraceHelper:
             await self.packet_injector(packet, wait_for_ack=False)
         else:
             logger.warning("No packet injector available - trace packet not forwarded")
-            
-        # Mark as do_not_retransmit so engine won't try to send it again
-        # but allow it to flow back for standard packet logging
-        packet.mark_do_not_retransmit()
 
     def _log_no_forward_reason(self, packet, trace_path: list, trace_path_len: int) -> None:
         """

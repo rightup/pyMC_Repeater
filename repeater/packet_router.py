@@ -102,12 +102,15 @@ class PacketRouter:
         2. Pass to repeater engine for all processing decisions
         """
         payload_type = packet.get_payload_type()
+        processed_by_injection = False
         
         # Route to specific handlers for parsing only
         if payload_type == TraceHandler.payload_type():
             # Process trace packet
             if self.daemon.trace_helper:
                 await self.daemon.trace_helper.process_trace_packet(packet)
+                # Skip engine processing for trace packets - they're handled by trace helper
+                processed_by_injection = True
 
         elif payload_type == ControlHandler.payload_type():
             # Process control/discovery packet
@@ -122,8 +125,8 @@ class PacketRouter:
                 snr = getattr(packet, "snr", 0.0)
                 await self.daemon.advert_helper.process_advert_packet(packet, rssi, snr)
         
-        # Always pass to repeater engine for processing decisions and statistics
-        if self.daemon.repeater_handler:
+        # Only pass to repeater engine if not already processed by injection
+        if self.daemon.repeater_handler and not processed_by_injection:
             metadata = {
                 "rssi": getattr(packet, "rssi", 0),
                 "snr": getattr(packet, "snr", 0.0),
