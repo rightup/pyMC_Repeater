@@ -119,7 +119,7 @@ class RepeaterDaemon:
             self.trace_helper = TraceHelper(
                 local_hash=self.local_hash,
                 repeater_handler=self.repeater_handler,
-                dispatcher=self.dispatcher,
+                packet_injector=self.router.inject_packet,
                 log_fn=logger.info,
             )
             logger.info("Trace processing helper initialized")
@@ -137,7 +137,7 @@ class RepeaterDaemon:
             if allow_discovery:
                 self.discovery_helper = DiscoveryHelper(
                     local_identity=self.local_identity,
-                    dispatcher=self.dispatcher,
+                    packet_injector=self.router.inject_packet,
                     node_type=2,
                     log_fn=logger.info,
                 )

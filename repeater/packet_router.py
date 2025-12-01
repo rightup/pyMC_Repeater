@@ -48,6 +48,48 @@ class PacketRouter:
     async def enqueue(self, packet):
         """Add packet to router queue."""
         await self.queue.put(packet)
+
+    async def inject_packet(self, packet, wait_for_ack: bool = False):
+        """
+        Inject a new packet into the system for direct transmission.
+        
+        This method bypasses the normal routing and sends packets directly
+        via the dispatcher. Used by helpers to send response packets.
+        
+        IMPORTANT: Pre-marks packet as seen to prevent processing our own
+        transmitted packets as duplicates when they're received back.
+        
+        Args:
+            packet: The packet to send
+            wait_for_ack: Whether to wait for acknowledgment
+            
+        Returns:
+            True if packet was sent successfully, False otherwise
+        """
+        try:
+            # Pre-mark the packet as seen BEFORE transmission to prevent
+            # our own radio from processing it as an incoming duplicate
+            if hasattr(self.daemon, 'repeater_handler') and self.daemon.repeater_handler:
+                self.daemon.repeater_handler.mark_seen(packet)
+                logger.debug("Pre-marked injected packet as seen to prevent duplicate processing")
+            
+            if hasattr(self.daemon, 'dispatcher') and self.daemon.dispatcher:
+                success = await self.daemon.dispatcher.send_packet(packet, wait_for_ack=wait_for_ack)
+                
+                if success:
+                    packet_len = len(packet.payload) if packet.payload else 0
+                    logger.debug(f"Injected packet sent successfully ({packet_len} bytes)")
+                else:
+                    logger.warning("Failed to send injected packet")
+                
+                return success
+            else:
+                logger.error("No dispatcher available for packet injection")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error injecting packet: {e}")
+            return False
     
     async def _process_queue(self):
         """Process packets through the router queue."""

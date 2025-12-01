@@ -19,19 +19,19 @@ logger = logging.getLogger("TraceHelper")
 class TraceHelper:
     """Helper class for processing trace packets in the repeater."""
 
-    def __init__(self, local_hash: int, repeater_handler, dispatcher, log_fn=None):
+    def __init__(self, local_hash: int, repeater_handler, packet_injector=None, log_fn=None):
         """
         Initialize the trace helper.
 
         Args:
             local_hash: The local node's hash identifier
             repeater_handler: The RepeaterHandler instance
-            dispatcher: The Dispatcher instance for sending packets
+            packet_injector: Callable to inject new packets into the router for sending
             log_fn: Optional logging function for TraceHandler
         """
         self.local_hash = local_hash
         self.repeater_handler = repeater_handler
-        self.dispatcher = dispatcher
+        self.packet_injector = packet_injector  # Function to inject packets into router
         
         # Create TraceHandler internally as a parsing utility
         self.trace_handler = TraceHandler(log_fn=log_fn or logger.info)
@@ -84,8 +84,13 @@ class TraceHelper:
 
             if should_forward:
                 await self._forward_trace_packet(packet, trace_path_len)
+                # Packet was sent directly, but let it flow back to engine for standard logging
+                # The engine will see do_not_retransmit flag and won't try to send it again
             else:
+                # This is the final destination or can't forward - just log and record
                 self._log_no_forward_reason(packet, trace_path, trace_path_len)
+                # Mark packet to not be retransmitted since we're not forwarding
+                packet.mark_do_not_retransmit()
 
         except Exception as e:
             logger.error(f"Error processing trace packet: {e}")
@@ -188,6 +193,7 @@ class TraceHelper:
     def _should_forward_trace(self, packet, trace_path: list, trace_path_len: int) -> bool:
         """
         Determine if this node should forward the trace packet.
+        Uses the same logic as the original working implementation.
 
         Args:
             packet: The trace packet
@@ -197,35 +203,22 @@ class TraceHelper:
         Returns:
             True if the packet should be forwarded, False otherwise
         """
-        # Check if we've reached the end of the trace path
-        if packet.path_len >= trace_path_len:
-            return False
-
-        # Check if path index is valid
-        if len(trace_path) <= packet.path_len:
-            return False
-
-        # Check if this node is the next hop
-        if trace_path[packet.path_len] != self.local_hash:
-            return False
-
-        # Check for duplicates
-        if self.repeater_handler and self.repeater_handler.is_duplicate(packet):
-            return False
-
-        return True
+        # Use the exact logic from the original working code
+        return (packet.path_len < trace_path_len and 
+                len(trace_path) > packet.path_len and
+                trace_path[packet.path_len] == self.local_hash and
+                self.repeater_handler and not self.repeater_handler.is_duplicate(packet))
 
     async def _forward_trace_packet(self, packet, trace_path_len: int) -> None:
         """
-        Forward a trace packet by appending SNR and setting up correct routing.
-
+        Forward a trace packet by appending SNR and sending directly.
         Args:
             packet: The trace packet to forward
             trace_path_len: The length of the trace path
         """
-        # Update the packet record to show it was transmitted
+        # Update the packet record to show it will be transmitted
         if self.repeater_handler and hasattr(self.repeater_handler, 'recent_packets'):
-            packet_hash = packet.calculate_packet_hash().hex().upper()[:16]
+            packet_hash = packet.calculate_packet_hash().hex()[:16]
             for record in reversed(self.repeater_handler.recent_packets):
                 if record.get("packet_hash") == packet_hash:
                     record["transmitted"] = True
@@ -257,27 +250,16 @@ class TraceHelper:
             f"Forwarding trace, stored SNR {current_snr:.1f}dB at position {packet.path_len - 1}"
         )
 
-        # For direct trace packets, we need to update the routing path to point to next hop
-        # Parse the trace payload to get the trace route
-        parsed_data = self.trace_handler._parse_trace_payload(packet.payload)
-        if parsed_data.get("valid", False):
-            trace_path = parsed_data["trace_path"]
+        # Inject packet into router for proper routing and transmission
+        # Router will handle marking as seen to prevent duplicate processing
+        if self.packet_injector:
+            await self.packet_injector(packet, wait_for_ack=False)
+        else:
+            logger.warning("No packet injector available - trace packet not forwarded")
             
-            # Check if there's a next hop after current position
-            if packet.path_len < len(trace_path):
-                next_hop = trace_path[packet.path_len]
-                
-                # Set up direct routing to next hop by putting it at front of path
-                # The SNR data stays in the path, but we prepend the next hop for routing
-                packet.path = bytearray([next_hop] + list(packet.path))
-                packet.path_len = len(packet.path)
-                
-                logger.debug(f"Set next trace hop to 0x{next_hop:02X}")
-            else:
-                logger.info("Trace reached end of route")
-
-        # Don't mark as seen - let the packet flow to repeater handler for normal processing
-        # The repeater handler will handle duplicate detection and forwarding logic
+        # Mark as do_not_retransmit so engine won't try to send it again
+        # but allow it to flow back for standard packet logging
+        packet.mark_do_not_retransmit()
 
     def _log_no_forward_reason(self, packet, trace_path: list, trace_path_len: int) -> None:
         """

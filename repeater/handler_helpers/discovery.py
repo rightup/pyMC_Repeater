@@ -20,7 +20,7 @@ class DiscoveryHelper:
     def __init__(
         self,
         local_identity,
-        dispatcher,
+        packet_injector=None,
         node_type: int = 2,
         log_fn=None,
     ):
@@ -29,12 +29,12 @@ class DiscoveryHelper:
 
         Args:
             local_identity: The LocalIdentity instance for this repeater
-            dispatcher: The Dispatcher instance for sending packets
+            packet_injector: Callable to inject new packets into the router for sending
             node_type: Node type identifier (2 = Repeater)
             log_fn: Optional logging function for ControlHandler
         """
         self.local_identity = local_identity
-        self.dispatcher = dispatcher
+        self.packet_injector = packet_injector  # Function to inject packets into router
         self.node_type = node_type
         
         # Create ControlHandler internally as a parsing utility
@@ -108,22 +108,25 @@ class DiscoveryHelper:
                 prefix_only=prefix_only,
             )
 
-            # Send response asynchronously
-            asyncio.create_task(self._send_packet_async(response_packet, tag))
+            # Send response via router injection
+            if self.packet_injector:
+                asyncio.create_task(self._send_packet_async(response_packet, tag))
+            else:
+                logger.warning("No packet injector available - discovery response not sent")
 
         except Exception as e:
             logger.error(f"Error creating discovery response: {e}")
 
     async def _send_packet_async(self, packet, tag: int) -> None:
         """
-        Send a discovery response packet asynchronously.
+        Send a discovery response packet via router injection.
 
         Args:
             packet: The packet to send
             tag: The tag for logging purposes
         """
         try:
-            success = await self.dispatcher.send_packet(packet, wait_for_ack=False)
+            success = await self.packet_injector(packet, wait_for_ack=False)
             if success:
                 logger.info(f"Response sent for tag 0x{tag:08X}")
             else:
