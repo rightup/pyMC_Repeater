@@ -53,8 +53,8 @@ class PacketRouter:
         """
         Inject a new packet into the system for transmission through the engine.
         
-        This method uses the engine's main packet handler but marks the packet
-        as originated locally to bypass forwarding logic.
+        This method uses the engine's main packet handler with the local_transmission
+        flag to bypass forwarding logic while maintaining proper statistics and airtime.
         
         Args:
             packet: The packet to send
@@ -64,19 +64,17 @@ class PacketRouter:
             True if packet was sent successfully, False otherwise
         """
         try:
-            # Mark this packet as locally originated to bypass forwarding checks
-            packet._locally_injected = True
-            
             metadata = {
                 "rssi": getattr(packet, "rssi", 0),
                 "snr": getattr(packet, "snr", 0.0), 
                 "timestamp": getattr(packet, "timestamp", 0),
             }
             
-            await self.daemon.repeater_handler(packet, metadata)
+            # Use local_transmission=True to bypass forwarding logic
+            await self.daemon.repeater_handler(packet, metadata, local_transmission=True)
             
             packet_len = len(packet.payload) if packet.payload else 0
-            logger.debug(f"Injected packet processed by engine ({packet_len} bytes)")
+            logger.debug(f"Injected packet processed by engine as local transmission ({packet_len} bytes)")
             return True
                 
         except Exception as e:

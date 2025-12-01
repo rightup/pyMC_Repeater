@@ -102,7 +102,7 @@ class RepeaterHandler(BaseHandler):
         
         self._start_background_tasks()
 
-    async def __call__(self, packet: Packet, metadata: Optional[dict] = None) -> None:
+    async def __call__(self, packet: Packet, metadata: Optional[dict] = None, local_transmission: bool = False) -> None:
 
         if metadata is None:
             metadata = {}
@@ -130,9 +130,20 @@ class RepeaterHandler(BaseHandler):
 
         original_path = list(packet.path) if packet.path else []
 
-        # Process for forwarding (skip if in monitor mode)
-        result = None if monitor_mode else self.process_packet(packet, snr)
+        # Process for forwarding (skip if in monitor mode or if this is a local transmission)
+        result = None if (monitor_mode or local_transmission) else self.process_packet(packet, snr)
         forwarded_path = None
+        
+        # For local transmissions, create a direct transmission result
+        if local_transmission and not monitor_mode:
+            # Mark local packet as seen to prevent duplicate processing when received back
+            self.mark_seen(packet)
+            # Calculate transmission delay for local packets
+            delay = self._calculate_tx_delay(packet, snr)
+            result = (packet, delay)
+            forwarded_path = list(packet.path) if packet.path else []
+            logger.debug(f"Local transmission: calculated delay {delay:.3f}s")
+        
         if result:
             fwd_pkt, delay = result
             tx_delay_ms = delay * 1000.0
@@ -488,24 +499,15 @@ class RepeaterHandler(BaseHandler):
 
     def direct_forward(self, packet: Packet) -> Optional[Packet]:
 
-        # Check if we're the next hop (skip for locally injected packets)
+        # Check if we're the next hop
         if not packet.path or len(packet.path) == 0:
-            # For locally injected packets, this is expected - they don't have paths yet
-            if hasattr(packet, '_locally_injected') and packet._locally_injected:
-                pass
-            else:
-                self._last_drop_reason = "Direct: no path"
-                return None
+            self._last_drop_reason = "Direct: no path"
+            return None
 
-        elif len(packet.path) > 0:
-            next_hop = packet.path[0] 
-            if next_hop != self.local_hash:
-                # Skip this check for locally injected packets
-                if hasattr(packet, '_locally_injected') and packet._locally_injected:
-                    pass
-                else:
-                    self._last_drop_reason = "Direct: not for us"
-                    return None
+        next_hop = packet.path[0] 
+        if next_hop != self.local_hash:
+            self._last_drop_reason = "Direct: not for us"
+            return None
 
         original_path = list(packet.path)
         packet.path = bytearray(packet.path[1:])
