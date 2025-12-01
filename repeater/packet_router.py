@@ -1,8 +1,9 @@
 """
-Packet routing pipeline for pyMC Repeater.
+Packet router for pyMC Repeater.
 
-This module provides a simple router that processes packets through handlers
-sequentially. All statistics and processing logic is handled by the engine.
+This module provides a simple router that routes packets to appropriate handlers
+based on payload type. All statistics, queuing, and processing logic is handled
+by the repeater engine for better separation of concerns.
 """
 
 import asyncio

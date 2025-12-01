@@ -7,7 +7,7 @@ from repeater.config import get_radio_for_board, load_config
 from repeater.engine import RepeaterHandler
 from repeater.web.http_server import HTTPStatsServer, _log_buffer
 from repeater.handler_helpers import TraceHelper, DiscoveryHelper, AdvertHelper
-from repeater.packet_pipeline import PacketPipeline
+from repeater.packet_router import PacketRouter
 
 logger = logging.getLogger("RepeaterDaemon")
 
@@ -26,7 +26,7 @@ class RepeaterDaemon:
         self.trace_helper = None
         self.advert_helper = None
         self.discovery_helper = None
-        self.pipeline = None
+        self.router = None
 
 
         log_level = config.get("logging", {}).get("level", "INFO")
@@ -106,14 +106,14 @@ class RepeaterDaemon:
                 self.config, self.dispatcher, self.local_hash, send_advert_func=self.send_advert
             )
 
-            # Create pipeline
-            self.pipeline = PacketPipeline(self)
-            await self.pipeline.start()
+            # Create router
+            self.router = PacketRouter(self)
+            await self.router.start()
             
-            # Register pipeline as entry point for ALL packets via fallback handler
-            # All received packets flow through pipeline → helpers → repeater validation
-            self.dispatcher.register_fallback_handler(self._pipeline_callback)
-            logger.info("Pipeline registered as fallback (catches all packets)")
+            # Register router as entry point for ALL packets via fallback handler
+            # All received packets flow through router → helpers → repeater engine
+            self.dispatcher.register_fallback_handler(self._router_callback)
+            logger.info("Packet router registered as fallback (catches all packets)")
 
             # Create processing helpers (handlers created internally)
             self.trace_helper = TraceHelper(
@@ -149,13 +149,13 @@ class RepeaterDaemon:
             logger.error(f"Failed to initialize dispatcher: {e}")
             raise
 
-    async def _pipeline_callback(self, packet):
+    async def _router_callback(self, packet):
         """
         Single entry point for ALL packets.
-        Enqueues packets for pipeline processing.
+        Enqueues packets for router processing.
         """
-        if self.pipeline:
-            await self.pipeline.enqueue(packet)
+        if self.router:
+            await self.router.enqueue(packet)
 
     def get_stats(self) -> dict:
         stats = {}
@@ -169,10 +169,6 @@ class RepeaterDaemon:
                     stats["public_key"] = pubkey.hex()
                 except Exception:
                     stats["public_key"] = None
-        
-        # Add pipeline statistics
-        if self.pipeline:
-            stats["pipeline"] = self.pipeline.get_stats()
         
         return stats
 
@@ -267,8 +263,8 @@ class RepeaterDaemon:
             await self.dispatcher.run_forever()
         except KeyboardInterrupt:
             logger.info("Shutting down...")
-            if self.pipeline:
-                await self.pipeline.stop()
+            if self.router:
+                await self.router.stop()
             if self.http_server:
                 self.http_server.stop()
 
