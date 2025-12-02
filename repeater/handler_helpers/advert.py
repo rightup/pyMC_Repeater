@@ -55,7 +55,8 @@ class AdvertHelper:
             
             if not advert_data or not advert_data.get("valid"):
                 logger.debug("Invalid advert packet")
-                return
+                packet.mark_do_not_retransmit()
+
             
             # Extract data from parsed advert
             pubkey = advert_data["public_key"]
