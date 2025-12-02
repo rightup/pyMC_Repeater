@@ -260,10 +260,12 @@ class RepeaterHandler(BaseHandler):
         }
 
         # Store packet record to persistent storage
-        # Skip LetsMesh if packet has a drop_reason (invalid/bad packet)
+        # Skip LetsMesh only for invalid packets (not duplicates or operational drops)
         if self.storage:
             try:
-                skip_letsmesh = bool(drop_reason)
+                # Only skip LetsMesh for actual invalid/bad packets
+                invalid_reasons = ["Invalid advert packet", "Empty payload", "Path too long"]
+                skip_letsmesh = drop_reason in invalid_reasons if drop_reason else False
                 self.storage.record_packet(packet_record, skip_letsmesh_if_invalid=skip_letsmesh)
             except Exception as e:
                 logger.error(f"Failed to store packet record: {e}")
