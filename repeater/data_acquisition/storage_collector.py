@@ -82,8 +82,13 @@ class StorageCollector:
             "packets_received": self.repeater_handler.rx_count,
         }
 
-    def record_packet(self, packet_record: dict):
-        """Record packet to storage and publish to MQTT/LetsMesh"""
+    def record_packet(self, packet_record: dict, skip_letsmesh_if_invalid: bool = True):
+        """Record packet to storage and publish to MQTT/LetsMesh
+        
+        Args:
+            packet_record: Dictionary containing packet information
+            skip_letsmesh_if_invalid: If True, don't publish packets with drop_reason to LetsMesh
+        """
         logger.debug(
             f"Recording packet: type={packet_record.get('type')}, "
             f"transmitted={packet_record.get('transmitted')}"
@@ -95,8 +100,11 @@ class StorageCollector:
         self.rrd_handler.update_packet_metrics(packet_record, cumulative_counts)
         self.mqtt_handler.publish(packet_record, "packet")
 
-        # Publish to LetsMesh if enabled
-        self._publish_to_letsmesh(packet_record)
+        # Publish to LetsMesh if enabled (skip invalid packets if requested)
+        if skip_letsmesh_if_invalid and packet_record.get('drop_reason'):
+            logger.debug(f"Skipping LetsMesh publish for packet with drop_reason: {packet_record.get('drop_reason')}")
+        else:
+            self._publish_to_letsmesh(packet_record)
 
     def _publish_to_letsmesh(self, packet_record: dict):
         """Publish packet to LetsMesh broker if enabled and allowed"""

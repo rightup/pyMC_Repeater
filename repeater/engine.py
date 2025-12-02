@@ -98,8 +98,6 @@ class RepeaterHandler(BaseHandler):
         self._transport_keys_cache_time = 0
         self._transport_keys_cache_ttl = 60  # Cache for 60 seconds
         
-        self._last_drop_reason = None
-        
         self._start_background_tasks()
 
     async def __call__(self, packet: Packet, metadata: Optional[dict] = None, local_transmission: bool = False) -> None:
@@ -108,9 +106,6 @@ class RepeaterHandler(BaseHandler):
             metadata = {}
 
         self.rx_count += 1
-
-        # Reset drop reason for this packet processing
-        self._last_drop_reason = None
 
         # Check if we're in monitor mode (receive only, no forwarding)
         mode = self.config.get("repeater", {}).get("mode", "forward")
@@ -177,8 +172,9 @@ class RepeaterHandler(BaseHandler):
             if monitor_mode:
                 drop_reason = "Monitor mode"
             else:
-                drop_reason = self._last_drop_reason or self._get_drop_reason(packet)
-            logger.debug(f"Packet not forwarded: {drop_reason}")
+                # Check if packet has a specific drop reason set by handlers
+                drop_reason = packet.drop_reason or self._get_drop_reason(packet)
+                logger.debug(f"Packet not forwarded: {drop_reason}")
 
         # Extract packet type and route from header
         if not hasattr(packet, "header") or packet.header is None:
@@ -264,9 +260,11 @@ class RepeaterHandler(BaseHandler):
         }
 
         # Store packet record to persistent storage
+        # Skip LetsMesh if packet has a drop_reason (invalid/bad packet)
         if self.storage:
             try:
-                self.storage.record_packet(packet_record)
+                skip_letsmesh = bool(drop_reason)
+                self.storage.record_packet(packet_record, skip_letsmesh_if_invalid=skip_letsmesh)
             except Exception as e:
                 logger.error(f"Failed to store packet record: {e}")
 
@@ -458,12 +456,14 @@ class RepeaterHandler(BaseHandler):
         # Validate
         valid, reason = self.validate_packet(packet)
         if not valid:
-            self._last_drop_reason = reason
+            packet.drop_reason = reason
             return None
 
         # Check if packet is marked do-not-retransmit
         if packet.is_marked_do_not_retransmit():
-            self._last_drop_reason = "Marked do not retransmit"
+            # Check if packet has custom drop reason
+            if not packet.drop_reason:
+                packet.drop_reason = "Marked do not retransmit"
             return None
 
         # Check global flood policy
@@ -474,15 +474,15 @@ class RepeaterHandler(BaseHandler):
              
                 allowed, check_reason = self._check_transport_codes(packet)
                 if not allowed:
-                    self._last_drop_reason = check_reason
+                    packet.drop_reason = check_reason
                     return None
             else:
-                self._last_drop_reason = "Global flood policy disabled"
+                packet.drop_reason = "Global flood policy disabled"
                 return None
 
         # Suppress duplicates
         if self.is_duplicate(packet):
-            self._last_drop_reason = "Duplicate"
+            packet.drop_reason = "Duplicate"
             return None
 
         if packet.path is None:
@@ -501,12 +501,12 @@ class RepeaterHandler(BaseHandler):
 
         # Check if we're the next hop
         if not packet.path or len(packet.path) == 0:
-            self._last_drop_reason = "Direct: no path"
+            packet.drop_reason = "Direct: no path"
             return None
 
         next_hop = packet.path[0] 
         if next_hop != self.local_hash:
-            self._last_drop_reason = "Direct: not for us"
+            packet.drop_reason = "Direct: not for us"
             return None
 
         original_path = list(packet.path)
@@ -608,7 +608,7 @@ class RepeaterHandler(BaseHandler):
             return fwd_pkt, delay
 
         else:
-            self._last_drop_reason = f"Unknown route type: {route_type}"
+            packet.drop_reason = f"Unknown route type: {route_type}"
             return None
 
     async def schedule_retransmit(self, fwd_pkt: Packet, delay: float, airtime_ms: float = 0.0):
