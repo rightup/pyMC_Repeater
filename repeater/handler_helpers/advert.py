@@ -54,7 +54,7 @@ class AdvertHelper:
             advert_data = await self.advert_handler(packet)
             
             if not advert_data or not advert_data.get("valid"):
-                logger.warning(f"Invalid advert packet from {packet.from_id}")
+                logger.warning("Invalid advert packet received, dropping.")
                 packet.mark_do_not_retransmit()
                 packet.drop_reason = "Invalid advert packet"
                 return
