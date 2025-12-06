@@ -96,6 +96,11 @@ sx1262:
 
   use_dio3_tcxo: false
 
+  # TCXO Voltage (if enabled)
+  # 1.6V is the minimum supported by SX1262/SX1268
+  # Default: 1.8V
+  dio3_tcxo_voltage: 1.8
+
   # Waveshare hardware flag
   is_waveshare: false
 

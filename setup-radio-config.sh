@@ -220,6 +220,9 @@ else
     preamble_length=$(echo "$hw_config" | jq -r '.preamble_length // empty')
     is_waveshare=$(echo "$hw_config" | jq -r '.is_waveshare // empty')
     use_dio3_tcxo=$(echo "$hw_config" | jq -r '.use_dio3_tcxo // empty')
+    dio3_tcxo_voltage=$(echo "$hw_config" | jq -r '.dio3_tcxo_voltage // empty')
+    platform=$(echo "$hw_config" | jq -r '.platform // empty')
+    timezone_utc=$(echo "$hw_config" | jq -r '.timezone_utc // empty')
 
     # Update sx1262 section in config.yaml (2-space indentation)
     [ -n "$bus_id" ] && sed "${SED_OPTS[@]}" "s/^  bus_id:.*/  bus_id: $bus_id/" "$CONFIG_FILE"
@@ -256,7 +259,7 @@ else
     # Update is_waveshare flag
     if [ "$is_waveshare" == "true" ]; then
         sed "${SED_OPTS[@]}" "s/^  is_waveshare:.*/  is_waveshare: true/" "$CONFIG_FILE"
-    else
+    elif [ "$is_waveshare" == "false" ]; then
         sed "${SED_OPTS[@]}" "s/^  is_waveshare:.*/  is_waveshare: false/" "$CONFIG_FILE"
     fi
 
@@ -282,6 +285,36 @@ else
             else
                 sed "${SED_OPTS[@]}" "/^  rxen_pin:.*/a\\  use_dio3_tcxo: false" "$CONFIG_FILE"
             fi
+        fi
+    fi
+
+    # Update dio3_tcxo_voltage if provided
+    if [ -n "$dio3_tcxo_voltage" ]; then
+        if grep -q "^  dio3_tcxo_voltage:" "$CONFIG_FILE"; then
+            sed "${SED_OPTS[@]}" "s/^  dio3_tcxo_voltage:.*/  dio3_tcxo_voltage: $dio3_tcxo_voltage/" "$CONFIG_FILE"
+        else
+            # Add after use_dio3_tcxo
+            sed "${SED_OPTS[@]}" "/^  use_dio3_tcxo:.*/a\\  dio3_tcxo_voltage: $dio3_tcxo_voltage" "$CONFIG_FILE"
+        fi
+    fi
+
+    # If platform or timezone hints are provided (e.g., Luckfox), set helper flags under repeater
+    if [ -n "$platform" ]; then
+        # Ensure we set repeater.luckfox boolean if platform == luckfox
+        if [ "$platform" = "luckfox" ]; then
+            if grep -q "^  luckfox:" "$CONFIG_FILE"; then
+                sed "${SED_OPTS[@]}" "s/^  luckfox:.*/  luckfox: true/" "$CONFIG_FILE"
+            else
+                sed "${SED_OPTS[@]}" "/^  node_name:.*/a\\  luckfox: true" "$CONFIG_FILE"
+            fi
+        fi
+    fi
+
+    if [ "$timezone_utc" = "true" ]; then
+        if grep -q "^  timezone_utc:" "$CONFIG_FILE"; then
+            sed "${SED_OPTS[@]}" "s/^  timezone_utc:.*/  timezone_utc: true/" "$CONFIG_FILE"
+        else
+            sed "${SED_OPTS[@]}" "/^  node_name:.*/a\\  timezone_utc: true" "$CONFIG_FILE"
         fi
     fi
 fi
