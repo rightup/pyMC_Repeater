@@ -224,6 +224,7 @@ def get_radio_for_board(board_config: dict):
             "txled_pin": spi_config.get("txled_pin", -1),
             "rxled_pin": spi_config.get("rxled_pin", -1),
             "use_dio3_tcxo": spi_config.get("use_dio3_tcxo", False),
+            "dio3_tcxo_voltage": spi_config.get("dio3_tcxo_voltage", 1.4),
             "is_waveshare": spi_config.get("is_waveshare", False),
             "frequency": int(radio_config["frequency"]),
             "tx_power": radio_config["tx_power"],
