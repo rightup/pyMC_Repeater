@@ -4,7 +4,13 @@ import binascii
 import base64
 import paho.mqtt.client as mqtt
 
-from datetime import datetime, timedelta, UTC
+# Python 3.11 introduced datetime.UTC; provide a fallback for 3.8–3.10
+try:  # pragma: no cover - tiny compatibility shim
+    from datetime import datetime, timedelta, UTC
+except ImportError:  # Python < 3.11
+    from datetime import datetime, timedelta, timezone
+    UTC = timezone.utc
+
 from nacl.signing import SigningKey
 from typing import Callable, Optional
 from .. import __version__

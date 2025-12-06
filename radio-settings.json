@@ -93,6 +93,13 @@
       "tx_power": 22,
       "use_dio3_tcxo": true,
       "preamble_length": 17
+    },
+    "luckfox": {
+      "name": "Luckfox (SX1262/E22 wiring)",
+      "platform": "luckfox",
+      "timezone_utc": true,
+      "use_dio3_tcxo": true,
+      "dio3_tcxo_voltage": 1.8
     }
   }
 }
