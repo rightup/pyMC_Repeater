@@ -89,6 +89,14 @@ class AdvertHelper:
                 is_new_neighbor = False
             
             # Build advert record
+            path_len = getattr(packet, "path_len", None)
+            if path_len is None:
+                path_len = len(packet.path) if getattr(packet, "path", None) is not None else 0
+
+            is_share = False
+            if hasattr(packet, "has_transport_codes") and packet.has_transport_codes():
+                is_share = packet.transport_codes[0] == 0 and packet.transport_codes[1] == 0
+
             advert_record = {
                 "timestamp": current_time,
                 "pubkey": pubkey,
@@ -101,7 +109,7 @@ class AdvertHelper:
                 "rssi": rssi,
                 "snr": snr,
                 "is_new_neighbor": is_new_neighbor,
-                "zero_hop": route_type in [0x02, 0x03],  # True for direct routes (no intermediate hops)
+                "zero_hop": path_len == 0 and not is_share,
             }
             
             # Store to database

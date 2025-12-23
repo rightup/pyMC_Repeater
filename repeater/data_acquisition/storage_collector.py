@@ -186,6 +186,28 @@ class StorageCollector:
 
     def get_neighbors(self) -> dict:
         return self.sqlite_handler.get_neighbors()
+    
+    def get_node_name_by_pubkey(self, pubkey: str) -> Optional[str]:
+        """
+        Lookup node name from adverts table by public key.
+        
+        Args:
+            pubkey: Public key in hex string format
+            
+        Returns:
+            Node name if found, None otherwise
+        """
+        try:
+            import sqlite3
+            with sqlite3.connect(self.sqlite_handler.sqlite_path) as conn:
+                result = conn.execute(
+                    "SELECT node_name FROM adverts WHERE pubkey = ? AND node_name IS NOT NULL ORDER BY last_seen DESC LIMIT 1",
+                    (pubkey,)
+                ).fetchone()
+                return result[0] if result else None
+        except Exception as e:
+            logger.debug(f"Could not lookup node name for {pubkey[:8] if pubkey else 'None'}: {e}")
+            return None
 
     def cleanup_old_data(self, days: int = 7):
         self.sqlite_handler.cleanup_old_data(days)

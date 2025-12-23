@@ -2,12 +2,14 @@ import asyncio
 import logging
 import os
 import sys
+import time
 
 from repeater.config import get_radio_for_board, load_config
 from repeater.engine import RepeaterHandler
 from repeater.web.http_server import HTTPStatsServer, _log_buffer
-from repeater.handler_helpers import TraceHelper, DiscoveryHelper, AdvertHelper
+from repeater.handler_helpers import TraceHelper, DiscoveryHelper, AdvertHelper, LoginHelper, TextHelper, PathHelper, ProtocolRequestHelper
 from repeater.packet_router import PacketRouter
+from repeater.identity_manager import IdentityManager
 
 logger = logging.getLogger("RepeaterDaemon")
 
@@ -22,11 +24,18 @@ class RepeaterDaemon:
         self.repeater_handler = None
         self.local_hash = None
         self.local_identity = None
+        self.identity_manager = None
         self.http_server = None
         self.trace_helper = None
         self.advert_helper = None
         self.discovery_helper = None
+        self.login_helper = None
+        self.text_helper = None
+        self.path_helper = None
+        self.protocol_request_helper = None
+        self.acl = None
         self.router = None
+        self._battery_alert_task = None
 
 
         log_level = config.get("logging", {}).get("level", "INFO")
@@ -84,6 +93,11 @@ class RepeaterDaemon:
             self.dispatcher = Dispatcher(self.radio)
             logger.info("Dispatcher initialized")
 
+            # Initialize Identity Manager for additional identities (e.g., room servers)
+            self.identity_manager = IdentityManager(self.config)
+            logger.info("Identity manager initialized")
+
+            # Set up default repeater identity (not managed by identity manager)
             identity_key = self.config.get("mesh", {}).get("identity_key")
             if not identity_key:
                 logger.error("No identity key found in configuration. Cannot init repeater.")
@@ -95,10 +109,13 @@ class RepeaterDaemon:
 
             pubkey = local_identity.get_public_key()
             self.local_hash = pubkey[0]
+            
             logger.info(f"Local identity set: {local_identity.get_address_bytes().hex()}")
-            local_hash_hex = f"0x{self.local_hash: 02x}"
+            local_hash_hex = f"0x{self.local_hash:02x}"
             logger.info(f"Local node hash (from identity): {local_hash_hex}")
 
+            # Load additional identities from config (e.g., room servers)
+            await self._load_additional_identities()
 
             self.dispatcher._is_own_packet = lambda pkt: False
 
@@ -145,9 +162,329 @@ class RepeaterDaemon:
             else:
                 logger.info("Discovery response handler disabled")
 
+            # Create login helper (will create per-identity ACLs)
+            self.login_helper = LoginHelper(
+                identity_manager=self.identity_manager,
+                packet_injector=self.router.inject_packet,
+                log_fn=logger.info,
+            )
+            
+            # Register default repeater identity
+            self.login_helper.register_identity(
+                name="repeater",
+                identity=self.local_identity,
+                identity_type="repeater",
+                config=self.config  # Pass full config so repeater can access top-level security section
+            )
+            
+            # Register room server identities with their configs
+            for name, identity, config in self.identity_manager.get_identities_by_type("room_server"):
+                self.login_helper.register_identity(
+                    name=name, 
+                    identity=identity, 
+                    identity_type="room_server",
+                    config=config  # Pass room-specific config
+                )
+            
+            logger.info("Login processing helper initialized")
+            
+            # Initialize text message helper with per-identity ACLs
+            self.text_helper = TextHelper(
+                identity_manager=self.identity_manager,
+                packet_injector=self.router.inject_packet,
+                acl_dict=self.login_helper.get_acl_dict(),  # Per-identity ACLs
+                log_fn=logger.info,
+                config_path=getattr(self, 'config_path', None),  # For CLI to save changes
+                config=self.config,  # For CLI to read/modify settings
+                save_config_callback=lambda: self._save_config(getattr(self, 'config_path', '/tmp/config.yaml')),  # For CLI to persist changes
+                sqlite_handler=self.repeater_handler.storage.sqlite_handler if self.repeater_handler and self.repeater_handler.storage else None,  # For room server database
+                send_advert_callback=self.send_advert,  # For CLI advert command
+            )
+            
+            # Register default repeater identity for text messages
+            self.text_helper.register_identity(
+                name="repeater",
+                identity=self.local_identity,
+                identity_type="repeater",
+                radio_config=self.config.get("radio", {})
+            )
+            
+            # Register room server identities for text messages
+            for name, identity, config in self.identity_manager.get_identities_by_type("room_server"):
+                self.text_helper.register_identity(
+                    name=name,
+                    identity=identity,
+                    identity_type="room_server",
+                    radio_config=config  # Pass room-specific config (includes max_posts, etc.)
+                )
+            
+            logger.info("Text message processing helper initialized")
+            
+            # Initialize PATH packet helper for updating client out_path
+            self.path_helper = PathHelper(
+                acl_dict=self.login_helper.get_acl_dict(),  # Per-identity ACLs
+                log_fn=logger.info,
+            )
+            logger.info("PATH packet processing helper initialized")
+            
+            # Initialize protocol request handler for status/telemetry requests
+            self.protocol_request_helper = ProtocolRequestHelper(
+                identity_manager=self.identity_manager,
+                packet_injector=self.router.inject_packet,
+                acl_dict=self.login_helper.get_acl_dict(),
+                radio=self.radio,
+                engine=self.repeater_handler,
+                neighbor_tracker=self.advert_helper,
+            )
+            # Register repeater identity for protocol requests
+            self.protocol_request_helper.register_identity(
+                name="repeater",
+                identity=self.local_identity,
+                identity_type="repeater"
+            )
+            logger.info("Protocol request handler initialized")
+            self._start_battery_alert_monitor()
+
         except Exception as e:
             logger.error(f"Failed to initialize dispatcher: {e}")
             raise
+    
+    def _save_config(self, config_path: str):
+        """Save configuration to file (called by CLI when settings change)."""
+        import yaml
+        try:
+            with open(config_path, 'w') as f:
+                yaml.dump(self.config, f, default_flow_style=False)
+            logger.info(f"Configuration saved to {config_path}")
+        except Exception as e:
+            logger.error(f"Failed to save config: {e}")
+            raise
+
+    async def _load_additional_identities(self):
+        from pymc_core import LocalIdentity
+        
+        identities_config = self.config.get("identities", {})
+        
+        # Load room server identities
+        room_servers = identities_config.get("room_servers") or []
+        for room_config in room_servers:
+            try:
+                name = room_config.get("name")
+                identity_key = room_config.get("identity_key")
+                
+                if not name or not identity_key:
+                    logger.warning(
+                        f"Skipping room server config: missing name or identity_key"
+                    )
+                    continue
+                
+                # Convert identity_key to bytes if it's a hex string
+                if isinstance(identity_key, bytes):
+                    identity_key_bytes = identity_key
+                elif isinstance(identity_key, str):
+                    try:
+                        identity_key_bytes = bytes.fromhex(identity_key)
+                        if len(identity_key_bytes) != 32:
+                            logger.error(f"Identity key for '{name}' is invalid length: {len(identity_key_bytes)} bytes (expected 32)")
+                            continue
+                    except ValueError as e:
+                        logger.error(f"Identity key for '{name}' is not valid hex: {e}")
+                        continue
+                else:
+                    logger.error(f"Identity key for '{name}' has unknown type: {type(identity_key)}")
+                    continue
+                
+                # Create the identity
+                room_identity = LocalIdentity(seed=identity_key_bytes)
+                
+                # Register with the manager and all helpers
+                success = self._register_identity_everywhere(
+                    name=name,
+                    identity=room_identity,
+                    config=room_config,
+                    identity_type="room_server"
+                )
+                
+                if success:
+                    room_hash = room_identity.get_public_key()[0]
+                    logger.info(
+                        f"Loaded room server '{name}': hash=0x{room_hash:02x}, "
+                        f"address={room_identity.get_address_bytes().hex()}"
+                    )
+                
+            except Exception as e:
+                logger.error(f"Failed to load room server identity '{name}': {e}")
+        
+        # Summary logging
+        total_identities = len(self.identity_manager.list_identities())
+        logger.info(f"Identity manager loaded {total_identities} total identities")
+
+    def _register_identity_everywhere(
+        self,
+        name: str,
+        identity,
+        config: dict,
+        identity_type: str
+    ) -> bool:
+        """
+        Register an identity with the manager and all helpers in one place.
+        This is the single source of truth for identity registration.
+        """
+        # Register with identity manager
+        success = self.identity_manager.register_identity(
+            name=name,
+            identity=identity,
+            config=config,
+            identity_type=identity_type
+        )
+        
+        if not success:
+            return False
+        
+        # Register with all helpers
+        if self.login_helper:
+            self.login_helper.register_identity(
+                name=name,
+                identity=identity,
+                identity_type=identity_type,
+                config=config
+            )
+        
+        if self.text_helper:
+            self.text_helper.register_identity(
+                name=name,
+                identity=identity,
+                identity_type=identity_type,
+                radio_config=self.config.get("radio", {})
+            )
+        
+        if self.protocol_request_helper:
+            self.protocol_request_helper.register_identity(
+                name=name,
+                identity=identity,
+                identity_type=identity_type
+            )
+        
+        return True
+
+
+    def _start_battery_alert_monitor(self):
+        alerts_config = self.config.get("alerts", {})
+        if not alerts_config.get("battery_enabled", True):
+            logger.info("Battery alert monitor disabled")
+            return
+        if self._battery_alert_task:
+            return
+        self._battery_alert_task = asyncio.create_task(self._battery_alert_loop())
+        logger.info("Battery alert monitor started")
+
+    async def _battery_alert_loop(self):
+        alerts_config = self.config.get("alerts", {})
+        threshold = int(alerts_config.get("battery_threshold_percent", 10))
+        check_interval = int(alerts_config.get("battery_check_interval_seconds", 60))
+        cooldown = int(alerts_config.get("battery_alert_cooldown_seconds", 1800))
+        room_name = alerts_config.get("battery_room_name", "#alerts")
+
+        last_alert_time = 0.0
+        in_alert = False
+        missing_room_logged = False
+
+        while True:
+            percent = self._read_ups_battery_percent()
+            if percent is None:
+                await asyncio.sleep(check_interval)
+                continue
+
+            if percent < threshold:
+                now = time.time()
+                if not in_alert or (cooldown > 0 and now - last_alert_time >= cooldown):
+                    room_info = self._find_alert_room_server(room_name)
+                    if not room_info:
+                        if not missing_room_logged:
+                            logger.warning(
+                                "Battery alert channel %s not available (no room server configured)",
+                                room_name,
+                            )
+                            missing_room_logged = True
+                        await asyncio.sleep(check_interval)
+                        continue
+
+                    missing_room_logged = False
+                    room_server, display_name = room_info
+                    ok = await self._send_battery_alert(room_server, percent, display_name)
+                    if ok:
+                        last_alert_time = now
+                        in_alert = True
+            else:
+                in_alert = False
+                missing_room_logged = False
+
+            await asyncio.sleep(check_interval)
+
+    def _read_ups_battery_percent(self):
+        cache_path = "/var/lib/ups-lowpower/last_batcap"
+        try:
+            with open(cache_path, "r", encoding="utf-8") as handle:
+                lines = handle.read().splitlines()
+        except FileNotFoundError:
+            return None
+        except OSError:
+            return None
+
+        for line in lines:
+            if line.startswith("batcap="):
+                value = line.split("=", 1)[1].strip()
+                try:
+                    return int(float(value))
+                except ValueError:
+                    return None
+
+        return None
+
+    def _find_alert_room_server(self, room_name: str):
+        if not self.text_helper or not self.identity_manager:
+            return None
+
+        target = (room_name or "").strip()
+        if not target:
+            return None
+
+        target_norm = target.lstrip("#").lower()
+
+        for name, identity, config in self.identity_manager.get_identities_by_type("room_server"):
+            settings = config.get("settings", {}) if config else {}
+            display_name = settings.get("room_name") or name
+            name_norm = (name or "").lower()
+            display_norm = (display_name or "").lstrip("#").lower()
+
+            if name_norm == target_norm or display_norm == target_norm:
+                hash_byte = identity.get_public_key()[0]
+                room_server = self.text_helper.room_servers.get(hash_byte)
+                if room_server:
+                    return room_server, display_name
+
+        return None
+
+    async def _send_battery_alert(self, room_server, percent: int, room_display_name: str) -> bool:
+        repeater_name = self.config.get("repeater", {}).get("node_name", "repeater")
+        message = f"LOW BATTERY {percent}% - {repeater_name}"
+
+        try:
+            return await room_server.add_post(
+                client_pubkey=room_server.local_identity.get_public_key(),
+                message_text=message,
+                sender_timestamp=int(time.time()),
+                txt_type=0,
+                allow_server_author=True,
+            )
+        except Exception as exc:
+            logger.error(
+                "Battery alert send failed for room %s: %s",
+                room_display_name,
+                exc,
+                exc_info=True,
+            )
+            return False
 
     async def _router_callback(self, packet):
         """
@@ -159,6 +496,32 @@ class RepeaterDaemon:
                 await self.router.enqueue(packet)
             except Exception as e:
                 logger.error(f"Error enqueuing packet in router: {e}", exc_info=True)
+    
+    def register_text_handler_for_identity(
+        self, 
+        name: str, 
+        identity, 
+        identity_type: str = "room_server",
+        radio_config: dict = None
+    ):
+
+        if not self.text_helper:
+            logger.warning("Text helper not initialized, cannot register identity")
+            return False
+            
+        try:
+            self.text_helper.register_identity(
+                name=name,
+                identity=identity,
+                identity_type=identity_type,
+                radio_config=radio_config or self.config.get("radio", {}),
+            )
+            logger.info(f"Registered text handler for {identity_type} '{name}'")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to register text handler for '{name}': {e}")
+            return False
+    
     def get_stats(self) -> dict:
         stats = {}
         
