@@ -12,7 +12,7 @@ repeater:
 
   # Path to identity file (public/private key)
   # If not specified, a new identity will be generated
-  identity_file: null
+  identity_key: null
 
   # Duplicate packet cache TTL in seconds
   cache_ttl: 60
