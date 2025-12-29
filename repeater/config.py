@@ -33,9 +33,9 @@ def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
     if "repeater" not in config:
         config["repeater"] = {}
 
-    # Only auto-generate identity_key if not provided
-    if "identity_key" not in config["repeater"]:
-        config["repeater"]["identity_key"] = _load_or_create_identity_key()
+    # Load or auto-generate identity_key if not provided
+    key_path = config["repeater"]["identity_key"] if "identity_key" in config["repeater"] else None
+    config["repeater"]["identity_key"] = _load_or_create_identity_key(key_path)
 
     if os.getenv("PYMC_REPEATER_LOG_LEVEL"):
         if "logging" not in config:
