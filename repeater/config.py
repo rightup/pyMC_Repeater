@@ -30,12 +30,12 @@ def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
     except Exception as e:
         raise RuntimeError(f"Failed to load configuration from {config_path}: {e}") from e
 
-    if "mesh" not in config:
-        config["mesh"] = {}
+    if "repeater" not in config:
+        config["repeater"] = {}
 
     # Only auto-generate identity_key if not provided
-    if "identity_key" not in config["mesh"]:
-        config["mesh"]["identity_key"] = _load_or_create_identity_key()
+    if "identity_key" not in config["repeater"]:
+        config["repeater"]["identity_key"] = _load_or_create_identity_key()
 
     if os.getenv("PYMC_REPEATER_LOG_LEVEL"):
         if "logging" not in config:
