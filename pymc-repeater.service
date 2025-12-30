@@ -1,7 +1,5 @@
-"""
-Systemd service file template for  Py MC - Meshcore Repeater Daemon.
-Install as /etc/systemd/system/pymc-repeater.service
-"""
+#Systemd service file template for  Py MC - Meshcore Repeater Daemon.
+#Install as /etc/systemd/system/pymc-repeater.service
 
 [Unit]
 Description=pyMC Repeater Daemon
@@ -23,7 +21,7 @@ Restart=on-failure
 RestartSec=5
 
 # Resource limits
-MemoryLimit=256M
+MemoryHigh=256M
 
 # Logging
 StandardOutput=journal
