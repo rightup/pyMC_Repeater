@@ -132,7 +132,7 @@ class RepeaterHandler(BaseHandler):
         # For local transmissions, create a direct transmission result
         if local_transmission and not monitor_mode:
             # Mark local packet as seen to prevent duplicate processing when received back
-            self.mark_seen(packet)
+            self.has_seen(packet)
             # Calculate transmission delay for local packets
             delay = self._calculate_tx_delay(packet, snr)
             result = (packet, delay)
@@ -348,20 +348,18 @@ class RepeaterHandler(BaseHandler):
         # Default reason
         return "Unknown"
 
-    def is_duplicate(self, packet: Packet) -> bool:
-
+    def has_seen(self, packet: Packet) -> bool:
         pkt_hash = packet.calculate_packet_hash().hex().upper()
         if pkt_hash in self.seen_packets:
             return True
-        return False
-
-    def mark_seen(self, packet: Packet):
-
-        pkt_hash = packet.calculate_packet_hash().hex().upper()
         self.seen_packets[pkt_hash] = time.time()
-
         if len(self.seen_packets) > self.max_cache_size:
             self.seen_packets.popitem(last=False)
+        return False
+
+    def is_duplicate(self, packet: Packet) -> bool:
+        pkt_hash = packet.calculate_packet_hash().hex().upper()
+        return pkt_hash in self.seen_packets
 
     def validate_packet(self, packet: Packet) -> Tuple[bool, str]:
 
@@ -482,8 +480,7 @@ class RepeaterHandler(BaseHandler):
                 packet.drop_reason = "Global flood policy disabled"
                 return None
 
-        # Suppress duplicates
-        if self.is_duplicate(packet):
+        if self.has_seen(packet):
             packet.drop_reason = "Duplicate"
             return None
 
@@ -495,8 +492,6 @@ class RepeaterHandler(BaseHandler):
         packet.path.append(self.local_hash)
         packet.path_len = len(packet.path)
 
-        self.mark_seen(packet)
-
         return packet
 
     def direct_forward(self, packet: Packet) -> Optional[Packet]:
@@ -506,12 +501,15 @@ class RepeaterHandler(BaseHandler):
             packet.drop_reason = "Direct: no path"
             return None
 
-        next_hop = packet.path[0] 
+        next_hop = packet.path[0]
         if next_hop != self.local_hash:
             packet.drop_reason = "Direct: not for us"
             return None
 
-        original_path = list(packet.path)
+        if self.has_seen(packet):
+            packet.drop_reason = "Duplicate"
+            return None
+
         packet.path = bytearray(packet.path[1:])
         packet.path_len = len(packet.path)
 

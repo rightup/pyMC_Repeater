@@ -208,7 +208,7 @@ class RepeaterDaemon:
 
             # Mark our own advert as seen to prevent re-forwarding it
             if self.repeater_handler:
-                self.repeater_handler.mark_seen(packet)
+                self.repeater_handler.has_seen(packet)
                 logger.debug("Marked own advert as seen in duplicate cache")
 
             logger.info(f"Sent flood advert '{node_name}' at ({latitude: .6f}, {longitude: .6f})")

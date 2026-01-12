@@ -201,7 +201,7 @@ class TraceHelper:
         return (packet.path_len < trace_path_len and 
                 len(trace_path) > packet.path_len and
                 trace_path[packet.path_len] == self.local_hash and
-                self.repeater_handler and not self.repeater_handler.is_duplicate(packet))
+                self.repeater_handler and not self.repeater_handler.has_seen(packet))
 
     async def _forward_trace_packet(self, packet, trace_path_len: int) -> None:
         """
