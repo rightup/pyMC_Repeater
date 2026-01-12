@@ -320,10 +320,6 @@ class RepeaterHandler(BaseHandler):
             del self.seen_packets[k]
 
     def _get_drop_reason(self, packet: Packet) -> str:
-
-        if self.is_duplicate(packet):
-            return "Duplicate"
-
         if not packet or not packet.payload:
             return "Empty payload"
 
@@ -356,10 +352,6 @@ class RepeaterHandler(BaseHandler):
         if len(self.seen_packets) > self.max_cache_size:
             self.seen_packets.popitem(last=False)
         return False
-
-    def is_duplicate(self, packet: Packet) -> bool:
-        pkt_hash = packet.calculate_packet_hash().hex().upper()
-        return pkt_hash in self.seen_packets
 
     def validate_packet(self, packet: Packet) -> Tuple[bool, str]:
 

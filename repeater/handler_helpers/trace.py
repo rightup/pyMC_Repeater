@@ -267,5 +267,5 @@ class TraceHelper:
         elif trace_path[packet.path_len] != self.local_hash:
             expected_hash = trace_path[packet.path_len] if packet.path_len < len(trace_path) else None
             logger.info(f"Not our turn (next hop: 0x{expected_hash:02x})")
-        elif self.repeater_handler and self.repeater_handler.is_duplicate(packet):
+        else:
             logger.info("Duplicate packet, ignoring")
