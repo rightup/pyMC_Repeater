@@ -109,7 +109,7 @@ class _BrokerConnection:
         payload_b64 = b64url(json.dumps(payload, separators=(",", ":")).encode())
 
         signing_input = f"{header_b64}.{payload_b64}".encode()
-        
+
         # Sign using LocalIdentity (supports both standard and firmware keys)
         signature = self.local_identity.sign(signing_input)
         signature_hex = binascii.hexlify(signature).decode()
@@ -136,7 +136,7 @@ class _BrokerConnection:
 
         # Log disconnect reason
         if rc == 0:
-            logging.info(f"Disconnect received from {self.broker['name']}")
+            logging.info(f"Clean disconnect from {self.broker['name']}")
         else:
             logging.warning(f"Unexpected disconnect from {self.broker['name']} (rc={rc})")
 
@@ -152,16 +152,16 @@ class _BrokerConnection:
         """Schedule reconnection with exponential backoff"""
         if self._reconnect_timer:
             self._reconnect_timer.cancel()
-        
+
         # Exponential backoff: 5s, 10s, 20s, 40s, 80s, up to max
         delay = min(5 * (2 ** self._reconnect_attempts), self._max_reconnect_delay)
         self._reconnect_attempts += 1
-        
+
         logging.info(f"Scheduling reconnect to {self.broker['name']} in {delay}s (attempt {self._reconnect_attempts})")
         self._reconnect_timer = threading.Timer(delay, self._attempt_reconnect)
         self._reconnect_timer.daemon = True
         self._reconnect_timer.start()
-    
+
     def _attempt_reconnect(self):
         """Attempt to reconnect to broker"""
         try:
@@ -171,7 +171,7 @@ class _BrokerConnection:
         except Exception as e:
             logging.error(f"Reconnection failed for {self.broker['name']}: {e}")
             self._schedule_reconnect()  # Try again later
-    
+
     def refresh_jwt_token(self):
         """Refresh JWT token for MQTT authentication"""
         token = self._generate_jwt()
@@ -209,12 +209,12 @@ class _BrokerConnection:
         """Disconnect from broker"""
         self._should_be_connected = False
         self._running = False
-        
+
         # Cancel any pending reconnection
         if self._reconnect_timer:
             self._reconnect_timer.cancel()
             self._reconnect_timer = None
-        
+
         self.client.loop_stop()
         self.client.disconnect()
         logging.info(f"Disconnected from {self.broker['name']}")
@@ -255,7 +255,7 @@ class MeshCoreToMqttJwtPusher:
         # Store local identity and get public key
         self.local_identity = local_identity
         public_key = local_identity.get_public_key().hex().upper()
-        
+
         # Extract values from config
         from ..config import get_node_info
 
@@ -297,7 +297,7 @@ class MeshCoreToMqttJwtPusher:
                     logging.info(f"Added custom broker: {broker_config['name']}")
                 else:
                     logging.warning(f"Skipping invalid broker config: {broker_config}")
-        
+
         # Validate that we have at least one broker
         if not self.brokers:
             raise ValueError(
