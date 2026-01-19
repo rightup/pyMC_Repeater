@@ -72,6 +72,7 @@ class _BrokerConnection:
         self._connect_time = None
         self._tls_verified = False
         self._running = False
+        self._should_be_connected = False
         self._reconnect_attempts = 0
         self._reconnect_timer = None
         self._max_reconnect_delay = 300  # 5 minutes max
@@ -132,14 +133,18 @@ class _BrokerConnection:
         """MQTT disconnection callback"""
         was_running = self._running
         self._running = False
-        
-        if rc != 0:  # Unexpected disconnect
-            logging.warning(f"Disconnected from {self.broker['name']} (rc={rc})")
-            if was_running:  # Only reconnect if we were intentionally connected
-                self._schedule_reconnect()
+
+        # Log disconnect reason
+        if rc == 0:
+            logging.info(f"Disconnect received from {self.broker['name']}")
         else:
-            logging.info(f"Clean disconnect from {self.broker['name']}")
-        
+            logging.warning(f"Unexpected disconnect from {self.broker['name']} (rc={rc})")
+
+        # Reconnect if we should be connected, regardless of rc value
+        if self._should_be_connected:
+            logging.info(f"Connection lost but should be connected - scheduling reconnect")
+            self._schedule_reconnect()
+
         if self._on_disconnect_callback:
             self._on_disconnect_callback(self.broker["name"])
 
@@ -196,11 +201,13 @@ class _BrokerConnection:
             f"({protocol}://{self.broker['host']}:{self.broker['port']}) ..."
         )
 
+        self._should_be_connected = True
         self.client.connect(self.broker["host"], self.broker["port"], keepalive=60)
         self.client.loop_start()
 
     def disconnect(self):
         """Disconnect from broker"""
+        self._should_be_connected = False
         self._running = False
         
         # Cancel any pending reconnection
