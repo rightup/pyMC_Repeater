@@ -246,6 +246,9 @@ class RepeaterHandler(BaseHandler):
             if hasattr(packet, "payload") and packet.payload and len(packet.payload) >= 1:
                 src_hash = f"{packet.payload[0]:02X}"
 
+        # Calculate airtime for the received packet (once, stored with packet)
+        packet_airtime_ms = self.airtime_mgr.calculate_airtime(packet.get_raw_length())
+
         # Record packet for charts
         packet_record = {
             "timestamp": time.time(),
@@ -284,6 +287,7 @@ class RepeaterHandler(BaseHandler):
             "lbt_attempts": lbt_attempts if transmitted else 0,
             "lbt_backoff_delays_ms": lbt_backoff_delays_ms if transmitted and lbt_backoff_delays_ms else None,
             "lbt_channel_busy": lbt_channel_busy if transmitted else False,
+            "airtime_ms": packet_airtime_ms,
         }
 
         # Store packet record to persistent storage

@@ -250,6 +250,27 @@ class SQLiteHandler:
                     )
                     logger.info(f"Migration '{migration_name}' applied successfully")
                 
+                # Migration 4: Add airtime_ms column to packets table
+                migration_name = "add_airtime_ms_to_packets"
+                existing = conn.execute(
+                    "SELECT migration_name FROM migrations WHERE migration_name = ?",
+                    (migration_name,)
+                ).fetchone()
+                
+                if not existing:
+                    cursor = conn.execute("PRAGMA table_info(packets)")
+                    columns = [column[1] for column in cursor.fetchall()]
+                    
+                    if "airtime_ms" not in columns:
+                        conn.execute("ALTER TABLE packets ADD COLUMN airtime_ms REAL")
+                        logger.info("Added airtime_ms column to packets table")
+                    
+                    conn.execute(
+                        "INSERT INTO migrations (migration_name, applied_at) VALUES (?, ?)",
+                        (migration_name, time.time())
+                    )
+                    logger.info(f"Migration '{migration_name}' applied successfully")
+                
                 conn.commit()
                 
         except Exception as e:
@@ -350,8 +371,8 @@ class SQLiteHandler:
                         transmitted, is_duplicate, drop_reason, src_hash, dst_hash, path_hash,
                         header, transport_codes, payload, payload_length, 
                         tx_delay_ms, packet_hash, original_path, forwarded_path, raw_packet,
-                        lbt_attempts, lbt_backoff_delays_ms, lbt_channel_busy
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        lbt_attempts, lbt_backoff_delays_ms, lbt_channel_busy, airtime_ms
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     record.get("timestamp", time.time()),
                     record.get("type", 0),
@@ -377,7 +398,8 @@ class SQLiteHandler:
                     record.get("raw_packet"),
                     record.get("lbt_attempts", 0),
                     json.dumps(record.get("lbt_backoff_delays_ms")) if record.get("lbt_backoff_delays_ms") else None,
-                    int(bool(record.get("lbt_channel_busy", False)))
+                    int(bool(record.get("lbt_channel_busy", False))),
+                    record.get("airtime_ms")
                 ))
                 
         except Exception as e:
@@ -543,7 +565,7 @@ class SQLiteHandler:
                         transmitted, is_duplicate, drop_reason, src_hash, dst_hash, path_hash,
                         header, transport_codes, payload, payload_length, 
                         tx_delay_ms, packet_hash, original_path, forwarded_path, raw_packet,
-                        lbt_attempts, lbt_backoff_delays_ms, lbt_channel_busy
+                        lbt_attempts, lbt_backoff_delays_ms, lbt_channel_busy, airtime_ms
                     FROM packets 
                     ORDER BY timestamp DESC
                     LIMIT ?
@@ -590,7 +612,7 @@ class SQLiteHandler:
                         transmitted, is_duplicate, drop_reason, src_hash, dst_hash, path_hash,
                         header, transport_codes, payload, payload_length, 
                         tx_delay_ms, packet_hash, original_path, forwarded_path, raw_packet,
-                        lbt_attempts, lbt_backoff_delays_ms, lbt_channel_busy
+                        lbt_attempts, lbt_backoff_delays_ms, lbt_channel_busy, airtime_ms
                     FROM packets
                 """
                 
@@ -621,7 +643,7 @@ class SQLiteHandler:
                         transmitted, is_duplicate, drop_reason, src_hash, dst_hash, path_hash,
                         header, transport_codes, payload, payload_length, 
                         tx_delay_ms, packet_hash, original_path, forwarded_path, raw_packet,
-                        lbt_attempts, lbt_backoff_delays_ms, lbt_channel_busy
+                        lbt_attempts, lbt_backoff_delays_ms, lbt_channel_busy, airtime_ms
                     FROM packets 
                     WHERE packet_hash = ?
                 """, (packet_hash,)).fetchone()
