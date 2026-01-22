@@ -400,22 +400,49 @@ class APIEndpoints:
             config_yaml['radio']['bandwidth'] = int(bw_khz * 1000)
             config_yaml['radio']['coding_rate'] = int(radio_preset.get('coding_rate', 5))
             
-            # Update hardware-specific settings (SPI pins, etc.)
-            if 'spi' in hw_config:
-                config_yaml['radio']['spi'] = {
-                    'bus': hw_config['spi'].get('bus', 0),
-                    'cs': hw_config['spi'].get('cs', 0)
-                }
+            # Handle hardware-specific TX power (can be overridden by user later)
+            if 'tx_power' in hw_config:
+                config_yaml['radio']['tx_power'] = hw_config.get('tx_power', 22)
             
-            if 'pins' in hw_config:
-                pins = hw_config['pins']
-                config_yaml['radio']['pins'] = {
-                    'reset': pins.get('reset', 22),
-                    'busy': pins.get('busy', 17),
-                    'dio1': pins.get('dio1', 16),
-                    'txen': pins.get('txen', -1),
-                    'rxen': pins.get('rxen', -1)
-                }
+            # Handle preamble length (goes in radio section)
+            if 'preamble_length' in hw_config:
+                config_yaml['radio']['preamble_length'] = hw_config.get('preamble_length', 17)
+            
+            # Update hardware-specific settings under sx1262 section
+            if 'sx1262' not in config_yaml:
+                config_yaml['sx1262'] = {}
+            
+            # SPI configuration
+            if 'bus_id' in hw_config:
+                config_yaml['sx1262']['bus_id'] = hw_config.get('bus_id', 0)
+            if 'cs_id' in hw_config:
+                config_yaml['sx1262']['cs_id'] = hw_config.get('cs_id', 0)
+            
+            # Pin configuration
+            if 'reset_pin' in hw_config:
+                config_yaml['sx1262']['reset_pin'] = hw_config.get('reset_pin', 22)
+            if 'busy_pin' in hw_config:
+                config_yaml['sx1262']['busy_pin'] = hw_config.get('busy_pin', 17)
+            if 'irq_pin' in hw_config:
+                config_yaml['sx1262']['irq_pin'] = hw_config.get('irq_pin', 16)
+            if 'txen_pin' in hw_config:
+                config_yaml['sx1262']['txen_pin'] = hw_config.get('txen_pin', -1)
+            if 'rxen_pin' in hw_config:
+                config_yaml['sx1262']['rxen_pin'] = hw_config.get('rxen_pin', -1)
+            if 'cs_pin' in hw_config:
+                config_yaml['sx1262']['cs_pin'] = hw_config.get('cs_pin', -1)
+            if 'txled_pin' in hw_config:
+                config_yaml['sx1262']['txled_pin'] = hw_config.get('txled_pin', -1)
+            if 'rxled_pin' in hw_config:
+                config_yaml['sx1262']['rxled_pin'] = hw_config.get('rxled_pin', -1)
+            
+            # Hardware flags
+            if 'use_dio3_tcxo' in hw_config:
+                config_yaml['sx1262']['use_dio3_tcxo'] = hw_config.get('use_dio3_tcxo', False)
+            if 'use_dio2_rf' in hw_config:
+                config_yaml['sx1262']['use_dio2_rf'] = hw_config.get('use_dio2_rf', False)
+            if 'is_waveshare' in hw_config:
+                config_yaml['sx1262']['is_waveshare'] = hw_config.get('is_waveshare', False)
             
             # Write updated config
             with open(self._config_path, 'w') as f:

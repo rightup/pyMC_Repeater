@@ -238,6 +238,10 @@ install_repeater() {
         echo "    Generated version: $GENERATED_VERSION"
     fi
     
+    # Clean up stale bytecode in source directory before copying
+    find "$SCRIPT_DIR/repeater" -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+    find "$SCRIPT_DIR/repeater" -type f -name '*.pyc' -delete 2>/dev/null || true
+    
     echo "29"; echo "# Cleaning old installation files..."
     # Remove old repeater directory to ensure clean install
     rm -rf "$INSTALL_DIR/repeater" 2>/dev/null || true
@@ -428,7 +432,10 @@ upgrade_repeater() {
             python3 -c "from setuptools_scm import get_version; get_version(write_to='repeater/_version.py')" 2>&1 || echo "    Warning: Could not generate _version.py file"
             echo "    Generated version: $GENERATED_VERSION"
         fi
-        echo "    ✓ Version file generated"
+        # Clean up stale bytecode in source directory before copying
+        find "$SCRIPT_DIR/repeater" -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+        find "$SCRIPT_DIR/repeater" -type f -name '*.pyc' -delete 2>/dev/null || true
+        echo "    ✓ Version file generated and bytecode cleaned"
         
         echo "[3.8/9] Cleaning old installation files..."
         # Remove old repeater directory to ensure clean upgrade
@@ -785,6 +792,7 @@ if [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
     echo "  start     - Start the service"
     echo "  stop      - Stop the service"
     echo "  restart   - Restart the service"
+    echo "  logs      - View live logs"
     echo "  status    - Show status"
     echo "  debug     - Show debug information"
     echo ""
@@ -829,6 +837,12 @@ case "$1" in
     "start"|"stop"|"restart")
         manage_service "$1"
         exit 0
+        ;;
+    "logs")
+        clear
+        echo "=== Live Logs (Press Ctrl+C to return) ==="
+        echo ""
+        journalctl -u "$SERVICE_NAME" -f
         ;;
     "status")
         show_detailed_status
