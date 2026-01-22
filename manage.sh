@@ -167,27 +167,18 @@ install_repeater() {
     fi
     
     # Welcome screen
-    $DIALOG --backtitle "pyMC Repeater Management" --title "Welcome" --msgbox "\nWelcome to pyMC Repeater Setup\n\nThis installer will configure your Raspberry Pi as a LoRa mesh network repeater.\n\nPress OK to continue..." 12 70
+    $DIALOG --backtitle "pyMC Repeater Management" --title "Welcome" --msgbox "\nWelcome to pyMC Repeater Setup\n\nThis installer will configure your device as a LoRa mesh network repeater.\n\nPress OK to continue..." 12 70
     
-    # SPI Check
-    CONFIG_FILE=""
-    if [ -f "/boot/firmware/config.txt" ]; then
-        CONFIG_FILE="/boot/firmware/config.txt"
-    elif [ -f "/boot/config.txt" ]; then
-        CONFIG_FILE="/boot/config.txt"
-    fi
-    
-    if [ -n "$CONFIG_FILE" ] && ! grep -q "dtparam=spi=on" "$CONFIG_FILE" 2>/dev/null && ! grep -q "spi_bcm2835" /proc/modules 2>/dev/null; then
-        if ask_yes_no "SPI Not Enabled" "\nSPI interface is required but not enabled!\n\nWould you like to enable it now?\n(This will require a reboot)"; then
-            echo "dtparam=spi=on" >> "$CONFIG_FILE"
-            show_info "SPI Enabled" "\nSPI has been enabled in $CONFIG_FILE\n\nSystem will reboot now. Please run this script again after reboot."
-            reboot
+    # SPI Check - just verify SPI is available
+    if [ ! -e /dev/spidev0.0 ] && [ ! -e /dev/spidev1.0 ]; then
+        # Provide platform-specific hints
+        if [ -f "/boot/firmware/config.txt" ] || [ -f "/boot/config.txt" ]; then
+            show_error "SPI not enabled!\n\nPlease run: sudo raspi-config\n-> Interface Options -> SPI -> Enable\n\nThen reboot and run this script again."
+        elif command -v luckfox-config &> /dev/null; then
+            show_error "SPI not enabled!\n\nPlease run: sudo luckfox-config\n-> Advanced Options -> SPI interface -> Enable\n\nThen reboot and run this script again."
         else
-            show_error "SPI is required for LoRa radio operation.\n\nPlease enable SPI manually and run this script again."
-            return
+            show_error "SPI not available.\n\nPlease enable SPI for your device and run this script again."
         fi
-    elif [ -z "$CONFIG_FILE" ]; then
-        show_error "Could not find config.txt file.\n\nPlease enable SPI manually:\nsudo raspi-config -> Interfacing Options -> SPI -> Enable"
         return
     fi
     
@@ -202,26 +193,37 @@ install_repeater() {
     fi
     
     echo "10"; echo "# Adding user to hardware groups..."
-    usermod -a -G gpio,i2c,spi "$SERVICE_USER" 2>/dev/null || true
-    usermod -a -G dialout "$SERVICE_USER" 2>/dev/null || true
+    # Create groups if they don't exist
+    getent group gpio >/dev/null 2>&1 || groupadd gpio
+    getent group spi >/dev/null 2>&1 || groupadd spi
+    for grp in gpio i2c spi dialout; do
+        getent group "$grp" >/dev/null 2>&1 && usermod -a -G "$grp" "$SERVICE_USER" 2>/dev/null || true
+    done
+    
+    # Create udev rules for GPIO and SPI access
+    echo 'SUBSYSTEM=="gpio", KERNEL=="gpiochip*", GROUP="gpio", MODE="0660"' > /etc/udev/rules.d/99-gpio.rules
+    echo 'SUBSYSTEM=="spidev", GROUP="spi", MODE="0660"' > /etc/udev/rules.d/99-spi.rules
+    udevadm control --reload-rules 2>/dev/null || true
+    udevadm trigger 2>/dev/null || true
     
     echo "20"; echo "# Creating directories..."
     mkdir -p "$INSTALL_DIR" "$CONFIG_DIR" "$LOG_DIR" /var/lib/pymc_repeater
     
     echo "25"; echo "# Installing system dependencies..."
     apt-get update -qq
-    apt-get install -y libffi-dev jq pip python3-rrdtool wget swig build-essential python3-dev
-    pip install --break-system-packages setuptools_scm >/dev/null 2>&1 || true
+    apt-get install -y libffi-dev jq python3-pip python3-rrdtool wget swig build-essential python3-dev
+    python3 -m pip install --break-system-packages setuptools_scm >/dev/null 2>&1 || python3 -m pip install setuptools_scm >/dev/null 2>&1 || true
     
     # Install mikefarah yq v4 if not already installed
     if ! command -v yq &> /dev/null || [[ "$(yq --version 2>&1)" != *"mikefarah/yq"* ]]; then
         YQ_VERSION="v4.40.5"
-        YQ_BINARY="yq_linux_arm64"
-        if [[ "$(uname -m)" == "x86_64" ]]; then
-            YQ_BINARY="yq_linux_amd64"
-        elif [[ "$(uname -m)" == "armv7"* ]]; then
-            YQ_BINARY="yq_linux_arm"
-        fi
+        ARCH="$(uname -m)"
+        case "$ARCH" in
+            x86_64)       YQ_BINARY="yq_linux_amd64" ;;
+            aarch64|arm64) YQ_BINARY="yq_linux_arm64" ;;
+            armv7*|armhf) YQ_BINARY="yq_linux_arm" ;;
+            *)            YQ_BINARY="yq_linux_arm64" ;;  # fallback
+        esac
         wget -qO /usr/local/bin/yq "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/${YQ_BINARY}" && chmod +x /usr/local/bin/yq
     fi
     
@@ -314,7 +316,16 @@ EOF
         export SETUPTOOLS_SCM_PRETEND_VERSION="1.0.5"
     fi
     
-    if pip install --break-system-packages --force-reinstall --no-cache-dir --ignore-installed .; then
+    # Install dependencies from pyproject.toml (use PyPI pymc_core, skip git URLs)
+    echo "Installing dependencies..."
+    DEPS=$(grep -A20 "^dependencies" pyproject.toml | grep '"' | sed 's/.*"\(.*\)".*/\1/' | grep -v "@" | tr '\n' ' ')
+    python3 -m pip install --break-system-packages pymc_core $DEPS 2>/dev/null || \
+        python3 -m pip install pymc_core $DEPS
+    # Install hardware dependencies (spidev needs --no-binary to compile for correct Python)
+    python3 -m pip install --break-system-packages --no-binary spidev spidev python-periphery pyserial gpiod 2>/dev/null || \
+        python3 -m pip install --no-binary spidev spidev python-periphery pyserial gpiod
+    
+    if python3 -m pip install --break-system-packages --no-deps --no-cache-dir . 2>/dev/null || python3 -m pip install --no-deps --no-cache-dir .; then
         echo ""
         echo "✓ Python package installation completed successfully!"
         
@@ -389,18 +400,19 @@ upgrade_repeater() {
         echo "[3/9] Updating system dependencies..."
         apt-get update -qq
 
-        apt-get install -y libffi-dev jq pip python3-rrdtool wget swig build-essential python3-dev
-        pip install --break-system-packages setuptools_scm >/dev/null 2>&1 || true
+        apt-get install -y libffi-dev jq python3-pip python3-rrdtool wget swig build-essential python3-dev
+        python3 -m pip install --break-system-packages setuptools_scm >/dev/null 2>&1 || python3 -m pip install setuptools_scm >/dev/null 2>&1 || true
         
         # Install mikefarah yq v4 if not already installed
         if ! command -v yq &> /dev/null || [[ "$(yq --version 2>&1)" != *"mikefarah/yq"* ]]; then
             YQ_VERSION="v4.40.5"
-            YQ_BINARY="yq_linux_arm64"
-            if [[ "$(uname -m)" == "x86_64" ]]; then
-                YQ_BINARY="yq_linux_amd64"
-            elif [[ "$(uname -m)" == "armv7"* ]]; then
-                YQ_BINARY="yq_linux_arm"
-            fi
+            ARCH="$(uname -m)"
+            case "$ARCH" in
+                x86_64)       YQ_BINARY="yq_linux_amd64" ;;
+                aarch64|arm64) YQ_BINARY="yq_linux_arm64" ;;
+                armv7*|armhf) YQ_BINARY="yq_linux_arm" ;;
+                *)            YQ_BINARY="yq_linux_arm64" ;;  # fallback
+            esac
             wget -qO /usr/local/bin/yq "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/${YQ_BINARY}" && chmod +x /usr/local/bin/yq
         fi
         echo "    ✓ Dependencies updated"
@@ -490,8 +502,17 @@ EOF
             export SETUPTOOLS_SCM_PRETEND_VERSION="1.0.5"
         fi
         
-        # Force reinstall the package and all dependencies for clean upgrade
-        if python3 -m pip install --break-system-packages --force-reinstall --no-cache-dir --ignore-installed .; then
+        # Install dependencies from pyproject.toml (use PyPI pymc_core, skip git URLs)
+        echo "Installing dependencies..."
+        DEPS=$(grep -A20 "^dependencies" pyproject.toml | grep '"' | sed 's/.*"\(.*\)".*/\1/' | grep -v "@" | tr '\n' ' ')
+        python3 -m pip install --break-system-packages pymc_core $DEPS 2>/dev/null || \
+            python3 -m pip install pymc_core $DEPS
+        # Install hardware dependencies (spidev needs --no-binary to compile for correct Python)
+        python3 -m pip install --break-system-packages --no-binary spidev spidev python-periphery pyserial gpiod 2>/dev/null || \
+            python3 -m pip install --no-binary spidev spidev python-periphery pyserial gpiod
+        
+        # Install the main package
+        if python3 -m pip install --break-system-packages --no-deps --no-cache-dir . 2>/dev/null || python3 -m pip install --no-deps --no-cache-dir .; then
             echo ""
             echo "✓ Package and dependencies updated successfully!"
         else
@@ -667,10 +688,10 @@ show_detailed_status() {
         # Add system info
         status_info="${status_info}System Info:\n"
         status_info="${status_info}- SPI: "
-        if grep -q "spi_bcm2835" /proc/modules 2>/dev/null; then
-            status_info="${status_info}Enabled ✓\n"
+        if [ -e /dev/spidev0.0 ] || [ -e /dev/spidev1.0 ]; then
+            status_info="${status_info}Available ✓\n"
         else
-            status_info="${status_info}Disabled ✗\n"
+            status_info="${status_info}Not available ✗\n"
         fi
         
         status_info="${status_info}- IP Address: $ip_address\n"
