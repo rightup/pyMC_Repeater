@@ -59,6 +59,30 @@ class LogBuffer(logging.Handler):
 _log_buffer = LogBuffer(max_lines=100)
 
 
+class CRCErrorTracker(logging.Handler):
+    """Logging handler that detects CRC errors from SX1262_wrapper and persists them to SQLite."""
+
+    def __init__(self):
+        super().__init__()
+        self._storage = None
+
+    def set_storage(self, storage_collector):
+        """Attach storage collector for persistent writes. Called during server init."""
+        self._storage = storage_collector
+
+    def emit(self, record):
+        try:
+            if record.name == "SX1262_wrapper" and "CRC error detected" in record.getMessage():
+                if self._storage:
+                    self._storage.record_crc_error(record.created)
+        except Exception:
+            self.handleError(record)
+
+
+# Global CRC error tracker instance
+_crc_tracker = CRCErrorTracker()
+
+
 class DocEndpoint:
     """Simple wrapper to serve API docs at /doc"""
     
@@ -190,6 +214,14 @@ class HTTPStatsServer:
         self.app = StatsApp(
             stats_getter, node_name, pub_key, send_advert_func, config, event_loop, daemon_instance, config_path
         )
+        
+        # Connect CRC error tracker to storage for persistent writes
+        try:
+            if daemon_instance and hasattr(daemon_instance, 'repeater_handler') and daemon_instance.repeater_handler:
+                _crc_tracker.set_storage(daemon_instance.repeater_handler.storage)
+                logger.info("CRC error tracker connected to storage")
+        except Exception as e:
+            logger.warning(f"Could not connect CRC error tracker to storage: {e}")
         
         # Create auth endpoints (APIEndpoints has the config_manager)
         self.auth_app = AuthEndpoints(self.config, self.jwt_handler, self.token_manager, self.app.api.config_manager)

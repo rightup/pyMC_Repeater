@@ -6,7 +6,7 @@ import sys
 from repeater.config import get_radio_for_board, load_config
 from repeater.config_manager import ConfigManager
 from repeater.engine import RepeaterHandler
-from repeater.web.http_server import HTTPStatsServer, _log_buffer
+from repeater.web.http_server import HTTPStatsServer, _log_buffer, _crc_tracker
 from repeater.handler_helpers import TraceHelper, DiscoveryHelper, AdvertHelper, LoginHelper, TextHelper, PathHelper, ProtocolRequestHelper
 from repeater.packet_router import PacketRouter
 from repeater.identity_manager import IdentityManager
@@ -47,6 +47,8 @@ class RepeaterDaemon:
         root_logger = logging.getLogger()
         _log_buffer.setLevel(getattr(logging, log_level))
         root_logger.addHandler(_log_buffer)
+        _crc_tracker.setLevel(logging.WARNING)
+        root_logger.addHandler(_crc_tracker)
 
     async def initialize(self):
 

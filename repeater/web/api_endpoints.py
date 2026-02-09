@@ -62,6 +62,9 @@ logger = logging.getLogger("HTTPServer")
 # GET    /api/noise_floor_stats?hours=24 - Get noise floor statistics
 # GET    /api/noise_floor_chart_data?hours=24 - Get noise floor chart data
 
+# Radio Health
+# GET    /api/crc_count?hours=24 - Get CRC error count for time period
+
 # CAD Calibration
 # POST   /api/cad_calibration_start {"samples": 8, "delay": 100} - Start CAD calibration
 # POST   /api/cad_calibration_stop - Stop CAD calibration
@@ -1385,6 +1388,19 @@ class APIEndpoints:
             })
         except Exception as e:
             logger.error(f"Error fetching noise floor chart data: {e}")
+            return self._error(e)
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    def crc_count(self, hours: int = 24):
+        """Get CRC error count for the specified time period."""
+        try:
+            storage = self._get_storage()
+            hours = int(hours)
+            stats = storage.get_crc_error_count(hours=hours)
+            return self._success(stats)
+        except Exception as e:
+            logger.error(f"Error fetching CRC error count: {e}")
             return self._error(e)
 
     @cherrypy.expose

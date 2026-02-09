@@ -203,6 +203,12 @@ class StorageCollector:
         self.sqlite_handler.store_noise_floor(noise_record)
         self.mqtt_handler.publish(noise_record, "noise_floor")
 
+    def record_crc_error(self, timestamp: float = None):
+        self.sqlite_handler.store_crc_error(timestamp or time.time())
+
+    def get_crc_error_count(self, hours: int = 24) -> dict:
+        return self.sqlite_handler.get_crc_error_count(hours)
+
     def get_packet_stats(self, hours: int = 24) -> dict:
         return self.sqlite_handler.get_packet_stats(hours)
 
