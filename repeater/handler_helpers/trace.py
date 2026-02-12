@@ -72,11 +72,21 @@ class TraceHelper:
             trace_tag = parsed_data.get("tag")
             if trace_tag in self.pending_pings:
                 ping_info = self.pending_pings[trace_tag]
+                # Extract per-hop SNR values from the packet routing path
+                hop_snrs = []
+                for i in range(packet.path_len):
+                    if i < len(packet.path):
+                        raw = packet.path[i]
+                        hop_snrs.append({
+                            'raw': raw,
+                            'db': round(snr_register_to_db(raw), 1)
+                        })
                 # Store response data
                 ping_info['result'] = {
                     'path': trace_path,
                     'snr': packet.get_snr(),
                     'rssi': getattr(packet, "rssi", 0),
+                    'hop_snrs': hop_snrs,
                     'received_at': time.time()
                 }
                 # Signal the waiting coroutine

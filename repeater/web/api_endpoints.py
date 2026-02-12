@@ -78,10 +78,11 @@ logger = logging.getLogger("HTTPServer")
 # GET    /api/transport_key?key_id=X - Get specific transport key
 # DELETE /api/transport_key?key_id=X - Delete transport key
 
-# Network Policy
+# Network Diagnostics
 # GET    /api/global_flood_policy - Get global flood policy
 # POST   /api/global_flood_policy - Update global flood policy
 # POST   /api/ping_neighbor - Ping a neighbor node
+# POST   /api/trace {"path": ["AA","BB","CC"], "timeout": 30} - Multi-hop trace with per-hop SNR
 
 # Identity Management
 # GET    /api/identities - List all identities
@@ -1793,6 +1794,124 @@ class APIEndpoints:
             raise
         except Exception as e:
             logger.error(f"Error pinging neighbor: {e}", exc_info=True)
+            return self._error(str(e))
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    @cherrypy.tools.json_in()
+    def trace(self):
+
+        # Enable CORS for this endpoint only if configured
+        self._set_cors_headers()
+        
+        # Handle OPTIONS request for CORS preflight
+        if cherrypy.request.method == "OPTIONS":
+            return ""
+        
+        try:
+            self._require_post()
+            data = cherrypy.request.json or {}
+            path_param = data.get("path")
+            timeout = int(data.get("timeout", 30))
+            
+            if not path_param or not isinstance(path_param, list) or len(path_param) == 0:
+                return self._error("Missing or empty 'path' parameter (list of hex prefixes)")
+            
+            # Parse each hop (accepts hex string like "A5" or "0xA5")
+            trace_path = []
+            for hop_hex in path_param:
+                try:
+                    hop = int(hop_hex, 16) if isinstance(hop_hex, str) else int(hop_hex)
+                    if hop < 0 or hop > 255:
+                        return self._error(f"Hop value out of range (0x00-0xFF): {hop_hex}")
+                    trace_path.append(hop)
+                except (ValueError, TypeError):
+                    return self._error(f"Invalid hop format: {hop_hex}")
+            
+            # Check if router and trace_helper are available
+            if not hasattr(self.daemon_instance, 'router'):
+                return self._error("Packet router not available")
+            
+            router = self.daemon_instance.router
+            if not hasattr(self.daemon_instance, 'trace_helper'):
+                return self._error("Trace helper not available")
+            
+            trace_helper = self.daemon_instance.trace_helper
+            
+            # Generate unique tag for this trace
+            import random
+            trace_tag = random.randint(0, 0xFFFFFFFF)
+            
+            # Create trace packet with full path
+            from pymc_core.protocol import PacketBuilder
+            packet = PacketBuilder.create_trace(
+                tag=trace_tag,
+                auth_code=0x12345678,
+                flags=0x00,
+                path=trace_path
+            )
+            
+            # Wait for response with timeout
+            import asyncio
+            
+            async def send_and_wait():
+                """Async helper to send trace and wait for response"""
+                # Register trace with TraceHelper (must be done in async context)
+                event = trace_helper.register_ping(trace_tag, trace_path[-1])
+                
+                # Send packet via router
+                await router.inject_packet(packet)
+                logger.info(f"Trace sent along path [{','.join(f'0x{h:02x}' for h in trace_path)}] tag={trace_tag}")
+                
+                try:
+                    await asyncio.wait_for(event.wait(), timeout=timeout)
+                    return True
+                except asyncio.TimeoutError:
+                    return False
+            
+            # Run the async send and wait in the daemon's event loop
+            try:
+                if self.event_loop is None:
+                    return self._error("Event loop not available")
+                
+                future = asyncio.run_coroutine_threadsafe(send_and_wait(), self.event_loop)
+                response_received = future.result(timeout=timeout + 1)
+            except Exception as e:
+                logger.error(f"Error waiting for trace response: {e}")
+                trace_helper.pending_pings.pop(trace_tag, None)
+                return self._error(f"Error waiting for response: {str(e)}")
+            
+            if response_received:
+                # Get result
+                ping_info = trace_helper.pending_pings.pop(trace_tag, None)
+                if not ping_info:
+                    return self._error("Trace info not found after response")
+                
+                result = ping_info.get('result')
+                if result:
+                    # Calculate round-trip time
+                    rtt_ms = (result['received_at'] - ping_info['sent_at']) * 1000
+                    
+                    return self._success({
+                        "path": [f"0x{h:02x}" for h in result['path']],
+                        "hops": len(result['path']),
+                        "hop_snrs": result.get('hop_snrs', []),
+                        "rtt_ms": round(rtt_ms, 2),
+                        "snr_db": result['snr'],
+                        "rssi": result['rssi'],
+                        "tag": trace_tag
+                    }, message="Trace complete")
+                else:
+                    return self._error("Received response but no data")
+            else:
+                # Timeout
+                trace_helper.pending_pings.pop(trace_tag, None)
+                return self._error(f"Trace timeout after {timeout}s")
+            
+        except cherrypy.HTTPError:
+            raise
+        except Exception as e:
+            logger.error(f"Error in trace: {e}", exc_info=True)
             return self._error(str(e))
 
     # ========== Identity Management Endpoints ==========
