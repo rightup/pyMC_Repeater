@@ -18,7 +18,7 @@ I am continuing to try and make it work with 62.5Khz. But have had no success ye
 
 I am also attempting to make it listen to a second frequency set. But this will be limited to 125Khz as a primary, and 125/250/500Khz as a secondary. this is a hardware limitation.
 
-What’s working.
+What’s working.   
 Packet repeating,   
 Adverts,   
 Dropping CRC fail packets,   
@@ -30,7 +30,7 @@ I have altered the manage.sh script to allow for the SX1302,
 And when selected during install it will build the SX1302_HAL library from Semtech as required. 
 
 
-For NSW Wide settings please use the following. (edit /etc/pymc_repeater/config.yaml)
+For NSW Wide settings please use the following. (edit /etc/pymc_repeater/config.yaml)   
   frequency: 915800000   
   tx_power: 26   
   bandwidth: 250000   
