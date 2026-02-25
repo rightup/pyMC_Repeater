@@ -353,7 +353,7 @@ class SX1302Radio:
             logger.error(f"Send failed: {ret}")
             return False
 
-        return True
+        return None  # No LBT metadata; returning True causes dispatcher to store bool as _tx_metadata
 
     def _measure_noise_floor(self):
         """Run a spectral scan on the operating frequency and update _last_rssi."""
