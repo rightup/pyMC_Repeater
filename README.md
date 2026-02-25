@@ -48,20 +48,20 @@ For NSW Wide settings please use the following. (edit /etc/pymc_repeater/config.
 
   Run manage.sh and select Uninstall, or manually:
 
-  sudo systemctl stop pymc-repeater
-  sudo systemctl disable pymc-repeater
-  sudo rm -f /etc/systemd/system/pymc-repeater.service
-  sudo systemctl daemon-reload
-  sudo rm -rf /opt/pymc_repeater /etc/pymc_repeater /var/log/pymc_repeater /var/lib/pymc_repeater
-  sudo userdel repeater 2>/dev/null || true
+  sudo systemctl stop pymc-repeater   
+  sudo systemctl disable pymc-repeater   
+  sudo rm -f /etc/systemd/system/pymc-repeater.service   
+  sudo systemctl daemon-reload     
+  sudo rm -rf /opt/pymc_repeater /etc/pymc_repeater /var/log/pymc_repeater /var/lib/pymc_repeater   
+  sudo userdel repeater 2>/dev/null || true   
 
-  Also remove any previous source clone:
-  rm -rf ~/pyMC_Repeater* ~/rightup_pymc_rep_dev 2>/dev/null || true
+  Also remove any previous source clone:   
+  rm -rf ~/pyMC_Repeater* ~/rightup_pymc_rep_dev 2>/dev/null || true   
 
   
 ###  2. Clone the branch
 
-  git clone -b dev_merge https://github.com/l34rn3d/pyMC_Repeater_WM1302.git ~/pymc_dev
+  git clone -b dev_merge https://github.com/l34rn3d/pyMC_Repeater_WM1302.git ~/pymc_dev   
   cd ~/pymc_dev
 
   
@@ -69,13 +69,13 @@ For NSW Wide settings please use the following. (edit /etc/pymc_repeater/config.
 
   sudo ./manage.sh
 
-  Select Install. The installer will:
-  - Install system dependencies (gcc, make, swig, etc.)
-  - Copy files to /opt/pymc_repeater/
-  - Clone and build sx1302_hal from source for your architecture
-  - Create reset_lgw.sh (pinctrl-based GPIO reset)
-  - Install Python packages
-  - Start the service
+  Select Install. The installer will:   
+  - Install system dependencies (gcc, make, swig, etc.)   
+  - Copy files to /opt/pymc_repeater/   
+  - Clone and build sx1302_hal from source for your architecture   
+  - Create reset_lgw.sh (pinctrl-based GPIO reset)   
+  - Install Python packages   
+  - Start the service   
 
   
 ###  4. Complete the web wizard
@@ -90,14 +90,14 @@ sudo tee -a /etc/pymc_repeater/config.yaml << 'EOF'
 radio_type: "sx1302"
 
 sx1302:
-  com_path: "/dev/spidev0.0"
+  com_path: "/dev/spidev0.0"   
   sx1261_spi_path: "/dev/spidev0.1"
 EOF
 
   
 ###  6. Restart and verify
 
-  sudo systemctl restart pymc-repeater
+  sudo systemctl restart pymc-repeater   
   sudo journalctl -u pymc-repeater -f
 
   Expected: concentrator starts, TX adverts appear within ~30 seconds.
