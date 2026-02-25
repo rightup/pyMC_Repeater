@@ -40,6 +40,76 @@ For NSW Wide settings please use the following. (edit /etc/pymc_repeater/config.
   sync_word: 18   
 
 ---
+
+
+  Clean & Deploy — pyMC Repeater (dev_merge)
+
+  1. Clean existing install
+
+  Run manage.sh and select Uninstall, or manually:
+
+  sudo systemctl stop pymc-repeater
+  sudo systemctl disable pymc-repeater
+  sudo rm -f /etc/systemd/system/pymc-repeater.service
+  sudo systemctl daemon-reload
+  sudo rm -rf /opt/pymc_repeater /etc/pymc_repeater /var/log/pymc_repeater /var/lib/pymc_repeater
+  sudo userdel repeater 2>/dev/null || true
+
+  Also remove any previous source clone:
+  rm -rf ~/pyMC_Repeater* ~/rightup_pymc_rep_dev 2>/dev/null || true
+
+  
+  2. Clone the branch
+
+  git clone -b dev_merge https://github.com/l34rn3d/pyMC_Repeater_WM1302.git ~/pymc_dev
+  cd ~/pymc_dev
+
+  
+  3. Install
+
+  sudo ./manage.sh
+
+  Select Install. The installer will:
+  - Install system dependencies (gcc, make, swig, etc.)
+  - Copy files to /opt/pymc_repeater/
+  - Clone and build sx1302_hal from source for your architecture
+  - Create reset_lgw.sh (pinctrl-based GPIO reset)
+  - Install Python packages
+  - Start the service
+
+  
+  4. Complete the web wizard
+
+  Navigate to http://<device-ip>:8000 and complete setup. Select SX1302 as your hardware.
+
+  
+  5. Fix radio_type in config (known gap — web wizard does not write this yet)
+
+sudo tee -a /etc/pymc_repeater/config.yaml << 'EOF'
+
+radio_type: "sx1302"
+
+sx1302:
+  com_path: "/dev/spidev0.0"
+  sx1261_spi_path: "/dev/spidev0.1"
+EOF
+
+  
+  6. Restart and verify
+
+  sudo systemctl restart pymc-repeater
+  sudo journalctl -u pymc-repeater -f
+
+  Expected: concentrator starts, TX adverts appear within ~30 seconds.
+
+  
+  Note: Step 5 is a manual workaround. The web wizard not writing radio_type is documented in the merge proposal as Gap 1 — the upstream web UI needs fixing before this
+  becomes a clean install-only flow.
+
+
+
+
+---
   
 I started **pyMC_core** as a way to really get under the skin of **MeshCore** — to see how it ticked and why it behaved the way it did.
 After a few late nights of tinkering, testing, and head-scratching, I shared what I’d learned with the community.
