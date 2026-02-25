@@ -5,7 +5,7 @@ Repeater Daemon in Python using the `pymc_core` Lib.
 ---
 
 
-My AI slop created driver to make a SX1302 based concentrator as commonly found in the now semi dormant "LoRa Helium" network hotspots.
+My AI assisted driver to make a SX1302 based concentrator as commonly found in the now semi dormant "LoRa Helium" network hotspots.
 
 These hotspots are commonly a PI4 (full or compute) a PiHat and a SX1302 or SX1301 concentrator. 
 
