@@ -105,11 +105,21 @@ setup_sx1302_hal() {
     fi
 
     echo "    Linking shared library..."
-    local link_archives="$hal_dir/libloragw/libloragw.a"
-    [ -f "$hal_dir/libtools/libtools.a" ] && link_archives="$link_archives $hal_dir/libtools/libtools.a"
+    local libloragw_a="$hal_dir/libloragw/libloragw.a"
+    local libtools_a="$hal_dir/libtools/libtools.a"
 
-    # shellcheck disable=SC2086
-    if ! gcc -shared -o "$so_file" -Wl,--whole-archive $link_archives -Wl,--no-whole-archive; then
+    if [ ! -f "$libloragw_a" ]; then
+        echo "    ✗ libloragw.a not found — build failed"
+        return 1
+    fi
+    if [ ! -f "$libtools_a" ]; then
+        echo "    ✗ libtools.a not found — libtools build failed"
+        return 1
+    fi
+
+    if ! gcc -shared -o "$so_file" \
+        -Wl,--whole-archive "$libloragw_a" "$libtools_a" \
+        -Wl,--no-whole-archive; then
         echo "    ✗ Failed to create libloragw.so"
         return 1
     fi
