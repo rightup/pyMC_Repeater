@@ -57,3 +57,6 @@ identity.json
 *.log
 .DS_Store
 syncpi.sh
+
+# SX1302 HAL — built from source at install time, not stored in repo
+sx1302_hal/
