@@ -18,6 +18,7 @@ Validated on Debian 13 (Trixie) aarch64 — sensecap-zebra and sensecap-cricket 
 
 | File | Purpose |
 |------|---------|
+| `setup-sx1302.sh` | One-shot SX1302 setup script — run once after selecting WM1302 in the web wizard |
 | `repeater/hardware/__init__.py` | Package marker for hardware module |
 | `repeater/hardware/sx1302_wrapper.py` | WM1302 radio driver (thread-safe, async-compatible) |
 | `repeater/hardware/sx1302_bindings.py` | ctypes bindings for Semtech sx1302_hal C library |
@@ -42,16 +43,7 @@ Added one new hardware profile:
 Added `radio_type` dispatch so `get_radio_for_board()` instantiates `SX1302Radio` when `radio_type == "sx1302"`. SX1262 path unchanged.
 
 ### `manage.sh`
-Replaced stub `build_sx1302_library()` with `setup_sx1302_hal()` and `create_sx1302_reset_script()`.
-
-`setup_sx1302_hal()` runs during both install and upgrade and:
-- Clones `Lora-net/sx1302_hal` from GitHub if not present
-- Patches `libtools/Makefile` and `libloragw/Makefile` to add `-fPIC` (required for shared library on all architectures including aarch64)
-- Builds `libtools` and `libloragw` static archives
-- Globs all `.a` files from `libtools/` and links them with `libloragw.a` into `libloragw.so`
-- Calls `create_sx1302_reset_script()` to write the GPIO reset script
-
-`create_sx1302_reset_script()` writes a `pinctrl`-based `reset_lgw.sh` to `sx1302_hal/libloragw/` compatible with Raspberry Pi OS Bookworm and Debian 13 Trixie.
+No SX1302-specific logic. Removed the earlier stub `build_sx1302_library()`. SX1262 install and upgrade paths are unchanged. SX1302 users run `setup-sx1302.sh` separately after installation.
 
 ### `setup-radio-config.sh`
 Replaced with fork version. Key additions over upstream:
@@ -84,8 +76,8 @@ Added `sx1302_hal/` — library is built from source at install time, not stored
 - Documented in hardware profile; setup script filters incompatible presets
 
 ### Build Requirement
-- SX1262: pure Python, no change
-- SX1302: requires `gcc`, `make`, `swig`, `build-essential` to compile sx1302_hal once at install time. `manage.sh` handles this automatically.
+- SX1262: pure Python, no change to install flow
+- SX1302: requires `gcc`, `make`, `build-essential` to compile sx1302_hal. `setup-sx1302.sh` handles this — SX1262 users are not affected.
 
 ### Threading Model
 The SX1302 uses a background C library receive loop. The driver captures the asyncio event loop at init and uses `asyncio.run_coroutine_threadsafe()` to schedule callbacks — avoids blocking the main async loop.
@@ -101,6 +93,7 @@ Explicit `STAT_CRC_OK` check in the SX1302 RX loop before passing packets to the
 ## Backward Compatibility
 
 - All existing SX1262 configurations work with zero changes
+- `manage.sh` install/upgrade is unchanged for SX1262 users — no C build, no extra dependencies
 - `radio_type` field only required for SX1302; SX1262 profiles are unchanged
 - No changes to public APIs, config schema, or service behaviour for SX1262 users
 - No new Python dependencies
@@ -112,7 +105,7 @@ Explicit `STAT_CRC_OK` check in the SX1302 RX loop before passing packets to the
 The WM1302 requires Semtech's open-source C library:
 https://github.com/Lora-net/sx1302_hal
 
-`sx1302_hal/` is **not** included in the repository. `manage.sh` clones it from GitHub at install time and builds it for the target architecture. Pre-built binaries are not distributed.
+`sx1302_hal/` is **not** included in the repository. `setup-sx1302.sh` clones it from GitHub and builds it for the target architecture. Pre-built binaries are not distributed.
 
 ---
 
@@ -124,6 +117,7 @@ https://github.com/Lora-net/sx1302_hal
 - MQTT, RRDTool, SQLite storage logic
 - Systemd service configuration
 - Any SX1262 driver code
+- `manage.sh` install/upgrade flow for SX1262 users
 
 ---
 
@@ -135,26 +129,19 @@ https://github.com/Lora-net/sx1302_hal
 
 **Required fix**: The upstream web setup wizard and `ConfigManager` need to handle `radio_type` and the `sx1302` config section when SX1302 hardware is selected. This is the largest additional change required for a clean merge.
 
-**Current workaround**:
+**Current workaround**: After running `sudo ./manage.sh install` and selecting SX1302 hardware in the web wizard, run:
 ```bash
-sudo tee -a /etc/pymc_repeater/config.yaml << 'EOF'
-
-radio_type: "sx1302"
-
-sx1302:
-  com_path: "/dev/spidev0.0"
-  sx1261_spi_path: "/dev/spidev0.1"
-EOF
-sudo systemctl restart pymc-repeater
+sudo ./setup-sx1302.sh
 ```
+This builds the library, creates the reset script, writes `radio_type: "sx1302"` and the `sx1302:` section to `config.yaml`, and restarts the service.
 
 ---
 
-### 2. `manage.sh` install does not copy or build `sx1302_hal` *(fixed in dev_merge)*
+### 2. `manage.sh` install does not build `sx1302_hal` *(addressed by setup-sx1302.sh)*
 
 **Impact**: Service crashes on first start with `libloragw.so: cannot open shared object file`.
 
-**Fix applied**: `setup_sx1302_hal()` in `manage.sh` clones `Lora-net/sx1302_hal` from GitHub and builds it during install and upgrade. Called automatically — no manual steps required.
+**Fix applied**: `setup-sx1302.sh` clones `Lora-net/sx1302_hal` from GitHub and builds it for the target device. SX1262 users are unaffected — `manage.sh` is unchanged.
 
 ---
 
@@ -162,7 +149,7 @@ sudo systemctl restart pymc-repeater
 
 **Impact**: Pre-compiled x86_64 artifacts in the original fork repository are unusable on aarch64 hardware.
 
-**Fix applied**: `sx1302_hal/` removed from repository and added to `.gitignore`. `setup_sx1302_hal()` always clones and builds from source on the target device.
+**Fix applied**: `sx1302_hal/` removed from repository and added to `.gitignore`. `setup-sx1302.sh` always clones and builds from source on the target device.
 
 ---
 
@@ -170,7 +157,7 @@ sudo systemctl restart pymc-repeater
 
 **Impact**: `lgw_start()` returns -1 (hardware not responding) because the concentrator is not properly reset before initialisation.
 
-**Fix applied**: `create_sx1302_reset_script()` is called by `setup_sx1302_hal()` after every clone/build. Uses `pinctrl` (not `gpioset`) — required on Debian 12/13.
+**Fix applied**: `setup-sx1302.sh` writes `reset_lgw.sh` to `sx1302_hal/libloragw/` using `pinctrl` (not `gpioset`) — required on Debian 12/13.
 
 ---
 
@@ -182,7 +169,7 @@ sudo systemctl restart pymc-repeater
 
 **Root cause**: `libtools` in `sx1302_hal` builds separate archives (`libtinymt32.a`, `libparson.a`, `libbase64.a`) rather than a single `libtools.a`. The original link step assumed one archive and silently omitted the others, producing an incomplete `.so`.
 
-**Fix applied**: `setup_sx1302_hal()` now globs all `.a` files from `libtools/` and includes them all in the link command. Missing archives cause an explicit build failure rather than a silent omission.
+**Fix applied**: `setup-sx1302.sh` globs all `.a` files from `libtools/` and includes them all in the link command. Missing archives cause an explicit build failure rather than a silent omission.
 
 ---
 
