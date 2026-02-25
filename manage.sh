@@ -65,109 +65,6 @@ is_installed() {
     [ -d "$INSTALL_DIR" ] && service_exists
 }
 
-# Clone, build, and configure sx1302_hal for the target architecture
-setup_sx1302_hal() {
-    local install_dir="$1"
-    local hal_dir="$install_dir/sx1302_hal"
-    local so_file="$hal_dir/libloragw/libloragw.so"
-
-    if [ -f "$so_file" ]; then
-        echo "    ✓ SX1302 library already built"
-        create_sx1302_reset_script "$hal_dir"
-        return 0
-    fi
-
-    echo "    Setting up SX1302/WM1302 support ($(uname -m))..."
-
-    if [ ! -d "$hal_dir" ]; then
-        echo "    Cloning Lora-net/sx1302_hal..."
-        if ! git clone --depth=1 https://github.com/Lora-net/sx1302_hal.git "$hal_dir" 2>&1; then
-            echo "    ✗ Failed to clone sx1302_hal — SX1302/WM1302 will not be available"
-            return 1
-        fi
-        echo "    ✓ sx1302_hal cloned"
-    fi
-
-    echo "    Building for $(uname -m)..."
-
-    # Patch Makefiles to add -fPIC — required for shared library on all architectures
-    sed -i 's/^CFLAGS\s*:=\(.*\)/CFLAGS :=\1 -fPIC/' "$hal_dir/libtools/Makefile" 2>/dev/null || true
-    sed -i 's/^CFLAGS\s*:=\(.*\)/CFLAGS :=\1 -fPIC/' "$hal_dir/libloragw/Makefile" 2>/dev/null || true
-
-    if ! make -C "$hal_dir/libtools" all 2>&1; then
-        echo "    ✗ libtools build failed"
-        return 1
-    fi
-
-    if ! make -C "$hal_dir/libloragw" all 2>&1; then
-        echo "    ✗ libloragw build failed"
-        return 1
-    fi
-
-    echo "    Linking shared library..."
-    local libloragw_a="$hal_dir/libloragw/libloragw.a"
-
-    if [ ! -f "$libloragw_a" ]; then
-        echo "    ✗ libloragw.a not found — build failed"
-        return 1
-    fi
-
-    # Collect all static archives from libtools (libtinymt32.a, libparson.a, etc.)
-    local libtools_archives
-    mapfile -t libtools_archives < <(find "$hal_dir/libtools" -name "*.a" 2>/dev/null)
-    if [ ${#libtools_archives[@]} -eq 0 ]; then
-        echo "    ✗ No libtools archives found — libtools build failed"
-        return 1
-    fi
-
-    if ! gcc -shared -o "$so_file" \
-        -Wl,--whole-archive "$libloragw_a" "${libtools_archives[@]}" \
-        -Wl,--no-whole-archive; then
-        echo "    ✗ Failed to create libloragw.so"
-        return 1
-    fi
-
-    echo "    ✓ SX1302 library built for $(uname -m)"
-    create_sx1302_reset_script "$hal_dir"
-}
-
-# Create GPIO reset script for SX1302 concentrator (pinctrl — Bookworm/Trixie)
-create_sx1302_reset_script() {
-    local hal_dir="$1"
-    local reset_script="$hal_dir/libloragw/reset_lgw.sh"
-
-    [ -f "$reset_script" ] && return 0
-
-    cat > "$reset_script" << 'RESET_EOF'
-#!/bin/bash
-# SX1302 GPIO reset sequence
-# Pins: 18=POWER_EN, 17=SX1302_RESET, 5=SX1261_RESET, 13=ADC_RESET
-set -e
-if ! command -v pinctrl &>/dev/null; then
-    echo "Error: pinctrl not found" >&2
-    exit 1
-fi
-pinctrl set 18 op dh
-sleep 0.01
-pinctrl set 17 op dh
-sleep 0.01
-pinctrl set 17 dl
-sleep 0.01
-pinctrl set 5 op dl
-sleep 0.01
-pinctrl set 5 dh
-sleep 0.01
-pinctrl set 13 op dl
-sleep 0.01
-pinctrl set 13 dh
-sleep 0.5
-exit 0
-RESET_EOF
-
-    chmod +x "$reset_script"
-    echo "    ✓ reset_lgw.sh created"
-}
-
 # Function to check if service is running
 is_running() {
     systemctl is-active "$SERVICE_NAME" >/dev/null 2>&1
@@ -443,10 +340,6 @@ EOF
         echo ""
         echo "✓ Python package installation completed successfully!"
 
-        echo ""
-        echo "=== Setting up SX1302/WM1302 Support ==="
-        setup_sx1302_hal "$INSTALL_DIR"
-
         # Reload systemd and start the service
         systemctl daemon-reload
         systemctl start "$SERVICE_NAME"
@@ -634,9 +527,6 @@ upgrade_repeater() {
         cp radio-settings.json /var/lib/pymc_repeater/ 2>/dev/null || true
         cp radio-presets.json /var/lib/pymc_repeater/ 2>/dev/null || true
         echo "    ✓ Files updated"
-
-        echo "[4.5/9] Setting up SX1302/WM1302 support..."
-        setup_sx1302_hal "$INSTALL_DIR"
 
         echo "[5/9] Validating and updating configuration..."
         if validate_and_update_config; then
