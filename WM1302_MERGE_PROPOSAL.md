@@ -43,7 +43,7 @@ Added one new hardware profile:
 Added `radio_type` dispatch so `get_radio_for_board()` instantiates `SX1302Radio` when `radio_type == "sx1302"`. SX1262 path unchanged.
 
 ### `manage.sh`
-No SX1302-specific logic. Removed the earlier stub `build_sx1302_library()`. SX1262 install and upgrade paths are unchanged. SX1302 users run `setup-sx1302.sh` separately after installation.
+Removed the earlier stub `build_sx1302_library()`. No SX1302-specific logic remains. SX1262 install and upgrade paths are unchanged.
 
 ### `setup-radio-config.sh`
 Replaced with fork version. Key additions over upstream:
@@ -73,7 +73,7 @@ Added `sx1302_hal/` — library is built from source at install time, not stored
 
 ### Bandwidth Constraint
 - SX1302 **cannot** operate at 62.5 kHz — limited to 125/250/500 kHz
-- Documented in hardware profile; setup script filters incompatible presets
+- Documented in hardware profile
 
 ### Build Requirement
 - SX1262: pure Python, no change to install flow
@@ -109,6 +109,18 @@ https://github.com/Lora-net/sx1302_hal
 
 ---
 
+## SX1302 Installation Flow
+
+After `sudo ./manage.sh install` and selecting SX1302 hardware in the web wizard, the user must run:
+
+```bash
+sudo ./setup-sx1302.sh
+```
+
+This builds `libloragw.so`, writes the GPIO reset script, writes `radio_type: "sx1302"` and the `sx1302:` block to `config.yaml`, and restarts the service. There is currently no mechanism to trigger this automatically from the web wizard.
+
+---
+
 ## What This PR Does NOT Change
 
 - Python version requirement
@@ -118,70 +130,3 @@ https://github.com/Lora-net/sx1302_hal
 - Systemd service configuration
 - Any SX1262 driver code
 - `manage.sh` install/upgrade flow for SX1262 users
-
----
-
-## Integration Gaps Found During Testing
-
-### 1. Web UI does not write `radio_type` or `sx1302` config section *(open — requires upstream fix)*
-
-**Impact**: Critical. The upstream web setup wizard accepts SX1302 hardware selection but does not write `radio_type: "sx1302"` or the `sx1302:` block to `config.yaml`. On service restart, `get_radio_for_board()` defaults to `sx1262`, loading the wrong driver.
-
-**Required fix**: The upstream web setup wizard and `ConfigManager` need to handle `radio_type` and the `sx1302` config section when SX1302 hardware is selected. This is the largest additional change required for a clean merge.
-
-**Current workaround**: After running `sudo ./manage.sh install` and selecting SX1302 hardware in the web wizard, run:
-```bash
-sudo ./setup-sx1302.sh
-```
-This builds the library, creates the reset script, writes `radio_type: "sx1302"` and the `sx1302:` section to `config.yaml`, and restarts the service.
-
----
-
-### 2. `manage.sh` install does not build `sx1302_hal` *(addressed by setup-sx1302.sh)*
-
-**Impact**: Service crashes on first start with `libloragw.so: cannot open shared object file`.
-
-**Fix applied**: `setup-sx1302.sh` clones `Lora-net/sx1302_hal` from GitHub and builds it for the target device. SX1262 users are unaffected — `manage.sh` is unchanged.
-
----
-
-### 3. `sx1302_hal` must be built from source on the target device *(fixed in dev_merge)*
-
-**Impact**: Pre-compiled x86_64 artifacts in the original fork repository are unusable on aarch64 hardware.
-
-**Fix applied**: `sx1302_hal/` removed from repository and added to `.gitignore`. `setup-sx1302.sh` always clones and builds from source on the target device.
-
----
-
-### 4. GPIO reset script (`reset_lgw.sh`) is not created during install *(fixed in dev_merge)*
-
-**Impact**: `lgw_start()` returns -1 (hardware not responding) because the concentrator is not properly reset before initialisation.
-
-**Fix applied**: `setup-sx1302.sh` writes `reset_lgw.sh` to `sx1302_hal/libloragw/` using `pinctrl` (not `gpioset`) — required on Debian 12/13.
-
----
-
-## Bugs Found and Fixed During Testing
-
-### 5. `libloragw.so` missing `tinymt32_init` symbol *(fixed in dev_merge)*
-
-**Impact**: `OSError: libloragw.so: undefined symbol: tinymt32_init` on service start.
-
-**Root cause**: `libtools` in `sx1302_hal` builds separate archives (`libtinymt32.a`, `libparson.a`, `libbase64.a`) rather than a single `libtools.a`. The original link step assumed one archive and silently omitted the others, producing an incomplete `.so`.
-
-**Fix applied**: `setup-sx1302.sh` globs all `.a` files from `libtools/` and includes them all in the link command. Missing archives cause an explicit build failure rather than a silent omission.
-
----
-
-### 6. `SX1302Radio.send()` returning `True` causes `AttributeError` in engine *(fixed in dev_merge)*
-
-**Impact**: Every retransmitted packet triggers:
-```
-AttributeError: 'bool' object has no attribute 'get'
-  File "repeater/engine.py", line 183, in __call__
-    lbt_attempts = tx_metadata.get('lbt_attempts', 0)
-```
-
-**Root cause**: `pymc_core` dispatcher stores the return value of `radio.send()` as `packet._tx_metadata` if truthy. SX1302's `send()` was returning `True` on success. `engine.py` then attempted to call `.get()` on a bool when extracting LBT metadata.
-
-**Fix applied**: `SX1302Radio.send()` now returns `None` on success. SX1302 has no LBT subsystem — returning `None` correctly signals no LBT metadata, causing the dispatcher to leave `_tx_metadata` unset and `engine.py` to skip the LBT block cleanly.
