@@ -44,7 +44,7 @@ For NSW Wide settings please use the following. (edit /etc/pymc_repeater/config.
 
   Clean & Deploy — pyMC Repeater (dev_merge)
 
-  1. Clean existing install
+### 1. Clean existing install
 
   Run manage.sh and select Uninstall, or manually:
 
@@ -59,13 +59,13 @@ For NSW Wide settings please use the following. (edit /etc/pymc_repeater/config.
   rm -rf ~/pyMC_Repeater* ~/rightup_pymc_rep_dev 2>/dev/null || true
 
   
-  2. Clone the branch
+###  2. Clone the branch
 
   git clone -b dev_merge https://github.com/l34rn3d/pyMC_Repeater_WM1302.git ~/pymc_dev
   cd ~/pymc_dev
 
   
-  3. Install
+###  3. Install
 
   sudo ./manage.sh
 
@@ -78,12 +78,12 @@ For NSW Wide settings please use the following. (edit /etc/pymc_repeater/config.
   - Start the service
 
   
-  4. Complete the web wizard
+###  4. Complete the web wizard
 
   Navigate to http://<device-ip>:8000 and complete setup. Select SX1302 as your hardware.
 
   
-  5. Fix radio_type in config (known gap — web wizard does not write this yet)
+###  5. Fix radio_type in config (known gap — web wizard does not write this yet)
 
 sudo tee -a /etc/pymc_repeater/config.yaml << 'EOF'
 
@@ -95,7 +95,7 @@ sx1302:
 EOF
 
   
-  6. Restart and verify
+###  6. Restart and verify
 
   sudo systemctl restart pymc-repeater
   sudo journalctl -u pymc-repeater -f
