@@ -106,19 +106,22 @@ setup_sx1302_hal() {
 
     echo "    Linking shared library..."
     local libloragw_a="$hal_dir/libloragw/libloragw.a"
-    local libtools_a="$hal_dir/libtools/libtools.a"
 
     if [ ! -f "$libloragw_a" ]; then
         echo "    ✗ libloragw.a not found — build failed"
         return 1
     fi
-    if [ ! -f "$libtools_a" ]; then
-        echo "    ✗ libtools.a not found — libtools build failed"
+
+    # Collect all static archives from libtools (libtinymt32.a, libparson.a, etc.)
+    local libtools_archives
+    mapfile -t libtools_archives < <(find "$hal_dir/libtools" -name "*.a" 2>/dev/null)
+    if [ ${#libtools_archives[@]} -eq 0 ]; then
+        echo "    ✗ No libtools archives found — libtools build failed"
         return 1
     fi
 
     if ! gcc -shared -o "$so_file" \
-        -Wl,--whole-archive "$libloragw_a" "$libtools_a" \
+        -Wl,--whole-archive "$libloragw_a" "${libtools_archives[@]}" \
         -Wl,--no-whole-archive; then
         echo "    ✗ Failed to create libloragw.so"
         return 1
