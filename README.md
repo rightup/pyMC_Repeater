@@ -42,7 +42,7 @@ For NSW Wide settings please use the following. (edit /etc/pymc_repeater/config.
 ---
 
 
-  Clean & Deploy — pyMC Repeater (dev_merge)
+## To Build/Run the DEV build of pyMC 
 
 ### 1. Clean existing install
 
@@ -85,15 +85,8 @@ For NSW Wide settings please use the following. (edit /etc/pymc_repeater/config.
   
 ###  5. Fix radio_type in config (known gap — web wizard does not write this yet)
 
-sudo tee -a /etc/pymc_repeater/config.yaml << 'EOF'
-
-radio_type: "sx1302"
-
-sx1302:
-  com_path: "/dev/spidev0.0"   
-  sx1261_spi_path: "/dev/spidev0.1"
-EOF
-
+sudo ./setup-sx1302.sh
+The web wizard has no mechanism to trigger this automatically.
   
 ###  6. Restart and verify
 
@@ -103,8 +96,7 @@ EOF
   Expected: concentrator starts, TX adverts appear within ~30 seconds.
 
   
-  Note: Step 5 is a manual workaround. The web wizard not writing radio_type is documented in the merge proposal as Gap 1 — the upstream web UI needs fixing before this
-  becomes a clean install-only flow.
+
 
 
 
