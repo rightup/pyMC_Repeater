@@ -121,6 +121,36 @@ class RepeaterHandler(BaseHandler):
             f"rssi={metadata.get('rssi', 'N/A')}, snr={metadata.get('snr', 'N/A')}, mode={mode}"
         )
 
+        # --- Early duplicate check (before expensive processing) ---
+        # Matches C++ MeshCore behavior: hasSeen() is checked BEFORE any
+        # processing.  The packet hash excludes path data (except TRACE),
+        # so flood packets looping with different paths (e.g. the
+        # "35 35 35 35" pattern) are correctly caught here.  Without this
+        # early exit every path-variant duplicate triggers the full storage
+        # pipeline (deepcopy, SQLite INSERT, 19x COUNT(*), MQTT, WS, etc.)
+        if not local_transmission:
+            pkt_hash_early = packet.calculate_packet_hash().hex().upper()
+            if pkt_hash_early in self.seen_packets:
+                self.dropped_count += 1
+                logger.debug(f"Early duplicate drop (hash {pkt_hash_early[:16]})")
+                # Lightweight record for dashboard only — skip storage
+                header_info = PacketHeaderUtils.parse_header(packet.header)
+                self.recent_packets.append({
+                    "timestamp": time.time(),
+                    "type": header_info["payload_type"],
+                    "route": header_info["route_type"],
+                    "length": len(packet.payload or b""),
+                    "rssi": metadata.get("rssi", 0),
+                    "snr": metadata.get("snr", 0.0),
+                    "transmitted": False,
+                    "is_duplicate": True,
+                    "drop_reason": "Duplicate",
+                    "packet_hash": pkt_hash_early[:16],
+                })
+                if len(self.recent_packets) > self.max_recent_packets:
+                    self.recent_packets.pop(0)
+                return
+
         # clone the packet to avoid modifying the original
         processed_packet = copy.deepcopy(packet)
 
@@ -776,6 +806,19 @@ class RepeaterHandler(BaseHandler):
                     await self._record_noise_floor_async()
                     await self._record_crc_errors_async()
                     self.last_noise_measurement = current_time
+
+                # Periodic maintenance: prune seen-packet cache and old DB rows
+                if not hasattr(self, '_last_cleanup_time'):
+                    self._last_cleanup_time = current_time
+                if current_time - self._last_cleanup_time >= 21600:  # every 6 hours
+                    self.cleanup_cache()
+                    if self.storage:
+                        try:
+                            self.storage.cleanup_old_data(days=7)
+                            logger.info("Periodic DB cleanup completed")
+                        except Exception as e:
+                            logger.error(f"Periodic DB cleanup failed: {e}")
+                    self._last_cleanup_time = current_time
 
                 # Check advert sending (every N hours)
                 if self.send_advert_interval_hours > 0 and self.send_advert_func:

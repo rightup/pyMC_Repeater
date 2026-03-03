@@ -150,18 +150,19 @@ class StorageCollector:
         # Broadcast to WebSocket clients for real-time updates
         if self.websocket_available:
             try:
-                self.websocket_broadcast_packet(packet_record)
-                
-                # Broadcast 24-hour packet stats (same as /api/packet_stats?hours=24)
-                packet_stats_24h = self.sqlite_handler.get_packet_stats(hours=24)
-                uptime_seconds = time.time() - self.repeater_handler.start_time if self.repeater_handler else 0
-                
-                self.websocket_broadcast_stats({
-                    "packet_stats": packet_stats_24h,
-                    "system_stats": {
-                        "uptime_seconds": uptime_seconds,
-                    }
-                })
+                from .websocket_handler import _connected_clients
+                if not _connected_clients:
+                    pass  # No clients connected — skip expensive broadcast + stats query
+                else:
+                    self.websocket_broadcast_packet(packet_record)
+                    packet_stats_24h = self.sqlite_handler.get_packet_stats(hours=24)
+                    uptime_seconds = time.time() - self.repeater_handler.start_time if self.repeater_handler else 0
+                    self.websocket_broadcast_stats({
+                        "packet_stats": packet_stats_24h,
+                        "system_stats": {
+                            "uptime_seconds": uptime_seconds,
+                        }
+                    })
             except Exception as e:
                 logger.debug(f"WebSocket broadcast failed: {e}")
 
