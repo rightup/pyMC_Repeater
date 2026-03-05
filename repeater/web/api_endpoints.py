@@ -1455,6 +1455,106 @@ class APIEndpoints:
             return self._error(e)
 
     @cherrypy.expose
+    @cherrypy.tools.json_out()
+    def crc_error_logs(self, hours: int = 24, limit: int = 0):
+        """Return rich per-event CRC error logs parsed from journalctl."""
+        try:
+            import subprocess
+            import re
+
+            hours = int(hours)
+            limit = int(limit)
+
+            # Build journalctl command — cross-distro compatible
+            cmd = [
+                "journalctl",
+                "-u", "pymc-repeater",
+                "--no-pager",
+                "--since", f"-{hours}h",
+                "--grep", "CRC error #",
+                "-o", "short-iso",
+            ]
+
+            try:
+                result = subprocess.run(
+                    cmd, capture_output=True, text=True, timeout=10
+                )
+            except FileNotFoundError:
+                return self._error("journalctl not available on this system")
+            except subprocess.TimeoutExpired:
+                return self._error("journalctl query timed out")
+
+            if result.returncode != 0 and not result.stdout:
+                # Try without -u flag (some setups log under different unit names)
+                cmd_fallback = [
+                    "journalctl",
+                    "--no-pager",
+                    "--since", f"-{hours}h",
+                    "--grep", "CRC error #",
+                    "-o", "short-iso",
+                ]
+                try:
+                    result = subprocess.run(
+                        cmd_fallback, capture_output=True, text=True, timeout=10
+                    )
+                except (FileNotFoundError, subprocess.TimeoutExpired):
+                    pass
+
+            # Parse structured fields from each log line
+            # Format: [RX] CRC error #N - RSSI=XdBm, SNR=X.XdB, SignalRSSI=XdBm,
+            #         Length=N, NoiseFloor=X.XdBm, DeviceErrors=0xNNNN, IRQ=0xNNNN,
+            #         RawData=hex
+            pattern = re.compile(
+                r"CRC error #(?P<seq>\d+)"
+                r" - RSSI=(?P<rssi>-?\d+)dBm"
+                r", SNR=(?P<snr>-?[\d.]+)dB"
+                r", SignalRSSI=(?P<signal_rssi>-?\d+)dBm"
+                r", Length=(?P<length>\d+)"
+                r", NoiseFloor=(?P<noise_floor>-?[\d.]+)dBm"
+                r", DeviceErrors=(?P<device_errors>0x[0-9A-Fa-f]+)"
+                r", IRQ=(?P<irq>0x[0-9A-Fa-f]+)"
+                r"(?:, RawData=(?P<raw_data>\S+))?"
+            )
+
+            # Timestamp at start of journalctl short-iso lines
+            ts_pattern = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[^\s]*)")
+
+            entries = []
+            for line in result.stdout.splitlines():
+                m = pattern.search(line)
+                if not m:
+                    continue
+
+                ts_match = ts_pattern.match(line)
+                timestamp = ts_match.group(1) if ts_match else None
+
+                entries.append({
+                    "timestamp": timestamp,
+                    "seq": int(m.group("seq")),
+                    "rssi": int(m.group("rssi")),
+                    "snr": float(m.group("snr")),
+                    "signal_rssi": int(m.group("signal_rssi")),
+                    "length": int(m.group("length")),
+                    "noise_floor": float(m.group("noise_floor")),
+                    "device_errors": m.group("device_errors"),
+                    "irq": m.group("irq"),
+                    "raw_data": m.group("raw_data") or "",
+                })
+
+            if limit > 0:
+                entries = entries[-limit:]
+
+            return self._success({
+                "logs": entries,
+                "hours": hours,
+                "count": len(entries),
+            })
+
+        except Exception as e:
+            logger.error(f"Error fetching CRC error logs: {e}")
+            return self._error(e)
+
+    @cherrypy.expose
     def cad_calibration_stream(self):
         cherrypy.response.headers['Content-Type'] = 'text/event-stream'
         cherrypy.response.headers['Cache-Control'] = 'no-cache'
