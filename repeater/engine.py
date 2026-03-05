@@ -807,6 +807,10 @@ class RepeaterHandler(BaseHandler):
                     "rx_delay_base": delays_config.get("rx_delay_base", 0.0),
                 },
                 "web": self.config.get("web", {}),  # Include web configuration
+                "mesh": {
+                    "loop_detect": self.config.get("mesh", {}).get("loop_detect", "off"),
+                    "global_flood_allow": self.config.get("mesh", {}).get("global_flood_allow", True),
+                },
             },
             "public_key": None,
         }
