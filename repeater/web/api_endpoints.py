@@ -1507,6 +1507,16 @@ class APIEndpoints:
                 self.config["repeater"]["advert_interval_minutes"] = mins
                 applied.append(f"advert.interval={mins}m")
             
+            # Update flood loop detection mode
+            if "loop_detect" in data:
+                mode = str(data["loop_detect"]).strip().lower()
+                if mode not in ("off", "minimal", "moderate", "strict"):
+                    return self._error("loop_detect must be one of: off, minimal, moderate, strict")
+                if "mesh" not in self.config:
+                    self.config["mesh"] = {}
+                self.config["mesh"]["loop_detect"] = mode
+                applied.append(f"loop_detect={mode}")
+            
             if not applied:
                 return self._error("No valid settings provided")
             
@@ -1514,7 +1524,7 @@ class APIEndpoints:
             result = self.config_manager.update_and_save(
                 updates={},  # Updates already applied to self.config above
                 live_update=True,
-                live_update_sections=['repeater', 'delays', 'radio']
+                live_update_sections=['repeater', 'delays', 'radio', 'mesh']
             )
             
             logger.info(f"Radio config updated: {', '.join(applied)}")
