@@ -54,6 +54,9 @@ htmlcov/
 config.yaml
 identity.json
 
+# Distribution Radio Settings
+radio_settings_dist.json
+
 # Logs
 *.log
 .DS_Store

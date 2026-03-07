@@ -259,7 +259,7 @@ class APIEndpoints:
     @cherrypy.expose
     @cherrypy.tools.json_out()
     def hardware_options(self):
-        """Get available hardware configurations from radio-settings.json"""
+        """Get available hardware configurations from radio-settings-dist.json or radio-settings.json"""
         try:
             import json
 
@@ -270,13 +270,19 @@ class APIEndpoints:
                 or "/var/lib/pymc_repeater"
             )
             config_dir = Path(storage_dir_cfg)
+            installed_dist_path = config_dir / 'radio-settings-dist.json'
             installed_path = config_dir / 'radio-settings.json'
             dev_path = os.path.join(os.path.dirname(__file__), '..', '..', 'radio-settings.json')
             
-            hardware_file = str(installed_path) if installed_path.exists() else dev_path
+            if installed_dist_path.exists():
+                hardware_file = str(installed_dist_path)
+            elif installed_path.exists():
+                hardware_file = str(installed_path)
+            else:
+                hardware_file = dev_path
             
             if not os.path.exists(hardware_file):
-                logger.error(f"Hardware file not found. Tried: {installed_path}, {dev_path}")
+                logger.error(f"Hardware file not found. Tried: {installed_dist_path}, {installed_path}, {dev_path}")
                 return {'error': 'Hardware configuration file not found', 'hardware': []}
             
             with open(hardware_file, 'r') as f:
