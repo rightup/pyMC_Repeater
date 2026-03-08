@@ -129,22 +129,22 @@ class _BrokerConnection:
         try:
             signature = self.local_identity.sign(signing_input)
         except Exception as e:
-            logging.error(f"JWT signing failed for {self.broker['name']}: {e}")
-            logging.error(f"  - public_key: {self.public_key}")
-            logging.error(f"  - signing_input length: {len(signing_input)}")
+            logger.error(f"JWT signing failed for {self.broker['name']}: {e}")
+            logger.error(f"  - public_key: {self.public_key}")
+            logger.error(f"  - signing_input length: {len(signing_input)}")
             raise
         
         signature_hex = binascii.hexlify(signature).decode()
         token = f"{header_b64}.{payload_b64}.{signature_hex}"
         
-        logging.debug(f"JWT token generated for {self.broker['name']}: {token[:50]}...")
+        logger.debug(f"JWT token generated for {self.broker['name']}: {token[:50]}...")
 
         return token
 
     def _on_connect(self, client, userdata, flags, rc):
         """MQTT connection callback"""
         if rc == 0:
-            logging.info(f"Connected to {self.broker['name']}")
+            logger.info(f"Connected to {self.broker['name']}")
             self._running = True
             self._reconnect_attempts = 0  # Reset counter on success
             self._schedule_jwt_refresh()  # Schedule proactive JWT refresh
@@ -152,7 +152,7 @@ class _BrokerConnection:
                 self._on_connect_callback(self.broker["name"])
         else:
             error_msg = get_mqtt_error_message(rc, is_disconnect=False)
-            logging.error(f"Failed to connect to {self.broker['name']}: {error_msg}")
+            logger.error(f"Failed to connect to {self.broker['name']}: {error_msg}")
             self._schedule_reconnect()
 
     def _on_disconnect(self, client, userdata, rc):
@@ -162,11 +162,11 @@ class _BrokerConnection:
         
         if rc != 0:  # Unexpected disconnect
             error_msg = get_mqtt_error_message(rc, is_disconnect=True)
-            logging.warning(f"Disconnected from {self.broker['name']} (rc={rc}): {error_msg}")
+            logger.warning(f"Disconnected from {self.broker['name']} (rc={rc}): {error_msg}")
             if was_running:  # Only reconnect if we were intentionally connected
                 self._schedule_reconnect(reason=error_msg)
         else:
-            logging.info(f"Clean disconnect from {self.broker['name']}")
+            logger.info(f"Clean disconnect from {self.broker['name']}")
         
         if self._on_disconnect_callback:
             self._on_disconnect_callback(self.broker["name"])
@@ -180,7 +180,7 @@ class _BrokerConnection:
         delay = min(5 * (2 ** self._reconnect_attempts), self._max_reconnect_delay)
         self._reconnect_attempts += 1
         
-        logging.info(f"Scheduling reconnect to {self.broker['name']} in {delay}s (attempt {self._reconnect_attempts}, reason: {reason})")
+        logger.info(f"Scheduling reconnect to {self.broker['name']} in {delay}s (attempt {self._reconnect_attempts}, reason: {reason})")
         self._reconnect_timer = threading.Timer(delay, lambda: self._attempt_reconnect(reason))
         self._reconnect_timer.daemon = True
         self._reconnect_timer.start()
@@ -188,7 +188,7 @@ class _BrokerConnection:
     def _attempt_reconnect(self, reason: str = "connection lost"):
         """Attempt to reconnect to broker with fresh JWT"""
         try:
-            logging.info(f"Attempting reconnection to {self.broker['name']} (reason: {reason})...")
+            logger.info(f"Attempting reconnection to {self.broker['name']} (reason: {reason})...")
             
             # Stop the loop if it's still running (websocket mode requires clean restart)
             try:
@@ -203,7 +203,7 @@ class _BrokerConnection:
             self.client.loop_start()
             self._loop_running = True
         except Exception as e:
-            logging.error(f"Reconnection failed for {self.broker['name']}: {e}")
+            logger.error(f"Reconnection failed for {self.broker['name']}: {e}")
             self._schedule_reconnect()  # Try again later
     
     def _set_jwt_credentials(self):
@@ -213,11 +213,11 @@ class _BrokerConnection:
             username = f"v1_{self.public_key}"
             self.client.username_pw_set(username=username, password=token)
             self._connect_time = datetime.now(UTC)
-            logging.debug(f"JWT credentials set for {self.broker['name']}")
-            logging.debug(f"Using username: {username}")
-            logging.debug(f"Public key: {self.public_key[:16]}...{self.public_key[-16:]}")
+            logger.debug(f"JWT credentials set for {self.broker['name']}")
+            logger.debug(f"Using username: {username}")
+            logger.debug(f"Public key: {self.public_key[:16]}...{self.public_key[-16:]}")
         except Exception as e:
-            logging.error(f"Failed to set JWT credentials for {self.broker['name']}: {e}")
+            logger.error(f"Failed to set JWT credentials for {self.broker['name']}: {e}")
             raise
 
     def connect(self):
@@ -236,7 +236,7 @@ class _BrokerConnection:
         # Set JWT credentials before CONNECT handshake
         self._set_jwt_credentials()
 
-        logging.info(
+        logger.info(
             f"Connecting to {self.broker['name']} "
             f"({protocol}://{self.broker['host']}:{self.broker['port']}) ..."
         )
@@ -260,7 +260,7 @@ class _BrokerConnection:
         
         self.client.loop_stop()
         self.client.disconnect()
-        logging.info(f"Disconnected from {self.broker['name']}")
+        logger.info(f"Disconnected from {self.broker['name']}")
 
     def publish(self, topic: str, payload: str, retain: bool = False):
         """Publish message to broker"""
@@ -301,7 +301,7 @@ class _BrokerConnection:
         refresh_threshold = 0.80 + stagger_offset
         refresh_delay = expiry_seconds * refresh_threshold
         
-        logging.info(
+        logger.info(
             f"JWT refresh scheduled for {self.broker['name']} in {refresh_delay:.0f}s "
             f"({refresh_threshold*100:.0f}% of {self.jwt_expiry_minutes}min token lifetime)"
         )
@@ -314,7 +314,7 @@ class _BrokerConnection:
         if not self._running:
             return
         
-        logging.info(f"JWT token expiring soon for {self.broker['name']}, refreshing...")
+        logger.info(f"JWT token expiring soon for {self.broker['name']}, refreshing...")
         self._running = False
         self._jwt_refresh_timer = None
         self.client.disconnect()  # Triggers clean disconnect, then reconnect via timer
@@ -359,26 +359,26 @@ class MeshCoreToMqttJwtPusher:
         if broker_index == -2:
             # Custom brokers only - no built-in brokers
             self.brokers = []
-            logging.info("Custom broker mode: using only user-defined brokers")
+            logger.info("Custom broker mode: using only user-defined brokers")
         elif broker_index is None or broker_index == -1:
             # Connect to all built-in brokers + additional ones
             self.brokers = LETSMESH_BROKERS.copy()
-            logging.info(f"Multi-broker mode: connecting to all {len(LETSMESH_BROKERS)} built-in brokers")
+            logger.info(f"Multi-broker mode: connecting to all {len(LETSMESH_BROKERS)} built-in brokers")
         else:
             
             if broker_index >= len(LETSMESH_BROKERS):
                 raise ValueError(f"Invalid broker_index {broker_index}")
             self.brokers = [LETSMESH_BROKERS[broker_index]]
-            logging.info(f"Single broker mode: connecting to {self.brokers[0]['name']}")
+            logger.info(f"Single broker mode: connecting to {self.brokers[0]['name']}")
 
         # Add additional brokers from config
         if additional_brokers:
             for broker_config in additional_brokers:
                 if all(k in broker_config for k in ["name", "host", "port", "audience"]):
                     self.brokers.append(broker_config)
-                    logging.info(f"Added custom broker: {broker_config['name']}")
+                    logger.info(f"Added custom broker: {broker_config['name']}")
                 else:
-                    logging.warning(f"Skipping invalid broker config: {broker_config}")
+                    logger.warning(f"Skipping invalid broker config: {broker_config}")
         
         # Validate that we have at least one broker
         if not self.brokers:
@@ -419,7 +419,7 @@ class MeshCoreToMqttJwtPusher:
             )
             self.connections.append(conn)
 
-        logging.info(f"Initialized with {len(self.connections)} broker connection(s)")
+        logger.info(f"Initialized with {len(self.connections)} broker connection(s)")
 
     def _on_broker_connected(self, broker_name: str):
         """Callback when a broker connects"""
@@ -432,7 +432,7 @@ class MeshCoreToMqttJwtPusher:
             # Start heartbeat thread
             self._status_task = threading.Thread(target=self._status_heartbeat_loop, daemon=True)
             self._status_task.start()
-            logging.info(f"Started status heartbeat (interval: {self.status_interval}s)")
+            logger.info(f"Started status heartbeat (interval: {self.status_interval}s)")
 
     def _on_broker_disconnected(self, broker_name: str):
         """Callback when a broker disconnects"""
@@ -441,9 +441,9 @@ class MeshCoreToMqttJwtPusher:
         any_reconnecting = any(conn.has_pending_reconnect() for conn in self.connections)
         
         if all_down and not any_reconnecting:
-            logging.warning("All broker connections lost with no pending reconnects")
+            logger.warning("All broker connections lost with no pending reconnects")
         elif all_down:
-            logging.info("All brokers temporarily disconnected, reconnects pending")
+            logger.info("All brokers temporarily disconnected, reconnects pending")
 
     def connect(self):
         """Establish connections to all configured brokers"""
@@ -455,19 +455,19 @@ class MeshCoreToMqttJwtPusher:
                 else:
                     # Stagger additional brokers using background timers
                     delay = idx * 30
-                    logging.info(f"Staggering connection to {conn.broker['name']} by {delay}s")
+                    logger.info(f"Staggering connection to {conn.broker['name']} by {delay}s")
                     timer = threading.Timer(delay, lambda c=conn: self._delayed_connect(c))
                     timer.daemon = True
                     timer.start()
             except Exception as e:
-                logging.error(f"Failed to connect to {conn.broker['name']}: {e}")
+                logger.error(f"Failed to connect to {conn.broker['name']}: {e}")
     
     def _delayed_connect(self, conn):
         """Connect a broker after a delay (called by timer)"""
         try:
             conn.connect()
         except Exception as e:
-            logging.error(f"Failed to connect to {conn.broker['name']}: {e}")
+            logger.error(f"Failed to connect to {conn.broker['name']}: {e}")
 
     def disconnect(self):
         """Disconnect from all brokers"""
@@ -485,9 +485,9 @@ class MeshCoreToMqttJwtPusher:
             try:
                 conn.disconnect()
             except Exception as e:
-                logging.error(f"Error disconnecting from {conn.broker['name']}: {e}")
+                logger.error(f"Error disconnecting from {conn.broker['name']}: {e}")
 
-        logging.info("Disconnected from all brokers")
+        logger.info("Disconnected from all brokers")
 
     def _status_heartbeat_loop(self):
         """Background thread that publishes periodic status updates"""
@@ -499,11 +499,11 @@ class MeshCoreToMqttJwtPusher:
                 self.publish_status(
                     state="online", origin=self.node_name, radio_config=self.radio_config
                 )
-                logging.debug(f"Status heartbeat sent (next in {self.status_interval}s)")
+                logger.debug(f"Status heartbeat sent (next in {self.status_interval}s)")
                 
                 time.sleep(self.status_interval)
             except Exception as e:
-                logging.error(f"Status heartbeat error: {e}")
+                logger.error(f"Status heartbeat error: {e}")
                 time.sleep(self.status_interval)
 
     # ----------------------------------------------------------------
@@ -574,10 +574,10 @@ class MeshCoreToMqttJwtPusher:
                 if conn.is_connected():
                     result = conn.publish(topic, message, retain=retain)
                     results.append((conn.broker["name"], result))
-                    logging.debug(f"Published to {conn.broker['name']}/{topic}")
+                    logger.debug(f"Published to {conn.broker['name']}/{topic}")
 
         if not results:
-            logging.warning(f"No active broker connections for publishing to {topic}")
+            logger.warning(f"No active broker connections for publishing to {topic}")
 
         return results
 
