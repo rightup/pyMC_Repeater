@@ -126,17 +126,17 @@ output_format = "$OUTPUT_FORMAT"
 # Verify with pyMC if available
 try:
     from nacl.bindings import crypto_scalarmult_ed25519_base_noclamp
-    
+
     scalar = key_bytes[:32]
     pubkey = crypto_scalarmult_ed25519_base_noclamp(scalar)
-    
+
     print(f"Derived public key: {pubkey.hex()}")
-    
+
     # Calculate address (MeshCore uses first byte of pubkey directly, not SHA256)
     address = pubkey[0]
     print(f"Node address: 0x{address:02x}")
     print()
-    
+
 except ImportError:
     print("Warning: PyNaCl not available, skipping verification")
     print()

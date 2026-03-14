@@ -58,7 +58,7 @@ class ACL:
         sync_since: int = None,
         target_identity_hash: int = None,
         target_identity_name: str = None,
-        target_identity_config: dict = None
+        target_identity_config: dict = None,
     ) -> tuple[bool, int]:
 
         target_identity_config = target_identity_config or {}
@@ -79,9 +79,11 @@ class ACL:
             # Empty strings are treated as "not set"
             admin_pwd = identity_settings.get("admin_password") or None
             guest_pwd = identity_settings.get("guest_password") or None
-            
+
             if not admin_pwd and not guest_pwd:
-                logger.error(f"Room server '{target_identity_name}' has no passwords configured! Set admin_password and/or guest_password in settings.")
+                logger.error(
+                    f"Room server '{target_identity_name}' has no passwords configured! Set admin_password and/or guest_password in settings."
+                )
                 return False, 0
         else:
             # Repeater uses global passwords from its own security section
@@ -91,10 +93,12 @@ class ACL:
                 f"Repeater passwords - admin: {'SET' if admin_pwd else 'NONE'}, "
                 f"guest: {'SET' if guest_pwd else 'NONE'}"
             )
-        
+
         if target_identity_name:
-            logger.debug(f"Authenticating for identity '{target_identity_name}' (room_server={is_room_server})")
- 
+            logger.debug(
+                f"Authenticating for identity '{target_identity_name}' (room_server={is_room_server})"
+            )
+
         pub_key = client_identity.get_public_key()[:PUB_KEY_SIZE]
 
         if not password:
@@ -111,8 +115,12 @@ class ACL:
 
         permissions = 0
         logger.debug(f"Comparing password (len={len(password)}) against admin/guest")
-        logger.debug(f"Admin pwd len={len(admin_pwd) if admin_pwd else 0}, Guest pwd len={len(guest_pwd) if guest_pwd else 0}")
-        logger.debug(f"Password comparison: '{password}' vs admin='{admin_pwd[:4]}...' ({len(admin_pwd)} chars)")
+        logger.debug(
+            f"Admin pwd len={len(admin_pwd) if admin_pwd else 0}, Guest pwd len={len(guest_pwd) if guest_pwd else 0}"
+        )
+        logger.debug(
+            f"Password comparison: '{password}' vs admin='{admin_pwd[:4]}...' ({len(admin_pwd)} chars)"
+        )
         if admin_pwd and password == admin_pwd:
             permissions = PERM_ACL_ADMIN
             logger.info(f"Admin password validated for '{target_identity_name or 'unknown'}'")

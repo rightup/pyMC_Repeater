@@ -10,12 +10,13 @@ import struct
 import time
 
 from pymc_core.node.handlers.protocol_request import (
-    ProtocolRequestHandler,
-    REQ_TYPE_GET_STATUS,
-    REQ_TYPE_GET_TELEMETRY_DATA,
     REQ_TYPE_GET_ACCESS_LIST,
     REQ_TYPE_GET_NEIGHBOURS,
-    SERVER_RESPONSE_DELAY_MS
+    REQ_TYPE_GET_OWNER_INFO,
+    REQ_TYPE_GET_STATUS,
+    REQ_TYPE_GET_TELEMETRY_DATA,
+    SERVER_RESPONSE_DELAY_MS,
+    ProtocolRequestHandler,
 )
 
 logger = logging.getLogger("ProtocolRequestHelper")
@@ -23,8 +24,16 @@ logger = logging.getLogger("ProtocolRequestHelper")
 
 class ProtocolRequestHelper:
     """Provides repeater-specific protocol request handlers."""
-    
-    def __init__(self, identity_manager, packet_injector=None, acl_dict=None, radio=None, engine=None, neighbor_tracker=None):
+
+    def __init__(
+        self,
+        identity_manager,
+        packet_injector=None,
+        acl_dict=None,
+        radio=None,
+        engine=None,
+        neighbor_tracker=None,
+    ):
 
         self.identity_manager = identity_manager
         self.packet_injector = packet_injector
@@ -71,9 +80,10 @@ class ProtocolRequestHelper:
         }
         
         logger.info(f"Registered protocol request handler for '{name}': hash=0x{hash_byte:02X}")
-    
+
     def _create_acl_contacts_wrapper(self, acl):
         """Create contacts wrapper from ACL."""
+
         class ACLContactsWrapper:
             def __init__(self, identity_acl):
                 self._acl = identity_acl
@@ -119,60 +129,73 @@ class ProtocolRequestHelper:
             return False
     
     def _handle_get_status(self, client, timestamp: int, req_data: bytes):
+        """Build 56-byte RepeaterStats (firmware layout from MeshCore simple_repeater/MyMesh.h)."""
+        # RepeaterStats: uint16 batt, uint16 curr_tx_queue_len, int16 noise_floor, int16 last_rssi,
+        # uint32 n_packets_recv, n_packets_sent, total_air_time_secs, total_up_time_secs,
+        # n_sent_flood, n_sent_direct, n_recv_flood, n_recv_direct,
+        # uint16 err_events, int16 last_snr (×4), uint16 n_direct_dups, n_flood_dups,
+        # uint32 total_rx_air_time_secs, n_recv_errors  → 56 bytes
 
-        # C++ struct RepeaterStats (44 bytes total):
-        # uint16_t batt_milli_volts;
-        # uint16_t curr_tx_queue_len;
-        # int16_t noise_floor;
-        # int16_t last_rssi;
-        # uint32_t n_packets_recv;
-        # uint32_t n_packets_sent;
-        # uint32_t total_air_time_secs;
-        # uint32_t total_up_time_secs;
-        # uint32_t n_sent_flood;
-        # uint32_t n_sent_direct;
-        # uint32_t n_recv_flood;
-        # uint32_t n_recv_direct;
-        # uint32_t err_events;
-        # int16_t last_snr;
-        # uint32_t n_direct_dups;
-        # uint32_t n_flood_dups;
-        # uint32_t total_rx_air_time_secs;
-        
-        # Get stats from radio/engine
-        noise_floor = int(self.radio.get_noise_floor() * 1.0) if self.radio else -120
-        last_rssi = int(self.radio.last_rssi) if self.radio and hasattr(self.radio, 'last_rssi') else -120
-        last_snr = int((self.radio.last_snr * 4.0) if self.radio and hasattr(self.radio, 'last_snr') else 0)
-        
-        # Get packet counts
-        n_packets_recv = self.radio.packets_received if self.radio and hasattr(self.radio, 'packets_received') else 0
-        n_packets_sent = self.radio.packets_sent if self.radio and hasattr(self.radio, 'packets_sent') else 0
-        
-        # Get airtime stats
+        # Uptime: use engine start_time when available (fixes wrong "20521 days" from time.time())
+        if self.engine and hasattr(self.engine, "start_time"):
+            total_up_time_secs = int(time.time() - self.engine.start_time)
+        else:
+            total_up_time_secs = 0
+
+        # Radio: noise floor, last RSSI, last SNR (firmware stores SNR × 4)
+        if self.radio:
+            noise_floor = int(getattr(self.radio, "get_noise_floor", lambda: 0)() or 0)
+            if callable(getattr(self.radio, "get_last_rssi", None)):
+                last_rssi = int(self.radio.get_last_rssi() or -120)
+            else:
+                last_rssi = int(getattr(self.radio, "last_rssi", -120) or -120)
+            if callable(getattr(self.radio, "get_last_snr", None)):
+                last_snr = int((self.radio.get_last_snr() or 0) * 4)
+            else:
+                last_snr = int((getattr(self.radio, "last_snr", 0) or 0) * 4)
+        else:
+            noise_floor = 0
+            last_rssi = -120
+            last_snr = 0
+
+        # Packet counts: prefer engine (rx_count, forwarded_count); fall back to radio if present
+        if self.engine:
+            n_packets_recv = getattr(self.engine, "rx_count", 0)
+            n_packets_sent = getattr(self.engine, "forwarded_count", 0)
+        elif self.radio:
+            n_packets_recv = getattr(self.radio, "packets_received", 0) or 0
+            n_packets_sent = getattr(self.radio, "packets_sent", 0) or 0
+        else:
+            n_packets_recv = 0
+            n_packets_sent = 0
+
+        # Airtime (AirtimeManager uses total_airtime_ms for TX; total_rx_airtime_ms if we track RX)
         total_air_time_secs = 0
         total_rx_air_time_secs = 0
-        if self.engine and hasattr(self.engine, 'airtime_manager'):
-            total_air_time_secs = int(self.engine.airtime_manager.total_tx_airtime_ms / 1000)
-        
-        # Get routing stats
-        n_sent_flood = 0
-        n_sent_direct = 0
-        n_recv_flood = 0
-        n_recv_direct = 0
-        n_direct_dups = 0
-        n_flood_dups = 0
-        
         if self.engine:
-            n_sent_flood = getattr(self.engine, 'sent_flood_count', 0)
-            n_sent_direct = getattr(self.engine, 'sent_direct_count', 0)
-            n_recv_flood = getattr(self.engine, 'recv_flood_count', 0)
-            n_recv_direct = getattr(self.engine, 'recv_direct_count', 0)
-            n_direct_dups = getattr(self.engine, 'direct_dup_count', 0)
-            n_flood_dups = getattr(self.engine, 'flood_dup_count', 0)
-        
-        # Pack struct (little-endian)
+            am = getattr(self.engine, "airtime_mgr", None) or getattr(
+                self.engine, "airtime_manager", None
+            )
+            if am is not None:
+                total_air_time_secs = int(getattr(am, "total_airtime_ms", 0) or 0) // 1000
+                total_rx_air_time_secs = int(getattr(am, "total_rx_airtime_ms", 0) or 0) // 1000
+
+        # Routing stats (flood/direct and dups - from engine when available)
+        n_sent_flood = getattr(self.engine, "sent_flood_count", 0) if self.engine else 0
+        n_sent_direct = getattr(self.engine, "sent_direct_count", 0) if self.engine else 0
+        n_recv_flood = getattr(self.engine, "recv_flood_count", 0) if self.engine else 0
+        n_recv_direct = getattr(self.engine, "recv_direct_count", 0) if self.engine else 0
+        n_direct_dups = getattr(self.engine, "direct_dup_count", 0) if self.engine else 0
+        n_flood_dups = getattr(self.engine, "flood_dup_count", 0) if self.engine else 0
+        n_recv_errors = (
+            int(getattr(self.radio, "crc_error_count", 0) or 0)
+            if self.radio
+            else 0
+        )
+
+        # Pack 56-byte RepeaterStats (layout matches firmware)
         stats = struct.pack(
-            '<HHhhIIIIIIIIIhIII',
+            "<HHhhIIIIIIIIHhHHII",
             0,  # batt_milli_volts (not available on Pi)
             0,  # curr_tx_queue_len (TODO)
             noise_floor,
@@ -180,7 +203,7 @@ class ProtocolRequestHelper:
             n_packets_recv,
             n_packets_sent,
             total_air_time_secs,
-            int(time.time()),  # total_up_time_secs
+            total_up_time_secs,
             n_sent_flood,
             n_sent_direct,
             n_recv_flood,
@@ -190,8 +213,17 @@ class ProtocolRequestHelper:
             n_direct_dups,
             n_flood_dups,
             total_rx_air_time_secs,
+            n_recv_errors,
         )
-        
-        logger.debug(f"GET_STATUS: noise={noise_floor}dBm, rssi={last_rssi}dBm, snr={last_snr/4}dB")
-        
+
+        logger.debug(
+            "GET_STATUS: uptime=%ds, noise=%ddBm, rssi=%ddBm, snr=%.1fdB, rx=%s, tx=%s",
+            total_up_time_secs,
+            noise_floor,
+            last_rssi,
+            last_snr / 4.0,
+            n_packets_recv,
+            n_packets_sent,
+        )
+
         return stats

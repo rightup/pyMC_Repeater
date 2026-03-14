@@ -6,10 +6,17 @@ services:
     ports:
       - 8000:8000
     devices:
+      # SPI DEVICES (Your path may differ)
       - /dev/spidev0.0
       - /dev/gpiochip0
+      # USB DEVICES (Your path may differ)
+      - /dev/bus/usb/002:/dev/bus/usb/002
+    # SPI DEVICES PERMISSIONS
     cap_add:
       - SYS_RAWIO
+    # USB DEVICSE PERMISSIONS
+    group_add:
+     - plugdev
     volumes:
       - ./config.yaml:/etc/pymc_repeater/config.yaml
       - ./data:/var/lib/pymc_repeater

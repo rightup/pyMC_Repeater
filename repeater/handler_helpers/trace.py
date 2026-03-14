@@ -9,7 +9,7 @@ of packets through the mesh network.
 import asyncio
 import logging
 import time
-from typing import Dict, Any
+from typing import Any, Dict
 
 from pymc_core.hardware.signal_utils import snr_register_to_db
 from pymc_core.node.handlers.trace import TraceHandler
@@ -34,10 +34,15 @@ class TraceHelper:
         self.local_hash = local_hash
         self.repeater_handler = repeater_handler
         self.packet_injector = packet_injector  # Function to inject packets into router
-        
+
         # Ping callback system - track pending ping requests by tag
-        self.pending_pings = {}  # {tag: {'event': asyncio.Event(), 'result': dict, 'target': int, 'sent_at': float}}
-        
+        self.pending_pings = (
+            {}
+        )  # {tag: {'event': asyncio.Event(), 'result': dict, 'target': int, 'sent_at': float}}
+
+        # Optional: when trace reaches final node, call this (packet, parsed_data) to push 0x89 to companions
+        self.on_trace_complete = None  # async (packet, parsed_data) -> None
+
         # Create TraceHandler internally as a parsing utility
         self.trace_handler = TraceHandler(log_fn=log_fn or logger.info)
 
@@ -60,9 +65,7 @@ class TraceHelper:
             parsed_data = self.trace_handler._parse_trace_payload(packet.payload)
 
             if not parsed_data.get("valid", False):
-                logger.warning(
-                    f"Invalid trace packet: {parsed_data.get('error', 'Unknown error')}"
-                )
+                logger.warning(f"Invalid trace packet: {parsed_data.get('error', 'Unknown error')}")
                 return
 
             trace_path = parsed_data["trace_path"]
@@ -71,16 +74,23 @@ class TraceHelper:
             # Check if this is a response to one of our pings
             trace_tag = parsed_data.get("tag")
             if trace_tag in self.pending_pings:
+                rssi_val = getattr(packet, "rssi", 0)
+                if rssi_val == 0:
+                    logger.warning(
+                        f"Ignoring trace response for tag {trace_tag} "
+                        "with RSSI=0 (no signal data)"
+                    )
+                    return  # wait for a valid response or let timeout handle it
                 ping_info = self.pending_pings[trace_tag]
                 # Store response data
-                ping_info['result'] = {
-                    'path': trace_path,
-                    'snr': packet.get_snr(),
-                    'rssi': getattr(packet, "rssi", 0),
-                    'received_at': time.time()
+                ping_info["result"] = {
+                    "path": trace_path,
+                    "snr": packet.get_snr(),
+                    "rssi": rssi_val,
+                    "received_at": time.time(),
                 }
                 # Signal the waiting coroutine
-                ping_info['event'].set()
+                ping_info["event"].set()
                 logger.info(f"Ping response received for tag {trace_tag}")
 
             # Record the trace packet for dashboard/statistics
@@ -107,6 +117,12 @@ class TraceHelper:
             else:
                 # This is the final destination or can't forward - just log and record
                 self._log_no_forward_reason(packet, trace_path, trace_path_len)
+                # When trace completed (reached end of path), push PUSH_CODE_TRACE_DATA (0x89) to companions (firmware onTraceRecv)
+                if packet.path_len >= trace_path_len and self.on_trace_complete:
+                    try:
+                        await self.on_trace_complete(packet, parsed_data)
+                    except Exception as e:
+                        logger.debug("on_trace_complete error: %s", e)
 
         except Exception as e:
             logger.error(f"Error processing trace packet: {e}")
@@ -140,27 +156,37 @@ class TraceHelper:
 
                 # Add detailed SNR info if we have the corresponding hash
                 if i < len(trace_path):
-                    path_snr_details.append({
-                        "hash": f"{trace_path[i]:02X}",
-                        "snr_raw": snr_val,
-                        "snr_db": snr_db
-                    })
+                    path_snr_details.append(
+                        {"hash": f"{trace_path[i]:02X}", "snr_raw": snr_val, "snr_db": snr_db}
+                    )
 
         return {
             "timestamp": time.time(),
-            "header": f"0x{packet.header:02X}" if hasattr(packet, "header") and packet.header is not None else None,
-            "payload": packet.payload.hex() if hasattr(packet, "payload") and packet.payload else None,
-            "payload_length": len(packet.payload) if hasattr(packet, "payload") and packet.payload else 0,
+            "header": (
+                f"0x{packet.header:02X}"
+                if hasattr(packet, "header") and packet.header is not None
+                else None
+            ),
+            "payload": (
+                packet.payload.hex() if hasattr(packet, "payload") and packet.payload else None
+            ),
+            "payload_length": (
+                len(packet.payload) if hasattr(packet, "payload") and packet.payload else 0
+            ),
             "type": packet.get_payload_type(),  # 0x09 for trace
-            "route": packet.get_route_type(),   # Should be direct (1)
+            "route": packet.get_route_type(),  # Should be direct (1)
             "length": len(packet.payload or b""),
             "rssi": getattr(packet, "rssi", 0),
             "snr": getattr(packet, "snr", 0.0),
-            "score": self.repeater_handler.calculate_packet_score(
-                getattr(packet, "snr", 0.0),
-                len(packet.payload or b""),
-                self.repeater_handler.radio_config.get("spreading_factor", 8)
-            ) if self.repeater_handler else 0.0,
+            "score": (
+                self.repeater_handler.calculate_packet_score(
+                    getattr(packet, "snr", 0.0),
+                    len(packet.payload or b""),
+                    self.repeater_handler.radio_config.get("spreading_factor", 8),
+                )
+                if self.repeater_handler
+                else 0.0
+            ),
             "tx_delay_ms": 0,
             "transmitted": False,
             "is_duplicate": False,
@@ -217,21 +243,24 @@ class TraceHelper:
             True if the packet should be forwarded, False otherwise
         """
         # Use the exact logic from the original working code
-        return (packet.path_len < trace_path_len and 
-                len(trace_path) > packet.path_len and
-                trace_path[packet.path_len] == self.local_hash and
-                self.repeater_handler and not self.repeater_handler.is_duplicate(packet))
+        return (
+            packet.path_len < trace_path_len
+            and len(trace_path) > packet.path_len
+            and trace_path[packet.path_len] == self.local_hash
+            and self.repeater_handler
+            and not self.repeater_handler.is_duplicate(packet)
+        )
 
     async def _forward_trace_packet(self, packet, trace_path_len: int) -> None:
         """
         Forward a trace packet by appending SNR and sending via injection.
-        
+
         Args:
             packet: The trace packet to forward
             trace_path_len: The length of the trace path
         """
         # Update the packet record to show it will be transmitted
-        if self.repeater_handler and hasattr(self.repeater_handler, 'recent_packets'):
+        if self.repeater_handler and hasattr(self.repeater_handler, "recent_packets"):
             packet_hash = packet.calculate_packet_hash().hex().upper()[:16]
             for record in reversed(self.repeater_handler.recent_packets):
                 if record.get("packet_hash") == packet_hash:
@@ -284,41 +313,44 @@ class TraceHelper:
         elif len(trace_path) <= packet.path_len:
             logger.info("Path index out of bounds")
         elif trace_path[packet.path_len] != self.local_hash:
-            expected_hash = trace_path[packet.path_len] if packet.path_len < len(trace_path) else None
+            expected_hash = (
+                trace_path[packet.path_len] if packet.path_len < len(trace_path) else None
+            )
             logger.info(f"Not our turn (next hop: 0x{expected_hash:02x})")
         elif self.repeater_handler and self.repeater_handler.is_duplicate(packet):
             logger.info("Duplicate packet, ignoring")
 
     def register_ping(self, tag: int, target_hash: int) -> asyncio.Event:
         """Register a ping request and return an event to wait on.
-        
+
         Args:
             tag: The unique trace tag for this ping
             target_hash: The hash of the target node
-            
+
         Returns:
             asyncio.Event that will be set when response is received
         """
         event = asyncio.Event()
         self.pending_pings[tag] = {
-            'event': event,
-            'result': None,
-            'target': target_hash,
-            'sent_at': time.time()
+            "event": event,
+            "result": None,
+            "target": target_hash,
+            "sent_at": time.time(),
         }
         logger.debug(f"Registered ping with tag {tag} for target 0x{target_hash:02x}")
         return event
 
     def cleanup_stale_pings(self, max_age_seconds: int = 30):
         """Remove pending pings older than max_age_seconds.
-        
+
         Args:
             max_age_seconds: Maximum age in seconds before a ping is considered stale
         """
         current_time = time.time()
         stale_tags = [
-            tag for tag, info in self.pending_pings.items()
-            if current_time - info['sent_at'] > max_age_seconds
+            tag
+            for tag, info in self.pending_pings.items()
+            if current_time - info["sent_at"] > max_age_seconds
         ]
         for tag in stale_tags:
             self.pending_pings.pop(tag)

@@ -1,5 +1,5 @@
 """
-Comprehensive tests for pyMC_Repeater engine.py — RepeaterHandler.
+tests for pyMC_Repeater engine.py — RepeaterHandler.
 
 Covers: flood_forward, direct_forward, process_packet, duplicate detection,
 mark_seen, validate_packet, packet scoring, TX delay, cache management,
@@ -287,9 +287,10 @@ class TestDirectForward:
         assert result.path_len == 2
 
     def test_single_hop_path_consumed(self, handler):
-        """After consuming our hash the path becomes empty — packet delivered."""
+        """Single hop to us: we strip and return packet with empty path (forward so it can reach destination)."""
         pkt = _make_direct_packet(path=bytes([LOCAL_HASH]))
         result = handler.direct_forward(pkt)
+        assert result is not None
         assert list(result.path) == []
         assert result.path_len == 0
 
@@ -1031,10 +1032,6 @@ GOOD_PACKETS = [
      "Flood, path has 1 prior hop",
      lambda: _make_flood_packet(payload=b"\xDE\xAD", path=b"\x42")),
 
-    ("good_flood_path_near_max",
-     "Flood, path = MAX_PATH_SIZE - 1 (room for our hash)",
-     lambda: _make_flood_packet(payload=b"\xFF", path=bytes(range(MAX_PATH_SIZE - 1)))),
-
     ("good_flood_binary_payload",
      "Flood, all-zero payload",
      lambda: _make_flood_packet(payload=b"\x00" * 16)),
@@ -1048,7 +1045,7 @@ GOOD_PACKETS = [
      lambda: _make_flood_packet(payload=b"\xAB\x01\x02\x03", payload_type=4)),
 
     ("good_direct_minimal",
-     "Direct, 1-byte payload, single hop to us",
+     "Direct, 1-byte payload, single hop to us (forward with empty path)",
      lambda: _make_direct_packet(payload=b"\x01", path=bytes([LOCAL_HASH]))),
 
     ("good_direct_multihop",
@@ -1111,6 +1108,11 @@ BAD_PACKETS = [
      "Path exactly MAX_PATH_SIZE — no room to append",
      lambda: _make_flood_packet(payload=b"\x01", path=bytes(range(MAX_PATH_SIZE))),
      "Path length"),
+
+    ("bad_flood_path_near_max",
+     "Flood, path = MAX_PATH_SIZE - 1 (63 hops; path_len encodes 0-63, cannot append)",
+     lambda: _make_flood_packet(payload=b"\xFF", path=bytes(range(MAX_PATH_SIZE - 1))),
+     "cannot append"),
 
     ("bad_path_over_max",
      "Path exceeds MAX_PATH_SIZE",

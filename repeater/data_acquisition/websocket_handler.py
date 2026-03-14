@@ -1,19 +1,21 @@
 """
 WebSocket handler for real-time packet updates - simple ws4py implementation
 """
+
 import json
 import logging
 import threading
 import time
-import cherrypy
 from urllib.parse import parse_qs
-from ws4py.websocket import WebSocket
+
+import cherrypy
 from ws4py.server.cherrypyserver import WebSocketPlugin, WebSocketTool
+from ws4py.websocket import WebSocket
 
 logger = logging.getLogger("WebSocket")
 
 # Suppress noisy ws4py error logs for normal disconnections (ConnectionResetError, etc.)
-logging.getLogger('ws4py').setLevel(logging.CRITICAL)
+logging.getLogger("ws4py").setLevel(logging.CRITICAL)
 
 # Global set of connected clients
 _connected_clients = set()
@@ -69,14 +71,18 @@ class PacketWebSocket(WebSocket):
         # Auth success - store user and add to connected clients
         self.user = payload.get("sub")  # type: ignore[attr-defined]
         _connected_clients.add(self)
-        logger.info(f"WebSocket connected ({self.user or 'unknown user'}). Total clients: {len(_connected_clients)}")
-    
+        logger.info(
+            f"WebSocket connected ({self.user or 'unknown user'}). Total clients: {len(_connected_clients)}"
+        )
+
     def closed(self, code, reason=None):
         """Called when a WebSocket connection is closed"""
         _connected_clients.discard(self)
-        user = getattr(self, 'user', 'unknown')
-        logger.info(f"WebSocket disconnected (user: {user}, code: {code}, reason: {reason}). Total clients: {len(_connected_clients)}")
-    
+        user = getattr(self, "user", "unknown")
+        logger.info(
+            f"WebSocket disconnected (user: {user}, code: {code}, reason: {reason}). Total clients: {len(_connected_clients)}"
+        )
+
     def received_message(self, message):
         """Handle messages from client"""
         try:

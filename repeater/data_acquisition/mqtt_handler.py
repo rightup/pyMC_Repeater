@@ -1,10 +1,11 @@
 import json
 import logging
 import ssl
-from typing import Dict, Any, Optional
+from typing import Any, Dict, Optional
 
 try:
     import paho.mqtt.client as mqtt
+
     MQTT_AVAILABLE = True
 except ImportError:
     MQTT_AVAILABLE = False
@@ -102,17 +103,17 @@ class MQTTHandler:
         try:
             base_topic = self.mqtt_config.get("base_topic", "meshcore/repeater")
             topic = f"{base_topic}/{self.node_name}/{record_type}"
-            
+
             if record_type == "packet":
                 packet_record = PacketRecord.from_packet_record(
-                    record,
-                    origin=self.node_name,
-                    origin_id=self.node_id
+                    record, origin=self.node_name, origin_id=self.node_id
                 )
                 if not packet_record:
-                    logger.debug("Skipping MQTT publish: packet missing required data for PacketRecord")
+                    logger.debug(
+                        "Skipping MQTT publish: packet missing required data for PacketRecord"
+                    )
                     return
-                
+
                 payload = packet_record.to_dict()
                 logger.debug("Publishing packet using PacketRecord format")
             else:

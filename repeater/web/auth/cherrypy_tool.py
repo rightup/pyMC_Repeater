@@ -1,4 +1,5 @@
 import logging
+
 import cherrypy
 
 logger = logging.getLogger("HTTPServer")
@@ -40,10 +41,10 @@ def check_auth():
             cherrypy.request.user = {
                 "username": payload.get("sub"),
                 "client_id": payload.get("client_id"),
-                "auth_type": "jwt"
+                "auth_type": "jwt",
             }
             return
-    
+
     # Check for JWT token in query parameter (for EventSource/SSE)
     # EventSource doesn't support custom headers, so we use query param
     query_token = cherrypy.request.params.get("token")
@@ -54,7 +55,7 @@ def check_auth():
             cherrypy.request.user = {
                 "username": payload.get("sub"),
                 "client_id": payload.get("client_id"),
-                "auth_type": "jwt_query"
+                "auth_type": "jwt_query",
             }
             # Remove token from params to avoid exposing it in logs
             del cherrypy.request.params["token"]
@@ -69,15 +70,15 @@ def check_auth():
             cherrypy.request.user = {
                 "token_id": token_info["id"],
                 "token_name": token_info["name"],
-                "auth_type": "api_token"
+                "auth_type": "api_token",
             }
             return
-    
+
     # No valid authentication found
     logger.warning(f"Unauthorized access attempt to {cherrypy.request.path_info}")
     raise cherrypy.HTTPError(401, "Unauthorized - Valid JWT or API token required")
 
 
 # Register the tool
-cherrypy.tools.require_auth = cherrypy.Tool('before_handler', check_auth)
+cherrypy.tools.require_auth = cherrypy.Tool("before_handler", check_auth)
 logger.info("CherryPy require_auth tool registered")

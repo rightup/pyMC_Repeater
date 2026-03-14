@@ -2,6 +2,7 @@
 Service management utilities for pyMC Repeater.
 Provides functions for service control operations like restart.
 """
+
 import logging
 import subprocess
 from typing import Tuple
@@ -22,12 +23,9 @@ def restart_service() -> Tuple[bool, str]:
     # Try polkit-based restart first (works on bare metal / VMs with polkit running)
     try:
         result = subprocess.run(
-            ['systemctl', 'restart', 'pymc-repeater'],
-            capture_output=True,
-            text=True,
-            timeout=5
+            ["systemctl", "restart", "pymc-repeater"], capture_output=True, text=True, timeout=5
         )
-        
+
         if result.returncode == 0:
             logger.info("Service restart via polkit succeeded")
             return True, "Service restart initiated"

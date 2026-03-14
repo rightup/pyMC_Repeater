@@ -5,10 +5,11 @@ Only users with admin permissions (via ACL) can execute these commands.
 """
 
 import logging
-from typing import Optional, Dict, Any, Callable
-import yaml
-from pathlib import Path
 import time
+from pathlib import Path
+from typing import Any, Callable, Dict, Optional
+
+import yaml
 
 logger = logging.getLogger(__name__)
 
@@ -23,10 +24,10 @@ class MeshCLI:
     def __init__(
         self, 
         config_path: str, 
-        config: Dict[str, Any], 
+        config: Dict[str, Any],
         save_config_callback: Callable,
         identity_type: str = "repeater",
-        enable_regions: bool = True
+        enable_regions: bool = True,
     ):
         """
         Initialize the CLI handler.
@@ -43,10 +44,10 @@ class MeshCLI:
         self.save_config = save_config_callback
         self.identity_type = identity_type
         self.enable_regions = enable_regions
-        
+
         # Get repeater config shortcut
-        self.repeater_config = config.get('repeater', {})
-        
+        self.repeater_config = config.get("repeater", {})
+
     def handle_command(self, sender_pubkey: bytes, command: str, is_admin: bool) -> str:
         """
         Handle an incoming command from a client.
@@ -64,10 +65,10 @@ class MeshCLI:
             return "Error: Admin permission required"
         
         logger.debug(f"handle_command received: '{command}' (len={len(command)})")
-        
+
         # Extract optional sequence prefix (XX|)
         prefix = ""
-        if len(command) > 4 and command[2] == '|':
+        if len(command) > 4 and command[2] == "|":
             prefix = command[:3]
             command = command[3:]
             logger.debug(f"Extracted prefix: '{prefix}', remaining command: '{command}'")
@@ -180,6 +181,7 @@ class MeshCLI:
         if command == "clock":
             # Display current time
             import datetime
+
             dt = datetime.datetime.utcnow()
             return f"{dt.hour:02d}:{dt.minute:02d} - {dt.day}/{dt.month}/{dt.year} UTC"
         elif command == "clock sync":
@@ -198,13 +200,13 @@ class MeshCLI:
         
         if not new_password:
             return "Error: Password cannot be empty"
-        
+
         # Update security config
-        if 'security' not in self.config:
-            self.config['security'] = {}
-        
-        self.config['security']['password'] = new_password
-        
+        if "security" not in self.config:
+            self.config["security"] = {}
+
+        self.config["security"]["password"] = new_password
+
         # Save config
         try:
             self.save_config()
@@ -221,56 +223,56 @@ class MeshCLI:
     def _cmd_version(self) -> str:
         """Get version information."""
         role = "room_server" if self.identity_type == "room_server" else "repeater"
-        version = self.config.get('version', '1.0.0')
+        version = self.config.get("version", "1.0.0")
         return f"pyMC_{role} v{version}"
-    
+
     # ==================== Get Commands ====================
     
     def _cmd_get(self, param: str) -> str:
         """Handle get commands."""
         param = param.strip()
         logger.debug(f"_cmd_get called with param: '{param}' (len={len(param)})")
-        
+
         if param == "af":
-            af = self.repeater_config.get('airtime_factor', 1.0)
+            af = self.repeater_config.get("airtime_factor", 1.0)
             return f"> {af}"
-        
+
         elif param == "name":
-            name = self.repeater_config.get('name', 'Unknown')
+            name = self.repeater_config.get("name", "Unknown")
             return f"> {name}"
-        
+
         elif param == "repeat":
-            disabled = self.repeater_config.get('disable_forward', False)
+            disabled = self.repeater_config.get("disable_forward", False)
             return f"> {'off' if disabled else 'on'}"
-        
+
         elif param == "lat":
-            lat = self.repeater_config.get('latitude', 0.0)
+            lat = self.repeater_config.get("latitude", 0.0)
             return f"> {lat}"
-        
+
         elif param == "lon":
-            lon = self.repeater_config.get('longitude', 0.0)
+            lon = self.repeater_config.get("longitude", 0.0)
             return f"> {lon}"
-        
+
         elif param == "radio":
-            radio = self.config.get('radio', {})
-            freq_hz = radio.get('frequency', 915000000)
-            bw_hz = radio.get('bandwidth', 125000)
-            sf = radio.get('spreading_factor', 7)
-            cr = radio.get('coding_rate', 5)
+            radio = self.config.get("radio", {})
+            freq_hz = radio.get("frequency", 915000000)
+            bw_hz = radio.get("bandwidth", 125000)
+            sf = radio.get("spreading_factor", 7)
+            cr = radio.get("coding_rate", 5)
             # Convert Hz to MHz for freq, Hz to kHz for bandwidth (match C++ ftoa output)
             freq_mhz = freq_hz / 1_000_000.0
             bw_khz = bw_hz / 1_000.0
             return f"> {freq_mhz},{bw_khz},{sf},{cr}"
-        
+
         elif param == "freq":
-            freq_hz = self.config.get('radio', {}).get('frequency', 915000000)
+            freq_hz = self.config.get("radio", {}).get("frequency", 915000000)
             freq_mhz = freq_hz / 1_000_000.0
             return f"> {freq_mhz}"
-        
+
         elif param == "tx":
-            power = self.config.get('radio', {}).get('tx_power', 20)
+            power = self.config.get("radio", {}).get("tx_power", 20)
             return f"> {power}"
-        
+
         elif param == "public.key":
             # TODO: Get from identity
             return "Error: Not yet implemented"
@@ -278,51 +280,51 @@ class MeshCLI:
         elif param == "role":
             role = "room_server" if self.identity_type == "room_server" else "repeater"
             return f"> {role}"
-        
+
         elif param == "guest.password":
-            guest_pw = self.config.get('security', {}).get('guest_password', '')
+            guest_pw = self.config.get("security", {}).get("guest_password", "")
             return f"> {guest_pw}"
-        
+
         elif param == "allow.read.only":
-            allow = self.config.get('security', {}).get('allow_read_only', False)
+            allow = self.config.get("security", {}).get("allow_read_only", False)
             return f"> {'on' if allow else 'off'}"
-        
+
         elif param == "advert.interval":
-            interval = self.repeater_config.get('advert_interval_minutes', 120)
+            interval = self.repeater_config.get("advert_interval_minutes", 120)
             return f"> {interval}"
-        
+
         elif param == "flood.advert.interval":
-            interval = self.repeater_config.get('flood_advert_interval_hours', 24)
+            interval = self.repeater_config.get("flood_advert_interval_hours", 24)
             return f"> {interval}"
-        
+
         elif param == "flood.max":
-            max_flood = self.repeater_config.get('max_flood_hops', 3)
+            max_flood = self.repeater_config.get("max_flood_hops", 3)
             return f"> {max_flood}"
-        
+
         elif param == "rxdelay":
-            delay = self.repeater_config.get('rx_delay_base', 0.0)
+            delay = self.repeater_config.get("rx_delay_base", 0.0)
             return f"> {delay}"
-        
+
         elif param == "txdelay":
-            delay = self.repeater_config.get('tx_delay_factor', 1.0)
+            delay = self.repeater_config.get("tx_delay_factor", 1.0)
             return f"> {delay}"
-        
+
         elif param == "direct.txdelay":
-            delay = self.repeater_config.get('direct_tx_delay_factor', 0.5)
+            delay = self.repeater_config.get("direct_tx_delay_factor", 0.5)
             return f"> {delay}"
-        
+
         elif param == "multi.acks":
-            acks = self.repeater_config.get('multi_acks', 0)
+            acks = self.repeater_config.get("multi_acks", 0)
             return f"> {acks}"
-        
+
         elif param == "int.thresh":
-            thresh = self.repeater_config.get('interference_threshold', -120)
+            thresh = self.repeater_config.get("interference_threshold", -120)
             return f"> {thresh}"
-        
+
         elif param == "agc.reset.interval":
-            interval = self.repeater_config.get('agc_reset_interval', 0)
+            interval = self.repeater_config.get("agc_reset_interval", 0)
             return f"> {interval}"
-        
+
         else:
             return f"??: {param}"
     
@@ -335,144 +337,144 @@ class MeshCLI:
             return "Error: Missing value"
         
         key, value = parts[0], parts[1]
-        
+
         try:
             if key == "af":
-                self.repeater_config['airtime_factor'] = float(value)
+                self.repeater_config["airtime_factor"] = float(value)
                 self.save_config()
                 return "OK"
-            
+
             elif key == "name":
-                self.repeater_config['name'] = value
+                self.repeater_config["name"] = value
                 self.save_config()
                 return "OK"
-            
+
             elif key == "repeat":
                 disabled = value.lower() == "off"
-                self.repeater_config['disable_forward'] = disabled
+                self.repeater_config["disable_forward"] = disabled
                 self.save_config()
                 return f"OK - repeat is now {'OFF' if disabled else 'ON'}"
-            
+
             elif key == "lat":
-                self.repeater_config['latitude'] = float(value)
+                self.repeater_config["latitude"] = float(value)
                 self.save_config()
                 return "OK"
-            
+
             elif key == "lon":
-                self.repeater_config['longitude'] = float(value)
+                self.repeater_config["longitude"] = float(value)
                 self.save_config()
                 return "OK"
-            
+
             elif key == "radio":
                 # Format: freq bw sf cr
                 radio_parts = value.split()
                 if len(radio_parts) != 4:
                     return "Error: Expected freq bw sf cr"
-                
-                if 'radio' not in self.config:
-                    self.config['radio'] = {}
-                
-                self.config['radio']['frequency'] = float(radio_parts[0])
-                self.config['radio']['bandwidth'] = float(radio_parts[1])
-                self.config['radio']['spreading_factor'] = int(radio_parts[2])
-                self.config['radio']['coding_rate'] = int(radio_parts[3])
+
+                if "radio" not in self.config:
+                    self.config["radio"] = {}
+
+                self.config["radio"]["frequency"] = float(radio_parts[0])
+                self.config["radio"]["bandwidth"] = float(radio_parts[1])
+                self.config["radio"]["spreading_factor"] = int(radio_parts[2])
+                self.config["radio"]["coding_rate"] = int(radio_parts[3])
                 self.save_config()
                 return "OK - restart repeater to apply"
-            
+
             elif key == "freq":
-                if 'radio' not in self.config:
-                    self.config['radio'] = {}
-                self.config['radio']['frequency'] = float(value)
+                if "radio" not in self.config:
+                    self.config["radio"] = {}
+                self.config["radio"]["frequency"] = float(value)
                 self.save_config()
                 return "OK - restart repeater to apply"
-            
+
             elif key == "tx":
-                if 'radio' not in self.config:
-                    self.config['radio'] = {}
-                self.config['radio']['tx_power'] = int(value)
+                if "radio" not in self.config:
+                    self.config["radio"] = {}
+                self.config["radio"]["tx_power"] = int(value)
                 self.save_config()
                 return "OK"
-            
+
             elif key == "guest.password":
-                if 'security' not in self.config:
-                    self.config['security'] = {}
-                self.config['security']['guest_password'] = value
+                if "security" not in self.config:
+                    self.config["security"] = {}
+                self.config["security"]["guest_password"] = value
                 self.save_config()
                 return "OK"
-            
+
             elif key == "allow.read.only":
-                if 'security' not in self.config:
-                    self.config['security'] = {}
-                self.config['security']['allow_read_only'] = value.lower() == "on"
+                if "security" not in self.config:
+                    self.config["security"] = {}
+                self.config["security"]["allow_read_only"] = value.lower() == "on"
                 self.save_config()
                 return "OK"
-            
+
             elif key == "advert.interval":
                 mins = int(value)
                 if mins > 0 and (mins < 60 or mins > 240):
                     return "Error: interval range is 60-240 minutes"
-                self.repeater_config['advert_interval_minutes'] = mins
+                self.repeater_config["advert_interval_minutes"] = mins
                 self.save_config()
                 return "OK"
-            
+
             elif key == "flood.advert.interval":
                 hours = int(value)
                 if (hours > 0 and hours < 3) or hours > 48:
                     return "Error: interval range is 3-48 hours"
-                self.repeater_config['flood_advert_interval_hours'] = hours
+                self.repeater_config["flood_advert_interval_hours"] = hours
                 self.save_config()
                 return "OK"
-            
+
             elif key == "flood.max":
                 max_val = int(value)
                 if max_val > 64:
                     return "Error: max 64"
-                self.repeater_config['max_flood_hops'] = max_val
+                self.repeater_config["max_flood_hops"] = max_val
                 self.save_config()
                 return "OK"
-            
+
             elif key == "rxdelay":
                 delay = float(value)
                 if delay < 0:
                     return "Error: cannot be negative"
-                self.repeater_config['rx_delay_base'] = delay
+                self.repeater_config["rx_delay_base"] = delay
                 self.save_config()
                 return "OK"
-            
+
             elif key == "txdelay":
                 delay = float(value)
                 if delay < 0:
                     return "Error: cannot be negative"
-                self.repeater_config['tx_delay_factor'] = delay
+                self.repeater_config["tx_delay_factor"] = delay
                 self.save_config()
                 return "OK"
-            
+
             elif key == "direct.txdelay":
                 delay = float(value)
                 if delay < 0:
                     return "Error: cannot be negative"
-                self.repeater_config['direct_tx_delay_factor'] = delay
+                self.repeater_config["direct_tx_delay_factor"] = delay
                 self.save_config()
                 return "OK"
-            
+
             elif key == "multi.acks":
-                self.repeater_config['multi_acks'] = int(value)
+                self.repeater_config["multi_acks"] = int(value)
                 self.save_config()
                 return "OK"
-            
+
             elif key == "int.thresh":
-                self.repeater_config['interference_threshold'] = int(value)
+                self.repeater_config["interference_threshold"] = int(value)
                 self.save_config()
                 return "OK"
-            
+
             elif key == "agc.reset.interval":
                 interval = int(value)
                 # Round to nearest multiple of 4
                 rounded = (interval // 4) * 4
-                self.repeater_config['agc_reset_interval'] = rounded
+                self.repeater_config["agc_reset_interval"] = rounded
                 self.save_config()
                 return f"OK - interval rounded to {rounded}"
-            
+
             else:
                 return f"unknown config: {key}"
                 

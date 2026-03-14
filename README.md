@@ -30,6 +30,11 @@ The repeater daemon runs continuously as a background process, forwarding LoRa p
 
 ## Supported Hardware (Out of the Box)
 
+The repeater supports two radio backends:
+
+- **SX1262 (SPI)** — Direct connection to LoRa modules (HATs, etc.) as listed below.
+- **KISS modem** — Serial TNC using the KISS protocol. Set `radio_type: kiss` in config and configure `kiss.port` and `kiss.baud_rate`.
+
 > [!CAUTION]
 > ## Compatibility
 >
@@ -47,7 +52,6 @@ The repeater daemon runs continuously as a background process, forwarding LoRa p
 > - Connected directly via SPI
 > - Connected via a CH341F USB–SPI adapter
 > - Connected using hardware that supports Meshcore Kiss Modem firmware
-
 
 The following hardware is currently supported out-of-the-box:
 
@@ -316,16 +320,33 @@ This script will:
 The script will prompt you for each optional removal step.
 
 
-## Docker
+## Docker Compose
 
-You can now run PyMC Repeater from within a [Docker Container](https://www.docker.com/). Checkout the example [Docker Compose](./docker-compose.yml) file before you get started.
+You can now run pyMC Repeater from within a [Docker Container](https://www.docker.com/). Checkout the example [Docker Compose](./docker-compose.yml) file before you get started. It will need some configuration changes based on what hardware you're using (USB vs SPI). Look at the commented out lines to see which hardware requires what lines and only enable what you need.
+
+Here is what you'll need to do in order to get the container running:
+
+1. Copy the `config.yaml.example` to `config.yaml`
+
+```bash
+cp ./config.yaml.example ./config.yaml
+```
+
+2. Run the configuration script and follow the prompts.
+
+```bash
+sudo bash ./setup-radio-config.sh
+```
+
+3. Modify the `config.yaml` file with a unique web UI password. This allows you to bypass the `/setup` page when logging for the first time. You can find the value under `repeater.security.admin_password`. Change to _anything_ besides the default of `admin123`.
+
+4. Configure the [docker compose](./docker-compose.yml) to your specific hardware and file paths. Be sure to comment-out or delete lines that aren't required for your hardware. Please note that your hardware devices might be at a different path than those listed in the docker compose file.
+
+5. Build and start the container.
 
 ```bash
 docker compose up -d --force-recreate --build
 ```
-
-Just note that you will have to pass in a `config.yaml` into the container. You can create a new config by following the instructions in the [Configuration section](#configuration).
-
 
 ## Roadmap / Planned Features
 
@@ -399,7 +420,3 @@ This software is intended for educational and experimental purposes. Always test
 ## License
 
 This project is licensed under the MIT License - see the LICENSE file for details.
-
-
-
-

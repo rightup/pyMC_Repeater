@@ -3,7 +3,7 @@ info:
   title: pyMC Repeater API
   description: |
     REST API for pyMC Repeater - LoRa mesh network repeater with room server functionality.
-    
+
     ## Features
     - System statistics and monitoring
     - Packet history and analysis
@@ -726,7 +726,7 @@ paths:
       summary: Get RRD time-series data
       description: |
         Retrieve Round-Robin Database metrics for graphing.
-        
+
         **Note:** This endpoint extracts parameters from the request internally.
         Parameters are handled automatically by the backend.
       responses:
@@ -821,7 +821,7 @@ paths:
       summary: Get system metrics graph data
       description: |
         Returns time-series data for system metrics like packet counts, RSSI, SNR, etc.
-        
+
         Available metrics:
         - rx_count: Received packets
         - tx_count: Transmitted packets
@@ -1557,7 +1557,7 @@ paths:
       summary: Get ACL information for all identities
       description: |
         Get ACL configuration and statistics for all registered identities.
-        
+
         Returns information including:
         - Identity name, type, and hash
         - Max clients allowed
@@ -1741,7 +1741,7 @@ paths:
       summary: Get room messages
       description: |
         Retrieve messages from a room with pagination.
-        
+
         **Max Messages Per Room**: 32 (hard limit)
         - Older messages auto-deleted every 10 minutes
         - Cannot be increased beyond 32
@@ -1847,15 +1847,15 @@ paths:
       summary: Post message to room
       description: |
         Add a new message to a room server. Message will be distributed to all synced clients.
-        
+
         **Special author values:**
         - `"server"` or `"system"` - System message, goes to ALL clients (API only)
         - Any hex string - Normal message, NOT sent to that client
-        
+
         **Security:**
         - Radio messages cannot use server key (blocked)
         - API messages can use server key (for announcements)
-        
+
         **Rate Limits:**
         - 10 messages/minute per author_pubkey
         - 160 bytes max message length
@@ -1992,7 +1992,7 @@ paths:
       summary: Get room statistics
       description: |
         Get detailed statistics for one or all room servers.
-        
+
         **Room Limits:**
         - 32 messages maximum per room (hard limit)
         - Messages auto-expire every 10 minutes
@@ -2101,7 +2101,7 @@ paths:
       summary: Get room clients
       description: |
         List all clients synced to a room with their status.
-        
+
         **Client Filtering:**
         - Clients only receive messages where author_pubkey ≠ client_pubkey
         - unsynced_count shows pending messages for each client
@@ -2335,7 +2335,7 @@ components:
           type: boolean
           description: Client is currently active (synced within timeout period)
           example: true
-    
+
     Identity:
       type: object
       required: [name, type, hash, public_key]
@@ -2385,7 +2385,7 @@ components:
               default: 32
               description: Maximum messages to keep (room_server only, hard limit 32)
               example: 32
-    
+
     ACLClient:
       type: object
       required: [public_key, public_key_full, address, permissions]

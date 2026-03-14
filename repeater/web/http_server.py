@@ -14,15 +14,22 @@ from pymc_core.protocol.utils import PAYLOAD_TYPES, ROUTE_TYPES
 
 from repeater import __version__
 from repeater.data_acquisition import SQLiteHandler
+
 from .api_endpoints import APIEndpoints
-from .auth_endpoints import AuthEndpoints
-from .auth.jwt_handler import JWTHandler
-from .auth.api_tokens import APITokenManager
 from .auth import cherrypy_tool  # Import to register the tool
+from .auth.api_tokens import APITokenManager
+from .auth.jwt_handler import JWTHandler
+from .auth_endpoints import AuthEndpoints
 
 # WebSocket support
 try:
-    from repeater.data_acquisition.websocket_handler import PacketWebSocket, init_websocket, broadcast_packet
+    from repeater.data_acquisition.websocket_handler import (
+        PacketWebSocket,
+        broadcast_packet,
+        init_websocket,
+    )
+    from .companion_ws_proxy import CompanionFrameWebSocket, set_daemon as _set_companion_daemon
+
     WEBSOCKET_AVAILABLE = True
 except ImportError:
     WEBSOCKET_AVAILABLE = False
@@ -61,40 +68,41 @@ _log_buffer = LogBuffer(max_lines=100)
 
 class DocEndpoint:
     """Simple wrapper to serve API docs at /doc"""
-    
+
     def __init__(self, api_endpoints):
         self.api_endpoints = api_endpoints
-    
+
     @cherrypy.expose
     def index(self, **kwargs):
         """Serve Swagger UI at /doc"""
         return self.api_endpoints.docs()
-    
+
     @cherrypy.expose
     def docs(self):
         """Serve Swagger UI at /doc/docs"""
         return self.api_endpoints.docs()
-    
+
     @cherrypy.expose
     def openapi_json(self):
         """Serve OpenAPI spec in JSON format at /doc/openapi.json"""
-        import os
-        import yaml
         import json
-        
-        spec_path = os.path.join(os.path.dirname(__file__), 'openapi.yaml')
+        import os
+
+        import yaml
+
+        spec_path = os.path.join(os.path.dirname(__file__), "openapi.yaml")
         try:
-            with open(spec_path, 'r') as f:
+            with open(spec_path, "r") as f:
                 spec_content = yaml.safe_load(f)
-            
-            cherrypy.response.headers['Content-Type'] = 'application/json'
-            return json.dumps(spec_content).encode('utf-8')
+
+            cherrypy.response.headers["Content-Type"] = "application/json"
+            return json.dumps(spec_content).encode("utf-8")
         except FileNotFoundError:
             cherrypy.response.status = 404
-            return json.dumps({"error": "OpenAPI spec not found"}).encode('utf-8')
+            return json.dumps({"error": "OpenAPI spec not found"}).encode("utf-8")
         except Exception as e:
             cherrypy.response.status = 500
-            return json.dumps({"error": f"Error loading OpenAPI spec: {e}"}).encode('utf-8')
+            return json.dumps({"error": f"Error loading OpenAPI spec: {e}"}).encode("utf-8")
 
 
 class StatsApp:
@@ -116,7 +124,7 @@ class StatsApp:
         self.pub_key = pub_key
         self.dashboard_template = None
         self.config = config or {}
-        
+
         # Path to the compiled Vue.js application
         # Use web_path from config if provided, otherwise use default
         default_html_dir = os.path.join(os.path.dirname(__file__), "html")
@@ -124,8 +132,10 @@ class StatsApp:
         self.html_dir = web_path if web_path is not None else default_html_dir
 
         # Create nested API object for routing
-        self.api = APIEndpoints(stats_getter, send_advert_func, self.config, event_loop, daemon_instance, config_path)
-        
+        self.api = APIEndpoints(
+            stats_getter, send_advert_func, self.config, event_loop, daemon_instance, config_path
+        )
+
         # Create doc endpoint for API documentation
         self.doc = DocEndpoint(self.api)
 
@@ -134,7 +144,7 @@ class StatsApp:
         """Serve the Vue.js application index.html."""
         index_path = os.path.join(self.html_dir, "index.html")
         try:
-            with open(index_path, 'r', encoding='utf-8') as f:
+            with open(index_path, "r", encoding="utf-8") as f:
                 return f.read()
         except FileNotFoundError:
             raise cherrypy.HTTPError(404, "Application not found. Please build the frontend first.")
@@ -148,19 +158,18 @@ class StatsApp:
         # Handle OPTIONS requests for any path
         if cherrypy.request.method == "OPTIONS":
             return ""
-        
+
         # Let API routes pass through
-        if args and args[0] == 'api':
+        if args and args[0] == "api":
             raise cherrypy.NotFound()
-        
+
         # Handle WebSocket routes
-        if args and len(args) >= 2 and args[0] == 'ws' and args[1] == 'packets':
+        if args and len(args) >= 2 and args[0] == "ws" and args[1] in ("packets", "companion_frame"):
             # WebSocket tool will intercept this
             return ""
-        
+
         # For all other routes, serve the Vue.js app (client-side routing)
         return self.index()
-    
 
 
 class HTTPStatsServer:
@@ -183,20 +192,30 @@ class HTTPStatsServer:
         self.port = port
         self.config = config or {}
         self.config_path = config_path
-        
+        self.daemon_instance = daemon_instance
+
         # Initialize authentication handlers
         self._init_auth_handlers()
-        
+
         self.app = StatsApp(
-            stats_getter, node_name, pub_key, send_advert_func, config, event_loop, daemon_instance, config_path
+            stats_getter,
+            node_name,
+            pub_key,
+            send_advert_func,
+            config,
+            event_loop,
+            daemon_instance,
+            config_path,
         )
-        
+
         # Create auth endpoints (APIEndpoints has the config_manager)
-        self.auth_app = AuthEndpoints(self.config, self.jwt_handler, self.token_manager, self.app.api.config_manager)
-        
+        self.auth_app = AuthEndpoints(
+            self.config, self.jwt_handler, self.token_manager, self.app.api.config_manager
+        )
+
         # Create documentation endpoints as separate app
         self.doc_app = DocEndpoint(self.app.api)
-        
+
         # Set up CORS at the server level if enabled
         self._cors_enabled = self.config.get("web", {}).get("cors_enabled", False)
         logger.info(f"CORS enabled: {self._cors_enabled}")
@@ -207,43 +226,46 @@ class HTTPStatsServer:
         repeater_config = self.config.get("repeater", {})
         security_config = repeater_config.get("security", {})
         jwt_secret = security_config.get("jwt_secret", "")
-        
+
         if not jwt_secret:
             # Auto-generate JWT secret
             jwt_secret = secrets.token_hex(32)
-            logger.warning("No JWT secret found in config, auto-generated one. Please save this to config.yaml:")
-            
+            logger.warning(
+                "No JWT secret found in config, auto-generated one. Please save this to config.yaml:"
+            )
+
             # Try to save to config if config_path is available
             if self.config_path:
                 try:
                     import yaml
-                    with open(self.config_path, 'r') as f:
+
+                    with open(self.config_path, "r") as f:
                         config_data = yaml.safe_load(f) or {}
-                    
-                    if 'repeater' not in config_data:
-                        config_data['repeater'] = {}
-                    if 'security' not in config_data['repeater']:
-                        config_data['repeater']['security'] = {}
-                    config_data['repeater']['security']['jwt_secret'] = jwt_secret
-                    
-                    with open(self.config_path, 'w') as f:
+
+                    if "repeater" not in config_data:
+                        config_data["repeater"] = {}
+                    if "security" not in config_data["repeater"]:
+                        config_data["repeater"]["security"] = {}
+                    config_data["repeater"]["security"]["jwt_secret"] = jwt_secret
+
+                    with open(self.config_path, "w") as f:
                         yaml.dump(config_data, f, default_flow_style=False)
-                    
+
                     logger.info(f"Saved auto-generated JWT secret to {self.config_path}")
                 except Exception as e:
                     logger.error(f"Failed to save JWT secret to config: {e}")
-        
+
         # Initialize JWT handler with configurable expiry (default 1 hour)
         jwt_expiry_minutes = security_config.get("jwt_expiry_minutes", 60)
         self.jwt_handler = JWTHandler(jwt_secret, expiry_minutes=jwt_expiry_minutes)
         logger.info(f"JWT handler initialized (token expiry: {jwt_expiry_minutes} minutes)")
-        
+
         # Initialize API token manager
         storage_dir = self.config.get("storage", {}).get("storage_dir", ".")
-        
+
         # Ensure storage directory exists
         os.makedirs(storage_dir, exist_ok=True)
-        
+
         # Initialize SQLiteHandler and APITokenManager
         self.sqlite_handler = SQLiteHandler(Path(storage_dir))
         self.token_manager = APITokenManager(self.sqlite_handler, jwt_secret)
@@ -254,29 +276,25 @@ class HTTPStatsServer:
         # Configure CORS to allow Authorization header
         # cherrypy-cors will handle preflight requests automatically
         cherrypy_cors.install()
-        
+
         logger.info("CORS support enabled with Authorization header")
-    
+
     def _json_error_handler(self, status, message, traceback, version):
         """Return JSON error responses instead of HTML for API endpoints"""
         cherrypy.response.headers["Content-Type"] = "application/json"
-        return json.dumps({
-            "success": False,
-            "error": message
-        })
+        return json.dumps({"success": False, "error": message})
 
     def start(self):
 
         try:
-   
+
             if self._cors_enabled:
                 self._setup_server_cors()
-            
 
             default_html_dir = os.path.join(os.path.dirname(__file__), "html")
             web_path = self.config.get("web", {}).get("web_path")
             html_dir = web_path if web_path is not None else default_html_dir
-            
+
             assets_dir = os.path.join(html_dir, "assets")
             next_dir = os.path.join(html_dir, "_next")
 
@@ -288,11 +306,11 @@ class HTTPStatsServer:
                     # "tools.gzip.mime_types": ["application/json", "text/html", "text/plain"],
                     # Ensure proper content types for static files
                     "tools.staticfile.content_types": {
-                        'js': 'application/javascript',
-                        'css': 'text/css',
-                        'html': 'text/html; charset=utf-8',
-                        'svg': 'image/svg+xml',
-                        'txt': 'text/plain'
+                        "js": "application/javascript",
+                        "css": "text/css",
+                        "html": "text/html; charset=utf-8",
+                        "svg": "image/svg+xml",
+                        "txt": "text/plain",
                     },
                 },
                 # Require authentication for all /api endpoints
@@ -330,7 +348,7 @@ class HTTPStatsServer:
                     "tools.staticfile.filename": os.path.join(html_dir, "favicon.ico"),
                 },
             }
-            
+
             # Add WebSocket configuration to main config if available
             if WEBSOCKET_AVAILABLE:
                 try:
@@ -340,33 +358,46 @@ class HTTPStatsServer:
                         "tools.websocket.handler_cls": PacketWebSocket,
                         "tools.trailing_slash.on": False,
                         "tools.require_auth.on": False,
-                        "tools.gzip.on": False,  
+                        "tools.gzip.on": False,
                     }
                     logger.info("WebSocket endpoint configured at /ws/packets")
+
+                    # Companion frame proxy (binary WS ↔ TCP byte pipe)
+                    if self.daemon_instance:
+                        _set_companion_daemon(self.daemon_instance)
+                        config["/ws/companion_frame"] = {
+                            "tools.websocket.on": True,
+                            "tools.websocket.handler_cls": CompanionFrameWebSocket,
+                            "tools.trailing_slash.on": False,
+                            "tools.require_auth.on": False,
+                            "tools.gzip.on": False,
+                        }
+                        logger.info("WebSocket endpoint configured at /ws/companion_frame")
                 except Exception as e:
                     logger.error(f"Failed to initialize WebSocket: {e}")
                     import traceback
+
                     logger.error(traceback.format_exc())
-            
+
             # Add CORS configuration if enabled
             if self._cors_enabled:
                 cors_config = {
                     "cors.expose.on": True,
                     "tools.response_headers.on": True,
                     "tools.response_headers.headers": [
-                        ('Access-Control-Allow-Origin', '*'),
-                        ('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS'),
-                        ('Access-Control-Allow-Headers', 'Authorization, Content-Type, X-API-Key'),
-                        ('Access-Control-Allow-Credentials', 'true'),
+                        ("Access-Control-Allow-Origin", "*"),
+                        ("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS"),
+                        ("Access-Control-Allow-Headers", "Authorization, Content-Type, X-API-Key"),
+                        ("Access-Control-Allow-Credentials", "true"),
                     ],
                     # Disable automatic trailing slash redirects to prevent CORS issues
                     "tools.trailing_slash.on": False,
                 }
-                
+
                 # Apply CORS to paths
                 config["/"].update(cors_config)
                 config["/api"].update(cors_config)
-            
+
             # Add Vue.js assets support only if assets directory exists
             if os.path.isdir(assets_dir):
                 config["/assets"] = {
@@ -374,12 +405,12 @@ class HTTPStatsServer:
                     "tools.staticdir.dir": assets_dir,
                     # Set proper content types for assets
                     "tools.staticdir.content_types": {
-                        'js': 'application/javascript',
-                        'css': 'text/css',
-                        'map': 'application/json'
+                        "js": "application/javascript",
+                        "css": "text/css",
+                        "map": "application/json",
                     },
                 }
-            
+
             # Add Next.js support only if _next directory exists
             if os.path.isdir(next_dir):
                 config["/_next"] = {
@@ -387,9 +418,9 @@ class HTTPStatsServer:
                     "tools.staticdir.dir": next_dir,
                     # Set proper content types for Next.js assets
                     "tools.staticdir.content_types": {
-                        'js': 'application/javascript',
-                        'css': 'text/css',
-                        'map': 'application/json'
+                        "js": "application/javascript",
+                        "css": "text/css",
+                        "map": "application/json",
                     },
                 }
 
@@ -421,13 +452,13 @@ class HTTPStatsServer:
 
             # Mount main app
             cherrypy.tree.mount(self.app, "/", config)
-            
+
             # Mount auth endpoints
             auth_config = {
                 "/": {
                     "tools.response_headers.on": True,
                     "tools.response_headers.headers": [
-                        ('Content-Type', 'application/json'),
+                        ("Content-Type", "application/json"),
                     ],
                     # Disable automatic trailing slash redirects
                     "tools.trailing_slash.on": False,
@@ -436,42 +467,48 @@ class HTTPStatsServer:
             if self._cors_enabled:
                 auth_config["/"]["cors.expose.on"] = True
                 # Add CORS headers for OPTIONS requests
-                auth_config["/"]["tools.response_headers.headers"].extend([
-                    ('Access-Control-Allow-Origin', '*'),
-                    ('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS'),
-                    ('Access-Control-Allow-Headers', 'Authorization, Content-Type, X-API-Key'),
-                    ('Access-Control-Allow-Credentials', 'true'),
-                ])
-            
+                auth_config["/"]["tools.response_headers.headers"].extend(
+                    [
+                        ("Access-Control-Allow-Origin", "*"),
+                        ("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS"),
+                        ("Access-Control-Allow-Headers", "Authorization, Content-Type, X-API-Key"),
+                        ("Access-Control-Allow-Credentials", "true"),
+                    ]
+                )
+
             cherrypy.tree.mount(self.auth_app, "/auth", auth_config)
-            
+
             # Mount documentation endpoints as separate app (no auth required for docs)
             doc_config = {
                 "/": {
                     "tools.require_auth.on": False,  # Docs are publicly accessible
                     "tools.response_headers.on": True,
                     "tools.response_headers.headers": [
-                        ('Content-Type', 'text/html; charset=utf-8'),
+                        ("Content-Type", "text/html; charset=utf-8"),
                     ],
                     "tools.trailing_slash.on": False,
                 }
             }
             if self._cors_enabled:
                 doc_config["/"]["cors.expose.on"] = True
-                doc_config["/"]["tools.response_headers.headers"].extend([
-                    ('Access-Control-Allow-Origin', '*'),
-                    ('Access-Control-Allow-Methods', 'GET, POST, OPTIONS'),
-                    ('Access-Control-Allow-Headers', 'Authorization, Content-Type, X-API-Key'),
-                ])
-            
+                doc_config["/"]["tools.response_headers.headers"].extend(
+                    [
+                        ("Access-Control-Allow-Origin", "*"),
+                        ("Access-Control-Allow-Methods", "GET, POST, OPTIONS"),
+                        ("Access-Control-Allow-Headers", "Authorization, Content-Type, X-API-Key"),
+                    ]
+                )
+
             cherrypy.tree.mount(self.doc_app, "/doc", doc_config)
-            
+
             # Store auth handlers in cherrypy config for middleware access
-            cherrypy.config.update({
-                "jwt_handler": self.jwt_handler,
-                "token_manager": self.token_manager,
-                "security_config": self.config.get("security", {}),
-            })
+            cherrypy.config.update(
+                {
+                    "jwt_handler": self.jwt_handler,
+                    "token_manager": self.token_manager,
+                    "security_config": self.config.get("security", {}),
+                }
+            )
 
             # Completely disable access logging
             cherrypy.log.access_log.propagate = False

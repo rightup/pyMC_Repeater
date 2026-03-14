@@ -29,9 +29,8 @@ classifiers = [
 keywords = ["mesh", "networking", "lora", "repeater", "daemon", "iot"]
 
 
-
 dependencies = [
-    "pymc_core[hardware] @ git+https://github.com/rightup/pyMC_core.git@feat/newRadios",
+    "pymc_core[hardware]@git+https://github.com/rightup/pyMC_core.git@feat/companion",
     "pyyaml>=6.0.0",
     "cherrypy>=18.0.0",
     "paho-mqtt>=1.6.0",
@@ -44,6 +43,14 @@ dependencies = [
 
 
 [project.optional-dependencies]
+# SX1262/SPI support (Linux only; required for Raspberry Pi HATs)
+hardware = [
+    "pymc_core[hardware]",
+]
+# RRD metrics (Performance Metrics chart); system librrd required (e.g. apt install rrdtool)
+rrd = [
+    "rrdtool",
+]
 dev = [
     "pytest>=7.4.0",
     "pytest-asyncio>=0.21.0",
@@ -55,8 +62,9 @@ dev = [
 [project.scripts]
 pymc-repeater = "repeater.main:main"
 
-[tool.setuptools]
-packages = ["repeater"]
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["repeater*"]
 
 [tool.setuptools.package-data]
 repeater = [
@@ -78,4 +86,4 @@ line_length = 100
 [tool.setuptools_scm]
 version_scheme = "guess-next-dev"
 local_scheme = "no-local-version"
-
+version_file = "repeater/_version.py"

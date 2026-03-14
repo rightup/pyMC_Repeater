@@ -43,55 +43,75 @@ repeater_name=${repeater_name:-$default_name}
 
 echo "Repeater name: $repeater_name"
 echo ""
-echo "=== Step 1: Select Hardware ==="
+
+# Step 0.5: Radio type (SX1262 hardware vs KISS modem)
+echo "=== Step 0.5: Select Radio Type ==="
 echo ""
+echo "  1) SX1262 hardware (SPI LoRa module - Raspberry Pi HAT, etc.)"
+echo "  2) KISS modem (serial TNC - requires pyMC_core with KISS support)"
+echo ""
+read -p "Select radio type (1 or 2): " radio_type_sel
 
-if [ ! -f "$HARDWARE_CONFIG" ]; then
-    echo "Error: Hardware configuration file not found at $HARDWARE_CONFIG"
-    exit 1
-fi
+if [ "$radio_type_sel" = "2" ]; then
+    RADIO_TYPE="kiss"
+    hw_key="kiss"
+    hw_name="KISS modem"
+    echo "Selected: $hw_name"
+    echo ""
+else
+    RADIO_TYPE="sx1262"
+    echo "Selected: SX1262 hardware"
+    echo ""
+    echo "=== Step 1: Select Hardware ==="
+    echo ""
 
-# Parse hardware options from radio-settings.json
-hw_index=0
-declare -a hw_keys
-declare -a hw_names
-
-# Extract hardware keys and names using grep and sed
-hw_data=$(grep -o '"[^"]*":\s*{' "$HARDWARE_CONFIG" | grep -v hardware | sed 's/"\([^"]*\)".*/\1/' | while read hw_key; do
-    hw_name=$(grep -A 1 "\"$hw_key\"" "$HARDWARE_CONFIG" | grep "\"name\"" | sed 's/.*"name":\s*"\([^"]*\)".*/\1/')
-    if [ -n "$hw_name" ]; then
-        echo "$hw_key|$hw_name"
+    if [ ! -f "$HARDWARE_CONFIG" ]; then
+        echo "Error: Hardware configuration file not found at $HARDWARE_CONFIG"
+        exit 1
     fi
-done)
 
-while IFS='|' read -r hw_key hw_name; do
-    if [ -n "$hw_key" ] && [ -n "$hw_name" ]; then
-        echo "  $((hw_index + 1))) $hw_name ($hw_key)"
-        hw_keys[$hw_index]="$hw_key"
-        hw_names[$hw_index]="$hw_name"
-        ((hw_index++))
+    # Parse hardware options from radio-settings.json
+    hw_index=0
+    declare -a hw_keys
+    declare -a hw_names
+
+    # Extract hardware keys and names using grep and sed
+    hw_data=$(grep -o '"[^"]*":\s*{' "$HARDWARE_CONFIG" | grep -v hardware | sed 's/"\([^"]*\)".*/\1/' | while read hw_key; do
+        hw_name=$(grep -A 1 "\"$hw_key\"" "$HARDWARE_CONFIG" | grep "\"name\"" | sed 's/.*"name":\s*"\([^"]*\)".*/\1/')
+        if [ -n "$hw_name" ]; then
+            echo "$hw_key|$hw_name"
+        fi
+    done)
+
+    while IFS='|' read -r hw_key hw_name; do
+        if [ -n "$hw_key" ] && [ -n "$hw_name" ]; then
+            echo "  $((hw_index + 1))) $hw_name ($hw_key)"
+            hw_keys[$hw_index]="$hw_key"
+            hw_names[$hw_index]="$hw_name"
+            ((hw_index++))
+        fi
+    done <<< "$hw_data"
+
+    if [ "$hw_index" -eq 0 ]; then
+        echo "Error: No hardware configurations found"
+        exit 1
     fi
-done <<< "$hw_data"
 
-if [ "$hw_index" -eq 0 ]; then
-    echo "Error: No hardware configurations found"
-    exit 1
+    echo ""
+    read -p "Select hardware (1-$hw_index): " hw_selection
+
+    if ! [ "$hw_selection" -ge 1 ] 2>/dev/null || [ "$hw_selection" -gt "$hw_index" ]; then
+        echo "Error: Invalid selection"
+        exit 1
+    fi
+
+    selected_hw=$((hw_selection - 1))
+    hw_key="${hw_keys[$selected_hw]}"
+    hw_name="${hw_names[$selected_hw]}"
+
+    echo "Selected: $hw_name"
+    echo ""
 fi
-
-echo ""
-read -p "Select hardware (1-$hw_index): " hw_selection
-
-if ! [ "$hw_selection" -ge 1 ] 2>/dev/null || [ "$hw_selection" -gt "$hw_index" ]; then
-    echo "Error: Invalid selection"
-    exit 1
-fi
-
-selected_hw=$((hw_selection - 1))
-hw_key="${hw_keys[$selected_hw]}"
-hw_name="${hw_names[$selected_hw]}"
-
-echo "Selected: $hw_name"
-echo ""
 
 # Step 2: Radio Settings Selection
 echo "=== Step 2: Select Radio Settings ==="
@@ -104,13 +124,13 @@ API_RESPONSE=$(curl -s --max-time 5 https://api.meshcore.nz/api/v1/config 2>/dev
 if [ -z "$API_RESPONSE" ]; then
     echo "Warning: Failed to fetch configuration from API (timeout or error)"
     echo "Using local radio presets file..."
-    
+
     LOCAL_PRESETS="$SCRIPT_DIR/radio-presets.json"
     if [ ! -f "$LOCAL_PRESETS" ]; then
         echo "Error: Local radio presets file not found at $LOCAL_PRESETS"
         exit 1
     fi
-    
+
     API_RESPONSE=$(cat "$LOCAL_PRESETS")
     if [ -z "$API_RESPONSE" ]; then
         echo "Error: Failed to read local radio presets file"
@@ -179,13 +199,43 @@ echo "Selected: $title"
 echo "Frequency: ${freq}MHz, SF: $sf, BW: $bw, CR: $cr"
 echo ""
 
-# Update config.yaml
+# KISS modem: prompt for serial port and baud rate
+if [ "$RADIO_TYPE" = "kiss" ]; then
+    echo "=== KISS Modem Settings ==="
+    echo ""
+    default_port="/dev/ttyUSB0"
+    read -p "Serial port [$default_port]: " kiss_port
+    kiss_port=${kiss_port:-$default_port}
+    default_baud="9600"
+    read -p "Baud rate [$default_baud]: " kiss_baud
+    kiss_baud=${kiss_baud:-$default_baud}
+    echo "KISS: port=$kiss_port, baud_rate=$kiss_baud"
+    echo ""
+fi
+
+# Ensure config file exists (create from example if missing)
 if [ ! -f "$CONFIG_FILE" ]; then
-    echo "Error: Config file not found at $CONFIG_FILE"
-    exit 1
+    if [ -f "$CONFIG_DIR/config.yaml.example" ]; then
+        cp "$CONFIG_DIR/config.yaml.example" "$CONFIG_FILE"
+        echo "Created $CONFIG_FILE from config.yaml.example"
+    elif [ -f "$SCRIPT_DIR/config.yaml.example" ]; then
+        cp "$SCRIPT_DIR/config.yaml.example" "$CONFIG_FILE"
+        echo "Created $CONFIG_FILE from $SCRIPT_DIR/config.yaml.example"
+    else
+        echo "Error: Config file not found at $CONFIG_FILE"
+        echo "Copy config.yaml.example to config.yaml or run from a directory that has it."
+        exit 1
+    fi
 fi
 
 echo "Updating configuration..."
+
+# Radio type (sx1262 or kiss)
+if grep -q "^radio_type:" "$CONFIG_FILE"; then
+    sed "${SED_OPTS[@]}" "s/^radio_type:.*/radio_type: $RADIO_TYPE/" "$CONFIG_FILE"
+else
+    { echo "radio_type: $RADIO_TYPE"; cat "$CONFIG_FILE"; } > "$CONFIG_FILE.tmp" && mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
+fi
 
 # Repeater name
 sed "${SED_OPTS[@]}" "s/^  node_name:.*/  node_name: \"$repeater_name\"/" "$CONFIG_FILE"
@@ -196,7 +246,18 @@ sed "${SED_OPTS[@]}" "s/^  spreading_factor:.*/  spreading_factor: $sf/" "$CONFI
 sed "${SED_OPTS[@]}" "s/^  bandwidth:.*/  bandwidth: $bw_hz/" "$CONFIG_FILE"
 sed "${SED_OPTS[@]}" "s/^  coding_rate:.*/  coding_rate: $cr/" "$CONFIG_FILE"
 
-# Extract hardware-specific settings from radio-settings.json
+# KISS modem: update kiss section
+if [ "$RADIO_TYPE" = "kiss" ]; then
+    if grep -q "^kiss:" "$CONFIG_FILE"; then
+        sed "${SED_OPTS[@]}" "s/^  port:.*/  port: \"$kiss_port\"/" "$CONFIG_FILE"
+        sed "${SED_OPTS[@]}" "s/^  baud_rate:.*/  baud_rate: $kiss_baud/" "$CONFIG_FILE"
+    else
+        printf '\nkiss:\n  port: "%s"\n  baud_rate: %s\n' "$kiss_port" "$kiss_baud" >> "$CONFIG_FILE"
+    fi
+fi
+
+# Extract hardware-specific settings from radio-settings.json (SX1262 only)
+if [ "$RADIO_TYPE" = "sx1262" ]; then
 echo "Extracting hardware configuration from $HARDWARE_CONFIG..."
 
 # Use jq to extract all fields from the selected hardware
@@ -257,7 +318,7 @@ else
     [ -n "$irq_pin" ] && sed "${SED_OPTS[@]}" "s/^  irq_pin:.*/  irq_pin: $irq_pin/" "$CONFIG_FILE"
     [ -n "$txen_pin" ] && sed "${SED_OPTS[@]}" "s/^  txen_pin:.*/  txen_pin: $txen_pin/" "$CONFIG_FILE"
     [ -n "$rxen_pin" ] && sed "${SED_OPTS[@]}" "s/^  rxen_pin:.*/  rxen_pin: $rxen_pin/" "$CONFIG_FILE"
-    
+
     # Handle LED pins - add if missing, update if present
     if [ -n "$txled_pin" ]; then
         if grep -q "^  txled_pin:" "$CONFIG_FILE"; then
@@ -267,7 +328,7 @@ else
             sed "${SED_OPTS[@]}" "/^  rxen_pin:.*/a\\  txled_pin: $txled_pin" "$CONFIG_FILE"
         fi
     fi
-    
+
     if [ -n "$rxled_pin" ]; then
         if grep -q "^  rxled_pin:" "$CONFIG_FILE"; then
             sed "${SED_OPTS[@]}" "s/^  rxled_pin:.*/  rxled_pin: $rxled_pin/" "$CONFIG_FILE"
@@ -276,7 +337,7 @@ else
             sed "${SED_OPTS[@]}" "/^  txled_pin:.*/a\\  rxled_pin: $rxled_pin" "$CONFIG_FILE"
         fi
     fi
-    
+
     [ -n "$tx_power" ] && sed "${SED_OPTS[@]}" "s/^  tx_power:.*/  tx_power: $tx_power/" "$CONFIG_FILE"
     [ -n "$preamble_length" ] && sed "${SED_OPTS[@]}" "s/^  preamble_length:.*/  preamble_length: $preamble_length/" "$CONFIG_FILE"
 
@@ -336,6 +397,7 @@ else
         fi
     fi
 fi
+fi
 
 # Cleanup
 rm -f /tmp/radio_*_* "$CONFIG_FILE.bak"
@@ -344,14 +406,19 @@ echo "Configuration updated successfully!"
 echo ""
 echo "Applied Configuration:"
 echo "  Repeater Name: $repeater_name"
+echo "  Radio Type: $RADIO_TYPE"
 echo "  Hardware: $hw_name ($hw_key)"
 echo "  Frequency: ${freq}MHz (${freq_hz}Hz)"
 echo "  Spreading Factor: $sf"
 echo "  Bandwidth: ${bw}kHz (${bw_hz}Hz)"
 echo "  Coding Rate: $cr"
+if [ "$RADIO_TYPE" = "kiss" ]; then
+    echo "  KISS Port: $kiss_port"
+    echo "  KISS Baud Rate: $kiss_baud"
+fi
 echo ""
 echo "Hardware GPIO Configuration:"
-if [ -n "$bus_id" ]; then
+if [ "$RADIO_TYPE" = "sx1262" ] && [ -n "$bus_id" ]; then
     echo "  Bus ID: $bus_id"
     echo "  Chip Select: $cs_id (pin $cs_pin)"
     echo "  Reset Pin: $reset_pin"

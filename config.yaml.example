@@ -1,4 +1,6 @@
 # Default Repeater Configuration
+# radio_type: sx1262 | kiss (use kiss for serial KISS TNC modem)
+radio_type: sx1262
 
 repeater:
   # Node name for logging and identification
@@ -90,20 +92,20 @@ repeater:
   security:
     # Maximum number of authenticated clients (across all identities)
     max_clients: 1
-    
+
     # Admin password for full access
     admin_password: "admin123"
-    
+
     # Guest password for limited access
     guest_password: "guest123"
-    
+
     # Allow read-only access for clients without password/not in ACL
     allow_read_only: false
-    
+
     # JWT secret key for signing tokens (auto-generated if not provided)
     # Generate with: python -c "import secrets; print(secrets.token_hex(32))"
     jwt_secret: ""
-    
+
     # JWT token expiry time in minutes (default: 60 minutes / 1 hour)
     # Controls how long users stay logged in before needing to re-authenticate
     jwt_expiry_minutes: 60
@@ -114,6 +116,11 @@ mesh:
   # true = allow flooding globally, false = deny flooding globally
   # Individual transport keys can override this setting
   global_flood_allow: true
+
+  # Path hash mode for flood packets (0-hop): per-hop hash size in path encoding
+  # 0 = 1-byte hashes (legacy), 1 = 2-byte, 2 = 3-byte. Must match mesh convention.
+  # Affects originated adverts and any other flood packets sent by the repeater.
+  path_hash_mode: 0
 
   # Flood loop detection mode
   # off = disabled, minimal = allow up to 3 self-hashes, moderate = allow up to 1, strict = allow 0
@@ -130,7 +137,7 @@ identities:
     # - name: "TestBBS"
     #   identity_key: "your_room_identity_key_hex_here"
     #   type: "room_server"
-    #   
+    #
     #   # Room-specific settings
     #   settings:
     #     node_name: "Test BBS Room"
@@ -138,17 +145,34 @@ identities:
     #     longitude: 0.0
     #     admin_password: "room_admin_password"
     #     guest_password: "room_guest_password"
-    
-  # Add more room servers as needed
-  # - name: "SocialHub"
-  #   identity_key: "another_identity_key_hex_here"
-  #   type: "room_server"
-  #   settings:
-  #     node_name: "Social Hub"
-  #     latitude: 0.0
-  #     longitude: 0.0
-  #     admin_password: "social_admin_123"
-  #     guest_password: "social_guest_123"
+    # Add more room servers as needed
+    # - name: "SocialHub"
+    #   identity_key: "another_identity_key_hex_here"
+    #   type: "room_server"
+    #   settings:
+    #     node_name: "Social Hub"
+    #     latitude: 0.0
+    #     longitude: 0.0
+    #     admin_password: "social_admin_123"
+    #     guest_password: "social_guest_123"
+
+  # Companion Identities
+  # Each companion exposes the MeshCore frame protocol over TCP for standard clients.
+  # One TCP client per companion at a time. Clients connect to repeater-ip:tcp_port.
+  companions:
+    # - name: "RepeaterCompanion"
+    #   identity_key: "your_companion_identity_key_hex_here"
+    #   settings:
+    #     node_name: "RepeaterCompanion"
+    #     tcp_port: 5000
+    #     bind_address: "0.0.0.0"
+    #     tcp_timeout: 120   # seconds; default 120 when omitted; 0 = disable (no timeout)
+    # - name: "BotCompanion"
+    #   identity_key: "another_companion_identity_key_hex"
+    #   settings:
+    #     node_name: "meshcore-bot"
+    #     tcp_port: 5001
+    #     tcp_timeout: 120   # seconds; default 120 when omitted; 0 = disable (no timeout)
 
 # Radio hardware type
 # Supported:
@@ -161,7 +185,7 @@ radio_type: sx1262
 ch341:
   vid: 6790   # 0x1A86
   pid: 21778  # 0x5512
-  
+
 radio:
   # Frequency in Hz (869.618 MHz for EU)
   frequency: 869618000
@@ -186,6 +210,11 @@ radio:
 
   # Use implicit header mode
   implicit_header: false
+
+# KISS modem (when radio_type: kiss). Requires pyMC_core with KISS support.
+# kiss:
+#   port: "/dev/ttyUSB0"
+#   baud_rate: 9600
 
 # SX1262 Hardware Configuration
 # NOTE:
@@ -238,39 +267,39 @@ duty_cycle:
 mqtt:
   # Enable/disable MQTT publishing
   enabled: false
-  
+
   # MQTT broker settings
   broker: "localhost"
   port: 1883  # Use 8883 for TLS/SSL, 80/443/9001 for WebSockets
-  
+
   # Use WebSocket transport instead of standard TCP
   # Typically uses ports: 80 (ws://), 443 (wss://), or 9001
   use_websockets: false
-  
+
   # Authentication (optional)
   username: null
   password: null
-  
+
   # TLS/SSL configuration (optional)
   # For public brokers with trusted certificates, just enable TLS:
   # tls:
   #   enabled: true
   tls:
     enabled: false
-    
+
     # Advanced TLS options (usually not needed for public brokers):
-    
+
     # Custom CA certificate for server verification
     # Leave null to use system default CA certificates (recommended)
     ca_cert: null  # e.g., "/etc/ssl/certs/ca-certificates.crt"
-    
+
     # Client certificate and key for mutual TLS (rarely needed)
     client_cert: null  # e.g., "/etc/pymc/client.crt"
     client_key: null   # e.g., "/etc/pymc/client.key"
-    
+
     # Skip certificate verification (insecure, not recommended)
     insecure: false
-  
+
   # Base topic for publishing
   # Messages will be published to: {base_topic}/{node_name}/{packet|advert}
   base_topic: "meshcore/repeater"
@@ -278,36 +307,37 @@ mqtt:
 
 # Storage Configuration
 storage:
-  # Directory for persistent storage files (SQLite, RRD)
+  # Directory for persistent storage files (SQLite, RRD).
+  # Use a writable path for local/dev (e.g. "./var/pymc_repeater" or "~/var/pymc_repeater").
   storage_dir: "/var/lib/pymc_repeater"
 
   # Data retention settings
   retention:
     # Clean up SQLite records older than this many days
     sqlite_cleanup_days: 31
-    
+
     # RRD archives are managed automatically:
     # - 1 minute resolution for 1 week
-    # - 5 minute resolution for 1 month  
+    # - 5 minute resolution for 1 month
     # - 1 hour resolution for 1 year
 
 
 letsmesh:
   enabled: false
   iata_code: "Test"  # e.g., "SFO", "LHR", "Test"
-  
+
   # ============================================================
   # BROKER SELECTION MODE - Choose how to connect to brokers
   # ============================================================
-  # 
+  #
   # EXAMPLE 1: Single built-in broker (default, most common)
   # Connect to Europe only - simple, low bandwidth
   broker_index: 0    # 0 = Europe, 1 = US West
-  
+
   # EXAMPLE 2: All built-in brokers for maximum redundancy
   # Survives single broker failure, best uptime
   # broker_index: -1  # or null - connects to both EU and US
-  
+
   # EXAMPLE 3: Only custom brokers (private/self-hosted)
   # Ignores built-in LetsMesh brokers completely
   # broker_index: -2
@@ -316,7 +346,7 @@ letsmesh:
   #     host: "mqtt.myserver.com"
   #     port: 443
   #     audience: "mqtt.myserver.com"
-  
+
   # EXAMPLE 4: Single built-in + custom backup
   # Use EU primary with your own backup
   # broker_index: 0
@@ -325,7 +355,7 @@ letsmesh:
   #     host: "mqtt-backup.mydomain.com"
   #     port: 8883
   #     audience: "mqtt-backup.mydomain.com"
-  
+
   # EXAMPLE 5: All built-in + multiple custom (maximum redundancy)
   # EU + US + your own servers - best for critical deployments
   # broker_index: -1
@@ -339,14 +369,14 @@ letsmesh:
   #     port: 443
   #     audience: "mqtt-2.mydomain.com"
   # ============================================================
-  
+
   status_interval: 300
   owner: ""
   email: ""
-  
+
   # Block specific packet types from being published to LetsMesh
   # If not specified or empty list, all types are published
-  # Available types: REQ, RESPONSE, TXT_MSG, ACK, ADVERT, GRP_TXT, 
+  # Available types: REQ, RESPONSE, TXT_MSG, ACK, ADVERT, GRP_TXT,
   #                  GRP_DATA, ANON_REQ, PATH, TRACE, RAW_CUSTOM
   disallowed_packet_types: []
     # - REQ           # Don't publish requests

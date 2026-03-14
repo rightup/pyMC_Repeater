@@ -3,14 +3,13 @@ import logging
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Any, Dict, Optional
 
-from .sqlite_handler import SQLiteHandler
-from .rrdtool_handler import RRDToolHandler
-from .mqtt_handler import MQTTHandler
 from .letsmesh_handler import MeshCoreToMqttJwtPusher
+from .mqtt_handler import MQTTHandler
+from .rrdtool_handler import RRDToolHandler
+from .sqlite_handler import SQLiteHandler
 from .storage_utils import PacketRecord
-
 
 logger = logging.getLogger("StorageCollector")
 
@@ -67,16 +66,18 @@ class StorageCollector:
                 self.disallowed_packet_types = set()
         else:
             self.disallowed_packet_types = set()
-            
+
         # Initialize hardware stats collector
         from .hardware_stats import HardwareStatsCollector
+
         self.hardware_stats = HardwareStatsCollector()
         logger.info("Hardware stats collector initialized")
-        
+
         # Initialize WebSocket handler for real-time updates
         self.websocket_available = False
         try:
             from .websocket_handler import broadcast_packet, broadcast_stats
+
             self.websocket_broadcast_packet = broadcast_packet
             self.websocket_broadcast_stats = broadcast_stats
             self.websocket_available = True
@@ -92,23 +93,23 @@ class StorageCollector:
                 "packets_sent": 0,
                 "packets_received": 0,
                 "errors": 0,
-                "queue_len": 0
+                "queue_len": 0,
             }
 
         uptime_secs = int(time.time() - self.repeater_handler.start_time)
-        
+
         # Get airtime stats
         airtime_stats = self.repeater_handler.airtime_mgr.get_stats()
-        
+
         # Get latest noise floor from database
         noise_floor = None
         try:
             recent_noise = self.sqlite_handler.get_noise_floor_history(hours=0.5, limit=1)
             if recent_noise and len(recent_noise) > 0:
-                noise_floor = recent_noise[-1].get('noise_floor_dbm')
+                noise_floor = recent_noise[-1].get("noise_floor_dbm")
         except Exception as e:
             logger.debug(f"Could not fetch noise floor: {e}")
-        
+
         stats = {
             "uptime_secs": uptime_secs,
             "packets_sent": self.repeater_handler.forwarded_count,
@@ -116,22 +117,22 @@ class StorageCollector:
             "errors": 0,
             "queue_len": 0,  # N/A for Python repeater
         }
-        
+
         # Add airtime stats
         if airtime_stats:
             stats["tx_air_secs"] = airtime_stats["total_airtime_ms"] / 1000
             stats["current_airtime_ms"] = airtime_stats["current_airtime_ms"]
             stats["utilization_percent"] = airtime_stats["utilization_percent"]
-        
+
         # Add noise floor if available
         if noise_floor is not None:
             stats["noise_floor"] = noise_floor
-        
+
         return stats
 
     def record_packet(self, packet_record: dict, skip_letsmesh_if_invalid: bool = True):
         """Record packet to storage and publish to MQTT/LetsMesh
-        
+
         Args:
             packet_record: Dictionary containing packet information
             skip_letsmesh_if_invalid: If True, don't publish packets with drop_reason to LetsMesh
@@ -146,28 +147,34 @@ class StorageCollector:
         cumulative_counts = self.sqlite_handler.get_cumulative_counts()
         self.rrd_handler.update_packet_metrics(packet_record, cumulative_counts)
         self.mqtt_handler.publish(packet_record, "packet")
-        
+
         # Broadcast to WebSocket clients for real-time updates
         if self.websocket_available:
             try:
                 self.websocket_broadcast_packet(packet_record)
-                
+
                 # Broadcast 24-hour packet stats (same as /api/packet_stats?hours=24)
                 packet_stats_24h = self.sqlite_handler.get_packet_stats(hours=24)
-                uptime_seconds = time.time() - self.repeater_handler.start_time if self.repeater_handler else 0
-                
-                self.websocket_broadcast_stats({
-                    "packet_stats": packet_stats_24h,
-                    "system_stats": {
-                        "uptime_seconds": uptime_seconds,
+                uptime_seconds = (
+                    time.time() - self.repeater_handler.start_time if self.repeater_handler else 0
+                )
+
+                self.websocket_broadcast_stats(
+                    {
+                        "packet_stats": packet_stats_24h,
+                        "system_stats": {
+                            "uptime_seconds": uptime_seconds,
+                        },
                     }
-                })
+                )
             except Exception as e:
                 logger.debug(f"WebSocket broadcast failed: {e}")
 
         # Publish to LetsMesh if enabled (skip invalid packets if requested)
-        if skip_letsmesh_if_invalid and packet_record.get('drop_reason'):
-            logger.debug(f"Skipping LetsMesh publish for packet with drop_reason: {packet_record.get('drop_reason')}")
+        if skip_letsmesh_if_invalid and packet_record.get("drop_reason"):
+            logger.debug(
+                f"Skipping LetsMesh publish for packet with drop_reason: {packet_record.get('drop_reason')}"
+            )
         else:
             self._publish_to_letsmesh(packet_record)
 
@@ -264,23 +271,24 @@ class StorageCollector:
 
     def get_neighbors(self) -> dict:
         return self.sqlite_handler.get_neighbors()
-    
+
     def get_node_name_by_pubkey(self, pubkey: str) -> Optional[str]:
         """
         Lookup node name from adverts table by public key.
-        
+
         Args:
             pubkey: Public key in hex string format
-            
+
         Returns:
             Node name if found, None otherwise
         """
         try:
             import sqlite3
+
             with sqlite3.connect(self.sqlite_handler.sqlite_path) as conn:
                 result = conn.execute(
                     "SELECT node_name FROM adverts WHERE pubkey = ? AND node_name IS NOT NULL ORDER BY last_seen DESC LIMIT 1",
-                    (pubkey,)
+                    (pubkey,),
                 ).fetchone()
                 return result[0] if result else None
         except Exception as e:

@@ -7,6 +7,7 @@ allowing other nodes to discover repeaters on the mesh network.
 
 import asyncio
 import logging
+
 from pymc_core.node.handlers.control import ControlHandler
 
 logger = logging.getLogger("DiscoveryHelper")
@@ -21,6 +22,7 @@ class DiscoveryHelper:
         packet_injector=None,
         node_type: int = 2,
         log_fn=None,
+        debug_log_fn=None,
     ):
         """
         Initialize the discovery helper.
@@ -30,13 +32,18 @@ class DiscoveryHelper:
             packet_injector: Callable to inject new packets into the router for sending
             node_type: Node type identifier (2 = Repeater)
             log_fn: Optional logging function for ControlHandler
+            debug_log_fn: Optional logging for verbose ControlHandler messages (e.g. callback
+                presence). Pass logger.debug to avoid INFO noise when forwarding to companions.
         """
         self.local_identity = local_identity
         self.packet_injector = packet_injector  # Function to inject packets into router
         self.node_type = node_type
-        
+
         # Create ControlHandler internally as a parsing utility
-        self.control_handler = ControlHandler(log_fn=log_fn or logger.info)
+        self.control_handler = ControlHandler(
+            log_fn=log_fn or logger.info,
+            debug_log_fn=debug_log_fn,
+        )
 
         # Set up the request callback
         self.control_handler.set_request_callback(self._on_discovery_request)

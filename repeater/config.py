@@ -49,7 +49,7 @@ def get_node_info(config: Dict[str, Any]) -> Dict[str, Any]:
         "model": letsmesh_config.get("model", "PyMC-Repeater"),
         "disallowed_packet_types": disallowed_hex,
         "email": letsmesh_config.get("email", ""),
-        "owner": letsmesh_config.get("owner", "")
+        "owner": letsmesh_config.get("owner", ""),
     }
 
 
@@ -107,14 +107,21 @@ def save_config(config_data: Dict[str, Any], config_path: Optional[str] = None) 
         # Create backup of existing config
         config_file = Path(config_path)
         if config_file.exists():
-            backup_path = config_file.with_suffix('.yaml.backup')
+            backup_path = config_file.with_suffix(".yaml.backup")
             config_file.rename(backup_path)
             logger.info(f"Created backup at {backup_path}")
-        
-        # Save new config
-        with open(config_path, 'w') as f:
-            yaml.safe_dump(config_data, f, default_flow_style=False, sort_keys=False)
-        
+
+        # Save new config (allow_unicode=True so emojis etc. are not escaped as \U0001F47E)
+        with open(config_path, "w", encoding="utf-8") as f:
+            yaml.safe_dump(
+                config_data,
+                f,
+                default_flow_style=False,
+                sort_keys=False,
+                allow_unicode=True,
+                width=1000000,
+            )
+
         logger.info(f"Saved configuration to {config_path}")
         return True
         
@@ -211,7 +218,9 @@ def get_radio_for_board(board_config: dict):
             return int(value.strip().rstrip(','), 0)
         raise ValueError(f"Invalid int value type: {type(value)}")
 
-    radio_type = board_config.get("radio_type", "sx1262").lower()
+    radio_type = board_config.get("radio_type", "sx1262").lower().strip()
+    if radio_type == "kiss-modem":
+        radio_type = "kiss"
 
     if radio_type in ("sx1262", "sx1262_ch341"):
         from pymc_core.hardware.sx1262_wrapper import SX1262Radio
@@ -283,6 +292,52 @@ def get_radio_for_board(board_config: dict):
 
         return radio
 
+    elif radio_type == "kiss":
+        try:
+            from pymc_core.hardware.kiss_modem_wrapper import KissModemWrapper
+        except ImportError:
+            try:
+                from pymc_core.hardware.kiss_serial_wrapper import (
+                    KissSerialWrapper as KissModemWrapper,
+                )
+            except ImportError:
+                raise RuntimeError(
+                    "KISS modem support requires pyMC_core with KISS support. "
+                    "Install your fork with: pip install -e /path/to/pyMC_core"
+                ) from None
+
+        kiss_config = board_config.get("kiss")
+        if not kiss_config:
+            raise ValueError("Missing 'kiss' section in configuration file for radio_type: kiss")
+
+        port = kiss_config.get("port")
+        if not port:
+            raise ValueError("Missing 'port' in 'kiss' section (e.g. /dev/ttyUSB0)")
+
+        baudrate = int(kiss_config.get("baud_rate", 115200))
+        radio_cfg = board_config.get("radio") or {}
+        radio_config = {
+            "frequency": int(radio_cfg.get("frequency", 869618000)),
+            "bandwidth": int(radio_cfg.get("bandwidth", 62500)),
+            "spreading_factor": int(radio_cfg.get("spreading_factor", 8)),
+            "coding_rate": int(radio_cfg.get("coding_rate", 8)),
+            "tx_power": int(radio_cfg.get("tx_power", 14)),
+        }
+        radio = KissModemWrapper(
+            port=port,
+            baudrate=baudrate,
+            radio_config=radio_config,
+            auto_configure=True,
+        )
+
+        if hasattr(radio, "begin"):
+            try:
+                radio.begin()
+            except Exception as e:
+                raise RuntimeError(f"Failed to initialize KISS modem: {e}") from e
+
+        return radio
+
     raise RuntimeError(
-        f"Unknown radio type: {radio_type}. Supported: sx1262, sx1262_ch341"
+        f"Unknown radio type: {radio_type}. Supported: sx1262, sx1262_ch341, kiss (or kiss-modem)"
     )

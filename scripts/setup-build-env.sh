@@ -23,7 +23,7 @@ log_error() {
 }
 
 # Check if running as root or with sudo
-if [ "$EUID" -ne 0 ]; then 
+if [ "$EUID" -ne 0 ]; then
     log_error "This script must be run with sudo or as root"
     exit 1
 fi

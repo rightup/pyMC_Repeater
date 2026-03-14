@@ -152,7 +152,7 @@ if [ -n "$DEB_FILE" ]; then
     # Run lintian to check package quality
     log_step "Running lintian checks..."
     lintian "$DEB_FILE" || log_warn "Lintian found some issues (non-fatal)"
-    
+
     log_info ""
     log_info "════════════════════════════════════════════════════════════"
     log_info "Production build complete!"

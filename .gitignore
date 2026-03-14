@@ -52,12 +52,18 @@ htmlcov/
 
 # Config
 config.yaml
+config.yaml.backup
 identity.json
 
 # Distribution Radio Settings
 radio_settings_dist.json
+# Data
+data/
 
 # Logs
 *.log
 .DS_Store
 syncpi.sh
+
+# Docker
+/data

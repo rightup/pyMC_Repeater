@@ -38,13 +38,13 @@ case "$1" in
             echo "Installing pymc_core[hardware] from PyPI..."
             python3 -m pip install --break-system-packages 'pymc_core[hardware]>=1.0.7' || true
         fi
-        
+
         # Install packages not available in Debian repos
         if ! python3 -c "import cherrypy_cors" 2>/dev/null; then
             echo "Installing cherrypy-cors from PyPI..."
             python3 -m pip install --break-system-packages 'cherrypy-cors==1.7.0' || true
         fi
-        
+
         if ! python3 -c "import ws4py" 2>/dev/null; then
             echo "Installing ws4py from PyPI..."
             python3 -m pip install --break-system-packages 'ws4py>=0.5.1' || true

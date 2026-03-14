@@ -12,6 +12,7 @@ RUN apt-get update && apt-get install -y \
     python3-rrdtool \
     jq \
     wget \
+    libusb-1.0-0 \
     swig \
     git \
     build-essential \
@@ -26,6 +27,8 @@ WORKDIR ${INSTALL_DIR}
 # Copy source
 COPY repeater ./repeater
 COPY pyproject.toml .
+COPY radio-presets.json .
+COPY radio-settings.json .
 
 # Install package
 RUN pip install --no-cache-dir .

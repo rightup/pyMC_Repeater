@@ -1,8 +1,8 @@
-import secrets
-import hmac
 import hashlib
-from typing import Optional, List, Dict
+import hmac
 import logging
+import secrets
+from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -11,18 +11,14 @@ class APITokenManager:
     def __init__(self, sqlite_handler, secret_key: str):
 
         self.db = sqlite_handler
-        self.secret_key = secret_key.encode('utf-8')
-    
+        self.secret_key = secret_key.encode("utf-8")
+
     def generate_api_token(self) -> str:
         return secrets.token_hex(32)
-    
+
     def hash_token(self, token: str) -> str:
-        return hmac.new(
-            self.secret_key,
-            token.encode('utf-8'),
-            hashlib.sha256
-        ).hexdigest()
-    
+        return hmac.new(self.secret_key, token.encode("utf-8"), hashlib.sha256).hexdigest()
+
     def create_token(self, name: str) -> tuple[int, str]:
         plaintext_token = self.generate_api_token()
         token_hash = self.hash_token(plaintext_token)
@@ -43,7 +39,6 @@ class APITokenManager:
             logger.info(f"Revoked API token ID {token_id}")
         
         return deleted
-    
+
     def list_tokens(self) -> List[Dict]:
         return self.db.list_api_tokens()
-
