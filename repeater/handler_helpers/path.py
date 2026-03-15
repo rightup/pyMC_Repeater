@@ -13,6 +13,7 @@ class PathHelper:
     async def process_path_packet(self, packet):
 
         from pymc_core.protocol.crypto import CryptoUtils
+        from pymc_core.protocol.packet_utils import PathUtils
 
         try:
             if len(packet.payload) < 2:
@@ -59,13 +60,18 @@ class PathHelper:
                 logger.debug(f"Failed to decrypt PATH packet from 0x{src_hash:02X}")
                 return False
 
-            # Parse decrypted PATH data
-            # Format: path_len(1) + path[path_len] + extra_type(1) + extra[...]
+            # Parse decrypted PATH data.
+            # Firmware format: encoded_path_len(1) + path[path_hash_count*path_hash_size] + extra_type(1) + extra[...]
             if len(decrypted) < 1:
                 logger.debug(f"Decrypted PATH data too short")
                 return False
 
-            path_len = decrypted[0]
+            path_len_encoded = decrypted[0]
+            if not PathUtils.is_valid_path_len(path_len_encoded):
+                logger.debug(f"Invalid encoded PATH length byte: {path_len_encoded}")
+                return False
+
+            path_len = PathUtils.get_path_byte_len(path_len_encoded)
             if len(decrypted) < 1 + path_len:
                 logger.debug(
                     f"PATH data truncated: need {1 + path_len} bytes, got {len(decrypted)}"
@@ -76,12 +82,12 @@ class PathHelper:
 
             # Update client's out_path (same as C++ memcpy)
             client.out_path = bytearray(path_data)
-            client.out_path_len = path_len
+            client.out_path_len = path_len_encoded
             client.last_activity = int(time.time())
 
             logger.info(
                 f"Updated out_path for client 0x{src_hash:02X} -> 0x{dest_hash:02X}: "
-                f"path_len={path_len}, path={[hex(b) for b in path_data]}"
+                f"path_len_encoded={path_len_encoded}, path_len={path_len}, path={[hex(b) for b in path_data]}"
             )
 
             # Don't mark as do_not_retransmit - let it forward normally

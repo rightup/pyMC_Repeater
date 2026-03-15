@@ -34,13 +34,12 @@ LOOP_DETECT_MINIMAL = "minimal"
 LOOP_DETECT_MODERATE = "moderate"
 LOOP_DETECT_STRICT = "strict"
 
-# Thresholds for 1-byte path hashes loop detection.
-# Count how many times our own hash already exists in the incoming FLOOD path.
-# If occurrences >= threshold, treat as loop and drop.
-LOOP_DETECT_MAX_COUNTERS = {
-    LOOP_DETECT_MINIMAL: 4,
-    LOOP_DETECT_MODERATE: 2,
-    LOOP_DETECT_STRICT: 1,
+# MeshCore loop thresholds by mode and hash-size (bytes per hop).
+# Drop when local hash occurrences in the incoming FLOOD path are >= threshold.
+LOOP_DETECT_THRESHOLDS = {
+    LOOP_DETECT_MINIMAL: {1: 4, 2: 2, 3: 1},
+    LOOP_DETECT_MODERATE: {1: 2, 2: 1, 3: 1},
+    LOOP_DETECT_STRICT: {1: 1, 2: 1, 3: 1},
 }
 
 
@@ -546,8 +545,17 @@ class RepeaterHandler(BaseHandler):
         if not packet or not packet.payload:
             return "Empty payload"
 
-        if len(packet.path or []) >= MAX_PATH_SIZE:
+        path_len_encoded = getattr(packet, "path_len", 0) or 0
+        if not isinstance(path_len_encoded, int) or not PathUtils.is_valid_path_len(path_len_encoded):
+            return f"Invalid encoded path_len: {path_len_encoded}"
+        path_bytes = packet.path or bytearray()
+        if len(path_bytes) > MAX_PATH_SIZE:
             return "Path too long"
+        expected_path_bytes = PathUtils.get_path_byte_len(path_len_encoded)
+        if len(path_bytes) < expected_path_bytes:
+            return "Path shorter than encoded path_len"
+        if len(path_bytes) > expected_path_bytes:
+            return "Path longer than encoded path_len"
 
         route_type = packet.header & PH_ROUTE_MASK
 
@@ -588,10 +596,28 @@ class RepeaterHandler(BaseHandler):
         if not packet or not packet.payload:
             return False, "Empty payload"
 
-        if len(packet.path or []) >= MAX_PATH_SIZE:
+        path_len_encoded = getattr(packet, "path_len", 0) or 0
+        if not isinstance(path_len_encoded, int) or not PathUtils.is_valid_path_len(path_len_encoded):
+            return False, f"Invalid encoded path_len: {path_len_encoded}"
+
+        path_bytes = packet.path or bytearray()
+        actual_path_len = len(path_bytes)
+        if actual_path_len > MAX_PATH_SIZE:
             return (
                 False,
-                f"Path length {len(packet.path or [])} exceeds MAX_PATH_SIZE ({MAX_PATH_SIZE})",
+                f"Path length {actual_path_len} exceeds MAX_PATH_SIZE ({MAX_PATH_SIZE})",
+            )
+
+        expected_path_len = PathUtils.get_path_byte_len(path_len_encoded)
+        if actual_path_len < expected_path_len:
+            return (
+                False,
+                f"Path bytes truncated: expected {expected_path_len}, got {actual_path_len}",
+            )
+        if actual_path_len > expected_path_len:
+            return (
+                False,
+                f"Path bytes mismatch: expected {expected_path_len}, got {actual_path_len}",
             )
 
         return True, ""
@@ -616,13 +642,29 @@ class RepeaterHandler(BaseHandler):
         if mode == LOOP_DETECT_OFF:
             return False
 
-        max_counter = LOOP_DETECT_MAX_COUNTERS.get(mode)
+        hash_size = packet.get_path_hash_size()
+        mode_thresholds = LOOP_DETECT_THRESHOLDS.get(mode)
+        if mode_thresholds is None:
+            return False
+        max_counter = mode_thresholds.get(hash_size)
         if max_counter is None:
             return False
 
-        path = packet.path or bytearray()
-        local_count = sum(1 for hop in path if hop == self.local_hash)
-        return local_count >= max_counter
+        path = bytes(packet.path or b"")
+        hop_count = packet.get_path_hash_count()
+        if hop_count <= 0 or hash_size <= 0:
+            return False
+
+        local_prefix = bytes(self.local_hash_bytes[:hash_size])
+        max_hops_in_path = min(hop_count, len(path) // hash_size)
+        local_count = 0
+        for hop_idx in range(max_hops_in_path):
+            start = hop_idx * hash_size
+            if path[start : start + hash_size] == local_prefix:
+                local_count += 1
+                if local_count >= max_counter:
+                    return True
+        return False
 
     def _check_transport_codes(self, packet: Packet) -> Tuple[bool, str]:
 
@@ -761,6 +803,17 @@ class RepeaterHandler(BaseHandler):
 
         hash_size = packet.get_path_hash_size()
         hop_count = packet.get_path_hash_count()
+
+        # Firmware parity: optional repeater flood hop cap (flood.max / max_flood_hops).
+        flood_max_hops = self.config.get("repeater", {}).get("max_flood_hops", None)
+        if flood_max_hops is not None:
+            try:
+                flood_max_hops = int(flood_max_hops)
+            except (TypeError, ValueError):
+                flood_max_hops = None
+            if flood_max_hops is not None and flood_max_hops >= 0 and hop_count >= flood_max_hops:
+                packet.drop_reason = f"Flood hop cap reached ({flood_max_hops})"
+                return None
 
         # path_len encodes hop count in 6 bits (0-63); adding ourselves must not exceed 63
         if hop_count >= 63:

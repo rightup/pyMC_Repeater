@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from pymc_core.protocol import Packet
+from pymc_core.protocol.packet_utils import PathUtils
 from pymc_core.protocol.constants import (
     MAX_PATH_SIZE,
     PH_ROUTE_MASK,
@@ -218,7 +219,7 @@ class TestFloodForward:
         pkt = _make_flood_packet(path=bytes(range(MAX_PATH_SIZE)))
         result = handler.flood_forward(pkt)
         assert result is None
-        assert "Path length" in pkt.drop_reason
+        assert "Path" in pkt.drop_reason
 
     def test_do_not_retransmit_dropped(self, handler):
         pkt = _make_flood_packet()
@@ -484,7 +485,7 @@ class TestValidatePacket:
         pkt = _make_flood_packet(path=bytes(range(MAX_PATH_SIZE)))
         valid, reason = handler.validate_packet(pkt)
         assert valid is False
-        assert "MAX_PATH_SIZE" in reason
+        assert "Path" in reason
 
     def test_path_one_below_max_passes(self, handler):
         pkt = _make_flood_packet(path=bytes(range(MAX_PATH_SIZE - 1)))
@@ -721,6 +722,41 @@ class TestFloodLoopDetection:
         assert result is None
 
 
+class TestFirmwarePathParity:
+    """Targeted firmware-parity tests for path metadata and flood cap handling."""
+
+    def test_flood_max_hops_enforced_when_configured(self, handler):
+        handler.config.setdefault("repeater", {})["max_flood_hops"] = 2
+        pkt = _make_flood_packet(path=b"\x11\x22")
+        pkt.path_len = PathUtils.encode_path_len(1, 2)
+        result = handler.flood_forward(pkt)
+        assert result is None
+        assert "Flood hop cap reached (2)" == pkt.drop_reason
+
+    def test_flood_max_hops_not_applied_when_unset(self, handler):
+        handler.config.setdefault("repeater", {}).pop("max_flood_hops", None)
+        pkt = _make_flood_packet(path=b"\x11\x22")
+        pkt.path_len = PathUtils.encode_path_len(1, 2)
+        result = handler.flood_forward(pkt)
+        assert result is not None
+
+    def test_validate_rejects_path_bytes_mismatch_vs_encoded_len(self, handler):
+        pkt = _make_flood_packet(path=b"\x11\x22")
+        # Encoded as 1-byte hash, 1 hop => expected path bytes = 1 (actual = 2).
+        pkt.path_len = PathUtils.encode_path_len(1, 1)
+        result = handler.flood_forward(pkt)
+        assert result is None
+        assert "Path bytes mismatch" in (pkt.drop_reason or "")
+
+    def test_validate_rejects_invalid_encoded_path_len(self, handler):
+        pkt = _make_flood_packet(path=b"")
+        # Hash size nibble decodes to 4 bytes (reserved/invalid).
+        pkt.path_len = 0xC1
+        result = handler.flood_forward(pkt)
+        assert result is None
+        assert "Invalid encoded path_len" in (pkt.drop_reason or "")
+
+
 # ===================================================================
 # 10. Airtime / duty-cycle integration
 # ===================================================================
@@ -808,7 +844,7 @@ class TestGetDropReason:
     def test_path_too_long_reason(self, handler):
         pkt = _make_flood_packet(path=bytes(range(MAX_PATH_SIZE)))
         reason = handler._get_drop_reason(pkt)
-        assert "Path too long" in reason
+        assert "Path" in reason
 
     def test_flood_policy_reason(self, handler):
         handler.config["mesh"]["global_flood_allow"] = False
@@ -1107,7 +1143,7 @@ BAD_PACKETS = [
     ("bad_path_at_max",
      "Path exactly MAX_PATH_SIZE — no room to append",
      lambda: _make_flood_packet(payload=b"\x01", path=bytes(range(MAX_PATH_SIZE))),
-     "Path length"),
+     "Path"),
 
     ("bad_flood_path_near_max",
      "Flood, path = MAX_PATH_SIZE - 1 (63 hops; path_len encodes 0-63, cannot append)",

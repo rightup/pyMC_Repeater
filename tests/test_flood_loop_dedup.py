@@ -321,26 +321,21 @@ class TestOwnHashReForwarding:
 
 class TestLoopDetectionMultiByte:
     """
-    Loop detection currently counts byte-level matches against local_hash
-    (single int). In multi-byte mode the per-hop hash is >1 byte, so
-    individual bytes in the path may coincidentally match.
-    These tests verify the actual engine behaviour.
+    Loop detection in multi-byte modes must match firmware semantics:
+    compare hop chunks (size=hash_size) against our local hash prefix.
     """
 
-    def test_2_byte_mode_strict_byte_level_match(self):
+    def test_2_byte_mode_strict_ignores_partial_byte_match(self):
         """
-        In 2-byte mode with strict, _is_flood_looped scans individual bytes.
-        If local_hash (0xAB) appears as a byte anywhere in the 2-byte path
-        entries, it counts as a match.
+        In 2-byte mode, strict should only match full 2-byte hop hashes.
+        A single matching byte must not trigger loop detection.
         """
         h = _make_handler(loop_detect="strict",
                           local_hash_bytes=bytes([0xAB, 0xCD, 0xEF]))
-        # Path: 2-byte hop [0xAB, 0x11] — byte 0xAB appears once
+        # Path: 2-byte hop [0xAB, 0x11] — partial byte overlap only
         pkt = _make_flood_packet(b"\xAB\x11", hash_size=2, hash_count=1)
         result = h.flood_forward(pkt)
-        # strict threshold=1, 0xAB appears once in raw bytes → loop detected
-        assert result is None
-        assert "loop" in pkt.drop_reason.lower()
+        assert result is not None
 
     def test_2_byte_mode_off_ignores_byte_match(self):
         """With loop_detect=off, even byte-level 0xAB matches are ignored."""
@@ -351,7 +346,7 @@ class TestLoopDetectionMultiByte:
         assert result is not None
 
     def test_2_byte_no_local_hash_byte_passes_strict(self):
-        """If local_hash byte doesn't appear anywhere in the 2-byte path, strict passes."""
+        """If no bytes overlap, strict also passes."""
         h = _make_handler(loop_detect="strict",
                           local_hash_bytes=bytes([0xAB, 0xCD, 0xEF]))
         # Path: [0x11, 0x22] — no 0xAB byte
@@ -359,25 +354,55 @@ class TestLoopDetectionMultiByte:
         result = h.flood_forward(pkt)
         assert result is not None
 
-    def test_3_byte_mode_local_hash_byte_in_path(self):
-        """In 3-byte mode, the 0xAB byte anywhere triggers strict loop detection."""
+    def test_2_byte_mode_strict_full_hash_match_detected(self):
+        """A full 2-byte hash match should trigger strict loop detection."""
         h = _make_handler(loop_detect="strict",
                           local_hash_bytes=bytes([0xAB, 0xCD, 0xEF]))
-        # 3-byte hop: [0x11, 0xAB, 0x33] — 0xAB in the middle
+        pkt = _make_flood_packet(b"\xAB\xCD", hash_size=2, hash_count=1)
+        result = h.flood_forward(pkt)
+        assert result is None
+        assert "loop" in pkt.drop_reason.lower()
+
+    def test_3_byte_mode_partial_hash_does_not_trigger_strict(self):
+        """3-byte strict must not trigger on partial-byte overlap."""
+        h = _make_handler(loop_detect="strict",
+                          local_hash_bytes=bytes([0xAB, 0xCD, 0xEF]))
+        # 3-byte hop: [0x11, 0xAB, 0x33] — contains 0xAB but not full [0xAB,0xCD,0xEF]
         pkt = _make_flood_packet(b"\x11\xAB\x33", hash_size=3, hash_count=1)
+        result = h.flood_forward(pkt)
+        assert result is not None
+
+    def test_3_byte_mode_full_hash_triggers_strict(self):
+        """3-byte strict drops only on full hash match."""
+        h = _make_handler(loop_detect="strict",
+                          local_hash_bytes=bytes([0xAB, 0xCD, 0xEF]))
+        pkt = _make_flood_packet(b"\xAB\xCD\xEF", hash_size=3, hash_count=1)
         result = h.flood_forward(pkt)
         assert result is None
 
-    def test_moderate_multi_byte_counts_all_byte_occurrences(self):
+    def test_minimal_two_byte_uses_threshold_two(self):
         """
-        moderate threshold=2. With 2-byte hops, each byte is counted
-        independently, so two occurrences of 0xAB across different hops
-        triggers the loop.
+        Firmware threshold for minimal + 2-byte hashes is 2 full matches.
+        One match passes, two matches drop.
         """
+        h = _make_handler(loop_detect="minimal",
+                          local_hash_bytes=bytes([0xAB, 0xCD, 0xEF]))
+        pkt = _make_flood_packet(b"\xAB\xCD\x11\x22", hash_size=2, hash_count=2)
+        assert h.flood_forward(pkt) is not None
+
+        pkt2 = _make_flood_packet(b"\xAB\xCD\x44\x55\xAB\xCD", hash_size=2, hash_count=3)
+        # Use a distinct payload to avoid duplicate suppression affecting the loop assertion.
+        pkt2.payload = bytearray(b"\x09\x08\x07")
+        pkt2.payload_len = len(pkt2.payload)
+        result = h.flood_forward(pkt2)
+        assert result is None
+        assert "loop" in pkt2.drop_reason.lower()
+
+    def test_moderate_two_byte_drops_at_one_full_match(self):
+        """Firmware threshold for moderate + 2-byte hashes is 1 full match."""
         h = _make_handler(loop_detect="moderate",
                           local_hash_bytes=bytes([0xAB, 0xCD, 0xEF]))
-        # Two 2-byte hops: [0xAB, 0x11, 0xAB, 0x22] — 0xAB appears twice
-        pkt = _make_flood_packet(b"\xAB\x11\xAB\x22", hash_size=2, hash_count=2)
+        pkt = _make_flood_packet(b"\xAB\xCD\x11\x22", hash_size=2, hash_count=2)
         result = h.flood_forward(pkt)
         assert result is None
         assert "loop" in pkt.drop_reason.lower()
@@ -659,7 +684,7 @@ class TestFloodChainLoopDetection:
         assert pkt2.drop_reason == "Duplicate"
 
     def test_two_byte_chain_loop_detected(self):
-        """2-byte mode: circular path A→B→A detected via byte-level scan."""
+        """2-byte mode: circular path A→B→A detected via full-hash chunk match."""
         hash_a = bytes([0xAA, 0xBB, 0x00])
         hash_b = bytes([0xCC, 0xDD, 0x00])
 
