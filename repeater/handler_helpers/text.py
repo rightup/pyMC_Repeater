@@ -12,6 +12,7 @@ import struct
 import time
 
 from pymc_core.node.handlers.text import TextMessageHandler
+from pymc_core.protocol.packet_utils import PathUtils
 
 from .mesh_cli import MeshCLI
 from .room_server import RoomServer
@@ -538,9 +539,13 @@ class TextHelper:
             )
 
             # Add path for direct routing if available from PATH packets
+            # out_path_len is encoded (wire format); slice by decoded byte count and re-encode to match actual bytes
             if client.out_path_len >= 0 and len(client.out_path) > 0:
-                reply_packet.path = bytearray(client.out_path[: client.out_path_len])
-                reply_packet.path_len = client.out_path_len
+                path_byte_len = PathUtils.get_path_byte_len(client.out_path_len)
+                actual_len = min(path_byte_len, len(client.out_path))
+                reply_packet.path = bytearray(client.out_path[:actual_len])
+                hash_size = PathUtils.get_path_hash_size(client.out_path_len)
+                reply_packet.path_len = PathUtils.encode_path_len(hash_size, actual_len // hash_size)
                 logger.debug(
                     f"CLI reply: Added stored out_path - path_len={reply_packet.path_len}, path={[hex(b) for b in reply_packet.path]}"
                 )

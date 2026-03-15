@@ -5,6 +5,7 @@ from typing import Dict, Optional
 
 from pymc_core.protocol import CryptoUtils, PacketBuilder
 from pymc_core.protocol.constants import PAYLOAD_TYPE_TXT_MSG
+from pymc_core.protocol.packet_utils import PathUtils
 
 logger = logging.getLogger("RoomServer")
 
@@ -378,9 +379,13 @@ class RoomServer:
             )
 
             # Add stored path for direct routing
+            # out_path_len is encoded (wire format); slice by decoded byte count and re-encode to match actual bytes
             if route_type == "direct" and len(client_info.out_path) > 0:
-                packet.path = bytearray(client_info.out_path[: client_info.out_path_len])
-                packet.path_len = client_info.out_path_len
+                path_byte_len = PathUtils.get_path_byte_len(client_info.out_path_len)
+                actual_len = min(path_byte_len, len(client_info.out_path))
+                packet.path = bytearray(client_info.out_path[:actual_len])
+                hash_size = PathUtils.get_path_hash_size(client_info.out_path_len)
+                packet.path_len = PathUtils.encode_path_len(hash_size, actual_len // hash_size)
 
             # Calculate ACK timeout
             if route_type == "flood":
