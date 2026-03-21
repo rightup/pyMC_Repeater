@@ -16,6 +16,23 @@
       "preamble_length": 17,
       "is_waveshare": true
     },
+    "rak13300": {
+      "name": "Rak7391 with rak13300 LoRa Module",
+      "bus_id": 0,
+      "cs_id": 0,
+      "cs_pin": -1,
+      "reset_pin": 4,
+      "busy_pin": 5,
+      "irq_pin": -1,
+      "txen_pin": -1,
+      "rxen_pin": -1,
+      "txled_pin": -1,
+      "rxled_pin": -1,
+      "tx_power": 22,
+      "preamble_length": 17,
+      "use_dio3_tcxo": true,
+      "is_waveshare": false
+    },
     "uconsole": {
       "name": "uConsole LoRa Module",
       "bus_id": 1,
@@ -78,7 +95,7 @@
       "tx_power": 22,
       "preamble_length": 17
     },
-      "meshadv": {
+    "meshadv": {
       "name": "MeshAdv",
       "bus_id": 0,
       "cs_id": 0,
