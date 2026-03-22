@@ -98,6 +98,17 @@ HT-RA62 module
     SPI Bus: SPI0
     GPIO Pins: CS=21, Reset=18, Busy=20, IRQ=16, use_dio3_tcxo=True, use_dio2_rf=True
 
+RAK7391 + RAK13300 (SPI, WisBlock slot via GPIO expander)
+
+    Hardware: RAK7391 + RAK13300 (SX1262)
+    Platform: Raspberry Pi CM4/CM5 inside RAK7391
+    Frequency: 868MHz (EU) or 915MHz (US)
+    TX Power: Up to 22 dBm
+    SPI Bus: SPI0
+    SPI Devices: /dev/spidev0.0 (slot A), /dev/spidev0.1 (slot B)
+    GPIO Pins (slot A): CS=0, Reset=4, Busy=5, IRQ=6
+    GPIO Pins (slot B): CS=1, Reset=12, Busy=13, IRQ=14
+
 ...
 
 ## Screenshots
