@@ -233,6 +233,52 @@ class StorageCollector:
     def get_crc_error_history(self, hours: int = 24, limit: int = None) -> list:
         return self.sqlite_handler.get_crc_error_history(hours, limit)
 
+    def get_device_stats(self) -> dict:
+        """Gather radio and device stats for MQTT status messages.
+
+        Returns a dict compatible with the meshcoretomqtt stats format::
+
+            {
+                "battery_mv": ...,
+                "uptime_secs": ...,
+                "noise_floor": ...,
+                "tx_air_secs": ...,
+                "rx_air_secs": ...,
+                "recv_errors": ...
+            }
+
+        Fields that cannot be determined are omitted.
+        """
+        stats: Dict[str, Any] = {}
+
+        if self.repeater_handler:
+            stats["uptime_secs"] = int(time.time() - self.repeater_handler.start_time)
+
+            # Noise floor from radio
+            noise_floor = self.repeater_handler.get_noise_floor()
+            if noise_floor is not None:
+                stats["noise_floor"] = noise_floor
+
+            # Airtime stats (convert ms -> secs)
+            airtime = self.repeater_handler.airtime_mgr.get_stats()
+            total_tx_ms = airtime.get("total_airtime_ms", 0)
+            stats["tx_air_secs"] = int(total_tx_ms / 1000)
+
+            # rx_air_secs and recv_errors are not tracked by pyMC_Repeater
+            # today, but we include the keys so consumers can detect their
+            # absence vs. zero.
+            stats["rx_air_secs"] = 0
+            stats["recv_errors"] = 0
+
+        # battery_mv is only available on embedded boards; omit when unknown.
+
+        return stats
+
+    def publish_status(self, status: str = "online"):
+        """Publish an MQTT status message including radio stats."""
+        stats = self.get_device_stats()
+        self.mqtt_handler.publish_status(status=status, stats=stats)
+
     def get_packet_stats(self, hours: int = 24) -> dict:
         return self.sqlite_handler.get_packet_stats(hours)
 

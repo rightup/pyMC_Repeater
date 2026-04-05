@@ -24,6 +24,17 @@ class MQTTHandler:
         self.available = MQTT_AVAILABLE
         self._init_client()
 
+    def _get_status_topic(self) -> str:
+        base_topic = self.mqtt_config.get("base_topic", "meshcore/repeater")
+        return f"{base_topic}/{self.node_name}/status"
+
+    def _build_offline_message(self) -> str:
+        return json.dumps({
+            "status": "offline",
+            "origin": self.node_name,
+            "origin_id": self.node_id,
+        })
+
     def _init_client(self):
         if not self.available or not self.mqtt_config.get("enabled", False):
             logger.info("MQTT disabled or not available")
@@ -73,6 +84,15 @@ class MQTTHandler:
             password = self.mqtt_config.get("password")
             if username:
                 self.client.username_pw_set(username, password)
+
+            # Set Last Will and Testament so status goes "offline" on disconnect
+            status_topic = self._get_status_topic()
+            self.client.will_set(
+                status_topic,
+                payload=self._build_offline_message(),
+                qos=1,
+                retain=True,
+            )
             
             broker = self.mqtt_config.get("broker", "localhost")
             port = self.mqtt_config.get("port", 1883)
@@ -125,6 +145,41 @@ class MQTTHandler:
             
         except Exception as e:
             logger.error(f"Failed to publish to MQTT: {e}")
+
+    def publish_status(self, status: str = "online", stats: dict = None):
+        """Publish a status message with optional radio/device stats.
+        
+        The message format matches meshcoretomqtt so downstream tools
+        like CoreScope can parse it:
+        
+            {
+                "status": "online",
+                "origin": "<node_name>",
+                "origin_id": "<node_id>",
+                "stats": { ... }
+            }
+        """
+        if not self.client:
+            return
+
+        try:
+            topic = self._get_status_topic()
+
+            payload = {
+                "status": status,
+                "origin": self.node_name,
+                "origin_id": self.node_id,
+            }
+
+            if stats:
+                payload["stats"] = stats
+
+            message = json.dumps(payload, default=str)
+            self.client.publish(topic, message, qos=1, retain=True)
+            logger.debug(f"Published status '{status}' to {topic}")
+
+        except Exception as e:
+            logger.error(f"Failed to publish status to MQTT: {e}")
 
     def close(self):
         if self.client:

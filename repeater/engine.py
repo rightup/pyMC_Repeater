@@ -128,6 +128,12 @@ class RepeaterHandler(BaseHandler):
         self._background_task = None
         self._last_crc_error_count = 0  # Track radio counter for delta persistence
         
+        # Status publish interval (seconds) — default 5 minutes
+        self.status_publish_interval = config.get("mqtt", {}).get(
+            "status_interval", 300
+        )
+        self.last_status_publish = 0  # force immediate publish on start
+        
         # Cache transport keys for efficient lookup
         self._transport_keys_cache = None
         self._transport_keys_cache_time = 0
@@ -1190,6 +1196,12 @@ class RepeaterHandler(BaseHandler):
                             logger.warning(f"SQLite cleanup failed: {e}")
                     self.last_db_cleanup = current_time
 
+                # Publish MQTT status with radio stats periodically
+                if (self.status_publish_interval > 0 and
+                        current_time - self.last_status_publish >= self.status_publish_interval):
+                    await self._publish_status_async()
+                    self.last_status_publish = current_time
+
                 # Sleep for 5 seconds before next check
                 await asyncio.sleep(5.0)
 
@@ -1276,6 +1288,16 @@ class RepeaterHandler(BaseHandler):
             logger.info("Runtime configuration reloaded successfully")
         except Exception as e:
             logger.error(f"Error reloading runtime config: {e}")
+
+    async def _publish_status_async(self):
+        """Publish an MQTT status message with radio stats."""
+        if not self.storage:
+            return
+        try:
+            self.storage.publish_status("online")
+            logger.debug("Published MQTT status with radio stats")
+        except Exception as e:
+            logger.error(f"Error publishing MQTT status: {e}")
 
     def cleanup(self):
         if self._background_task and not self._background_task.done():
