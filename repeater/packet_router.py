@@ -164,11 +164,15 @@ class PacketRouter:
 
         # Route to specific handlers for parsing only
         if payload_type == TraceHandler.payload_type():
-            # Process trace packet
+            # Process trace packet for local display (terminal RTT/SNR)
             if self.daemon.trace_helper:
                 await self.daemon.trace_helper.process_trace_packet(packet)
-                # Skip engine processing for trace packets - they're handled by trace helper
-                processed_by_injection = True
+            # Allow the engine to record + publish this packet to MQTT/LetsMesh.
+            # mark_do_not_retransmit prevents RF re-broadcast (same pattern as
+            # ControlHandler at line 180).  The trace request and response have
+            # different packet hashes, so the response won't be flagged as a
+            # duplicate of the request by the engine's seen-cache.
+            packet.mark_do_not_retransmit()
                 # Do not call _record_for_ui: TraceHelper.log_trace_record already persists the
                 # trace path from the payload. record_packet_only would treat packet.path (SNR bytes)
                 # as routing hashes and log bogus duplicate rows.
