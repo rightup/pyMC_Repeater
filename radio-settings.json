@@ -78,7 +78,7 @@
       "tx_power": 22,
       "preamble_length": 17
     },
-      "meshadv": {
+    "meshadv": {
       "name": "MeshAdv",
       "bus_id": 0,
       "cs_id": 0,
@@ -93,6 +93,26 @@
       "tx_power": 22,
       "use_dio3_tcxo": true,
       "preamble_length": 17
+    },
+    "meshtoad-v3": {
+      "name": "NULLHOP MeshToad V3 (USB)",
+      "bus_id": 7,
+      "cs_id": 0,
+      "cs_pin": -1,
+      "reset_pin": 2,
+      "busy_pin": 4,
+      "irq_pin": 6,
+      "txen_pin": -1,
+      "rxen_pin": 1,
+      "txled_pin": -1,
+      "rxled_pin": -1,
+      "tx_power": 30,
+      "preamble_length": 17,
+      "is_waveshare": false,
+      "use_dio3_tcxo": true,
+      "use_dio2_rf": true,
+      "gpio_chip": "/dev/gpiochip2",
+      "notes": "CH341 USB-SPI bridge. Requires frank-zago/ch341-i2c-spi-gpio kernel driver. Bus number may vary - check /sys/class/spi_master/ after driver loads."
     }
   }
 }
