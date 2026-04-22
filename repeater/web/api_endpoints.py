@@ -645,8 +645,13 @@ class APIEndpoints:
                 return self._error("Event loop not available")
             import asyncio
 
-            future = asyncio.run_coroutine_threadsafe(self.send_advert_func(), self.event_loop)
-            result = future.result(timeout=10)
+            async def delayed_advert():
+                """Match CLI advert timing before triggering the radio send."""
+                await asyncio.sleep(1.5)
+                return await self.send_advert_func()
+
+            future = asyncio.run_coroutine_threadsafe(delayed_advert(), self.event_loop)
+            result = future.result(timeout=15)
             return (
                 self._success("Advert sent successfully")
                 if result
