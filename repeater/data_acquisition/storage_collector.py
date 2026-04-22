@@ -36,6 +36,10 @@ class StorageCollector:
         self.sqlite_handler = SQLiteHandler(self.storage_dir)
         self.rrd_handler = RRDToolHandler(self.storage_dir)
         self.mqtt_handler = MQTTHandler(config.get("mqtt", {}), node_name, node_id)
+        # Rate-limit the heavy WebSocket stats broadcast (get_packet_stats is a
+        # GROUP BY query that can cost several ms on an SD card).  Sending it on
+        # every packet is unnecessary — the dashboard polls every few seconds.
+        self._last_ws_stats_broadcast: float = 0.0
 
         # Initialize LetsMesh handler if configured
         self.letsmesh_handler = None
@@ -201,16 +205,26 @@ class StorageCollector:
         if self.websocket_available:
             try:
                 self.websocket_broadcast_packet(packet_record)
-                packet_stats_24h = self.sqlite_handler.get_packet_stats(hours=24)
-                uptime_seconds = (
-                    time.time() - self.repeater_handler.start_time if self.repeater_handler else 0
-                )
-                self.websocket_broadcast_stats(
-                    {
-                        "packet_stats": packet_stats_24h,
-                        "system_stats": {"uptime_seconds": uptime_seconds},
-                    }
-                )
+
+                # get_packet_stats() is a GROUP BY aggregation over the full
+                # packets table — potentially several ms of SD-card I/O.
+                # Rate-limit the broadcast to at most once every 5 seconds.
+                # The dashboard polls on its own schedule; sub-second freshness
+                # here provides no UX benefit and burns I/O on every packet.
+                now = time.time()
+                if now - self._last_ws_stats_broadcast >= 5.0:
+                    self._last_ws_stats_broadcast = now
+                    packet_stats_24h = self.sqlite_handler.get_packet_stats(hours=24)
+                    uptime_seconds = (
+                        time.time() - self.repeater_handler.start_time
+                        if self.repeater_handler else 0
+                    )
+                    self.websocket_broadcast_stats(
+                        {
+                            "packet_stats": packet_stats_24h,
+                            "system_stats": {"uptime_seconds": uptime_seconds},
+                        }
+                    )
             except Exception as e:
                 logger.debug(f"WebSocket broadcast failed: {e}")
 
