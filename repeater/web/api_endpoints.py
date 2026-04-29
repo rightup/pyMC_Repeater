@@ -673,6 +673,16 @@ class APIEndpoints:
                     },
                     "accuracy": {"hdop": None, "pdop": None, "vdop": None},
                     "time": {"utc_time": None, "date": None, "datetime_utc": None},
+                    "location_update": {
+                        "enabled": False,
+                        "state": "disabled",
+                        "last_attempt": None,
+                        "last_success": None,
+                        "last_error": None,
+                        "last_latitude": None,
+                        "last_longitude": None,
+                        "interval_seconds": None,
+                    },
                     "satellites": {
                         "used_count": None,
                         "used_prns": [],

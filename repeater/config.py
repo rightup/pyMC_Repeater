@@ -96,6 +96,8 @@ def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
             "time_sync_interval_seconds": 3600.0,
             "time_sync_min_offset_seconds": 1.0,
             "time_sync_min_valid_year": 2020,
+            "update_repeater_location_from_fix": True,
+            "location_update_interval_seconds": 600.0,
         }
 
     # Ensure repeater.security exists with defaults for upgrades from older configs

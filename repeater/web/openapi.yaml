@@ -404,6 +404,30 @@ paths:
                           last_offset_seconds:
                             type: number
                             nullable: true
+                      location_update:
+                        type: object
+                        description: GPS-fix-to-repeater-location update status
+                        properties:
+                          enabled:
+                            type: boolean
+                          state:
+                            type: string
+                            enum: [disabled, unconfigured, waiting_for_fix, waiting_for_position, ready, updated, skipped, error]
+                          last_attempt:
+                            type: string
+                            nullable: true
+                          last_success:
+                            type: string
+                            nullable: true
+                          last_error:
+                            type: string
+                            nullable: true
+                          last_latitude:
+                            type: number
+                            nullable: true
+                          last_longitude:
+                            type: number
+                            nullable: true
                       satellites:
                         type: object
                       nmea:

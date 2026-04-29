@@ -166,6 +166,12 @@ gps:
   time_sync_min_offset_seconds: 1.0
   time_sync_min_valid_year: 2020
 
+  # Feed a valid GPS fix back into repeater.latitude/repeater.longitude so
+  # pyMC Repeater adverts and pyMC Console location details follow the receiver.
+  # Updates are throttled to avoid rewriting config on every NMEA sentence.
+  update_repeater_location_from_fix: true
+  location_update_interval_seconds: 600.0
+
 # Mesh Network Configuration
 mesh:
   # Unscoped flood policy - controls whether the repeater allows or denies unscoped flooding

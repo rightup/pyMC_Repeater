@@ -264,7 +264,10 @@ class RepeaterDaemon:
             )
             logger.info("Config manager initialized")
 
-            self.gps_service = GPSService(self.config)
+            self.gps_service = GPSService(
+                self.config,
+                location_update_callback=self._update_repeater_location_from_gps,
+            )
             self.gps_service.start()
             if self.config.get("gps", {}).get("enabled", False):
                 logger.info("GPS diagnostics initialized")
@@ -1031,6 +1034,55 @@ class RepeaterDaemon:
         except Exception as e:
             logger.error(f"Failed to send advert: {e}", exc_info=True)
             return False
+
+    def _update_repeater_location_from_gps(self, location: dict) -> bool:
+        """Persist the latest valid GPS fix as the repeater's advertised location."""
+        latitude = location.get("latitude")
+        longitude = location.get("longitude")
+        if latitude is None or longitude is None:
+            return False
+
+        repeater_config = self.config.setdefault("repeater", {})
+        current_latitude = repeater_config.get("latitude")
+        current_longitude = repeater_config.get("longitude")
+        try:
+            if (
+                current_latitude is not None
+                and current_longitude is not None
+                and abs(float(current_latitude) - float(latitude)) < 0.000001
+                and abs(float(current_longitude) - float(longitude)) < 0.000001
+            ):
+                return False
+        except (TypeError, ValueError):
+            pass
+
+        updates = {
+            "repeater": {
+                "latitude": float(latitude),
+                "longitude": float(longitude),
+            }
+        }
+        if self.config_manager:
+            result = self.config_manager.update_and_save(
+                updates=updates,
+                live_update=True,
+                live_update_sections=["repeater"],
+            )
+            if not result.get("success"):
+                logger.warning(
+                    "GPS location fix could not update repeater config: %s",
+                    result.get("error", "unknown error"),
+                )
+                return False
+        else:
+            repeater_config.update(updates["repeater"])
+
+        logger.info(
+            "Updated repeater location from GPS fix: latitude=%.6f longitude=%.6f",
+            latitude,
+            longitude,
+        )
+        return True
 
     def _signal_shutdown(self, sig, loop):
         """Handle SIGTERM/SIGINT by scheduling async shutdown."""

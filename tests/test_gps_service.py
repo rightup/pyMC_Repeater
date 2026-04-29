@@ -346,3 +346,64 @@ def test_gps_service_reflects_runtime_manual_location_updates():
     assert snapshot["gps_position"]["latitude"] == 42.83538333
     assert snapshot["gps_position"]["longitude"] == -71.1076
     assert snapshot["position_meta"]["source"] == "manual_config"
+
+
+def test_gps_service_updates_repeater_location_from_valid_fix(monkeypatch):
+    monotonic_now = [1000.0]
+    monkeypatch.setattr(_MODULE.time, "monotonic", lambda: monotonic_now[0])
+    location_updates = []
+    service = GPSService(
+        {
+            "gps": {
+                "enabled": True,
+                "time_sync_enabled": False,
+                "location_update_interval_seconds": 600.0,
+            }
+        },
+        location_update_callback=lambda payload: location_updates.append(payload) or True,
+    )
+
+    assert service.ingest_sentence(
+        _sentence("GPGGA,010203,4250.123,N,07106.456,W,1,05,1.4,32.0,M,0.0,M,,")
+    )
+
+    assert len(location_updates) == 1
+    assert location_updates[0]["latitude"] == 42.83538333
+    assert location_updates[0]["longitude"] == -71.1076
+    snapshot = service.get_snapshot()
+    assert snapshot["location_update"]["state"] == "updated"
+    assert snapshot["location_update"]["last_latitude"] == 42.83538333
+    assert snapshot["location_update"]["last_longitude"] == -71.1076
+
+    assert service.ingest_sentence(
+        _sentence("GPGGA,010204,4251.000,N,07107.000,W,1,05,1.4,33.0,M,0.0,M,,")
+    )
+    assert len(location_updates) == 1
+
+    monotonic_now[0] += 601.0
+    assert service.ingest_sentence(
+        _sentence("GPGGA,010205,4251.000,N,07107.000,W,1,05,1.4,33.0,M,0.0,M,,")
+    )
+    assert len(location_updates) == 2
+    assert location_updates[1]["latitude"] == 42.85
+    assert location_updates[1]["longitude"] == -71.11666667
+
+
+def test_gps_service_does_not_update_repeater_location_without_valid_fix():
+    location_updates = []
+    service = GPSService(
+        {
+            "gps": {
+                "enabled": True,
+                "time_sync_enabled": False,
+            }
+        },
+        location_update_callback=lambda payload: location_updates.append(payload) or True,
+    )
+
+    assert service.ingest_sentence(
+        _sentence("GPGGA,010203,4250.123,N,07106.456,W,0,00,8.8,32.0,M,0.0,M,,")
+    )
+
+    assert location_updates == []
+    assert service.get_snapshot()["location_update"]["state"] == "waiting_for_fix"

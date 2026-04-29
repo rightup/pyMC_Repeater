@@ -574,6 +574,7 @@ class GPSService:
         *,
         clock_setter: Optional[Callable[[datetime], None]] = None,
         time_provider: Optional[Callable[[], float]] = None,
+        location_update_callback: Optional[Callable[[Dict[str, Any]], bool]] = None,
     ):
         gps_config = config.get("gps", {}) if isinstance(config, dict) else {}
         repeater_config = config.get("repeater", {}) if isinstance(config, dict) else {}
@@ -600,6 +601,25 @@ class GPSService:
         self.time_sync_min_valid_year = int(gps_config.get("time_sync_min_valid_year", 2020))
         self._clock_setter = clock_setter or _set_system_clock_from_datetime
         self._time_provider = time_provider or time.time
+        self.location_update_enabled = bool(
+            gps_config.get("update_repeater_location_from_fix", True)
+        )
+        self.location_update_interval_seconds = max(
+            1.0, float(gps_config.get("location_update_interval_seconds", 600.0))
+        )
+        self._location_update_callback = location_update_callback
+        self._location_update_lock = threading.RLock()
+        self._last_location_update_monotonic: Optional[float] = None
+        self._location_update_status: Dict[str, Any] = {
+            "enabled": self.location_update_enabled,
+            "state": "disabled" if not self.location_update_enabled else "waiting_for_fix",
+            "last_attempt": None,
+            "last_success": None,
+            "last_error": None,
+            "last_latitude": None,
+            "last_longitude": None,
+            "interval_seconds": self.location_update_interval_seconds,
+        }
         self._time_sync_lock = threading.RLock()
         self._last_time_sync_monotonic: Optional[float] = None
         self._time_sync_status: Dict[str, Any] = {
@@ -650,6 +670,7 @@ class GPSService:
         accepted = self.parser.ingest_sentence(sentence)
         if accepted:
             self._maybe_sync_system_time()
+            self._maybe_update_repeater_location()
         return accepted
 
     def get_summary(self) -> Dict[str, Any]:
@@ -668,6 +689,7 @@ class GPSService:
             "gps_position": snapshot.get("gps_position"),
             "manual_position": snapshot.get("manual_position"),
             "time_sync": snapshot.get("time_sync"),
+            "location_update": snapshot.get("location_update"),
             "satellites": {
                 "used_count": snapshot["satellites"].get("used_count"),
                 "in_view_count": snapshot["satellites"].get("in_view_count"),
@@ -692,6 +714,7 @@ class GPSService:
                     "stale_after_seconds": self.parser.stale_after_seconds,
                 },
                 "time_sync": self._get_time_sync_status(snapshot),
+                "location_update": self._get_location_update_status(snapshot),
             }
         )
         if not self.enabled:
@@ -702,6 +725,112 @@ class GPSService:
             if snapshot["status"]["state"] in ("no_data", "stale"):
                 snapshot["status"]["state"] = "error"
         return snapshot
+
+    def _get_location_update_status(self, snapshot: Dict[str, Any]) -> Dict[str, Any]:
+        with self._location_update_lock:
+            status = deepcopy(self._location_update_status)
+
+        if not self.enabled or not self.location_update_enabled:
+            status["state"] = "disabled"
+            return status
+        if self._location_update_callback is None:
+            status["state"] = "unconfigured"
+            return status
+        if status.get("state") in ("updated", "error", "skipped"):
+            return status
+        if not snapshot.get("status", {}).get("fix_valid"):
+            status["state"] = "waiting_for_fix"
+        else:
+            position = snapshot.get("gps_position") or snapshot.get("position") or {}
+            latitude = _to_float(position.get("latitude"))
+            longitude = _to_float(position.get("longitude"))
+            if not _is_valid_latitude(latitude) or not _is_valid_longitude(longitude):
+                status["state"] = "waiting_for_position"
+            elif _is_zero_coordinate(latitude, longitude):
+                status["state"] = "waiting_for_position"
+            else:
+                status["state"] = "ready"
+        return status
+
+    def _record_location_update_status(
+        self,
+        *,
+        state: str,
+        latitude: Optional[float] = None,
+        longitude: Optional[float] = None,
+        error: Optional[str] = None,
+        success: bool = False,
+    ):
+        timestamp = datetime.now(timezone.utc).isoformat()
+        with self._location_update_lock:
+            self._location_update_status.update(
+                {
+                    "enabled": self.location_update_enabled,
+                    "state": state,
+                    "last_attempt": timestamp,
+                    "last_error": error,
+                    "last_latitude": latitude,
+                    "last_longitude": longitude,
+                    "interval_seconds": self.location_update_interval_seconds,
+                }
+            )
+            if success:
+                self._location_update_status["last_success"] = timestamp
+
+    def _maybe_update_repeater_location(self):
+        if not self.enabled or not self.location_update_enabled:
+            return
+        if self._location_update_callback is None:
+            return
+
+        now_monotonic = time.monotonic()
+        with self._location_update_lock:
+            if (
+                self._last_location_update_monotonic is not None
+                and now_monotonic - self._last_location_update_monotonic
+                < self.location_update_interval_seconds
+            ):
+                return
+
+        snapshot = self.parser.snapshot()
+        if not snapshot.get("status", {}).get("fix_valid"):
+            return
+
+        position = snapshot.get("position") or {}
+        latitude = _to_float(position.get("latitude"))
+        longitude = _to_float(position.get("longitude"))
+        if not _is_valid_latitude(latitude) or not _is_valid_longitude(longitude):
+            return
+        if _is_zero_coordinate(latitude, longitude):
+            return
+
+        self._last_location_update_monotonic = now_monotonic
+        payload = {
+            "latitude": latitude,
+            "longitude": longitude,
+            "altitude_m": _to_float(position.get("altitude_m")),
+            "fix": deepcopy(snapshot.get("fix") or {}),
+            "status": deepcopy(snapshot.get("status") or {}),
+            "time": deepcopy(snapshot.get("time") or {}),
+        }
+        try:
+            updated = bool(self._location_update_callback(payload))
+        except Exception as exc:
+            self._record_location_update_status(
+                state="error",
+                latitude=latitude,
+                longitude=longitude,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            logger.warning("GPS repeater location update failed: %s", exc)
+            return
+
+        self._record_location_update_status(
+            state="updated" if updated else "skipped",
+            latitude=latitude,
+            longitude=longitude,
+            success=updated,
+        )
 
     @staticmethod
     def _extract_manual_position(repeater_config: Dict[str, Any]) -> Optional[Dict[str, Any]]:
