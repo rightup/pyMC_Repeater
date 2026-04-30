@@ -623,18 +623,34 @@ class RoomServer:
                             continue
 
                         if last_activity == 0:
-                            logger.debug(
-                                f"Skipping client 0x{client.id.get_public_key()[0]:02X} (evicted)"
+                            # Client was evicted but has reconnected — restore sync
+                            # state so queued messages get delivered.  Preserve
+                            # sync_since to avoid replaying already-seen messages.
+                            preserved_sync_since = sync_state.get("sync_since", 0)
+                            logger.info(
+                                f"Room '{self.room_name}': Client "
+                                f"0x{client.id.get_public_key()[0]:02X} reconnected after "
+                                f"eviction, restoring sync_since={preserved_sync_since}"
                             )
-                            continue
+                            self.db.upsert_client_sync(
+                                room_hash=f"0x{self.room_hash:02X}",
+                                client_pubkey=client.id.get_public_key().hex(),
+                                sync_since=preserved_sync_since,
+                                last_activity=time.time(),
+                                push_failures=0,
+                                pending_ack_crc=0,
+                            )
+                            sync_since = preserved_sync_since
+                            # Fall through to check for unsynced messages
 
-                        if push_failures >= 3:
+                        elif push_failures >= 3:
                             logger.debug(
                                 f"Skipping client 0x{client.id.get_public_key()[0]:02X} (max failures)"
                             )
                             continue
 
-                        sync_since = sync_state.get("sync_since", 0)
+                        else:
+                            sync_since = sync_state.get("sync_since", 0)
                     else:
                         # Initialize sync state for new client
                         # Use sync_since from ACL client (sent during login) if available
