@@ -27,6 +27,7 @@ PUSH_ACK_TIMEOUT_FACTOR_MS = 2000
 # Safety limits and protections
 MAX_MESSAGE_LENGTH = 160  # Match C++ MAX_POST_TEXT_LEN (151 bytes for text)
 MAX_POSTS_PER_CLIENT_PER_MINUTE = 10  # Prevent spam
+DEDUP_WINDOW_SECS = 30  # Drop identical (author, text) within this window
 MAX_CLIENTS_PER_ROOM = 50  # From ACL default
 MAX_PUSH_FAILURES = 3  # Evict after this many consecutive failures
 INACTIVE_CLIENT_TIMEOUT = 3600  # Evict after 1 hour inactivity (seconds)
@@ -183,6 +184,7 @@ class RoomServer:
 
         # Safety and monitoring
         self.client_post_times = {}  # Track last N post times per client for rate limiting
+        self._recent_posts: Dict[tuple, float] = {}  # (pubkey_hex, text) → timestamp for dedup
         self.consecutive_sync_errors = 0  # Circuit breaker counter
         self.last_eviction_check = time.time()
         self.eviction_check_interval = 300  # Check every 5 minutes
@@ -242,6 +244,24 @@ class RoomServer:
             # SAFETY: Rate limit per client
             client_key = client_pubkey.hex()
             now = time.time()
+
+            # Deduplicate retransmissions: drop identical (author, text) within the window.
+            # Clients retry when they don't receive an ack quickly enough; without this guard
+            # every retry lands as a separate message in the room.
+            dedup_key = (client_key, message_text)
+            last_seen = self._recent_posts.get(dedup_key, 0)
+            if now - last_seen < DEDUP_WINDOW_SECS:
+                logger.debug(
+                    f"Room '{self.room_name}': Dropping duplicate from "
+                    f"{client_pubkey[:4].hex()} within {DEDUP_WINDOW_SECS}s window"
+                )
+                return False
+            self._recent_posts[dedup_key] = now
+
+            # Evict stale dedup entries to bound memory usage
+            if len(self._recent_posts) > 500:
+                cutoff = now - DEDUP_WINDOW_SECS
+                self._recent_posts = {k: v for k, v in self._recent_posts.items() if v > cutoff}
 
             if client_key not in self.client_post_times:
                 self.client_post_times[client_key] = []
