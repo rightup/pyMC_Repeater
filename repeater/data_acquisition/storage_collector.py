@@ -377,15 +377,27 @@ class StorageCollector:
 
     def get_node_name_by_pubkey(self, pubkey: str) -> Optional[str]:
         """
-        Lookup node name from adverts table by public key.
+        Lookup node display name for a public key.
+
+        Resolution order:
+        1. pubkey_aliases table (admin-assigned, highest priority)
+        2. adverts table (LoRa advert broadcasts from hardware devices)
 
         Args:
-            pubkey: Public key in hex string format
+            pubkey: Public key in hex string format (lowercase, 64 chars)
 
         Returns:
-            Node name if found, None otherwise
+            Display name if found, None otherwise
         """
+        if not pubkey:
+            return None
         try:
+            # 1. Check admin-assigned aliases first
+            alias = self.sqlite_handler.get_pubkey_alias(pubkey)
+            if alias:
+                return alias
+
+            # 2. Fall back to adverts table (hardware devices that have broadcast LoRa adverts)
             import sqlite3
 
             with sqlite3.connect(self.sqlite_handler.sqlite_path) as conn:
@@ -397,6 +409,15 @@ class StorageCollector:
         except Exception as e:
             logger.debug(f"Could not lookup node name for {pubkey[:8] if pubkey else 'None'}: {e}")
             return None
+
+    def set_pubkey_alias(self, pubkey: str, alias: str) -> bool:
+        return self.sqlite_handler.set_pubkey_alias(pubkey, alias)
+
+    def delete_pubkey_alias(self, pubkey: str) -> bool:
+        return self.sqlite_handler.delete_pubkey_alias(pubkey)
+
+    def get_all_pubkey_aliases(self) -> list:
+        return self.sqlite_handler.get_all_pubkey_aliases()
 
     def cleanup_old_data(self, days: int = 7):
         self.sqlite_handler.cleanup_old_data(days)

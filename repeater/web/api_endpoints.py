@@ -124,6 +124,11 @@ logger = logging.getLogger("HTTPServer")
 # DELETE /api/room_message?room_name=General&message_id=123 - Delete specific message
 # DELETE /api/room_messages_clear?room_name=General - Clear all messages in room
 
+# Pubkey Aliases (admin-assigned display names for clients not in adverts table)
+# GET    /api/pubkey_aliases - List all aliases
+# POST   /api/pubkey_alias {"pubkey": "...", "alias": "Alice"} - Set/update alias
+# DELETE /api/pubkey_alias?pubkey=... - Remove alias
+
 # OTA Updates
 # GET    /api/update/status          - Current + latest version, channel, state
 # POST   /api/update/check           - Force fresh GitHub version check
@@ -3813,14 +3818,19 @@ class APIEndpoints:
                 for client in all_clients:
                     try:
                         pub_key = client.id.get_public_key()
+                        pub_key_hex = pub_key.hex()
 
                         # Compute address from public key (first byte of SHA256)
                         address_bytes = CryptoUtils.sha256(pub_key)[:1]
 
+                        # Resolve display name: alias first, then adverts
+                        storage = self._get_storage()
+                        node_name = storage.get_node_name_by_pubkey(pub_key_hex) if storage else None
+
                         clients_list.append(
                             {
                                 "public_key": pub_key[:8].hex() + "..." + pub_key[-4:].hex(),
-                                "public_key_full": pub_key.hex(),
+                                "public_key_full": pub_key_hex,
                                 "address": address_bytes.hex(),
                                 "permissions": "admin" if client.is_admin() else "guest",
                                 "last_activity": client.last_activity,
@@ -3829,6 +3839,7 @@ class APIEndpoints:
                                 "identity_name": identity_info["name"],
                                 "identity_type": identity_info["type"],
                                 "identity_hash": identity_info["hash"],
+                                "node_name": node_name,
                             }
                         )
                     except Exception as client_error:
@@ -5110,6 +5121,78 @@ class APIEndpoints:
             raise
         except Exception as e:
             logger.error(f"DB vacuum error: {e}", exc_info=True)
+            return self._error(str(e))
+
+    # ======================
+    # Pubkey Aliases
+    # ======================
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    def pubkey_aliases(self):
+        """List all admin-assigned pubkey aliases.
+
+        GET /api/pubkey_aliases
+
+        Returns:
+            {"success": true, "data": [{"pubkey": "...", "alias": "Alice", ...}, ...]}
+        """
+        self._set_cors_headers()
+        if cherrypy.request.method == "OPTIONS":
+            return ""
+        try:
+            storage = self._get_storage()
+            aliases = storage.get_all_pubkey_aliases()
+            return self._success(aliases)
+        except Exception as e:
+            logger.error(f"Error listing pubkey aliases: {e}", exc_info=True)
+            return self._error(str(e))
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    def pubkey_alias(self, pubkey=None):
+        """Create/update or delete a pubkey alias.
+
+        POST /api/pubkey_alias {"pubkey": "<64-char hex>", "alias": "Alice"}
+        DELETE /api/pubkey_alias?pubkey=<64-char hex>
+
+        Returns:
+            {"success": true} or {"success": false, "error": "..."}
+        """
+        self._set_cors_headers()
+        if cherrypy.request.method == "OPTIONS":
+            return ""
+        try:
+            storage = self._get_storage()
+            method = cherrypy.request.method.upper()
+
+            if method == "POST":
+                data = self._parse_json_body()
+                pk = (data.get("pubkey") or "").strip().lower()
+                alias = (data.get("alias") or "").strip()
+                if not pk:
+                    return self._error("pubkey is required")
+                if len(pk) != 64:
+                    return self._error("pubkey must be a 64-character hex string (32 bytes)")
+                if not alias:
+                    return self._error("alias is required")
+                ok = storage.set_pubkey_alias(pk, alias)
+                return self._success({"pubkey": pk, "alias": alias}) if ok else self._error("Failed to save alias")
+
+            elif method == "DELETE":
+                pk = (pubkey or "").strip().lower()
+                if not pk:
+                    return self._error("pubkey query parameter is required")
+                deleted = storage.delete_pubkey_alias(pk)
+                return self._success({"deleted": deleted})
+
+            else:
+                raise cherrypy.HTTPError(405, "Method not allowed")
+
+        except cherrypy.HTTPError:
+            raise
+        except Exception as e:
+            logger.error(f"Error managing pubkey alias: {e}", exc_info=True)
             return self._error(str(e))
 
     # ======================

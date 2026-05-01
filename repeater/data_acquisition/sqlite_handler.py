@@ -246,6 +246,18 @@ class SQLiteHandler:
                     "CREATE INDEX IF NOT EXISTS idx_room_client_sync_pending ON room_client_sync(pending_ack_crc)"
                 )
 
+                # Pubkey aliases — admin-assigned names for clients not in adverts
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS pubkey_aliases (
+                        pubkey TEXT NOT NULL PRIMARY KEY,
+                        alias TEXT NOT NULL,
+                        created_at REAL NOT NULL,
+                        updated_at REAL NOT NULL
+                    )
+                """
+                )
+
                 conn.commit()
                 logger.info(f"SQLite database initialized: {self.sqlite_path}")
 
@@ -566,6 +578,123 @@ class SQLiteHandler:
                         (migration_name, time.time()),
                     )
                     logger.info(f"Migration '{migration_name}' applied successfully")
+
+
+                # Migration 11: Ensure room_client_sync has UNIQUE(room_hash, client_pubkey).
+                # The constraint was always in the CREATE TABLE statement, but databases created
+                # before this table existed will have picked it up correctly on first run.
+                # However, if the table was somehow created without the constraint (e.g. from an
+                # intermediate build), ON CONFLICT(room_hash, client_pubkey) DO UPDATE SET never
+                # fires — every upsert_client_sync call inserts a new row instead of updating the
+                # existing one, so sync_since never advances and the push loop re-sends the same
+                # message to the companion forever.
+                # Fix: recreate the table with the constraint, keeping only the most-recently-
+                # updated row for each (room_hash, client_pubkey) pair.
+                migration_name = "room_client_sync_unique_constraint"
+                existing = conn.execute(
+                    "SELECT migration_name FROM migrations WHERE migration_name = ?",
+                    (migration_name,),
+                ).fetchone()
+
+                if not existing:
+                    # Check whether the UNIQUE constraint already exists via sqlite_master.
+                    idx_check = conn.execute(
+                        """
+                        SELECT COUNT(*) FROM sqlite_master
+                        WHERE type='index'
+                          AND tbl_name='room_client_sync'
+                          AND (sql LIKE '%UNIQUE%' OR name LIKE '%unique%')
+                        """
+                    ).fetchone()[0]
+
+                    if idx_check == 0:
+                        # Rebuild the table with the constraint.
+                        conn.execute(
+                            """
+                            CREATE TABLE room_client_sync_new (
+                                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                room_hash TEXT NOT NULL,
+                                client_pubkey TEXT NOT NULL,
+                                sync_since REAL NOT NULL DEFAULT 0,
+                                pending_ack_crc INTEGER DEFAULT 0,
+                                push_post_timestamp REAL DEFAULT 0,
+                                ack_timeout_time REAL DEFAULT 0,
+                                push_failures INTEGER DEFAULT 0,
+                                last_activity REAL NOT NULL,
+                                updated_at REAL NOT NULL,
+                                UNIQUE(room_hash, client_pubkey)
+                            )
+                            """
+                        )
+                        # Copy only the most-recently-updated row per client.
+                        conn.execute(
+                            """
+                            INSERT INTO room_client_sync_new
+                                (room_hash, client_pubkey, sync_since, pending_ack_crc,
+                                 push_post_timestamp, ack_timeout_time, push_failures,
+                                 last_activity, updated_at)
+                            SELECT room_hash, client_pubkey, sync_since, pending_ack_crc,
+                                   push_post_timestamp, ack_timeout_time, push_failures,
+                                   last_activity, updated_at
+                            FROM room_client_sync
+                            WHERE id IN (
+                                SELECT MAX(id)
+                                FROM room_client_sync
+                                GROUP BY room_hash, client_pubkey
+                            )
+                            """
+                        )
+                        conn.execute("DROP TABLE room_client_sync")
+                        conn.execute(
+                            "ALTER TABLE room_client_sync_new RENAME TO room_client_sync"
+                        )
+                        # Recreate indices on the rebuilt table.
+                        conn.execute(
+                            "CREATE INDEX IF NOT EXISTS idx_room_client_sync_room "
+                            "ON room_client_sync(room_hash, client_pubkey)"
+                        )
+                        conn.execute(
+                            "CREATE INDEX IF NOT EXISTS idx_room_client_sync_pending "
+                            "ON room_client_sync(pending_ack_crc)"
+                        )
+                        logger.info(
+                            "Migration 11: Rebuilt room_client_sync with "
+                            "UNIQUE(room_hash, client_pubkey) constraint"
+                        )
+                    else:
+                        logger.info(
+                            "Migration 11: room_client_sync already has unique constraint, skipping rebuild"
+                        )
+
+                    conn.execute(
+                        "INSERT INTO migrations (migration_name, applied_at) VALUES (?, ?)",
+                        (migration_name, time.time()),
+                    )
+                    logger.info(f"Migration '{migration_name}' applied successfully")
+
+                # Migration 12: Create pubkey_aliases table for admin-assigned client names
+                migration_name = "add_pubkey_aliases_table"
+                existing = conn.execute(
+                    "SELECT migration_name FROM migrations WHERE migration_name = ?",
+                    (migration_name,),
+                ).fetchone()
+
+                if not existing:
+                    conn.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS pubkey_aliases (
+                            pubkey TEXT NOT NULL PRIMARY KEY,
+                            alias TEXT NOT NULL,
+                            created_at REAL NOT NULL,
+                            updated_at REAL NOT NULL
+                        )
+                        """
+                    )
+                    conn.execute(
+                        "INSERT INTO migrations (migration_name, applied_at) VALUES (?, ?)",
+                        (migration_name, time.time()),
+                    )
+                    logger.info("Migration 12: Created pubkey_aliases table")
 
                 conn.commit()
 
@@ -2566,3 +2695,75 @@ class SQLiteHandler:
         except Exception as e:
             logger.error(f"Failed to pop companion message: {e}")
             return None
+
+    # -----------------------------------------------------------------------
+    # Pubkey alias management
+    # -----------------------------------------------------------------------
+
+    def set_pubkey_alias(self, pubkey: str, alias: str) -> bool:
+        """Create or update a human-readable alias for a public key.
+
+        Args:
+            pubkey: Full hex public key string (64 chars / 32 bytes).
+            alias: Display name to associate with this pubkey.
+
+        Returns:
+            True on success.
+        """
+        try:
+            now = time.time()
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO pubkey_aliases (pubkey, alias, created_at, updated_at)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(pubkey) DO UPDATE SET alias = excluded.alias,
+                                                      updated_at = excluded.updated_at
+                    """,
+                    (pubkey.lower(), alias.strip(), now, now),
+                )
+                conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"Failed to set pubkey alias: {e}")
+            return False
+
+    def get_pubkey_alias(self, pubkey: str) -> Optional[str]:
+        """Return the alias for a pubkey, or None if not set."""
+        try:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT alias FROM pubkey_aliases WHERE pubkey = ?",
+                    (pubkey.lower(),),
+                ).fetchone()
+                return row[0] if row else None
+        except Exception as e:
+            logger.debug(f"Failed to get pubkey alias: {e}")
+            return None
+
+    def delete_pubkey_alias(self, pubkey: str) -> bool:
+        """Remove the alias for a pubkey. Returns True if a row was deleted."""
+        try:
+            with self._connect() as conn:
+                cursor = conn.execute(
+                    "DELETE FROM pubkey_aliases WHERE pubkey = ?",
+                    (pubkey.lower(),),
+                )
+                conn.commit()
+                return cursor.rowcount > 0
+        except Exception as e:
+            logger.error(f"Failed to delete pubkey alias: {e}")
+            return False
+
+    def get_all_pubkey_aliases(self) -> List[dict]:
+        """Return all pubkey aliases ordered by alias name."""
+        try:
+            with self._connect() as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute(
+                    "SELECT pubkey, alias, created_at, updated_at FROM pubkey_aliases ORDER BY alias ASC"
+                ).fetchall()
+                return [dict(r) for r in rows]
+        except Exception as e:
+            logger.error(f"Failed to list pubkey aliases: {e}")
+            return []
