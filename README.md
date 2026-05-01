@@ -123,6 +123,16 @@ RAK Wireless RAK6421 with RAK1330x
     GPIO Pins(IO Slot 1): Reset=16, Busy=24, IRQ=22, use_dio3_tcxo=True, use_dio2_rf=True
     GPIO Pins(IO Slot 2): Reset=24, Busy=19, IRQ=18, use_dio3_tcxo=True, use_dio2_rf=True
 
+RAK Wireless RAK7391 with RAK1330x
+
+    Hardware: RAK1330x LoRa module
+    Platform: Raspberry Pi (or compatible single-board computer)
+    Frequency: 868MHz (EU) or 915MHz (US)
+    TX Power: 22dBm on RAK13300, 30dBm on RAK13302
+    SPI Bus: SPI0
+    GPIO Pins(IO Slot 1): Reset=4, Busy=5, IRQ=6, use_dio3_tcxo=True, use_dio2_rf=False
+    GPIO Pins(IO Slot 2): Reset=12, Busy=13, IRQ=14, use_dio3_tcxo=True, use_dio2_rf=False
+
 ...
 
 ## Screenshots

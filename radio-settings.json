@@ -286,6 +286,46 @@
       "preamble_length": 17,
       "use_gpiod_backend": true,
       "gpio_chip": 1
+    },
+    "rak7391-13300x-slot1": {
+      "name": "Rak Wireless RAK7391 with RAK1330x on IO Slot 1",
+      "bus_id": 0,
+      "cs_id": 0,
+      "cs_pin": -1,
+      "reset_pin": 4,
+      "busy_pin": 5,
+      "irq_pin": 6,
+      "txen_pin": -1,
+      "rxen_pin": -1,
+      "txled_pin": -1,
+      "rxled_pin": -1,
+      "tx_power": 22,
+      "use_dio2_rf": false,
+      "use_dio3_tcxo": true,
+      "dio3_tcxo_voltage": 1.8,
+      "preamble_length": 17,
+      "use_gpiod_backend": true,
+      "gpio_chip": 2
+    },
+      "rak7391-13300x-slot2": {
+      "name": "Rak Wireless RAK7391 with RAK1330x on IO Slot 2",
+      "bus_id": 0,
+      "cs_id": 1,
+      "cs_pin": -1,
+      "reset_pin": 12,
+      "busy_pin": 13,
+      "irq_pin": 14,
+      "txen_pin": -1,
+      "rxen_pin": -1,
+      "txled_pin": -1,
+      "rxled_pin": -1,
+      "tx_power": 22,
+      "use_dio2_rf": false,
+      "use_dio3_tcxo": true,
+      "dio3_tcxo_voltage": 1.8,
+      "preamble_length": 17,
+      "use_gpiod_backend": true,
+      "gpio_chip": 2
     }
   }
 }
