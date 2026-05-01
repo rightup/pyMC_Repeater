@@ -278,8 +278,15 @@ class TextHelper:
         if hasattr(packet, "decrypted") and packet.decrypted:
             message_text = packet.decrypted.get("text", "<unknown>")
 
-            # Clean message text - remove null bytes and trailing whitespace
-            message_text = message_text.rstrip("\x00").rstrip()
+            # Clean message text - remove null bytes, Unicode replacement chars
+            # (U+FFFD appears when the client sends an invalid trailing byte and
+            # pymc_core decodes with errors="replace"), and trailing whitespace.
+            message_text = message_text.rstrip("\x00�").rstrip()
+
+            # Use the client's original sender timestamp when available — it is
+            # constant across all retransmissions of the same message, making it
+            # a reliable dedup key.  Fall back to wall clock if not provided.
+            client_sender_timestamp = packet.decrypted.get("sender_timestamp")
 
             logger.info(f"[{identity_type}:{identity_name}] Message: {message_text}")
 
@@ -345,8 +352,10 @@ class TextHelper:
                                 sender_pubkey = client_info.id.get_public_key()
                                 break
 
-                    # Store message as post
-                    sender_timestamp = int(time.time())
+                    # Store message as post.
+                    # Prefer the client's own timestamp (constant across retries)
+                    # so that add_post() can use it as a reliable dedup key.
+                    sender_timestamp = client_sender_timestamp or int(time.time())
                     success = await room_server.add_post(
                         client_pubkey=sender_pubkey,
                         message_text=message_text,

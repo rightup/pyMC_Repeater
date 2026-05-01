@@ -245,23 +245,44 @@ class RoomServer:
             client_key = client_pubkey.hex()
             now = time.time()
 
-            # Deduplicate retransmissions: drop identical (author, text) within the window.
-            # Clients retry when they don't receive an ack quickly enough; without this guard
-            # every retry lands as a separate message in the room.
-            dedup_key = (client_key, message_text)
-            last_seen = self._recent_posts.get(dedup_key, 0)
-            if now - last_seen < DEDUP_WINDOW_SECS:
-                logger.debug(
-                    f"Room '{self.room_name}': Dropping duplicate from "
-                    f"{client_pubkey[:4].hex()} within {DEDUP_WINDOW_SECS}s window"
-                )
-                return False
-            self._recent_posts[dedup_key] = now
+            if not allow_server_author:
+                # Deduplicate retransmissions.  The MeshCore client retransmits the
+                # same message up to 3 times before giving up, each time with the same
+                # sender_timestamp.  We use (author, sender_timestamp) as the primary
+                # key so that ALL retransmissions of the same logical message are caught
+                # regardless of trailing-byte differences in the decoded text (which can
+                # vary because pymc_core decodes invalid bytes as U+FFFD).
+                #
+                # Fall back to (author, normalised_text) + time-window when
+                # sender_timestamp is 0 (e.g. web-API posts or old pymc_core).
+                if sender_timestamp:
+                    dedup_key = (client_key, sender_timestamp)
+                    if dedup_key in self._recent_posts:
+                        logger.debug(
+                            f"Room '{self.room_name}': Dropping duplicate from "
+                            f"{client_pubkey[:4].hex()} (same sender_timestamp={sender_timestamp})"
+                        )
+                        return False
+                    self._recent_posts[dedup_key] = now
+                else:
+                    # Fallback: text + time-window (legacy / web-API path)
+                    dedup_text = message_text.rstrip("\x00�").rstrip()
+                    dedup_key = (client_key, dedup_text)
+                    last_seen = self._recent_posts.get(dedup_key, 0)
+                    if now - last_seen < DEDUP_WINDOW_SECS:
+                        logger.debug(
+                            f"Room '{self.room_name}': Dropping duplicate from "
+                            f"{client_pubkey[:4].hex()} within {DEDUP_WINDOW_SECS}s window"
+                        )
+                        return False
+                    self._recent_posts[dedup_key] = now
 
-            # Evict stale dedup entries to bound memory usage
-            if len(self._recent_posts) > 500:
-                cutoff = now - DEDUP_WINDOW_SECS
-                self._recent_posts = {k: v for k, v in self._recent_posts.items() if v > cutoff}
+                # Evict stale dedup entries to bound memory usage.
+                # All entries record the wall-clock time they were first seen (v),
+                # so a single cutoff works for both key shapes.
+                if len(self._recent_posts) > 500:
+                    cutoff = now - DEDUP_WINDOW_SECS
+                    self._recent_posts = {k: v for k, v in self._recent_posts.items() if v > cutoff}
 
             if client_key not in self.client_post_times:
                 self.client_post_times[client_key] = []

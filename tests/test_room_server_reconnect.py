@@ -224,14 +224,23 @@ class TestSyncLoopNormalClient:
 class TestAddPostDedup:
     """
     Clients retry a message when they don't receive an ack fast enough.
-    add_post() should store the first occurrence and silently drop retries
-    that arrive within DEDUP_WINDOW_SECS (30 s) with identical text.
+    The MeshCore client sends the SAME sender_timestamp on every retry of the
+    same message.  add_post() uses (author, sender_timestamp) as the primary
+    dedup key so ALL retransmissions are caught even when the decoded text
+    differs slightly (e.g. a trailing U+FFFD replacement char on one copy).
+
+    When sender_timestamp is 0 (web-API path) the fallback is
+    (author, normalised_text) + a time-window.
     """
 
     def _make_server_for_add_post(self):
         server, db, _ = _make_room_server()
         db.insert_room_message.return_value = 1
         return server, db
+
+    # ------------------------------------------------------------------
+    # Timestamp-based dedup (primary path — radio retransmissions)
+    # ------------------------------------------------------------------
 
     def test_first_post_is_stored(self):
         server, db = self._make_server_for_add_post()
@@ -241,27 +250,28 @@ class TestAddPostDedup:
         assert result is True
         db.insert_room_message.assert_called_once()
 
-    def test_duplicate_within_window_is_dropped(self):
+    def test_retry_same_timestamp_is_dropped(self):
+        """Retransmission carries identical sender_timestamp → duplicate."""
         server, db = self._make_server_for_add_post()
         pubkey = b"\xbb" * 32
         with patch("time.time", return_value=1000.0):
-            _run(server.add_post(pubkey, "hello mesh", sender_timestamp=1000))
+            _run(server.add_post(pubkey, "hello mesh", sender_timestamp=42000))
         db.insert_room_message.reset_mock()
-        # Same message 5 seconds later — still within the 30s window
-        with patch("time.time", return_value=1005.0):
-            result = _run(server.add_post(pubkey, "hello mesh", sender_timestamp=1005))
+        # Retry 15 s later — same sender_timestamp, text may differ (trailing U+FFFD)
+        with patch("time.time", return_value=1015.0):
+            result = _run(server.add_post(pubkey, "hello mesh�", sender_timestamp=42000))
         assert result is False
         db.insert_room_message.assert_not_called()
 
-    def test_same_text_after_window_is_accepted(self):
+    def test_retry_different_timestamp_is_stored(self):
+        """Different sender_timestamp means a genuinely different message."""
         server, db = self._make_server_for_add_post()
         pubkey = b"\xcc" * 32
         with patch("time.time", return_value=1000.0):
-            _run(server.add_post(pubkey, "hello again", sender_timestamp=1000))
+            _run(server.add_post(pubkey, "hello again", sender_timestamp=42000))
         db.insert_room_message.reset_mock()
-        # Same message after the window expires
-        with patch("time.time", return_value=1000.0 + DEDUP_WINDOW_SECS + 1):
-            result = _run(server.add_post(pubkey, "hello again", sender_timestamp=1031))
+        with patch("time.time", return_value=1060.0):
+            result = _run(server.add_post(pubkey, "hello again", sender_timestamp=42060))
         assert result is True
         db.insert_room_message.assert_called_once()
 
@@ -269,20 +279,47 @@ class TestAddPostDedup:
         server, db = self._make_server_for_add_post()
         pubkey = b"\xdd" * 32
         with patch("time.time", return_value=1000.0):
-            _run(server.add_post(pubkey, "message one", sender_timestamp=1000))
+            _run(server.add_post(pubkey, "message one", sender_timestamp=42001))
         db.insert_room_message.reset_mock()
         with patch("time.time", return_value=1001.0):
-            result = _run(server.add_post(pubkey, "message two", sender_timestamp=1001))
+            result = _run(server.add_post(pubkey, "message two", sender_timestamp=42002))
         assert result is True
         db.insert_room_message.assert_called_once()
 
-    def test_same_text_different_authors_both_stored(self):
+    def test_same_timestamp_different_authors_both_stored(self):
+        """Same timestamp from two different senders are independent messages."""
         server, db = self._make_server_for_add_post()
         pubkey_a = b"\xee" * 32
         pubkey_b = b"\xff" * 32
         with patch("time.time", return_value=1000.0):
-            r1 = _run(server.add_post(pubkey_a, "same text", sender_timestamp=1000))
-            r2 = _run(server.add_post(pubkey_b, "same text", sender_timestamp=1000))
+            r1 = _run(server.add_post(pubkey_a, "same text", sender_timestamp=42000))
+            r2 = _run(server.add_post(pubkey_b, "same text", sender_timestamp=42000))
         assert r1 is True
         assert r2 is True
         assert db.insert_room_message.call_count == 2
+
+    # ------------------------------------------------------------------
+    # Text + window fallback (sender_timestamp == 0, e.g. web-API posts)
+    # ------------------------------------------------------------------
+
+    def test_fallback_duplicate_within_window_is_dropped(self):
+        server, db = self._make_server_for_add_post()
+        pubkey = b"\xa1" * 32
+        with patch("time.time", return_value=1000.0):
+            _run(server.add_post(pubkey, "hello mesh", sender_timestamp=0))
+        db.insert_room_message.reset_mock()
+        with patch("time.time", return_value=1005.0):
+            result = _run(server.add_post(pubkey, "hello mesh", sender_timestamp=0))
+        assert result is False
+        db.insert_room_message.assert_not_called()
+
+    def test_fallback_same_text_after_window_is_accepted(self):
+        server, db = self._make_server_for_add_post()
+        pubkey = b"\xa2" * 32
+        with patch("time.time", return_value=1000.0):
+            _run(server.add_post(pubkey, "hello again", sender_timestamp=0))
+        db.insert_room_message.reset_mock()
+        with patch("time.time", return_value=1000.0 + DEDUP_WINDOW_SECS + 1):
+            result = _run(server.add_post(pubkey, "hello again", sender_timestamp=0))
+        assert result is True
+        db.insert_room_message.assert_called_once()
