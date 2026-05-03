@@ -73,7 +73,12 @@ class PacketRecord:
             SNR=str(packet_record.get("snr", 0)),
             RSSI=str(packet_record.get("rssi", 0)),
             score=str(int(packet_record.get("score", 0) * 1000)),
-            duration="0",
+            # `duration` is the LoRa time-on-air in integer milliseconds
+            # (Semtech formula, computed in engine._build_packet_record).
+            # Was previously hardcoded to "0" — the engine already had the
+            # value, it just wasn't surfaced on the MQTT publish payload,
+            # so downstream consumers had to re-derive it from `raw` bytes.
+            duration=str(int(round(packet_record.get("airtime_ms", 0)))),
             hash=packet_record.get("packet_hash", ""),
         )
 

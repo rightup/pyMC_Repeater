@@ -590,6 +590,28 @@ class RepeaterHandler(BaseHandler):
         pkt_hash = packet_hash or packet.calculate_packet_hash().hex().upper()
         payload = getattr(packet, "payload", None)
         payload_len = len(payload or b"")
+
+        # Compute the LoRa time-on-air for this packet's wire bytes so every
+        # packet_record carries an authoritative per-packet airtime.  The same
+        # value already feeds the duty-cycle counters at __call__ line ~154
+        # (RX) and ~215 (TX); recomputing here keeps `_build_packet_record`
+        # standalone for the record_packet_only / record_duplicate paths and
+        # avoids threading airtime through every caller's signature.
+        # Wrapped in try/except because `calculate_airtime` can raise on
+        # missing/invalid radio config; we degrade to 0.0 rather than dropping
+        # the packet record entirely.
+        try:
+            raw_len = (
+                packet.get_raw_length()
+                if hasattr(packet, "get_raw_length")
+                else 0
+            )
+            airtime_ms = (
+                self.airtime_mgr.calculate_airtime(raw_len) if raw_len > 0 else 0.0
+            )
+        except Exception:
+            airtime_ms = 0.0
+
         return {
             "timestamp": time.time(),
             "header": (
@@ -608,6 +630,10 @@ class RepeaterHandler(BaseHandler):
                 snr, payload_len, self.radio_config["spreading_factor"]
             ),
             "tx_delay_ms": tx_delay_ms,
+            # LoRa time-on-air for this packet's raw bytes (Semtech formula
+            # via AirtimeManager).  Used by storage_utils.PacketRecord to
+            # populate the outgoing MQTT `duration` field (was hardcoded "0").
+            "airtime_ms": airtime_ms,
             "transmitted": transmitted,
             "is_duplicate": is_duplicate,
             "packet_hash": pkt_hash[:16],
