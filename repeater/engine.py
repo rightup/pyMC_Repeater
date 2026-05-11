@@ -1,9 +1,10 @@
 import asyncio
 import copy
 import logging
+import random
 import struct
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from typing import Optional, Tuple
 
 from pymc_core.node.handlers.base import BaseHandler
@@ -70,6 +71,7 @@ class RepeaterHandler(BaseHandler):
         self.direct_tx_delay_factor = config.get("delays", {}).get("direct_tx_delay_factor", 0.5)
         self.use_score_for_tx = config.get("repeater", {}).get("use_score_for_tx", False)
         self.score_threshold = config.get("repeater", {}).get("score_threshold", 0.3)
+        self.max_flood_hops = config.get("repeater", {}).get("max_flood_hops", 64)
         self.send_advert_interval_hours = config.get("repeater", {}).get(
             "send_advert_interval_hours", 10
         )
@@ -99,8 +101,9 @@ class RepeaterHandler(BaseHandler):
         self.rx_count = 0
         self.forwarded_count = 0
         self.dropped_count = 0
-        self.recent_packets = []
         self.max_recent_packets = 50
+        self.recent_packets = deque(maxlen=self.max_recent_packets)
+        self._recent_hash_index = {}
         self.start_time = time.time()
         # Flood/direct and duplicate counters (for GET_STATUS / firmware RepeaterStats)
         self.recv_flood_count = 0
@@ -126,12 +129,31 @@ class RepeaterHandler(BaseHandler):
         self.last_db_cleanup = time.time()
         self.noise_floor_interval = NOISE_FLOOR_INTERVAL  # 30 seconds
         self._background_task = None
+        self._cached_noise_floor = None
         self._last_crc_error_count = 0  # Track radio counter for delta persistence
         
         # Cache transport keys for efficient lookup
         self._transport_keys_cache = None
         self._transport_keys_cache_time = 0
         self._transport_keys_cache_ttl = 60  # Cache for 60 seconds
+
+        # Serialise all radio TX calls.
+        #
+        # Background: since the queue loop dispatches each packet as an
+        # asyncio.create_task, multiple _route_packet coroutines can have their
+        # TX delay timers running concurrently — which is the intended behaviour
+        # (firmware nodes do the same with a hardware timer).  However, the
+        # LoRa radio is half-duplex: it can only transmit one packet at a time.
+        # Without serialisation, two tasks whose delay timers expire near-
+        # simultaneously both call dispatcher.send_packet, interleaving SPI/serial
+        # commands to the radio and both passing the LBT check before either has
+        # actually transmitted.
+        #
+        # _tx_lock is acquired after each delay sleep and held for the entire
+        # send_packet call.  Delays still run concurrently; only the radio
+        # access is serialised.  This also eliminates the TOCTOU gap in duty-cycle
+        # enforcement — see schedule_retransmit / delayed_send for details.
+        self._tx_lock = asyncio.Lock()
 
         self._start_background_tasks()
 
@@ -157,6 +179,7 @@ class RepeaterHandler(BaseHandler):
                 pass
 
         route_type = packet.header & PH_ROUTE_MASK
+        pkt_hash_full = packet.calculate_packet_hash().hex().upper()
 
         # TX mode: forward (repeat on), monitor (no repeat, tenants can TX), no_tx (all TX off)
         mode = self.config.get("repeater", {}).get("mode", "forward")
@@ -165,11 +188,12 @@ class RepeaterHandler(BaseHandler):
         allow_forward = mode == "forward"
         allow_local_tx = mode != "no_tx"
 
-        logger.debug(
-            f"RX packet: header=0x{packet.header:02x}, payload_len={len(packet.payload or b'')}, "
-            f"path_len={len(packet.path) if packet.path else 0}, "
-            f"rssi={metadata.get('rssi', 'N/A')}, snr={metadata.get('snr', 'N/A')}, mode={mode}"
-        )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                f"RX packet: header=0x{packet.header:02x}, payload_len={len(packet.payload or b'')}, "
+                f"path_len={len(packet.path) if packet.path else 0}, "
+                f"rssi={metadata.get('rssi', 'N/A')}, snr={metadata.get('snr', 'N/A')}, mode={mode}"
+            )
 
         # clone the packet to avoid modifying the original
         processed_packet = copy.deepcopy(packet)
@@ -186,23 +210,25 @@ class RepeaterHandler(BaseHandler):
         original_path_hashes = packet.get_path_hashes_hex()
         path_hash_size = packet.get_path_hash_size()
 
-        # Process for forwarding (skip if repeat disabled or if this is a local transmission)
+        # Process for forwarding (skip if repeat disabled or if this is a local transmission).
+        # Pass pkt_hash_full so flood_forward / direct_forward don't recompute SHA-256.
         result = (
             None
             if (not allow_forward or local_transmission)
-            else self.process_packet(processed_packet, snr)
+            else self.process_packet(processed_packet, snr, packet_hash=pkt_hash_full)
         )
         forwarded_path_hashes = None
 
         # For local transmissions, create a direct transmission result (if local TX allowed)
         if local_transmission and allow_local_tx:
             # Mark local packet as seen to prevent duplicate processing when received back
-            self.mark_seen(packet)
+            self.mark_seen(packet, packet_hash=pkt_hash_full)
             # Calculate transmission delay for local packets
             delay = self._calculate_tx_delay(packet, snr)
             result = (packet, delay)
             forwarded_path_hashes = packet.get_path_hashes_hex()
-            logger.debug(f"Local transmission: calculated delay {delay:.3f}s")
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"Local transmission: calculated delay {delay:.3f}s")
 
         if result:
             fwd_pkt, delay = result
@@ -300,9 +326,10 @@ class RepeaterHandler(BaseHandler):
             else:
                 # Check if packet has a specific drop reason set by handlers
                 drop_reason = processed_packet.drop_reason or self._get_drop_reason(
-                    processed_packet
+                    processed_packet, packet_hash=pkt_hash_full
                 )
-                logger.debug(f"Packet not forwarded: {drop_reason}")
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(f"Packet not forwarded: {drop_reason}")
 
         # Extract packet type and route from header
         if not hasattr(packet, "header") or packet.header is None:
@@ -313,13 +340,13 @@ class RepeaterHandler(BaseHandler):
             header_info = PacketHeaderUtils.parse_header(packet.header)
             payload_type = header_info["payload_type"]
             route_type = header_info["route_type"]
-            logger.debug(
-                f"Packet header=0x{packet.header:02x}, type={payload_type}, route={route_type}"
-            )
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    f"Packet header=0x{packet.header:02x}, type={payload_type}, route={route_type}"
+                )
 
         # Check if this is a duplicate
-        pkt_hash = packet.calculate_packet_hash().hex().upper()
-        is_dupe = pkt_hash in self.seen_packets and not transmitted
+        is_dupe = pkt_hash_full in self.seen_packets and not transmitted
 
         # Set drop reason for duplicates and count flood vs direct dups
         if is_dupe and drop_reason is None:
@@ -356,45 +383,40 @@ class RepeaterHandler(BaseHandler):
             lbt_attempts=lbt_attempts,
             lbt_backoff_delays_ms=lbt_backoff_delays_ms,
             lbt_channel_busy=lbt_channel_busy,
+            packet_hash=pkt_hash_full,
         )
 
         # Store packet record to persistent storage
-        # Skip LetsMesh only for invalid packets (not duplicates or operational drops)
+        # Skip mqtt only for invalid packets (not duplicates or operational drops)
         if self.storage:
             try:
-                # Only skip LetsMesh for actual invalid/bad packets
+                # Only skip mqtt for actual invalid/bad packets
                 invalid_reasons = ["Invalid advert packet", "Empty payload", "Path too long"]
-                skip_letsmesh = drop_reason in invalid_reasons if drop_reason else False
-                self.storage.record_packet(packet_record, skip_letsmesh_if_invalid=skip_letsmesh)
+                skip_mqtt = drop_reason in invalid_reasons if drop_reason else False
+                self.storage.record_packet(packet_record, skip_mqtt_if_invalid=skip_mqtt)
             except Exception as e:
                 logger.error(f"Failed to store packet record: {e}")
 
         # If this is a duplicate, try to attach it to the original packet
         if is_dupe and len(self.recent_packets) > 0:
-            # Find the original packet with same hash
-            for idx in range(len(self.recent_packets) - 1, -1, -1):
-                prev_pkt = self.recent_packets[idx]
-                if prev_pkt.get("packet_hash") == packet_record["packet_hash"]:
-                    # Add duplicate to original packet's duplicate list
-                    if "duplicates" not in prev_pkt:
-                        prev_pkt["duplicates"] = []
-                    if len(prev_pkt["duplicates"]) < self.max_duplicates_per_packet:
-                        prev_pkt["duplicates"].append(packet_record)
-                    # Don't add duplicate to main list, just track in original
-                    break
+            prev_pkt = self._recent_hash_index.get(packet_record["packet_hash"])
+            if prev_pkt is not None:
+                # Add duplicate to original packet's duplicate list
+                if "duplicates" not in prev_pkt:
+                    prev_pkt["duplicates"] = []
+                if len(prev_pkt["duplicates"]) < self.max_duplicates_per_packet:
+                    prev_pkt["duplicates"].append(packet_record)
+                # Don't add duplicate to main list, just track in original
             else:
                 # Original not found, add as regular packet
-                self.recent_packets.append(packet_record)
+                self._append_recent_packet(packet_record)
         else:
             # Not a duplicate or first occurrence
-            self.recent_packets.append(packet_record)
-
-        if len(self.recent_packets) > self.max_recent_packets:
-            self.recent_packets.pop(0)
+            self._append_recent_packet(packet_record)
 
     def log_trace_record(self, packet_record: dict) -> None:
         """Manually log a packet trace record (used by external callers)"""
-        self.recent_packets.append(packet_record)
+        self._append_recent_packet(packet_record)
 
         self.rx_count += 1
         if packet_record.get("transmitted", False):
@@ -408,9 +430,6 @@ class RepeaterHandler(BaseHandler):
                 self.storage.record_packet(packet_record)
             except Exception as e:
                 logger.error(f"Failed to store packet record: {e}")
-
-        if len(self.recent_packets) > self.max_recent_packets:
-            self.recent_packets.pop(0)
 
     def record_packet_only(self, packet: Packet, metadata: dict) -> None:
         """Record a packet for UI/storage without running forwarding or duplicate logic.
@@ -448,15 +467,14 @@ class RepeaterHandler(BaseHandler):
             path_hash,
             src_hash,
             dst_hash,
+            packet_hash=packet.calculate_packet_hash().hex().upper(),
         )
         try:
-            self.storage.record_packet(packet_record, skip_letsmesh_if_invalid=False)
+            self.storage.record_packet(packet_record, skip_mqtt_if_invalid=False)
         except Exception as e:
             logger.error(f"Failed to store packet record (record_packet_only): {e}")
             return
-        self.recent_packets.append(packet_record)
-        if len(self.recent_packets) > self.max_recent_packets:
-            self.recent_packets.pop(0)
+        self._append_recent_packet(packet_record)
 
     def record_duplicate(self, packet: Packet, rssi: int = 0, snr: float = 0.0) -> None:
         """Record a known-duplicate packet for UI/storage visibility without forwarding.
@@ -489,30 +507,26 @@ class RepeaterHandler(BaseHandler):
             transmitted=False,
             drop_reason="Duplicate",
             is_duplicate=True,
+            packet_hash=packet.calculate_packet_hash().hex().upper(),
         )
 
         if self.storage:
             try:
-                self.storage.record_packet(packet_record, skip_letsmesh_if_invalid=False)
+                self.storage.record_packet(packet_record, skip_mqtt_if_invalid=False)
             except Exception as e:
                 logger.error(f"Failed to store duplicate record: {e}")
 
         # Group under original in recent_packets
         if len(self.recent_packets) > 0:
-            for idx in range(len(self.recent_packets) - 1, -1, -1):
-                prev_pkt = self.recent_packets[idx]
-                if prev_pkt.get("packet_hash") == packet_record["packet_hash"]:
-                    if "duplicates" not in prev_pkt:
-                        prev_pkt["duplicates"] = []
-                    prev_pkt["duplicates"].append(packet_record)
-                    break
+            prev_pkt = self._recent_hash_index.get(packet_record["packet_hash"])
+            if prev_pkt is not None:
+                if "duplicates" not in prev_pkt:
+                    prev_pkt["duplicates"] = []
+                prev_pkt["duplicates"].append(packet_record)
             else:
-                self.recent_packets.append(packet_record)
+                self._append_recent_packet(packet_record)
         else:
-            self.recent_packets.append(packet_record)
-
-        if len(self.recent_packets) > self.max_recent_packets:
-            self.recent_packets.pop(0)
+            self._append_recent_packet(packet_record)
 
     def cleanup_cache(self):
 
@@ -570,11 +584,26 @@ class RepeaterHandler(BaseHandler):
         lbt_attempts: int = 0,
         lbt_backoff_delays_ms=None,
         lbt_channel_busy: bool = False,
+        packet_hash: Optional[str] = None,
     ) -> dict:
         """Build a single packet_record dict for storage and recent_packets."""
-        pkt_hash = packet.calculate_packet_hash().hex().upper()
+        pkt_hash = packet_hash or packet.calculate_packet_hash().hex().upper()
         payload = getattr(packet, "payload", None)
         payload_len = len(payload or b"")
+
+        # LoRa time-on-air for this packet (Semtech reference formula).
+        # Computed once here so every downstream consumer (MQTT, SQLite, Glass,
+        # websocket) reads the same value instead of recomputing or shipping
+        # zeros. The same calculator is used by the RX accumulator and the
+        # duty-cycle gate, keeping reporting and metering aligned.
+        airtime_ms = 0.0
+        try:
+            raw_len = packet.get_raw_length() if hasattr(packet, "get_raw_length") else 0
+            if raw_len > 0:
+                airtime_ms = float(self.airtime_mgr.calculate_airtime(raw_len))
+        except Exception as e:
+            logger.debug(f"Could not compute airtime for packet record: {e}")
+
         return {
             "timestamp": time.time(),
             "header": (
@@ -593,6 +622,7 @@ class RepeaterHandler(BaseHandler):
                 snr, payload_len, self.radio_config["spreading_factor"]
             ),
             "tx_delay_ms": tx_delay_ms,
+            "airtime_ms": airtime_ms,
             "transmitted": transmitted,
             "is_duplicate": is_duplicate,
             "packet_hash": pkt_hash[:16],
@@ -609,9 +639,22 @@ class RepeaterHandler(BaseHandler):
             "lbt_channel_busy": lbt_channel_busy,
         }
 
-    def _get_drop_reason(self, packet: Packet) -> str:
+    def _append_recent_packet(self, packet_record: dict) -> None:
+        """Append packet to bounded recent list and keep hash index aligned."""
+        if len(self.recent_packets) >= self.max_recent_packets:
+            oldest = self.recent_packets.popleft()
+            oldest_hash = oldest.get("packet_hash") if isinstance(oldest, dict) else None
+            if oldest_hash and self._recent_hash_index.get(oldest_hash) is oldest:
+                del self._recent_hash_index[oldest_hash]
 
-        if self.is_duplicate(packet):
+        self.recent_packets.append(packet_record)
+        pkt_hash = packet_record.get("packet_hash") if isinstance(packet_record, dict) else None
+        if pkt_hash:
+            self._recent_hash_index[pkt_hash] = packet_record
+
+    def _get_drop_reason(self, packet: Packet, packet_hash: Optional[str] = None) -> str:
+
+        if self.is_duplicate(packet, packet_hash=packet_hash):
             return "Duplicate"
 
         if not packet or not packet.payload:
@@ -623,10 +666,10 @@ class RepeaterHandler(BaseHandler):
         route_type = packet.header & PH_ROUTE_MASK
 
         if route_type == ROUTE_TYPE_FLOOD:
-            # Check if global flood policy blocked it
-            global_flood_allow = self.config.get("mesh", {}).get("global_flood_allow", True)
-            if not global_flood_allow:
-                return "Global flood policy disabled"
+            # Check if unscoped flood policy blocked it
+            unscoped_flood_allow = self.config.get("mesh", {}).get("unscoped_flood_allow", self.config.get("mesh", {}).get("global_flood_allow", True))
+            if not unscoped_flood_allow:
+                return "Unscoped flood policy disabled"
 
         if route_type == ROUTE_TYPE_DIRECT:
             hash_size = packet.get_path_hash_size()
@@ -639,16 +682,24 @@ class RepeaterHandler(BaseHandler):
         # Default reason
         return "Unknown"
 
-    def is_duplicate(self, packet: Packet) -> bool:
+    def is_duplicate(self, packet: Packet, packet_hash: Optional[str] = None) -> bool:
+        """Return True if this packet has already been seen.
 
-        pkt_hash = packet.calculate_packet_hash().hex().upper()
-        if pkt_hash in self.seen_packets:
-            return True
-        return False
+        Accepts an optional pre-computed packet_hash to avoid a redundant SHA-256
+        when the caller (e.g. __call__ → process_packet → flood/direct_forward)
+        has already calculated the hash.  Falls back to computing it if not provided.
 
-    def mark_seen(self, packet: Packet):
+        INVARIANT: this method is synchronous with no await points.  The caller
+        (process_packet / __call__) relies on is_duplicate + mark_seen being
+        effectively atomic within the asyncio event loop.  Do NOT add any await
+        here without revisiting that invariant.
+        """
+        pkt_hash = packet_hash or packet.calculate_packet_hash().hex().upper()
+        return pkt_hash in self.seen_packets
 
-        pkt_hash = packet.calculate_packet_hash().hex().upper()
+    def mark_seen(self, packet: Packet, packet_hash: Optional[str] = None):
+
+        pkt_hash = packet_hash or packet.calculate_packet_hash().hex().upper()
         self.seen_packets[pkt_hash] = time.time()
 
         if len(self.seen_packets) > self.max_cache_size:
@@ -747,9 +798,10 @@ class RepeaterHandler(BaseHandler):
                     transport_key = base64.b64decode(transport_key_encoded)
                     expected_code = calc_transport_code(transport_key, packet)
                     if transport_code_0 == expected_code:
-                        logger.debug(
-                            f"Transport code validated for key '{key_name}' with policy '{flood_policy}'"
-                        )
+                        if logger.isEnabledFor(logging.DEBUG):
+                            logger.debug(
+                                f"Transport code validated for key '{key_name}' with policy '{flood_policy}'"
+                            )
 
                         # Update last_used timestamp for this key
                         try:
@@ -758,9 +810,10 @@ class RepeaterHandler(BaseHandler):
                                 self.storage.update_transport_key(
                                     key_id=key_id, last_used=time.time()
                                 )
-                                logger.debug(
-                                    f"Updated last_used timestamp for transport key '{key_name}'"
-                                )
+                                if logger.isEnabledFor(logging.DEBUG):
+                                    logger.debug(
+                                        f"Updated last_used timestamp for transport key '{key_name}'"
+                                    )
                         except Exception as e:
                             logger.warning(
                                 f"Failed to update last_used for transport key '{key_name}': {e}"
@@ -777,17 +830,23 @@ class RepeaterHandler(BaseHandler):
                     continue
 
             # No matching transport code found
-            logger.debug(
-                f"Transport code 0x{transport_code_0:04X} denied (checked {len(transport_keys)} keys)"
-            )
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    f"Transport code 0x{transport_code_0:04X} denied (checked {len(transport_keys)} keys)"
+                )
             return False, "No matching transport code"
 
         except Exception as e:
             logger.error(f"Transport code validation error: {e}")
             return False, f"Transport code validation error: {e}"
 
-    def flood_forward(self, packet: Packet) -> Optional[Packet]:
+    def flood_forward(self, packet: Packet, packet_hash: Optional[str] = None) -> Optional[Packet]:
+        """Forward a FLOOD packet, appending our hash to the path.
 
+        INVARIANT: purely synchronous — no await points.  The is_duplicate +
+        mark_seen pair is atomic within the asyncio event loop.  Do NOT add any
+        await here without revisiting that invariant in __call__ / process_packet.
+        """
         # Validate
         valid, reason = self.validate_packet(packet)
         if not valid:
@@ -800,19 +859,20 @@ class RepeaterHandler(BaseHandler):
             if not packet.drop_reason:
                 packet.drop_reason = "Marked do not retransmit"
             return None
+        
+        # Check unscoped flood policy
+        unscoped_flood_allow = self.config.get("mesh", {}).get("unscoped_flood_allow", self.config.get("mesh", {}).get("global_flood_allow", True))
+        route_type = packet.header & PH_ROUTE_MASK
+        if route_type == ROUTE_TYPE_FLOOD:
+            if not unscoped_flood_allow:
+                packet.drop_reason = "Unscoped flood policy disabled"
+                return None
 
-        # Check global flood policy
-        global_flood_allow = self.config.get("mesh", {}).get("global_flood_allow", True)
-        if not global_flood_allow:
-            route_type = packet.header & PH_ROUTE_MASK
-            if route_type == ROUTE_TYPE_FLOOD or route_type == ROUTE_TYPE_TRANSPORT_FLOOD:
-             
-                allowed, check_reason = self._check_transport_codes(packet)
-                if not allowed:
-                    packet.drop_reason = check_reason
-                    return None
-            else:
-                packet.drop_reason = "Global flood policy disabled"
+        #Check transport scopes flood policy    
+        if route_type == ROUTE_TYPE_TRANSPORT_FLOOD:             
+            allowed, check_reason = self._check_transport_codes(packet)
+            if not allowed:
+                packet.drop_reason = "Transport code not allowed to flood"
                 return None
 
         mode = self._get_loop_detect_mode()
@@ -820,8 +880,8 @@ class RepeaterHandler(BaseHandler):
             packet.drop_reason = f"FLOOD loop detected ({mode})"
             return None
 
-        # Suppress duplicates
-        if self.is_duplicate(packet):
+        # Suppress duplicates — pass pre-computed hash to avoid a second SHA-256.
+        if self.is_duplicate(packet, packet_hash=packet_hash):
             packet.drop_reason = "Duplicate"
             return None
 
@@ -833,6 +893,10 @@ class RepeaterHandler(BaseHandler):
         hash_size = packet.get_path_hash_size()
         hop_count = packet.get_path_hash_count()
 
+        if self.max_flood_hops > 0 and hop_count >= self.max_flood_hops:
+            packet.drop_reason = f"Max flood hops limit reached ({hop_count}/{self.max_flood_hops})"
+            return None
+
         # path_len encodes hop count in 6 bits (0-63); adding ourselves must not exceed 63
         if hop_count >= 63:
             packet.drop_reason = "Path hop count at maximum (63), cannot append"
@@ -843,7 +907,7 @@ class RepeaterHandler(BaseHandler):
             packet.drop_reason = "Path would exceed MAX_PATH_SIZE"
             return None
 
-        self.mark_seen(packet)
+        self.mark_seen(packet, packet_hash=packet_hash)
 
         # Append hash_size bytes from our public key prefix
         packet.path.extend(self.local_hash_bytes[:hash_size])
@@ -851,8 +915,13 @@ class RepeaterHandler(BaseHandler):
 
         return packet
 
-    def direct_forward(self, packet: Packet) -> Optional[Packet]:
+    def direct_forward(self, packet: Packet, packet_hash: Optional[str] = None) -> Optional[Packet]:
+        """Forward a DIRECT packet, removing the first hop from the path.
 
+        INVARIANT: purely synchronous — no await points.  The is_duplicate +
+        mark_seen pair is atomic within the asyncio event loop.  Do NOT add any
+        await here without revisiting that invariant in __call__ / process_packet.
+        """
         # Validate packet (empty payload, oversized path, etc.)
         valid, reason = self.validate_packet(packet)
         if not valid:
@@ -878,12 +947,12 @@ class RepeaterHandler(BaseHandler):
             packet.drop_reason = "Direct: not for us"
             return None
 
-        # Suppress duplicates
-        if self.is_duplicate(packet):
+        # Suppress duplicates — pass pre-computed hash to avoid a second SHA-256.
+        if self.is_duplicate(packet, packet_hash=packet_hash):
             packet.drop_reason = "Duplicate"
             return None
 
-        self.mark_seen(packet)
+        self.mark_seen(packet, packet_hash=packet_hash)
 
         # Remove first hash entry (hash_size bytes)
         packet.path = bytearray(packet.path[hash_size:])
@@ -919,8 +988,6 @@ class RepeaterHandler(BaseHandler):
 
     def _calculate_tx_delay(self, packet: Packet, snr: float = 0.0) -> float:
 
-        import random
-
         packet_len = packet.get_raw_length()
         airtime_ms = self.airtime_mgr.calculate_airtime(packet_len)
 
@@ -950,34 +1017,47 @@ class RepeaterHandler(BaseHandler):
             # score 0.0 → multiplier 1.0 (100% of original)
             score_multiplier = max(0.2, 1.0 - score)
             delay_s = delay_s * score_multiplier
-            logger.debug(
-                f"Congestion detected (delay >= 50ms), score={score:.2f}, "
-                f"delay multiplier={score_multiplier:.2f}"
-            )
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    f"Congestion detected (delay >= 50ms), score={score:.2f}, "
+                    f"delay multiplier={score_multiplier:.2f}"
+                )
 
         # Cap at 5 seconds maximum
         delay_s = min(delay_s, 5.0)
 
-        logger.debug(
-            f"Route={'FLOOD' if route_type == ROUTE_TYPE_FLOOD else 'DIRECT'}, "
-            f"len={packet_len}B, airtime={airtime_ms:.1f}ms, delay={delay_s:.3f}s"
-        )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                f"Route={'FLOOD' if route_type == ROUTE_TYPE_FLOOD else 'DIRECT'}, "
+                f"len={packet_len}B, airtime={airtime_ms:.1f}ms, delay={delay_s:.3f}s"
+            )
 
         return delay_s
 
-    def process_packet(self, packet: Packet, snr: float = 0.0) -> Optional[Tuple[Packet, float]]:
+    def process_packet(
+        self,
+        packet: Packet,
+        snr: float = 0.0,
+        packet_hash: Optional[str] = None,
+    ) -> Optional[Tuple[Packet, float]]:
+        """Route a received packet to flood_forward or direct_forward.
 
+        packet_hash is the pre-computed SHA-256 hex string from __call__.
+        Passing it here avoids recomputing the hash in flood_forward /
+        direct_forward / is_duplicate / mark_seen — reducing SHA-256 calls
+        from 3 per forwarded packet to 1.
+        """
         route_type = packet.header & PH_ROUTE_MASK
 
         if route_type == ROUTE_TYPE_FLOOD or route_type == ROUTE_TYPE_TRANSPORT_FLOOD:
-            fwd_pkt = self.flood_forward(packet)
+            fwd_pkt = self.flood_forward(packet, packet_hash=packet_hash)
             if fwd_pkt is None:
                 return None
             delay = self._calculate_tx_delay(fwd_pkt, snr)
             return fwd_pkt, delay
 
         elif route_type == ROUTE_TYPE_DIRECT or route_type == ROUTE_TYPE_TRANSPORT_DIRECT:
-            fwd_pkt = self.direct_forward(packet)
+            fwd_pkt = self.direct_forward(packet, packet_hash=packet_hash)
             if fwd_pkt is None:
                 return None
             delay = self._calculate_tx_delay(fwd_pkt, snr)
@@ -1002,29 +1082,59 @@ class RepeaterHandler(BaseHandler):
 
         async def delayed_send():
             await asyncio.sleep(delay)
-            last_error = None
+
+            # Each attempt gets its own lock acquisition so the 1-second retry
+            # backoff (local_transmission only) happens OUTSIDE the lock.
+            # Holding _tx_lock across asyncio.sleep(1.0) would block every other
+            # queued TX task for the full backoff period.
+            #
+            # Loop runs once for relayed packets, twice for local_transmission:
+            #   attempt 0 — initial try (no pre-sleep)
+            #   attempt 1 — retry after 1s backoff outside the lock
             for attempt in range(2 if local_transmission else 1):
-                try:
-                    await self.dispatcher.send_packet(fwd_pkt, wait_for_ack=False)
-                    self._record_packet_sent(fwd_pkt)
+                if attempt > 0:
+                    # Back-off OUTSIDE the lock — other tasks can transmit here.
+                    logger.info("Retrying local TX in 1s (lock released during backoff)...")
+                    await asyncio.sleep(1.0)
+
+                async with self._tx_lock:
+                    # ── Authoritative duty-cycle gate ──────────────────────────
+                    # The upfront can_transmit() call in __call__ is advisory: it
+                    # avoids scheduling packets obviously over budget, but cannot
+                    # prevent a race between tasks whose delay timers expire nearly
+                    # simultaneously.  Both pass the advisory check before either
+                    # records airtime, then both attempt to transmit.
+                    #
+                    # Inside _tx_lock only one task runs at a time.  The check and
+                    # record_tx() are effectively atomic — no TOCTOU window.
+                    # Re-checked every attempt because airtime state may change
+                    # while we wait for the lock or sleep through backoff.
                     if airtime_ms > 0:
-                        self.airtime_mgr.record_tx(airtime_ms)
-                    packet_size = fwd_pkt.get_raw_length()
-                    logger.info(
-                        f"Retransmitted packet ({packet_size} bytes, "
-                        f"{airtime_ms:.1f}ms airtime)"
-                    )
-                    return
-                except Exception as e:
-                    last_error = e
-                    logger.error(f"Retransmit failed: {e}")
-                    if local_transmission and attempt == 0:
-                        logger.info("Retrying local TX in 1s...")
-                        await asyncio.sleep(1.0)
-                    else:
-                        raise
-            if last_error is not None:
-                raise last_error
+                        can_tx_now, _ = self.airtime_mgr.can_transmit(airtime_ms)
+                        if not can_tx_now:
+                            logger.warning(
+                                "Packet dropped at TX time: duty-cycle exceeded "
+                                "(airtime=%.1fms)", airtime_ms,
+                            )
+                            return
+
+                    try:
+                        await self.dispatcher.send_packet(fwd_pkt, wait_for_ack=False)
+                        self._record_packet_sent(fwd_pkt)
+                        if airtime_ms > 0:
+                            self.airtime_mgr.record_tx(airtime_ms)
+                        packet_size = fwd_pkt.get_raw_length()
+                        logger.info(
+                            f"Retransmitted packet ({packet_size} bytes, "
+                            f"{airtime_ms:.1f}ms airtime)"
+                        )
+                        return
+                    except Exception as e:
+                        logger.error(f"Retransmit failed (attempt {attempt + 1}): {e}")
+                        if local_transmission and attempt == 0:
+                            pass  # release lock, outer loop sleeps, then retries
+                        else:
+                            raise
 
         return asyncio.create_task(delayed_send())
 
@@ -1046,6 +1156,10 @@ class RepeaterHandler(BaseHandler):
             logger.debug(f"Failed to get noise floor: {e}")
             return None
 
+    def get_cached_noise_floor(self) -> Optional[float]:
+        """Return the last asynchronously-sampled noise floor value."""
+        return self._cached_noise_floor
+
     def get_stats(self) -> dict:
 
         uptime_seconds = time.time() - self.start_time
@@ -1064,8 +1178,8 @@ class RepeaterHandler(BaseHandler):
         rx_per_hour = len(packets_last_hour)
         forwarded_per_hour = sum(1 for p in packets_last_hour if p.get("transmitted", False))
 
-        # Get current noise floor from radio
-        noise_floor_dbm = self.get_noise_floor()
+        # Use cached value sampled by the background timer to avoid serial I/O on stats requests.
+        noise_floor_dbm = self.get_cached_noise_floor()
 
         # Get CRC error count from radio hardware
         radio = self.dispatcher.radio if self.dispatcher else None
@@ -1096,7 +1210,7 @@ class RepeaterHandler(BaseHandler):
             "direct_dup_count": self.direct_dup_count,
             "rx_per_hour": rx_per_hour,
             "forwarded_per_hour": forwarded_per_hour,
-            "recent_packets": self.recent_packets,
+            "recent_packets": list(self.recent_packets),
             "neighbors": neighbors,
             "uptime_seconds": uptime_seconds,
             "noise_floor_dbm": noise_floor_dbm,
@@ -1113,7 +1227,7 @@ class RepeaterHandler(BaseHandler):
                     ),
                     "latitude": repeater_config.get("latitude", 0.0),
                     "longitude": repeater_config.get("longitude", 0.0),
-                    "max_flood_hops": repeater_config.get("max_flood_hops", 3),
+                    "max_flood_hops": repeater_config.get("max_flood_hops", 64),
                     "advert_interval_minutes": repeater_config.get("advert_interval_minutes", 120),
                     "advert_rate_limit": repeater_config.get("advert_rate_limit", {}),
                     "advert_penalty_box": repeater_config.get("advert_penalty_box", {}),
@@ -1134,10 +1248,10 @@ class RepeaterHandler(BaseHandler):
                 "web": self.config.get("web", {}),  # Include web configuration
                 "mesh": {
                     "loop_detect": self.config.get("mesh", {}).get("loop_detect", "off"),
-                    "global_flood_allow": self.config.get("mesh", {}).get("global_flood_allow", True),
+                    "unscoped_flood_allow": self.config.get("mesh", {}).get("unscoped_flood_allow", self.config.get("mesh", {}).get("global_flood_allow", True)),
                     "path_hash_mode": self.config.get("mesh", {}).get("path_hash_mode", 0),
                 },
-                "letsmesh": self.config.get("letsmesh", {}),
+                "mqtt_brokers": self.config.get("mqtt_brokers", {}),
             },
             "public_key": None,
         }
@@ -1211,6 +1325,7 @@ class RepeaterHandler(BaseHandler):
             loop = asyncio.get_running_loop()
             noise_floor = await loop.run_in_executor(None, self.get_noise_floor)
             if noise_floor is not None:
+                self._cached_noise_floor = noise_floor
                 self.storage.record_noise_floor(noise_floor)
                 logger.debug(f"Recorded noise floor: {noise_floor} dBm")
             else:
@@ -1265,6 +1380,7 @@ class RepeaterHandler(BaseHandler):
             self.score_threshold = repeater_config.get("score_threshold", 0.3)
             self.send_advert_interval_hours = repeater_config.get("send_advert_interval_hours", 10)
             self.cache_ttl = repeater_config.get("cache_ttl", 60)
+            self.max_flood_hops = repeater_config.get("max_flood_hops", 64)
             self.loop_detect_mode = self._normalize_loop_detect_mode(
                 self.config.get("mesh", {}).get("loop_detect", LOOP_DETECT_OFF)
             )

@@ -65,6 +65,22 @@ class TextHelper:
 
         # Initialize CLI handler later when repeater identity is registered
         self.cli = None
+        self._pending_tasks = set()
+        self._loop: asyncio.AbstractEventLoop | None = None
+
+    def _track_task(self, task: asyncio.Task) -> None:
+        self._pending_tasks.add(task)
+
+        def _on_done(done_task: asyncio.Task) -> None:
+            self._pending_tasks.discard(done_task)
+            try:
+                done_task.result()
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.error(f"Background text task failed: {e}", exc_info=True)
+
+        task.add_done_callback(_on_done)
 
     def register_identity(
         self, name: str, identity, identity_type: str = "room_server", radio_config=None
@@ -151,8 +167,29 @@ class TextHelper:
 
                 self.room_servers[hash_byte] = room_server
 
-                # Start sync loop
-                asyncio.create_task(room_server.start())
+                # Start sync loop — may be called from a non-async HTTP handler thread
+                try:
+                    loop = asyncio.get_running_loop()
+                    start_task = loop.create_task(room_server.start())
+                    self._track_task(start_task)
+                except RuntimeError:
+                    # No running event loop in this thread
+                    if self._loop and self._loop.is_running():
+                        future = asyncio.run_coroutine_threadsafe(
+                            room_server.start(), self._loop
+                        )
+                        future.add_done_callback(
+                            lambda f: logger.error(
+                                f"Room server '{name}' failed: {f.exception()}",
+                                exc_info=f.exception(),
+                            )
+                            if not f.cancelled() and f.exception()
+                            else None
+                        )
+                    else:
+                        logger.error(
+                            f"Cannot start room server '{name}': no event loop available"
+                        )
 
                 logger.info(
                     f"Registered room server '{name}': hash=0x{hash_byte:02X}, "

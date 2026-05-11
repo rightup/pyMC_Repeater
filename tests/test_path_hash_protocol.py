@@ -74,7 +74,7 @@ def _make_handler(path_hash_mode=0, local_hash_bytes=None):
             "node_name": "test-node",
         },
         "mesh": {
-            "global_flood_allow": True,
+            "unscoped_flood_allow": True,
             "loop_detect": "off",
             "path_hash_mode": path_hash_mode,
         },

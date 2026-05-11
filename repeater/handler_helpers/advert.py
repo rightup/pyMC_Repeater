@@ -8,7 +8,8 @@ Includes adaptive rate limiting based on mesh activity.
 import asyncio
 import logging
 import time
-from collections import OrderedDict
+import itertools
+from collections import OrderedDict, deque
 from enum import Enum
 from typing import Dict, Optional, Tuple
 
@@ -123,9 +124,9 @@ class AdvertHelper:
         self._stats_advert_duplicates = 0
         self._stats_tier_changes = 0
         
-        # Recent drops tracking (keep last 20)
-        self._recent_drops = []
-        self._max_recent_drops = 20
+        # Recent drops tracking — bounded deque so append is O(1) and the
+        # oldest entry is evicted automatically (no pop(0) O(n) shift needed).
+        self._recent_drops: deque = deque(maxlen=20)
         
         # Memory management
         self._last_cleanup = time.time()
@@ -194,8 +195,8 @@ class AdvertHelper:
         
         # 5. Limit known neighbors set to prevent unbounded growth
         if len(self._known_neighbors) > 1000:
-            # Clear the oldest half (simple approach - could be more sophisticated)
-            self._known_neighbors = set(list(self._known_neighbors)[500:])
+            # itertools.islice avoids materialising the full list first (O(n) → O(k))
+            self._known_neighbors = set(itertools.islice(self._known_neighbors, 500))
         
         if expired_penalties or inactive_pubkeys:
             logger.debug(
@@ -571,20 +572,19 @@ class AdvertHelper:
                 # Track recent drop (deduplicate by pubkey)
                 pubkey_short = pubkey[:16]
                 
-                # Remove any existing entry for this pubkey
-                self._recent_drops = [d for d in self._recent_drops if d["pubkey"] != pubkey_short]
-                
-                # Add the new drop entry
+                # Remove any existing entry for this pubkey, then append the
+                # updated record.  Rebuilding as a deque preserves maxlen so
+                # the oldest entry is evicted automatically — no pop(0) needed.
+                self._recent_drops = deque(
+                    (d for d in self._recent_drops if d["pubkey"] != pubkey_short),
+                    maxlen=20,
+                )
                 self._recent_drops.append({
                     "pubkey": pubkey_short,
                     "name": node_name,
                     "reason": reason,
                     "timestamp": now
                 })
-                
-                # Keep only last N drops
-                if len(self._recent_drops) > self._max_recent_drops:
-                    self._recent_drops.pop(0)
                 
                 return
             

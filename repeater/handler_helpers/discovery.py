@@ -44,10 +44,25 @@ class DiscoveryHelper:
             log_fn=log_fn or logger.info,
             debug_log_fn=debug_log_fn,
         )
+        self._pending_tasks = set()
 
         # Set up the request callback
         self.control_handler.set_request_callback(self._on_discovery_request)
         logger.debug("Discovery handler initialized")
+
+    def _track_task(self, task: asyncio.Task) -> None:
+        self._pending_tasks.add(task)
+
+        def _on_done(done_task: asyncio.Task) -> None:
+            self._pending_tasks.discard(done_task)
+            try:
+                done_task.result()
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.error(f"Background discovery task failed: {e}", exc_info=True)
+
+        task.add_done_callback(_on_done)
 
     def _on_discovery_request(self, request_data: dict) -> None:
         """
@@ -115,7 +130,8 @@ class DiscoveryHelper:
 
             # Send response via router injection
             if self.packet_injector:
-                asyncio.create_task(self._send_packet_async(response_packet, tag))
+                task = asyncio.create_task(self._send_packet_async(response_packet, tag))
+                self._track_task(task)
             else:
                 logger.warning("No packet injector available - discovery response not sent")
 

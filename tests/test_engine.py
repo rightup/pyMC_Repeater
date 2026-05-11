@@ -46,7 +46,7 @@ def _make_config(**overrides) -> dict:
             "node_name": "test-node",
         },
         "mesh": {
-            "global_flood_allow": True,
+            "unscoped_flood_allow": True,
             "loop_detect": "off",
         },
         "delays": {
@@ -228,11 +228,10 @@ class TestFloodForward:
         assert result is None
         assert "do not retransmit" in pkt.drop_reason.lower()
 
-    def test_global_flood_deny_plain_flood(self, handler):
-        handler.config["mesh"]["global_flood_allow"] = False
+    def test_unscoped_flood_deny_plain_flood(self, handler):
+        handler.config["mesh"]["unscoped_flood_allow"] = False
         pkt = _make_flood_packet()
-        # When global_flood_allow=False, flood_forward calls _check_transport_codes
-        # which will fail because there are no transport codes on a plain flood
+        # When unscoped_flood_allow=False, flood_forward should fail on a packet type without a transport code defined
         result = handler.flood_forward(pkt)
         assert result is None
 
@@ -366,7 +365,8 @@ class TestProcessPacket:
 
     def test_transport_flood_dispatched(self, handler):
         pkt = _make_transport_flood_packet()
-        result = handler.process_packet(pkt, snr=5.0)
+        with patch.object(handler, '_check_transport_codes', return_value=(True, "")):
+            result = handler.process_packet(pkt, snr=5.0)
         assert result is not None
         fwd_pkt, _ = result
         assert fwd_pkt.path[-1] == LOCAL_HASH
@@ -656,30 +656,40 @@ class TestHashStabilityThroughForwarding:
 
 
 # ===================================================================
-# 9. Global flood policy
+# 9. unscoped flood policy
 # ===================================================================
 
-class TestGlobalFloodPolicy:
-    """global_flood_allow=False blocks plain flood, transport checked."""
+class TestUnscopedFloodPolicy:
+    """unscoped_flood_allow=False blocks plain flood, transport checked."""
 
     def test_flood_blocked_by_policy(self, handler):
-        handler.config["mesh"]["global_flood_allow"] = False
+        handler.config["mesh"]["unscoped_flood_allow"] = False
         pkt = _make_flood_packet()
         result = handler.flood_forward(pkt)
         assert result is None
 
     def test_direct_unaffected_by_flood_policy(self, handler):
-        handler.config["mesh"]["global_flood_allow"] = False
+        handler.config["mesh"]["unscoped_flood_allow"] = False
         pkt = _make_direct_packet()
         result = handler.direct_forward(pkt)
         assert result is not None  # direct is not blocked by flood policy
 
-    def test_transport_flood_checked_when_policy_off(self, handler):
-        handler.config["mesh"]["global_flood_allow"] = False
+    def test_transport_flood_unaffected_by_unscoped_policy(self, handler):
+        # unscoped_flood_allow controls only plain FLOOD packets.
+        # Transport floods are validated via _check_transport_codes regardless.
+        # With a configured scope that allows, transport flood passes even when
+        # unscoped traffic is denied — the two settings are fully independent.
+        handler.config["mesh"]["unscoped_flood_allow"] = False
         pkt = _make_transport_flood_packet()
-        # Will call _check_transport_codes which will fail (no storage keys)
-        result = handler.flood_forward(pkt)
-        assert result is None
+        with patch.object(handler, '_check_transport_codes', return_value=(True, "")):
+            result = handler.flood_forward(pkt)
+        assert result is not None  # transport flood passes; unscoped=False did not block it
+
+    def test_transport_flood_denied_with_no_keys(self, handler):
+        # Scope Not Configured = denied, regardless of unscoped_flood_allow.
+        pkt = _make_transport_flood_packet()
+        result = handler.flood_forward(pkt)  # no mocking — real _check_transport_codes
+        assert result is None  # denied because no transport keys configured
 
 
 class TestFloodLoopDetection:
@@ -812,7 +822,7 @@ class TestGetDropReason:
         assert "Path too long" in reason
 
     def test_flood_policy_reason(self, handler):
-        handler.config["mesh"]["global_flood_allow"] = False
+        handler.config["mesh"]["unscoped_flood_allow"] = False
         pkt = _make_flood_packet()
         reason = handler._get_drop_reason(pkt)
         assert "flood" in reason.lower()
@@ -838,7 +848,8 @@ class TestTransportForwarding:
 
     def test_transport_flood_appends_path(self, handler):
         pkt = _make_transport_flood_packet(path=b"\x11")
-        result = handler.process_packet(pkt, snr=5.0)
+        with patch.object(handler, '_check_transport_codes', return_value=(True, "")):
+            result = handler.process_packet(pkt, snr=5.0)
         assert result is not None
         fwd_pkt, _ = result
         assert fwd_pkt.path[-1] == LOCAL_HASH
@@ -853,7 +864,8 @@ class TestTransportForwarding:
 
     def test_transport_codes_preserved_after_flood(self, handler):
         pkt = _make_transport_flood_packet(transport_codes=(0xAAAA, 0xBBBB))
-        result = handler.process_packet(pkt, snr=5.0)
+        with patch.object(handler, '_check_transport_codes', return_value=(True, "")):
+            result = handler.process_packet(pkt, snr=5.0)
         assert result is not None
         fwd_pkt, _ = result
         assert fwd_pkt.transport_codes == [0xAAAA, 0xBBBB]
@@ -1127,23 +1139,9 @@ GOOD_PACKETS = [
      lambda: _make_direct_packet(payload=b"\xFF\xEE",
                                   path=bytes([LOCAL_HASH] + list(range(10))))),
 
-    ("good_transport_flood_basic",
-     "Transport flood, basic payload + transport codes",
-     lambda: _make_transport_flood_packet(payload=b"\x01\x02\x03\x04")),
-
-    ("good_transport_flood_with_path",
-     "Transport flood, existing 3-hop path",
-     lambda: _make_transport_flood_packet(payload=b"\xAA\xBB", path=b"\x11\x22\x33")),
-
-    ("good_transport_flood_max_codes",
-     "Transport flood, max uint16 transport codes",
-     lambda: _make_transport_flood_packet(payload=b"\xFF",
-                                           transport_codes=(0xFFFF, 0xFFFF))),
-
     ("good_transport_direct_basic",
      "Transport direct, basic hop to us",
      lambda: _make_transport_direct_packet(payload=b"\x01\x02")),
-
     ("good_transport_direct_long_path",
      "Transport direct, 5 remaining hops",
      lambda: _make_transport_direct_packet(
@@ -1202,12 +1200,12 @@ BAD_PACKETS = [
      "no path"),
 
     ("bad_flood_policy_off",
-     "Plain flood when global_flood_allow=False (needs config override)",
+     "Plain flood when unscoped_flood_allow=False (needs config override)",
      lambda: _make_flood_packet(payload=b"\x01\x02"),
-     "transport codes"),
+     "unscoped flood"),
 
-    ("bad_transport_flood_policy_off",
-     "Transport flood when policy off (no valid transport key)",
+    ("bad_transport_flood_no_keys",
+     "Transport flood with no configured transport keys — always denied",
      lambda: _make_transport_flood_packet(payload=b"\x01\x02"),
      "transport"),
 
@@ -1323,9 +1321,9 @@ class TestBadPacketArray:
         BAD_PACKETS, ids=_bad_ids,
     )
     def test_process_packet_drops(self, handler, name, desc, builder, expected_reason):
-        # Two entries need global_flood_allow=False
+        # Two entries need unscoped_flood_allow=False
         if "policy_off" in name:
-            handler.config["mesh"]["global_flood_allow"] = False
+            handler.config["mesh"]["unscoped_flood_allow"] = False
 
         pkt = builder()
         result = handler.process_packet(pkt, snr=5.0)
@@ -1337,7 +1335,7 @@ class TestBadPacketArray:
     )
     def test_drop_reason_set(self, handler, name, desc, builder, expected_reason):
         if "policy_off" in name:
-            handler.config["mesh"]["global_flood_allow"] = False
+            handler.config["mesh"]["unscoped_flood_allow"] = False
 
         pkt = builder()
         handler.process_packet(pkt, snr=5.0)
@@ -1353,7 +1351,7 @@ class TestBadPacketArray:
     def test_bad_packet_not_marked_seen(self, handler, name, desc, builder, expected_reason):
         """Dropped packets must NOT pollute the seen cache."""
         if "policy_off" in name:
-            handler.config["mesh"]["global_flood_allow"] = False
+            handler.config["mesh"]["unscoped_flood_allow"] = False
 
         pkt = builder()
         handler.process_packet(pkt, snr=5.0)

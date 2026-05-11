@@ -36,6 +36,8 @@ tags:
     description: User authentication and API token management
   - name: System
     description: System statistics and control
+  - name: GPS
+    description: Local GPS receiver diagnostics
   - name: Packets
     description: Packet history and statistics
   - name: Charts
@@ -317,6 +319,134 @@ paths:
                   core_version:
                     type: string
                     example: "0.5.0"
+
+  /gps:
+    get:
+      tags: [GPS]
+      summary: Get local GPS diagnostics
+      description: Returns parsed NMEA fix, position, motion, accuracy, satellites, and raw sentence health.
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      responses:
+        '200':
+          description: GPS diagnostics snapshot
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  data:
+                    type: object
+                    properties:
+                      enabled:
+                        type: boolean
+                      running:
+                        type: boolean
+                      status:
+                        type: object
+                      fix:
+                        type: object
+                      position:
+                        type: object
+                        description: Effective receiver position for API clients
+                      gps_position:
+                        type: object
+                        description: Raw position reported by the GPS receiver, even before a valid fix
+                      manual_position:
+                        type: object
+                        nullable: true
+                        description: Configured repeater latitude/longitude, when set to a non-zero coordinate
+                      position_meta:
+                        type: object
+                        properties:
+                          source:
+                            type: string
+                            enum: [gps, manual_config]
+                          source_label:
+                            type: string
+                          policy:
+                            type: string
+                            enum: [manual_until_gps_fix, gps_only]
+                          manual_config_available:
+                            type: boolean
+                          gps_fix_valid:
+                            type: boolean
+                      motion:
+                        type: object
+                      accuracy:
+                        type: object
+                      time:
+                        type: object
+                      time_sync:
+                        type: object
+                        description: GPS-to-system-clock sync status
+                        properties:
+                          enabled:
+                            type: boolean
+                          state:
+                            type: string
+                            enum: [disabled, waiting_for_fix, waiting_for_time, ready, in_sync, synced, error, ignored]
+                          last_attempt:
+                            type: string
+                            nullable: true
+                          last_success:
+                            type: string
+                            nullable: true
+                          last_error:
+                            type: string
+                            nullable: true
+                          last_gps_time:
+                            type: string
+                            nullable: true
+                          last_offset_seconds:
+                            type: number
+                            nullable: true
+                      location_update:
+                        type: object
+                        description: GPS-fix-to-repeater-location update status
+                        properties:
+                          enabled:
+                            type: boolean
+                          state:
+                            type: string
+                            enum: [disabled, unconfigured, waiting_for_fix, waiting_for_position, ready, updated, skipped, error]
+                          last_attempt:
+                            type: string
+                            nullable: true
+                          last_success:
+                            type: string
+                            nullable: true
+                          last_error:
+                            type: string
+                            nullable: true
+                          last_latitude:
+                            type: number
+                            nullable: true
+                          last_longitude:
+                            type: number
+                            nullable: true
+                      satellites:
+                        type: object
+                      nmea:
+                        type: object
+                      raw_attributes:
+                        type: object
+
+  /gps_stream:
+    get:
+      tags: [GPS]
+      summary: GPS diagnostics SSE stream
+      description: Server-Sent Events stream of live GPS diagnostics snapshots.
+      responses:
+        '200':
+          description: SSE stream
+          content:
+            text/event-stream:
+              schema:
+                type: string
 
   /send_advert:
     post:
@@ -1235,10 +1365,10 @@ paths:
   # ============================================================================
   # Network Policy
   # ============================================================================
-  /global_flood_policy:
+  /unscoped_flood_policy:
     get:
       tags: [Network Policy]
-      summary: Get global flood policy
+      summary: Get unscoped flood policy
       description: Retrieve current network flood policy configuration
       security:
         - BearerAuth: []
@@ -1252,7 +1382,7 @@ paths:
                 type: object
     post:
       tags: [Network Policy]
-      summary: Update global flood policy
+      summary: Update unscoped flood policy
       description: Modify network flood policy settings
       security:
         - BearerAuth: []

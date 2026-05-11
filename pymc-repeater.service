@@ -3,8 +3,9 @@
 
 [Unit]
 Description=pyMC Repeater Daemon
-After=network-online.target
+After=network-online.target dbus.socket
 Wants=network-online.target
+Requires=dbus.socket
 
 [Service]
 Type=simple
@@ -12,8 +13,8 @@ User=repeater
 Group=repeater
 WorkingDirectory=/var/lib/pymc_repeater
 
-# Start command - use python module directly with proper path
-ExecStart=/usr/bin/python3 -m repeater.main --config /etc/pymc_repeater/config.yaml
+# Start command - use venv python to avoid system package conflicts
+ExecStart=/opt/pymc_repeater/venv/bin/python -m repeater.main --config /etc/pymc_repeater/config.yaml
 
 # Restart on failure
 Restart=on-failure
@@ -33,6 +34,10 @@ SyslogIdentifier=pymc-repeater
 # Security (relaxed for service self-restart via sudo)
 ReadWritePaths=/var/log/pymc_repeater /var/lib/pymc_repeater /etc/pymc_repeater
 SupplementaryGroups=plugdev dialout
+
+# Allow GPS time sync to update CLOCK_REALTIME without running as root, also allow changing user via polkit or sudo
+CapabilityBoundingSet=CAP_SYS_TIME CAP_SETUID CAP_SETGID
+AmbientCapabilities=CAP_SYS_TIME
 
 [Install]
 WantedBy=multi-user.target

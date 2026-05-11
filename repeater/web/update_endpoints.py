@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import re
+import ssl
 import subprocess
 import threading
 import time
@@ -28,6 +29,7 @@ from datetime import datetime
 from typing import List, Optional
 
 import cherrypy
+from repeater.service_utils import is_buildroot
 
 logger = logging.getLogger("HTTPServer")
 
@@ -43,6 +45,31 @@ PACKAGE_NAME = "pymc_repeater"
 # How long (seconds) before a cached check result expires
 CHECK_CACHE_TTL = 600  # 10 minutes
 
+_github_ssl_ctx: Optional[ssl.SSLContext] = None
+_disk_version_mismatch_logged: Optional[tuple] = None
+_DISK_VERSION_MISMATCH_LOG_TTL = 300  # seconds
+_installed_version_cache: Optional[tuple] = None
+_INSTALLED_VERSION_CACHE_TTL = 15  # seconds
+
+
+def _get_github_ssl_context() -> ssl.SSLContext:
+    global _github_ssl_ctx
+    if _github_ssl_ctx is None:
+        _github_ssl_ctx = ssl.create_default_context()
+    return _github_ssl_ctx
+
+
+def _find_buildroot_upgrade_helper() -> Optional[str]:
+    candidates = [
+        "/root/pyMC_Repeater/buildroot-manage.sh",
+        "/opt/pymc_repeater/pyMC_Repeater/buildroot-manage.sh",
+        "/root/scripts/buildroot-manage.sh",
+    ]
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    return None
+
 
 class _RateLimitError(Exception):
     """Raised when GitHub returns HTTP 403 due to rate limiting."""
@@ -51,7 +78,7 @@ class _RateLimitError(Exception):
         self.reset_at = reset_at
 
 
-def _get_installed_version() -> str:
+def _get_installed_version(force_refresh: bool = False) -> str:
     """
     Return the highest dist-info version found for pymc_repeater across all
     directories the running interpreter actually uses.
@@ -69,6 +96,20 @@ def _get_installed_version() -> str:
     import site as _site
     import sys
 
+    global _installed_version_cache
+    now = time.time()
+    if (
+        not force_refresh
+        and _installed_version_cache is not None
+        and (now - _installed_version_cache[1]) < _INSTALLED_VERSION_CACHE_TTL
+    ):
+        return _installed_version_cache[0]
+
+    def _cache_and_return(value: str) -> str:
+        global _installed_version_cache
+        _installed_version_cache = (value, now)
+        return value
+
     # -- 1. Collect candidate directories ---------------------------------- #
     dirs: list = []
     try:
@@ -84,6 +125,13 @@ def _get_installed_version() -> str:
     for p in sys.path:
         if p and ("site-packages" in p or "dist-packages" in p) and p not in dirs:
             dirs.append(p)
+    # Explicitly include the dedicated venv's site-packages
+    _venv_site = "/opt/pymc_repeater/venv/lib"
+    if os.path.isdir(_venv_site):
+        for child in os.listdir(_venv_site):
+            sp = os.path.join(_venv_site, child, "site-packages")
+            if os.path.isdir(sp) and sp not in dirs:
+                dirs.append(sp)
 
     # -- 2. Scan for dist-info METADATA files ------------------------------ #
     pkg_glob = PACKAGE_NAME.replace("-", "_") + "-*.dist-info"
@@ -125,9 +173,9 @@ def _get_installed_version() -> str:
     if disk_version is None:
         try:
             from repeater import __version__
-            return __version__
+            return _cache_and_return(__version__)
         except Exception:
-            return "unknown"
+            return _cache_and_return("unknown")
 
     # -- 5. Sanity check: never return a version older than what's running -- #
     # If the running process is already on a higher version than anything found
@@ -136,17 +184,33 @@ def _get_installed_version() -> str:
         from repeater import __version__ as _running
         from packaging.version import Version
         if Version(_running) > Version(disk_version):
-            logger.debug(
-                f"[Update] Disk version {disk_version!r} < running {_running!r};"
-                " using running __version__ as installed version."
-            )
+            # status() polls can call this frequently; throttle mismatch logs.
+            global _disk_version_mismatch_logged
+            now = time.time()
+            should_log = True
+            if _disk_version_mismatch_logged is not None:
+                last_disk, last_running, last_ts = _disk_version_mismatch_logged
+                if (
+                    last_disk == disk_version
+                    and last_running == _running
+                    and (now - last_ts) < _DISK_VERSION_MISMATCH_LOG_TTL
+                ):
+                    should_log = False
+
+            if should_log:
+                logger.debug(
+                    f"[Update] Disk version {disk_version!r} < running {_running!r};"
+                    " using running __version__ as installed version."
+                )
+                _disk_version_mismatch_logged = (disk_version, _running, now)
+
             # Strip PEP 440 local identifier (+gXXXXXX) – it only encodes
             # the git hash and causes spurious mismatches with GitHub versions.
-            return re.sub(r'\+[a-zA-Z0-9.]+$', '', _running)
+            return _cache_and_return(re.sub(r'\+[a-zA-Z0-9.]+$', '', _running))
     except Exception:
         pass
 
-    return re.sub(r'\+[a-zA-Z0-9.]+$', '', disk_version)
+    return _cache_and_return(re.sub(r'\+[a-zA-Z0-9.]+$', '', disk_version))
 
 # Channels file – persisted so the choice survives daemon restarts
 _CHANNELS_FILE = "/var/lib/pymc_repeater/.update_channel"
@@ -364,6 +428,8 @@ class _UpdateState:
     def append_line(self, line: str) -> None:
         with self._lock:
             self.progress_lines.append(line)
+            if len(self.progress_lines) > 500:
+                self.progress_lines = self.progress_lines[-500:]
 
 
 _state = _UpdateState()
@@ -387,7 +453,8 @@ def _fetch_url(url: str, timeout: int = 10) -> str:
         headers["Authorization"] = f"Bearer {token}"
     req = urllib.request.Request(url, headers=headers)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        ctx = _get_github_ssl_context() if url.startswith("https") else None
+        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
             return resp.read().decode("utf-8", errors="replace")
     except urllib.error.HTTPError as exc:
         if exc.code == 403:
@@ -456,7 +523,7 @@ def _parse_dev_number(version_str: str) -> Optional[int]:
     return int(m.group(1)) if m else None
 
 
-def _cleanup_stale_dist_info() -> None:
+def _cleanup_stale_dist_info(allow_sudo: bool = True) -> None:
     import glob
     import shutil
     import site as _site
@@ -470,6 +537,13 @@ def _cleanup_stale_dist_info() -> None:
         dirs.append(_site.getusersitepackages())
     except AttributeError:
         pass
+    # Also scan the dedicated venv's site-packages
+    _venv_site = "/opt/pymc_repeater/venv/lib"
+    if os.path.isdir(_venv_site):
+        for child in os.listdir(_venv_site):
+            sp = os.path.join(_venv_site, child, "site-packages")
+            if os.path.isdir(sp) and sp not in dirs:
+                dirs.append(sp)
 
     pkg_glob = PACKAGE_NAME.replace("-", "_") + "-*.dist-info"
 
@@ -497,6 +571,7 @@ def _cleanup_stale_dist_info() -> None:
     except Exception:
         return  # can't determine winner safely — leave everything alone
 
+    removed_any = False
     for path, ver in found.items():
         if path == keep:
             continue
@@ -504,7 +579,13 @@ def _cleanup_stale_dist_info() -> None:
             shutil.rmtree(path)
             logger.info(f"[Update] Removed stale dist-info: {path} (version {ver})")
             _state.append_line(f"[pyMC updater] Removed stale dist-info: {os.path.basename(path)}")
+            removed_any = True
         except PermissionError:
+            if not allow_sudo:
+                logger.debug(
+                    f"[Update] Skipping stale dist-info cleanup without sudo permissions: {path}"
+                )
+                continue
             # dist-info is root-owned (pip ran via sudo); use sudo to remove
             try:
                 subprocess.run(
@@ -513,10 +594,27 @@ def _cleanup_stale_dist_info() -> None:
                 )
                 logger.info(f"[Update] Removed stale dist-info (sudo): {path} (version {ver})")
                 _state.append_line(f"[pyMC updater] Removed stale dist-info: {os.path.basename(path)}")
+                removed_any = True
             except Exception as exc2:
                 logger.warning(f"[Update] Could not remove stale dist-info {path}: {exc2}")
         except Exception as exc:
             logger.warning(f"[Update] Could not remove stale dist-info {path}: {exc}")
+
+    if removed_any:
+        global _installed_version_cache
+        _installed_version_cache = None
+
+
+def _startup_dist_info_cleanup() -> None:
+    """Best-effort cleanup during startup without sudo escalation."""
+    try:
+        _cleanup_stale_dist_info(allow_sudo=False)
+        fresh = _get_installed_version(force_refresh=True)
+        if fresh != "unknown":
+            with _state._lock:
+                _state.current_version = fresh
+    except Exception as exc:
+        logger.debug(f"[Update] Startup dist-info cleanup skipped: {exc}")
 
 
 def _has_update(installed: str, latest: str) -> bool:
@@ -655,15 +753,27 @@ def _do_check() -> None:
 
 
 def _migrate_service_unit() -> None:
-    """Strip legacy PYTHONPATH and fix WorkingDirectory in the systemd service unit.
+    """Strip legacy PYTHONPATH, fix WorkingDirectory, and ensure ExecStart
+    uses the venv python in the systemd service unit.
     """
+    if os.path.exists("/etc/pymc-image-build-id"):
+        logger.info("[Update] Buildroot image detected, skipping systemd unit migration.")
+        return
+
     import subprocess as _sp
     _SVC_UNIT = "/etc/systemd/system/pymc-repeater.service"
+    _VENV_PYTHON = "/opt/pymc_repeater/venv/bin/python"
     try:
         _sp.run(["sed", "-i", "/^Environment=.*PYTHONPATH/d", _SVC_UNIT], check=False)
         _sp.run(
             ["sed", "-i",
              "s|WorkingDirectory=/opt/pymc_repeater|WorkingDirectory=/var/lib/pymc_repeater|",
+             _SVC_UNIT],
+            check=False,
+        )
+        _sp.run(
+            ["sed", "-i",
+             f"s|ExecStart=/usr/bin/python3|ExecStart={_VENV_PYTHON}|",
              _SVC_UNIT],
             check=False,
         )
@@ -702,32 +812,60 @@ def _do_install() -> None:
 
     import os as _os
     env = _os.environ.copy()
-    env["PIP_ROOT_USER_ACTION"] = "ignore"
     env["SETUPTOOLS_SCM_PRETEND_VERSION"] = _state.latest_version or "1.0.0"
+
+    _VENV_DIR = "/opt/pymc_repeater/venv"
+    _VENV_PIP = os.path.join(_VENV_DIR, "bin", "pip")
+    _VENV_PYTHON = os.path.join(_VENV_DIR, "bin", "python")
 
     _state.append_line(f"[pyMC updater] Installing from channel '{channel}'…")
 
     _UPGRADE_WRAPPER = "/usr/local/bin/pymc-do-upgrade"
+    _BUILDROOT_UPGRADE_HELPER = _find_buildroot_upgrade_helper()
     is_root = (_os.geteuid() == 0)
 
-    if is_root:
+    if is_root and is_buildroot():
+        env["PYMC_REPEATER_REF"] = channel
+        env["PYMC_CORE_REF"] = channel
+        if not _BUILDROOT_UPGRADE_HELPER:
+            _state.finish_install(False, "Buildroot upgrade helper not found in repo checkout or image bootstrap paths")
+            return
+        _state.append_line(f"[pyMC updater] Buildroot image detected – using {_BUILDROOT_UPGRADE_HELPER}")
+        cmd = ["/bin/sh", _BUILDROOT_UPGRADE_HELPER, "upgrade"]
+    elif is_root:
         _migrate_service_unit()
+
+        # Ensure venv exists (migration from system-pip era)
+        if not os.path.isfile(_VENV_PYTHON):
+            _state.append_line("[pyMC updater] Creating venv (first-time migration)…")
+            _run(["python3", "-m", "venv", "--system-site-packages", _VENV_DIR], env=env)
+            _run([_VENV_PIP, "install", "--upgrade", "pip", "setuptools", "wheel"], env=env)
+
+        # Clean up system-level packages to avoid shadowing
+        _run(["python3", "-m", "pip", "uninstall", "-y", "pymc_repeater"], env=env)
+        _run(["python3", "-m", "pip", "uninstall", "-y", "pymc_core"], env=env)
+
+        # Remove stale source tree that could shadow the venv package
+        stale_src = "/opt/pymc_repeater/repeater"
+        if os.path.isdir(stale_src):
+            _state.append_line("[pyMC updater] Removing stale source tree…")
+            import shutil
+            shutil.rmtree(stale_src, ignore_errors=True)
+
         install_spec = (
             f"pymc_repeater[hardware] @ git+https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}.git@{channel}"
         )
-        _state.append_line(f"[pyMC updater] Running as root – direct pip install")
+        _state.append_line(f"[pyMC updater] Running as root – venv pip install")
         _state.append_line(f"[pyMC updater] Target: {install_spec}")
         cmd = [
-            "python3", "-m", "pip", "install",
-            "--break-system-packages",
+            _VENV_PIP, "install",
+            "--upgrade",
             "--no-cache-dir",
-            "--force-reinstall",
             install_spec,
         ]
     elif _os.path.isfile(_UPGRADE_WRAPPER):
         _state.append_line(f"[pyMC updater] Using sudo wrapper: {_UPGRADE_WRAPPER}")
-        # Pass the target version as $2 so the wrapper can set
-        # SETUPTOOLS_SCM_PRETEND_VERSION (sudo strips our env).
+        # The wrapper handles venv creation/migration internally
         cmd = ["sudo", _UPGRADE_WRAPPER, channel, _state.latest_version or ""]
     else:
         msg = (
@@ -758,6 +896,9 @@ def _do_install() -> None:
             _state.finish_install(False, f"Upgrade succeeded but service restart failed: {restart_msg}")
     else:
         _state.finish_install(False, "pip install failed – see progress log for details")
+
+
+_startup_dist_info_cleanup()
 
 
 # ---------------------------------------------------------------------------

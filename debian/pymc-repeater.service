@@ -11,5 +11,9 @@ ExecStart=/usr/bin/pymc-repeater
 Restart=always
 RestartSec=10
 
+# Allow GPS time sync to update CLOCK_REALTIME without running as root
+CapabilityBoundingSet=CAP_SYS_TIME
+AmbientCapabilities=CAP_SYS_TIME
+
 [Install]
 WantedBy=multi-user.target

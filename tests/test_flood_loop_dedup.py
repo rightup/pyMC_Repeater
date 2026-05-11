@@ -7,7 +7,7 @@ objects to verify:
   - Loop detection modes (off, minimal, moderate, strict) with real path bytes
   - Flood re-forwarding prevention (own hash already in path)
   - Multi-byte hash mode interaction with loop/dedup
-  - Global flood policy enforcement
+  - Unscoped flood policy enforcement
   - mark_seen / is_duplicate cache behaviour
   - do_not_retransmit flag handling
 """
@@ -50,7 +50,7 @@ def _make_handler(
     loop_detect="off",
     path_hash_mode=0,
     local_hash_bytes=None,
-    global_flood_allow=True,
+    unscoped_flood_allow=True,
 ):
     """Create a RepeaterHandler with real engine logic, mocking only hardware."""
     lhb = local_hash_bytes or LOCAL_HASH_BYTES
@@ -64,7 +64,7 @@ def _make_handler(
             "node_name": "test-node",
         },
         "mesh": {
-            "global_flood_allow": global_flood_allow,
+            "unscoped_flood_allow": unscoped_flood_allow,
             "loop_detect": loop_detect,
             "path_hash_mode": path_hash_mode,
         },
@@ -398,29 +398,29 @@ class TestLoopDetectionMultiByte:
 
 
 # ===================================================================
-# 5. Global flood policy
+# 5. Unscoped flood policy
 # ===================================================================
 
 
-class TestGlobalFloodPolicy:
-    """Test global_flood_allow=False blocks flood packets."""
+class TestUnscopedFloodPolicy:
+    """Test unscoped=False blocks flood packets."""
 
-    def test_global_flood_disabled_drops_flood(self):
-        h = _make_handler(global_flood_allow=False)
+    def test_unscoped_flood_disabled_drops_flood(self):
+        h = _make_handler(unscoped_flood_allow=False)
         pkt = _make_flood_packet(payload=b"\x01\x02")
         result = h.flood_forward(pkt)
         assert result is None
         assert pkt.drop_reason is not None
 
-    def test_global_flood_enabled_allows_flood(self):
-        h = _make_handler(global_flood_allow=True)
+    def test_unscoped_flood_enabled_allows_flood(self):
+        h = _make_handler(unscoped_flood_allow=True)
         pkt = _make_flood_packet(payload=b"\x01\x02")
         result = h.flood_forward(pkt)
         assert result is not None
 
     def test_transport_flood_without_codes_drops(self):
-        """ROUTE_TYPE_TRANSPORT_FLOOD with global_flood_allow=False and no valid codes."""
-        h = _make_handler(global_flood_allow=False)
+        """ROUTE_TYPE_TRANSPORT_FLOOD with unscoped_flood_allow=False and no valid codes."""
+        h = _make_handler(unscoped_flood_allow=False)
         # Nullify the storage to ensure transport code check fails
         h.storage = None
         pkt = Packet()

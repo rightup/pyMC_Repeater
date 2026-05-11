@@ -33,6 +33,7 @@ class ProtocolRequestHelper:
         radio=None,
         engine=None,
         neighbor_tracker=None,
+        config=None,
     ):
 
         self.identity_manager = identity_manager
@@ -41,6 +42,7 @@ class ProtocolRequestHelper:
         self.radio = radio
         self.engine = engine
         self.neighbor_tracker = neighbor_tracker
+        self.config = config or {}
         
         # Dictionary of core handlers keyed by dest_hash
         self.handlers = {}
@@ -61,6 +63,9 @@ class ProtocolRequestHelper:
         # Build request handlers dict
         request_handlers = {
             REQ_TYPE_GET_STATUS: self._handle_get_status,
+            REQ_TYPE_GET_ACCESS_LIST: self._make_handle_get_access_list(identity_acl),
+            REQ_TYPE_GET_NEIGHBOURS: self._handle_get_neighbours,
+            REQ_TYPE_GET_OWNER_INFO: self._handle_get_owner_info,
         }
         
         # Create core handler
@@ -227,3 +232,139 @@ class ProtocolRequestHelper:
         )
 
         return stats
+
+    def _make_handle_get_access_list(self, identity_acl):
+        """Create a closure for GET_ACCESS_LIST bound to a specific identity ACL."""
+        def _handler(client, timestamp: int, req_data: bytes):
+            return self._handle_get_access_list(client, timestamp, req_data, identity_acl)
+        return _handler
+
+    def _handle_get_access_list(self, client, timestamp: int, req_data: bytes, identity_acl):
+        """Return ACL entries: [pub_key_prefix(6) + permissions(1)] per client.
+
+        Admin-only. Matches C++ simple_repeater handleRequest REQ_TYPE_GET_ACCESS_LIST.
+        """
+        if not hasattr(client, "is_admin") or not client.is_admin():
+            logger.debug("GET_ACCESS_LIST rejected: client is not admin")
+            return None
+
+        # req_data[0] and req_data[1] are reserved bytes; must both be 0
+        if len(req_data) >= 2 and (req_data[0] != 0 or req_data[1] != 0):
+            logger.debug("GET_ACCESS_LIST: reserved bytes non-zero, ignoring")
+            return None
+
+        result = bytearray()
+        for ci in identity_acl.get_all_clients():
+            if ci.permissions == 0:
+                continue  # skip deleted entries
+            pubkey = ci.id.get_public_key()
+            result.extend(pubkey[:6])  # 6-byte pub_key prefix
+            result.append(ci.permissions & 0xFF)
+
+        logger.debug("GET_ACCESS_LIST: returning %d entries", len(result) // 7)
+        return bytes(result)
+
+    def _handle_get_neighbours(self, client, timestamp: int, req_data: bytes):
+        """Return paginated, sorted neighbour list.
+
+        Matches C++ simple_repeater handleRequest REQ_TYPE_GET_NEIGHBOURS.
+        Request: version(1) + count(1) + offset(2 LE) + order_by(1) + pubkey_prefix_len(1) + random(4)
+        Response: total_count(2 LE) + results_count(2 LE) + entries
+        Each entry: pubkey_prefix(N) + heard_seconds_ago(4 LE) + snr(1 signed)
+        """
+        if len(req_data) < 7:
+            logger.debug("GET_NEIGHBOURS: req_data too short (%d bytes)", len(req_data))
+            return None
+
+        request_version = req_data[0]
+        if request_version != 0:
+            logger.debug("GET_NEIGHBOURS: unsupported version %d", request_version)
+            return None
+
+        count = req_data[1]
+        offset = struct.unpack_from("<H", req_data, 2)[0]
+        order_by = req_data[4]
+        pubkey_prefix_len = min(req_data[5], 32)
+
+        # Fetch neighbours from storage
+        storage = getattr(self.neighbor_tracker, "storage", None) if self.neighbor_tracker else None
+        if not storage or not hasattr(storage, "get_neighbors"):
+            logger.debug("GET_NEIGHBOURS: no storage available")
+            # Return empty result
+            return struct.pack("<HH", 0, 0)
+
+        raw_neighbors = storage.get_neighbors()
+        now = time.time()
+
+        # Build sortable list: (pubkey_hex, heard_seconds_ago, snr)
+        entries = []
+        for pubkey_hex, info in raw_neighbors.items():
+            last_seen = info.get("last_seen", 0) or 0
+            heard_ago = max(0, int(now - last_seen))
+            snr_raw = info.get("snr", 0) or 0
+            # Store SNR as int8 (firmware stores snr * 4 as int8)
+            snr_int = max(-128, min(127, int(snr_raw * 4)))
+            entries.append((pubkey_hex, heard_ago, snr_int))
+
+        # Sort (matches C++ order_by values)
+        if order_by == 0:
+            entries.sort(key=lambda e: e[1])          # newest first (smallest heard_ago)
+        elif order_by == 1:
+            entries.sort(key=lambda e: e[1], reverse=True)  # oldest first
+        elif order_by == 2:
+            entries.sort(key=lambda e: e[2], reverse=True)  # strongest SNR first
+        elif order_by == 3:
+            entries.sort(key=lambda e: e[2])           # weakest SNR first
+
+        total_count = len(entries)
+
+        # Paginate
+        entry_size = pubkey_prefix_len + 4 + 1
+        max_results_bytes = 130  # firmware buffer limit
+        results = bytearray()
+        results_count = 0
+
+        for i in range(count):
+            idx = i + offset
+            if idx >= total_count:
+                break
+            if len(results) + entry_size > max_results_bytes:
+                break
+
+            pubkey_hex, heard_ago, snr_int = entries[idx]
+            try:
+                pubkey_bytes = bytes.fromhex(pubkey_hex)
+            except (ValueError, TypeError):
+                continue
+            results.extend(pubkey_bytes[:pubkey_prefix_len])
+            results.extend(struct.pack("<I", heard_ago))
+            results.append(snr_int & 0xFF)
+            results_count += 1
+
+        header = struct.pack("<HH", total_count, results_count)
+
+        logger.debug(
+            "GET_NEIGHBOURS: total=%d, returned=%d, offset=%d, order=%d",
+            total_count, results_count, offset, order_by,
+        )
+        return header + bytes(results)
+
+    def _handle_get_owner_info(self, client, timestamp: int, req_data: bytes):
+        """Return firmware version, node name, and owner info.
+
+        Matches C++ simple_repeater: sprintf("%s\\n%s\\n%s", FIRMWARE_VERSION, node_name, owner_info)
+        """
+        repeater_cfg = self.config.get("repeater", {})
+        node_name = repeater_cfg.get("node_name", "pyMC_Repeater")
+        owner_info = repeater_cfg.get("owner_info", "")
+
+        # Version: use package version if available, fallback to "pyMC"
+        try:
+            from importlib.metadata import version as pkg_version
+            fw_version = pkg_version("pymc-repeater")
+        except Exception:
+            fw_version = "pyMC"
+
+        result = f"{fw_version}\n{node_name}\n{owner_info}".encode("utf-8")
+        logger.debug("GET_OWNER_INFO: %s", result.decode("utf-8", errors="replace"))
+        return result

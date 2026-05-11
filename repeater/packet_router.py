@@ -54,6 +54,22 @@ class PacketRouter:
         self._inject_lock = asyncio.Lock()
         # Hash -> expiry time; skip delivering same PATH/protocol-response to companions more than once
         self._companion_delivered = {}
+        # Safety valve: cap the number of _route_packet tasks sleeping concurrently.
+        # LoRa's airtime budget naturally limits throughput, but burst arrivals
+        # (multi-hop amplification, collision retries) can stack many sleeping
+        # delay tasks before the duty-cycle gate fires.  30 is very generous for
+        # any realistic LoRa network but protects against pathological scenarios
+        # (e.g. a busy bridge node during a mesh-wide flood) exhausting memory or
+        # starving the event loop.
+        self._in_flight: int = 0
+        self._max_in_flight: int = 30
+        # Live set of in-flight tasks — kept in sync with _in_flight via the
+        # done-callback.  Used exclusively for shutdown drain; the integer
+        # counter is used for the cap check (faster, single source of truth).
+        self._route_tasks: set = set()
+        # Total packets dropped because the cap was reached.  Exposed in logs
+        # at shutdown so operators know whether the cap is actually firing.
+        self._cap_drop_count: int = 0
 
     async def start(self):
         self.running = True
@@ -68,7 +84,43 @@ class PacketRouter:
                 await self.router_task
             except asyncio.CancelledError:
                 pass
+
+        # Drain in-flight tasks gracefully, then cancel any that outlast the
+        # timeout.  This mirrors what the old _route_tasks set enabled and gives
+        # in-progress packets a fair chance to finish (e.g. their TX delay sleep
+        # + send) before the process exits.
+        if self._route_tasks:
+            pending_snapshot = set(self._route_tasks)
+            logger.info(
+                "Draining %d in-flight route task(s) (5 s timeout)...",
+                len(pending_snapshot),
+            )
+            _, still_pending = await asyncio.wait(pending_snapshot, timeout=5.0)
+            if still_pending:
+                logger.warning(
+                    "Cancelling %d route task(s) that did not finish within the shutdown timeout",
+                    len(still_pending),
+                )
+                for task in still_pending:
+                    task.cancel()
+                await asyncio.gather(*still_pending, return_exceptions=True)
+
+        if self._cap_drop_count:
+            logger.warning(
+                "In-flight cap dropped %d packet(s) during this session — "
+                "consider raising _max_in_flight if this is frequent",
+                self._cap_drop_count,
+            )
         logger.info("Packet router stopped")
+
+    def _on_route_done(self, task: asyncio.Task) -> None:
+        """Done-callback for _route_packet tasks: decrement counter and surface errors."""
+        self._in_flight -= 1
+        self._route_tasks.discard(task)
+        if not task.cancelled():
+            exc = task.exception()
+            if exc is not None:
+                logger.error("_route_packet raised: %s", exc, exc_info=exc)
     
     def _should_deliver_path_to_companions(self, packet) -> bool:
         """Return True if this PATH/protocol-response should be delivered to companions (first of duplicates)."""
@@ -76,8 +128,15 @@ class PacketRouter:
         if not key:
             return True
         now = time.time()
-        # Prune expired
-        self._companion_delivered = {k: v for k, v in self._companion_delivered.items() if v > now}
+        # Prune expired entries only when the dict grows large, avoiding a full
+        # dict comprehension on every packet.  200 entries × 60 s TTL means a
+        # sweep only triggers after ~200 unique PATH packets with no expiry — far
+        # more than any realistic companion session, and well below the 1000-entry
+        # threshold that could accumulate over hours without pruning.
+        if len(self._companion_delivered) > 200:
+            self._companion_delivered = {
+                k: v for k, v in self._companion_delivered.items() if v > now
+            }
         if key in self._companion_delivered:
             return False
         self._companion_delivered[key] = now + _COMPANION_DEDUPE_TTL_SEC
@@ -146,7 +205,21 @@ class PacketRouter:
         while self.running:
             try:
                 packet = await asyncio.wait_for(self.queue.get(), timeout=0.1)
-                await self._route_packet(packet)
+                # Drop early if the in-flight cap is reached.  This is a last-resort
+                # safety valve — under normal operation LoRa airtime and the duty-cycle
+                # gate keep _in_flight well below _max_in_flight.
+                if self._in_flight >= self._max_in_flight:
+                    self._cap_drop_count += 1
+                    logger.warning(
+                        "In-flight task cap reached (%d/%d), dropping packet "
+                        "(session total dropped: %d)",
+                        self._in_flight, self._max_in_flight, self._cap_drop_count,
+                    )
+                    continue
+                self._in_flight += 1
+                task = asyncio.create_task(self._route_packet(packet))
+                self._route_tasks.add(task)
+                task.add_done_callback(self._on_route_done)
             except asyncio.TimeoutError:
                 continue
             except Exception as e:

@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import time
@@ -5,8 +6,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from .letsmesh_handler import MeshCoreToMqttJwtPusher
-from .mqtt_handler import MQTTHandler
+from repeater.config import resolve_storage_dir
+
+from .mqtt_handler import MeshCoreToMqttPusher
 from .rrdtool_handler import RRDToolHandler
 from .sqlite_handler import SQLiteHandler
 from .storage_utils import PacketRecord
@@ -18,54 +20,34 @@ class StorageCollector:
     def __init__(self, config: dict, local_identity=None, repeater_handler=None):
         self.config = config
         self.repeater_handler = repeater_handler
+        self.glass_publish_callback = None
+        self._pending_tasks = set()
 
-        storage_dir_cfg = (
-            config.get("storage", {}).get("storage_dir")
-            or config.get("storage_dir")
-            or "/var/lib/pymc_repeater"
-        )
-        self.storage_dir = Path(storage_dir_cfg)
+        self.storage_dir = resolve_storage_dir(config)
         self.storage_dir.mkdir(parents=True, exist_ok=True)
-
-        node_name = config.get("repeater", {}).get("node_name", "unknown")
-        node_id = local_identity.get_public_key().hex() if local_identity else "unknown"
 
         self.sqlite_handler = SQLiteHandler(self.storage_dir)
         self.rrd_handler = RRDToolHandler(self.storage_dir)
-        self.mqtt_handler = MQTTHandler(config.get("mqtt", {}), node_name, node_id)
 
-        # Initialize LetsMesh handler if configured
-        self.letsmesh_handler = None
-        if config.get("letsmesh", {}).get("enabled", False) and local_identity:
+        # Initialize MQTT handler if configured
+        self.mqtt_handler = None
+        if (config.get("mqtt_brokers", {}) or config.get("letsmesh", {}) or config.get("mqtt", {})) and local_identity:
             try:
                 # Pass local_identity directly (supports both standard and firmware keys)
-                self.letsmesh_handler = MeshCoreToMqttJwtPusher(
+                self.mqtt_handler = MeshCoreToMqttPusher(
                     local_identity=local_identity,
                     config=config,
                     stats_provider=self._get_live_stats,
                 )
-                self.letsmesh_handler.connect()
-
-                # Get disallowed packet types from config
-                from ..config import get_node_info
-
-                node_info = get_node_info(config)
-                self.disallowed_packet_types = set(node_info["disallowed_packet_types"])
+                self.mqtt_handler.connect()
 
                 public_key_hex = local_identity.get_public_key().hex()
                 logger.info(
-                    f"LetsMesh handler initialized with public key: {public_key_hex[:16]}..."
+                    f"MQTT handler initialized with public key: {public_key_hex[:16]}..."
                 )
-                if self.disallowed_packet_types:
-                    logger.info(f"Disallowed packet types: {sorted(self.disallowed_packet_types)}")
-                else:
-                    logger.info("All packet types allowed")
             except Exception as e:
-                logger.error(f"Failed to initialize LetsMesh handler: {e}")
-                self.letsmesh_handler = None
-                self.disallowed_packet_types = set()
-        else:
-            self.disallowed_packet_types = set()
+                logger.error(f"Failed to initialize MQTT handler: {e}")
+                self.mqtt_handler = None
 
         # Initialize hardware stats collector
         from .hardware_stats import HardwareStatsCollector
@@ -75,15 +57,50 @@ class StorageCollector:
 
         # Initialize WebSocket handler for real-time updates
         self.websocket_available = False
+        self.websocket_has_connected_clients = lambda: False
+        self._last_ws_stats_broadcast: float = 0.0
+        self._ws_stats_broadcast_interval_sec: float = 5.0
         try:
-            from .websocket_handler import broadcast_packet, broadcast_stats
+            from .websocket_handler import (
+                broadcast_packet,
+                broadcast_stats,
+                has_connected_clients,
+            )
 
             self.websocket_broadcast_packet = broadcast_packet
             self.websocket_broadcast_stats = broadcast_stats
+            self.websocket_has_connected_clients = has_connected_clients
             self.websocket_available = True
             logger.info("WebSocket handler initialized for real-time updates")
         except ImportError:
             logger.debug("WebSocket handler not available")
+
+    def _track_task(self, task: asyncio.Task):
+        """Track background task for lifecycle management and error handling."""
+        self._pending_tasks.add(task)
+
+        def on_done(t: asyncio.Task):
+            self._pending_tasks.discard(t)
+            try:
+                t.result()
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.error(f"Background task error: {e}", exc_info=True)
+
+        task.add_done_callback(on_done)
+
+    def _schedule_background(self, coro_factory, *args, sync_fallback=None):
+        """Schedule a coroutine if a loop exists; otherwise run sync fallback."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            if sync_fallback is not None:
+                sync_fallback(*args)
+            return
+
+        task = loop.create_task(coro_factory(*args))
+        self._track_task(task)
 
     def _get_live_stats(self) -> dict:
         """Get live stats from RepeaterHandler"""
@@ -130,97 +147,164 @@ class StorageCollector:
 
         return stats
 
-    def record_packet(self, packet_record: dict, skip_letsmesh_if_invalid: bool = True):
-        """Record packet to storage and publish to MQTT/LetsMesh
+    def record_packet(self, packet_record: dict, skip_mqtt_if_invalid: bool = True):
+        """Record packet to storage and publish to MQTT
 
         Args:
             packet_record: Dictionary containing packet information
-            skip_letsmesh_if_invalid: If True, don't publish packets with drop_reason to LetsMesh
+            skip_mqtt_if_invalid: If True, don't publish packets with drop_reason to mqtt
         """
         logger.debug(
             f"Recording packet: type={packet_record.get('type')}, "
             f"transmitted={packet_record.get('transmitted')}"
         )
 
-        # Store to local databases and publish to local MQTT
+        # HOT PATH: Store to local databases only (fast, non-blocking)
         self.sqlite_handler.store_packet(packet_record)
         cumulative_counts = self.sqlite_handler.get_cumulative_counts()
         self.rrd_handler.update_packet_metrics(packet_record, cumulative_counts)
-        self.mqtt_handler.publish(packet_record, "packet")
 
-        # Broadcast to WebSocket clients for real-time updates
+        # DEFERRED: Publish to network sinks and WebSocket in background tasks
+        # This prevents network latency from blocking packet processing
+        self._schedule_background(
+            self._deferred_publish,
+            packet_record,
+            skip_mqtt_if_invalid,
+            sync_fallback=self._publish_packet_sync,
+        )
+
+    async def _deferred_publish(self, packet_record: dict, skip_mqtt: bool):
+        """Deferred background task for all network publishing operations."""
+        try:
+            self._publish_packet_sync(packet_record, skip_mqtt)
+        except Exception as e:
+            logger.error(f"Deferred publish failed: {e}", exc_info=True)
+
+    def _publish_packet_sync(self, packet_record: dict, skip_mqtt: bool):
+        """Publish packet updates synchronously (used when no asyncio loop is active)."""
+        self._publish_to_glass(packet_record, "packet")
+
         if self.websocket_available:
             try:
                 self.websocket_broadcast_packet(packet_record)
-
-                # Broadcast 24-hour packet stats (same as /api/packet_stats?hours=24)
-                packet_stats_24h = self.sqlite_handler.get_packet_stats(hours=24)
-                uptime_seconds = (
-                    time.time() - self.repeater_handler.start_time if self.repeater_handler else 0
-                )
-
-                self.websocket_broadcast_stats(
-                    {
-                        "packet_stats": packet_stats_24h,
-                        "system_stats": {
-                            "uptime_seconds": uptime_seconds,
-                        },
-                    }
-                )
+                if self.websocket_has_connected_clients():
+                    now_mono = time.monotonic()
+                    if (
+                        now_mono - self._last_ws_stats_broadcast
+                        >= self._ws_stats_broadcast_interval_sec
+                    ):
+                        self._last_ws_stats_broadcast = now_mono
+                        packet_stats_24h = self.sqlite_handler.get_packet_stats(hours=24)
+                        uptime_seconds = (
+                            time.time() - self.repeater_handler.start_time if self.repeater_handler else 0
+                        )
+                        self.websocket_broadcast_stats(
+                            {
+                                "packet_stats": packet_stats_24h,
+                                "system_stats": {"uptime_seconds": uptime_seconds},
+                            }
+                        )
             except Exception as e:
                 logger.debug(f"WebSocket broadcast failed: {e}")
 
-        # Publish to LetsMesh if enabled (skip invalid packets if requested)
-        if skip_letsmesh_if_invalid and packet_record.get("drop_reason"):
-            logger.debug(
-                f"Skipping LetsMesh publish for packet with drop_reason: {packet_record.get('drop_reason')}"
-            )
-        else:
-            self._publish_to_letsmesh(packet_record)
 
-    def _publish_to_letsmesh(self, packet_record: dict):
-        """Publish packet to LetsMesh broker if enabled and allowed"""
-        if not self.letsmesh_handler:
+        self._publish_packet_to_mqtt(packet_record)
+
+    def _publish_packet_to_mqtt(self, packet_record: dict):
+        """Publish packet to mqtt broker if enabled and allowed.
+
+        The ``duration`` field in the published JSON is sourced from
+        ``packet_record['airtime_ms']``, populated upstream by
+        RepeaterHandler._build_packet_record using the Semtech reference
+        time-on-air formula. No recomputation is needed here.
+        """
+        if not self.mqtt_handler:
             return
 
         try:
             packet_type = packet_record.get("type")
             if packet_type is None:
-                logger.error("Cannot publish to LetsMesh: packet_record missing 'type' field")
-                return
-
-            if packet_type in self.disallowed_packet_types:
-                logger.debug(f"Skipped publishing packet type 0x{packet_type:02X} (disallowed)")
+                logger.error("Cannot publish to mqtt: packet_record missing 'type' field")
                 return
 
             node_name = self.config.get("repeater", {}).get("node_name", "Unknown")
             packet = PacketRecord.from_packet_record(
-                packet_record, origin=node_name, origin_id=self.letsmesh_handler.public_key
+                packet_record, origin=node_name, origin_id=self.mqtt_handler.public_key
             )
 
             if packet:
-                self.letsmesh_handler.publish_packet(packet.to_dict())
-                logger.debug(f"Published packet type 0x{packet_type:02X} to LetsMesh")
+                self.mqtt_handler.publish_packet(packet.to_dict())
+                logger.debug(f"Published packet type 0x{packet_type:02X} to mqtt")
             else:
-                logger.debug("Skipped LetsMesh publish: packet missing raw_packet data")
+                logger.debug("Skipped mqtt publish: packet missing raw_packet data")
 
         except Exception as e:
-            logger.error(f"Failed to publish packet to LetsMesh: {e}", exc_info=True)
+            logger.error(f"Failed to publish packet to mqtt: {e}", exc_info=True)
 
     def record_advert(self, advert_record: dict):
+        """Record advert to storage and defer network publishing to background tasks."""
         self.sqlite_handler.store_advert(advert_record)
-        self.mqtt_handler.publish(advert_record, "advert")
+        self._schedule_background(
+            self._deferred_publish_advert,
+            advert_record,
+            sync_fallback=self._publish_advert_sync,
+        )
+
+    async def _deferred_publish_advert(self, advert_record: dict):
+        """Deferred background task for advert publishing."""
+        try:
+            self._publish_advert_sync(advert_record)
+        except Exception as e:
+            logger.error(f"Deferred advert publish failed: {e}", exc_info=True)
+
+    def _publish_advert_sync(self, advert_record: dict):
+        if self.mqtt_handler:
+            self.mqtt_handler.publish_mqtt(advert_record, "advert")
+        self._publish_to_glass(advert_record, "advert")
 
     def record_noise_floor(self, noise_floor_dbm: float):
+        """Record noise floor to storage and defer network publishing to background tasks."""
         noise_record = {"timestamp": time.time(), "noise_floor_dbm": noise_floor_dbm}
         self.sqlite_handler.store_noise_floor(noise_record)
-        self.mqtt_handler.publish(noise_record, "noise_floor")
+        self._schedule_background(
+            self._deferred_publish_noise_floor,
+            noise_record,
+            sync_fallback=self._publish_noise_floor_sync,
+        )
+
+    async def _deferred_publish_noise_floor(self, noise_record: dict):
+        """Deferred background task for noise floor publishing."""
+        try:
+            self._publish_noise_floor_sync(noise_record)
+        except Exception as e:
+            logger.error(f"Deferred noise floor publish failed: {e}", exc_info=True)
+
+    def _publish_noise_floor_sync(self, noise_record: dict):
+        if self.mqtt_handler:
+            self.mqtt_handler.publish_mqtt(noise_record, "noise_floor")
+        self._publish_to_glass(noise_record, "noise_floor")
 
     def record_crc_errors(self, count: int):
-        """Record a batch of CRC errors detected since last poll."""
+        """Record a batch of CRC errors detected since last poll and defer publishing."""
         crc_record = {"timestamp": time.time(), "count": count}
         self.sqlite_handler.store_crc_errors(crc_record)
-        self.mqtt_handler.publish(crc_record, "crc_errors")
+        self._schedule_background(
+            self._deferred_publish_crc_errors,
+            crc_record,
+            sync_fallback=self._publish_crc_errors_sync,
+        )
+
+    async def _deferred_publish_crc_errors(self, crc_record: dict):
+        """Deferred background task for CRC error publishing."""
+        try:
+            self._publish_crc_errors_sync(crc_record)
+        except Exception as e:
+            logger.error(f"Deferred CRC errors publish failed: {e}", exc_info=True)
+
+    def _publish_crc_errors_sync(self, crc_record: dict):
+        if self.mqtt_handler:
+            self.mqtt_handler.publish_mqtt(crc_record, "crc_errors")
+        self._publish_to_glass(crc_record, "crc_errors")
 
     def get_crc_error_count(self, hours: int = 24) -> int:
         return self.sqlite_handler.get_crc_error_count(hours)
@@ -245,6 +329,28 @@ class StorageCollector:
     ) -> list:
         return self.sqlite_handler.get_filtered_packets(
             packet_type, route, start_timestamp, end_timestamp, limit, offset
+        )
+
+    def get_airtime_data(
+        self,
+        start_timestamp: Optional[float] = None,
+        end_timestamp: Optional[float] = None,
+        limit: int = 50000,
+    ) -> list:
+        return self.sqlite_handler.get_airtime_data(start_timestamp, end_timestamp, limit)
+
+    def get_airtime_buckets(
+        self,
+        start_timestamp: float,
+        end_timestamp: float,
+        bucket_seconds: int = 60,
+        sf: int = 9,
+        bw_hz: int = 62500,
+        cr: int = 5,
+        preamble: int = 17,
+    ) -> dict:
+        return self.sqlite_handler.get_airtime_buckets(
+            start_timestamp, end_timestamp, bucket_seconds, sf, bw_hz, cr, preamble
         )
 
     def get_packet_by_hash(self, packet_hash: str) -> Optional[dict]:
@@ -305,13 +411,28 @@ class StorageCollector:
         return self.sqlite_handler.get_noise_floor_stats(hours)
 
     def close(self):
-        self.mqtt_handler.close()
-        if self.letsmesh_handler:
+        # Cancel all pending background tasks
+        for task in self._pending_tasks:
+            if not task.done():
+                task.cancel()
+
+        if self.mqtt_handler:
             try:
-                self.letsmesh_handler.disconnect()
-                logger.info("LetsMesh handler disconnected")
+                self.mqtt_handler.disconnect()
+                logger.info("MQTT handler disconnected")
             except Exception as e:
-                logger.error(f"Error disconnecting LetsMesh handler: {e}")
+                logger.error(f"Error disconnecting MQTT handler: {e}")
+
+    def set_glass_publisher(self, publish_callback):
+        self.glass_publish_callback = publish_callback
+
+    def _publish_to_glass(self, record: dict, record_type: str):
+        if not self.glass_publish_callback:
+            return
+        try:
+            self.glass_publish_callback(record_type, record)
+        except Exception as e:
+            logger.debug(f"Failed to publish telemetry to Glass MQTT: {e}")
 
     def create_transport_key(
         self,

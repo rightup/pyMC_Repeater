@@ -401,7 +401,7 @@ class MeshCLI:
             return f"> {interval}"
 
         elif param == "flood.max":
-            max_flood = self.repeater_config.get("max_flood_hops", 3)
+            max_flood = self.repeater_config.get("max_flood_hops", 64)
             return f"> {max_flood}"
 
         elif param == "rxdelay":

@@ -1,0 +1,1 @@
+var e=`pymc_pref_`;function t(t,n){try{let r=localStorage.getItem(e+t);return r===null?n:JSON.parse(r)}catch(e){return console.warn(`Failed to get preference ${t}:`,e),n}}function n(t,n){try{localStorage.setItem(e+t,JSON.stringify(n))}catch(e){console.warn(`Failed to set preference ${t}:`,e)}}export{n,t};

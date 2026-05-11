@@ -1,0 +1,37 @@
+# LetsMesh MC2MQTT broker preset.
+#
+# LetsMesh is the operator of the public MeshCore Packet Analyzer
+# infrastructure. These brokers speak the MeshCoreToMQTT (MC2MQTT)
+# protocol with the "letsmesh" format flavor, which today shares the
+# canonical MC2MQTT topic structure (meshcore/{IATA}/{PUBLIC_KEY}/...).
+#
+# Reference all LetsMesh endpoints with: brokers: [{preset: letsmesh}]
+#
+# Note: order matters for backward compatibility with the legacy
+# letsmesh.broker_index field. Index 0 is Europe, index 1 is US West.
+brokers:
+  - name: "Europe (LetsMesh v1)"
+    enabled: true
+    host: mqtt-eu-v1.letsmesh.net
+    port: 443
+    transport: "websockets"
+    audience: "mqtt-eu-v1.letsmesh.net"
+    use_jwt_auth: true
+    format: letsmesh
+    retain_status: false
+    tls:
+      enabled: true
+      insecure: false
+
+  - name: "US West (LetsMesh v1)"
+    enabled: true
+    host: mqtt-us-v1.letsmesh.net
+    port: 443
+    transport: "websockets"
+    audience: "mqtt-us-v1.letsmesh.net"
+    use_jwt_auth: true
+    format: letsmesh
+    retain_status: false
+    tls:
+      enabled: true
+      insecure: false

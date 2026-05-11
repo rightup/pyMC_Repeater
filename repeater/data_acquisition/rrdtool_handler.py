@@ -19,6 +19,14 @@ class RRDToolHandler:
         self.rrd_path = self.storage_dir / "metrics.rrd"
         self.available = RRDTOOL_AVAILABLE
         self._init_rrd()
+        # Timestamp of the last successful rrdtool.update() call (unix seconds,
+        # aligned to the 60-second RRD step).  Used to skip writes whose period
+        # has already been committed — no rrdtool.info() call needed.
+        self._last_rrd_update: int = 0
+        # Read-side cache: rrdtool.fetch() returns 24 h of data and is a
+        # blocking disk read.  Cache the result for 60 s — matching the RRD
+        # step size — so repeated dashboard refreshes don't hammer the SD card.
+        self._get_data_cache: tuple = (0.0, None)  # (fetched_at, result)
 
     def _init_rrd(self):
         if not self.available:
@@ -73,20 +81,23 @@ class RRDToolHandler:
             logger.error(f"Failed to create RRD database: {e}")
 
     def update_packet_metrics(self, record: dict, cumulative_counts: dict):
+        """Write packet metrics to RRD, throttled to once per 60-second step.
+
+        RRD enforces a 60-second minimum step between updates.  We track the
+        last written timestamp ourselves — no rrdtool.info() call needed, which
+        previously allocated thousands of Python objects per call.
+        """
         if not self.available or not self.rrd_path.exists():
             return
 
         try:
             timestamp = int(record.get("timestamp", time.time()))
 
-            try:
-                info = rrdtool.info(str(self.rrd_path))
-                last_update = int(info.get("last_update", timestamp - 60))
-                if timestamp <= last_update:
-                    return
-            except Exception as e:
-                logger.debug(f"Failed to get RRD info for packet update: {e}")
+            # Skip if this packet falls in the same 60-second period we already wrote.
+            if timestamp <= self._last_rrd_update:
+                return
 
+            # Build update string from cumulative counts
             rx_total = cumulative_counts.get("rx_total", 0)
             tx_total = cumulative_counts.get("tx_total", 0)
             drop_total = cumulative_counts.get("drop_total", 0)
@@ -97,7 +108,6 @@ class RRDToolHandler:
                 type_values.append(str(type_counts.get(f"type_{i}", 0)))
             type_values.append(str(type_counts.get("type_other", 0)))
 
-            # Handle None values for TX packets - use 'U' (unknown) for RRD
             rssi = record.get("rssi")
             snr = record.get("snr")
             score = record.get("score")
@@ -117,6 +127,7 @@ class RRDToolHandler:
             values = f"{basic_values}:{type_values_str}"
 
             rrdtool.update(str(self.rrd_path), values)
+            self._last_rrd_update = timestamp
 
         except Exception as e:
             logger.error(f"Failed to update RRD packet metrics: {e}")
@@ -134,9 +145,20 @@ class RRDToolHandler:
             )
             return None
 
+        # Serve from cache if result is still fresh.  RRD step is 60 s, so
+        # anything newer than that is guaranteed to be identical to a live fetch.
+        # Only the default (full 24-hour, no explicit bounds) call is cached —
+        # explicit start/end requests always bypass the cache.
+        now = time.time()
+        use_cache = start_time is None and end_time is None
+        if use_cache:
+            cache_fetched_at, cache_result = self._get_data_cache
+            if now - cache_fetched_at < 60.0 and cache_result is not None:
+                return cache_result
+
         try:
             if end_time is None:
-                end_time = int(time.time())
+                end_time = int(now)
             if start_time is None:
                 start_time = end_time - (24 * 3600)
 
@@ -191,6 +213,10 @@ class RRDToolHandler:
                 current_time += step
 
             result["timestamps"] = timestamps
+
+            # Populate read cache for default (unconstrained) calls only.
+            if use_cache:
+                self._get_data_cache = (now, result)
 
             return result
 

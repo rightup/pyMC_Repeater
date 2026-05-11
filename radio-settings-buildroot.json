@@ -1,0 +1,79 @@
+{
+  "default_board": "luckfox-pimesh-v2",
+  "default_radio_preset": "USA/Canada (Recommended)",
+  "buildroot_hardware": {
+    "luckfox-pimesh-v2": {
+      "name": "Luckfox PiMesh V2",
+      "description": "Luckfox Pico Pi with PiMesh-1W V2 / E22P wiring",
+      "hardware_id": "pimesh-1w-v2",
+      "tx_power": 22,
+      "aliases": [
+        "1",
+        "v2",
+        "pimesh-v2",
+        "pimesh-1w-v2"
+      ],
+      "sx1262_overrides": {
+        "cs_pin": -1,
+        "reset_pin": 54,
+        "busy_pin": 122,
+        "irq_pin": 121,
+        "radio_timing_delay": 0.012,
+        "en_pin": 0,
+        "txen_pin": -1,
+        "rxen_pin": -1,
+        "use_dio2_rf": true,
+        "use_dio3_tcxo": true,
+        "dio3_tcxo_voltage": 1.8
+      }
+    },
+    "luckfox-pimesh-v1": {
+      "name": "Luckfox PiMesh V1",
+      "description": "Luckfox Pico Pi with PiMesh-1W V1 wiring",
+      "hardware_id": "pimesh-1w-v1",
+      "tx_power": 22,
+      "aliases": [
+        "2",
+        "v1",
+        "pimesh-v1",
+        "pimesh-1w-v1"
+      ],
+      "sx1262_overrides": {
+        "cs_pin": 145,
+        "reset_pin": 54,
+        "busy_pin": 123,
+        "irq_pin": 55,
+        "radio_timing_delay": 0.012,
+        "en_pin": -1,
+        "txen_pin": 52,
+        "rxen_pin": 53,
+        "use_dio2_rf": false,
+        "use_dio3_tcxo": true,
+        "dio3_tcxo_voltage": 1.8
+      }
+    },
+    "luckfox-meshadv": {
+      "name": "Luckfox MeshAdv",
+      "description": "Luckfox Pico Pi with MeshAdv wiring",
+      "hardware_id": "meshadv",
+      "tx_power": 22,
+      "aliases": [
+        "3",
+        "meshadv"
+      ],
+      "sx1262_overrides": {
+        "cs_pin": 145,
+        "reset_pin": 54,
+        "busy_pin": 123,
+        "irq_pin": 55,
+        "radio_timing_delay": 0.012,
+        "en_pin": -1,
+        "txen_pin": 52,
+        "rxen_pin": 53,
+        "use_dio2_rf": false,
+        "use_dio3_tcxo": true,
+        "dio3_tcxo_voltage": 1.8
+      }
+    }
+  }
+}

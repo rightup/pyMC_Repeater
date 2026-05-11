@@ -22,6 +22,21 @@ class LoginHelper:
         
         self.handlers = {}
         self.acls = {}  # Per-identity ACLs keyed by hash_byte
+        self._pending_tasks = set()
+
+    def _track_task(self, task: asyncio.Task) -> None:
+        self._pending_tasks.add(task)
+
+        def _on_done(done_task: asyncio.Task) -> None:
+            self._pending_tasks.discard(done_task)
+            try:
+                done_task.result()
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.error(f"Background login task failed: {e}", exc_info=True)
+
+        task.add_done_callback(_on_done)
 
     def register_identity(
         self, name: str, identity, identity_type: str = "room_server", config: dict = None
@@ -141,7 +156,8 @@ class LoginHelper:
     def _send_packet_with_delay(self, packet, delay_ms: int):
    
         if self.packet_injector:
-            asyncio.create_task(self._delayed_send(packet, delay_ms))
+            task = asyncio.create_task(self._delayed_send(packet, delay_ms))
+            self._track_task(task)
         else:
             logger.error("No packet injector configured, cannot send login response")
 

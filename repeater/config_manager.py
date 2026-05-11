@@ -21,6 +21,129 @@ class ConfigManager:
         self.config_path = config_path
         self.config = config
         self.daemon = daemon_instance
+
+    def _get_live_radio_snapshot(self) -> Dict[str, Any]:
+        radio_cfg = self.config.get("radio", {}) or {}
+        return {
+            "frequency": int(radio_cfg.get("frequency", 0) or 0),
+            "bandwidth": int(radio_cfg.get("bandwidth", 0) or 0),
+            "spreading_factor": int(radio_cfg.get("spreading_factor", 0) or 0),
+            "coding_rate": int(radio_cfg.get("coding_rate", 0) or 0),
+            "tx_power": int(radio_cfg.get("tx_power", 0) or 0),
+        }
+
+    def _sync_repeater_handler_radio_config(self, radio_cfg: Dict[str, Any]) -> None:
+        repeater_handler = getattr(self.daemon, "repeater_handler", None)
+        if not repeater_handler or not hasattr(repeater_handler, "radio_config"):
+            return
+
+        if not isinstance(repeater_handler.radio_config, dict):
+            repeater_handler.radio_config = {}
+
+        repeater_handler.radio_config.update(
+            {
+                key: value
+                for key, value in radio_cfg.items()
+                if value not in (None, 0)
+            }
+        )
+
+    def _kiss_transport_restart_required(self) -> bool:
+        radio = getattr(self.daemon, "radio", None)
+        kiss_cfg = self.config.get("kiss", {}) or {}
+        if radio is None or not kiss_cfg:
+            return False
+
+        runtime_port = getattr(radio, "port", None)
+        runtime_baudrate = getattr(radio, "baudrate", None)
+
+        configured_port = kiss_cfg.get("port")
+        configured_baudrate = kiss_cfg.get("baud_rate")
+
+        if configured_port and runtime_port and str(configured_port) != str(runtime_port):
+            logger.info("KISS port change detected; service restart required")
+            return True
+
+        if configured_baudrate and runtime_baudrate and int(configured_baudrate) != int(runtime_baudrate):
+            logger.info("KISS baud rate change detected; service restart required")
+            return True
+
+        return False
+
+    def _apply_live_radio_config(self) -> bool:
+        radio = getattr(self.daemon, "radio", None)
+        if radio is None:
+            logger.warning("Radio not available for live update")
+            return False
+
+        radio_cfg = self._get_live_radio_snapshot()
+
+        try:
+            if hasattr(radio, "configure_radio"):
+                if hasattr(radio, "radio_config") and isinstance(radio.radio_config, dict):
+                    radio.radio_config.update(radio_cfg)
+
+                applied = radio.configure_radio(
+                    frequency=radio_cfg["frequency"],
+                    bandwidth=radio_cfg["bandwidth"],
+                    spreading_factor=radio_cfg["spreading_factor"],
+                    coding_rate=radio_cfg["coding_rate"],
+                )
+                if not applied:
+                    logger.warning("Live radio reconfiguration failed")
+                    return False
+            else:
+                current_frequency = getattr(radio, "frequency", None)
+                current_bandwidth = getattr(radio, "bandwidth", None)
+                current_spreading_factor = getattr(radio, "spreading_factor", None)
+                current_coding_rate = getattr(radio, "coding_rate", None)
+                current_tx_power = getattr(radio, "tx_power", None)
+
+                if (
+                    current_frequency != radio_cfg["frequency"]
+                    and hasattr(radio, "set_frequency")
+                    and not radio.set_frequency(radio_cfg["frequency"])
+                ):
+                    return False
+
+                if (
+                    current_tx_power != radio_cfg["tx_power"]
+                    and hasattr(radio, "set_tx_power")
+                    and not radio.set_tx_power(radio_cfg["tx_power"])
+                ):
+                    return False
+
+                coding_rate_changed = current_coding_rate != radio_cfg["coding_rate"]
+                if coding_rate_changed:
+                    setattr(radio, "coding_rate", radio_cfg["coding_rate"])
+
+                if current_spreading_factor != radio_cfg["spreading_factor"]:
+                    if not hasattr(radio, "set_spreading_factor"):
+                        return False
+                    if not radio.set_spreading_factor(radio_cfg["spreading_factor"]):
+                        return False
+
+                if current_bandwidth != radio_cfg["bandwidth"]:
+                    if not hasattr(radio, "set_bandwidth"):
+                        return False
+                    if not radio.set_bandwidth(radio_cfg["bandwidth"]):
+                        return False
+                elif coding_rate_changed:
+                    if hasattr(radio, "set_bandwidth"):
+                        if not radio.set_bandwidth(radio_cfg["bandwidth"]):
+                            return False
+                    elif hasattr(radio, "set_spreading_factor"):
+                        if not radio.set_spreading_factor(radio_cfg["spreading_factor"]):
+                            return False
+                    else:
+                        return False
+
+            self._sync_repeater_handler_radio_config(radio_cfg)
+            logger.info("Applied live radio configuration to running daemon")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to apply live radio config: {e}", exc_info=True)
+            return False
     
     def save_to_file(self) -> bool:
         """
@@ -66,10 +189,11 @@ class ConfigManager:
         
         try:
             daemon_config = self.daemon.config
+            live_update_ok = True
             
             # Default sections to update if not specified
             if sections is None:
-                sections = ['repeater', 'delays', 'radio', 'acl', 'identities']
+                sections = ['repeater', 'delays', 'radio', 'acl', 'identities', 'glass']
             
             # Update each section
             for section in sections:
@@ -112,8 +236,18 @@ class ConfigManager:
                     path_hash_mode = 0
                 self.daemon.dispatcher.set_default_path_hash_mode(path_hash_mode)
                 logger.info(f"Reloaded path hash mode: mesh.path_hash_mode={path_hash_mode}")
+
+            if 'radio_type' in sections:
+                logger.info("radio_type change detected; service restart required")
+                live_update_ok = False
+
+            if 'kiss' in sections and self._kiss_transport_restart_required():
+                live_update_ok = False
+
+            if 'radio' in sections:
+                live_update_ok = self._apply_live_radio_config() and live_update_ok
             
-            return True
+            return live_update_ok
             
         except Exception as e:
             logger.error(f"Failed to live update daemon config: {e}", exc_info=True)
@@ -141,7 +275,7 @@ class ConfigManager:
                 - live_updated: bool - Whether daemon was live updated
                 - error: str (optional) - Error message if failed
         """
-        result = {
+        result: Dict[str, Any] = {
             "success": False,
             "saved": False,
             "live_updated": False

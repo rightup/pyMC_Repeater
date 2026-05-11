@@ -1,0 +1,35 @@
+# Waev MC2MQTT broker preset.
+#
+# Waev is a real-time telemetry, monitoring, and analytics platform for
+# MeshCore radio networks. These brokers speak the MeshCoreToMQTT
+# (MC2MQTT) protocol with the "waev" format flavor, which today shares
+# the canonical MC2MQTT topic structure (meshcore/{IATA}/{PUBLIC_KEY}/...)
+# and is reserved for future Waev-specific deviations.
+#
+# Reference all Waev endpoints with: brokers: [{preset: waev}]
+brokers:
+  - name: "waev-a"
+    enabled: true
+    host: mqtt-a.waev.app
+    port: 443
+    transport: "websockets"
+    audience: "mqtt-a.waev.app"
+    use_jwt_auth: true
+    format: waev
+    retain_status: true
+    tls:
+      enabled: true
+      insecure: false
+
+  - name: "waev-b"
+    enabled: true
+    host: mqtt-b.waev.app
+    port: 443
+    transport: "websockets"
+    audience: "mqtt-b.waev.app"
+    use_jwt_auth: true
+    format: waev
+    retain_status: true
+    tls:
+      enabled: true
+      insecure: false

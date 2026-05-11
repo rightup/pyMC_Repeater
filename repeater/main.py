@@ -10,6 +10,8 @@ import time
 from repeater.companion.utils import validate_companion_node_name, normalize_companion_identity_key
 from repeater.config import get_radio_for_board, load_config, save_config
 from repeater.config_manager import ConfigManager
+from repeater.data_acquisition.glass_handler import GlassHandler
+from repeater.data_acquisition.gps_service import GPSService
 from repeater.engine import RepeaterHandler
 from repeater.handler_helpers import (
     AdvertHelper,
@@ -47,10 +49,14 @@ class RepeaterDaemon:
         self.text_helper = None
         self.path_helper = None
         self.protocol_request_helper = None
+        self.glass_handler = None
+        self.gps_service = None
         self.acl = None
         self.router = None
         self.companion_bridges: dict[int, object] = {}
         self.companion_frame_servers: list = []
+        self._shutdown_started = False
+        self._main_task = None
 
         log_level = config.get("logging", {}).get("level", "INFO")
         logging.basicConfig(
@@ -258,6 +264,16 @@ class RepeaterDaemon:
             )
             logger.info("Config manager initialized")
 
+            self.gps_service = GPSService(
+                self.config,
+                location_update_callback=self._update_repeater_location_from_gps,
+            )
+            self.gps_service.start()
+            if self.config.get("gps", {}).get("enabled", False):
+                logger.info("GPS diagnostics initialized")
+            else:
+                logger.info("GPS diagnostics disabled")
+
             # Initialize text message helper with per-identity ACLs
             self.text_helper = TextHelper(
                 identity_manager=self.identity_manager,
@@ -274,6 +290,7 @@ class RepeaterDaemon:
                 ),  # For room server database
                 send_advert_callback=self.send_advert,  # For CLI advert command
             )
+            self.text_helper._loop = asyncio.get_running_loop()
 
             # Register default repeater identity for text messages
             self.text_helper.register_identity(
@@ -311,6 +328,7 @@ class RepeaterDaemon:
                 radio=self.radio,
                 engine=self.repeater_handler,
                 neighbor_tracker=self.advert_helper,
+                config=self.config,
             )
             # Register repeater identity for protocol requests
             self.protocol_request_helper.register_identity(
@@ -335,6 +353,20 @@ class RepeaterDaemon:
 
             # When trace reaches final node, push PUSH_CODE_TRACE_DATA (0x89) to companion clients (firmware onTraceRecv)
             self.trace_helper.on_trace_complete = self._on_trace_complete_for_companions
+
+            # Optional pyMC_Glass integration loop (inform/control plane)
+            self.glass_handler = GlassHandler(
+                config=self.config,
+                daemon_instance=self,
+                config_manager=self.config_manager,
+            )
+            await self.glass_handler.start()
+            if (
+                self.repeater_handler
+                and self.repeater_handler.storage
+                and hasattr(self.repeater_handler.storage, "set_glass_publisher")
+            ):
+                self.repeater_handler.storage.set_glass_publisher(self.glass_handler.publish_telemetry)
 
         except Exception as e:
             logger.error(f"Failed to initialize dispatcher: {e}")
@@ -897,6 +929,9 @@ class RepeaterDaemon:
                 except Exception:
                     stats["public_key"] = None
 
+        if self.gps_service:
+            stats["gps"] = self.gps_service.get_summary()
+
         return stats
 
     async def _get_companion_stats(self, stats_type: int) -> dict:
@@ -923,7 +958,7 @@ class RepeaterDaemon:
                 "queue_len": min(255, queue_len),
             }
         if stats_type == STATS_TYPE_RADIO:
-            noise_floor = int(engine.get_noise_floor() or 0)
+            noise_floor = int(engine.get_cached_noise_floor() or 0)
             radio = getattr(self, "dispatcher", None) and getattr(self.dispatcher, "radio", None)
             if radio:
                 _r = getattr(radio, "get_last_rssi", lambda: 0)
@@ -972,6 +1007,13 @@ class RepeaterDaemon:
             node_name = repeater_config.get("node_name", "Repeater")
             latitude = repeater_config.get("latitude", 0.0)
             longitude = repeater_config.get("longitude", 0.0)
+            location_source = "config"
+
+            if self.gps_service:
+                location = self.gps_service.get_repeater_location()
+                latitude = location.get("latitude", latitude)
+                longitude = location.get("longitude", longitude)
+                location_source = str(location.get("source", location_source))
 
             flags = ADVERT_FLAG_IS_REPEATER | ADVERT_FLAG_HAS_NAME
 
@@ -994,20 +1036,101 @@ class RepeaterDaemon:
                 self.repeater_handler.mark_seen(packet)
                 logger.debug("Marked own advert as seen in duplicate cache")
 
-            logger.info(f"Sent flood advert '{node_name}' at ({latitude: .6f}, {longitude: .6f})")
+            logger.info(
+                "Sent flood advert '%s' at (% .6f, % .6f) source=%s",
+                node_name,
+                latitude,
+                longitude,
+                location_source,
+            )
             return True
 
         except Exception as e:
             logger.error(f"Failed to send advert: {e}", exc_info=True)
             return False
 
+    def _update_repeater_location_from_gps(self, location: dict) -> bool:
+        """Persist the latest valid GPS fix as the repeater's advertised location."""
+        latitude = location.get("latitude")
+        longitude = location.get("longitude")
+        if latitude is None or longitude is None:
+            return False
+
+        repeater_config = self.config.setdefault("repeater", {})
+        current_latitude = repeater_config.get("latitude")
+        current_longitude = repeater_config.get("longitude")
+        try:
+            if (
+                current_latitude is not None
+                and current_longitude is not None
+                and abs(float(current_latitude) - float(latitude)) < 0.000001
+                and abs(float(current_longitude) - float(longitude)) < 0.000001
+            ):
+                return False
+        except (TypeError, ValueError):
+            pass
+
+        updates = {
+            "repeater": {
+                "latitude": float(latitude),
+                "longitude": float(longitude),
+            }
+        }
+        if self.config_manager:
+            result = self.config_manager.update_and_save(
+                updates=updates,
+                live_update=True,
+                live_update_sections=["repeater"],
+            )
+            if not result.get("success"):
+                logger.warning(
+                    "GPS location fix could not update repeater config: %s",
+                    result.get("error", "unknown error"),
+                )
+                return False
+        else:
+            repeater_config.update(updates["repeater"])
+
+        logger.info(
+            "Updated repeater location from GPS fix: latitude=%.6f longitude=%.6f",
+            latitude,
+            longitude,
+        )
+        return True
+
     def _signal_shutdown(self, sig, loop):
         """Handle SIGTERM/SIGINT by scheduling async shutdown."""
+        if self._shutdown_started:
+            logger.info(f"Received signal {sig.name}, shutdown already in progress")
+            return
         logger.info(f"Received signal {sig.name}, shutting down...")
         loop.create_task(self._shutdown())
+        # Cancel run() so dispatcher.run_forever() unwinds cleanly.
+        if self._main_task and not self._main_task.done():
+            self._main_task.cancel()
 
     async def _shutdown(self):
         """Best-effort shutdown: stop background services and release hardware."""
+        if self._shutdown_started:
+            return
+        self._shutdown_started = True
+
+        # Stop companion frame servers first to close client sockets and child workers.
+        for frame_server in getattr(self, "companion_frame_servers", []):
+            try:
+                await frame_server.stop()
+            except Exception as e:
+                logger.warning(f"Companion frame server stop error: {e}")
+
+        # Stop companion bridges to flush/persist state.
+        if hasattr(self, "companion_bridges"):
+            for bridge in self.companion_bridges.values():
+                if hasattr(bridge, "stop"):
+                    try:
+                        await bridge.stop()
+                    except Exception as e:
+                        logger.warning(f"Companion bridge stop error: {e}")
+
         # Stop router
         if self.router:
             try:
@@ -1018,9 +1141,36 @@ class RepeaterDaemon:
         # Stop HTTP server
         if self.http_server:
             try:
-                self.http_server.stop()
+                await asyncio.wait_for(asyncio.to_thread(self.http_server.stop), timeout=3)
+            except asyncio.TimeoutError:
+                logger.warning("Timeout stopping HTTP server")
             except Exception as e:
                 logger.warning(f"Error stopping HTTP server: {e}")
+
+        # Stop Glass inform loop
+        if self.glass_handler:
+            try:
+                await self.glass_handler.stop()
+            except Exception as e:
+                logger.warning(f"Error stopping Glass handler: {e}")
+
+        # Stop GPS diagnostics.
+        if self.gps_service:
+            try:
+                self.gps_service.stop()
+            except Exception as e:
+                logger.warning(f"Error stopping GPS diagnostics: {e}")
+
+        # Close storage publishers (MQTT/LetsMesh) to stop their worker threads.
+        try:
+            if self.repeater_handler and self.repeater_handler.storage:
+                await asyncio.wait_for(
+                    asyncio.to_thread(self.repeater_handler.storage.close), timeout=5
+                )
+        except asyncio.TimeoutError:
+            logger.warning("Timeout closing storage publishers")
+        except Exception as e:
+            logger.warning(f"Error closing storage: {e}")
 
         # Release radio resources
         if self.radio and hasattr(self.radio, "cleanup"):
@@ -1038,12 +1188,7 @@ class RepeaterDaemon:
         except Exception as e:
             logger.debug(f"CH341 reset skipped/failed: {e}")
 
-        # Stop the event loop so the process can exit cleanly
-        try:
-            loop = asyncio.get_running_loop()
-            loop.stop()
-        except RuntimeError:
-            pass
+        # Do not force-stop the event loop here; asyncio.run() owns loop lifecycle.
 
     @staticmethod
     def _detect_container() -> bool:
@@ -1059,6 +1204,7 @@ class RepeaterDaemon:
     async def run(self):
 
         logger.info("Repeater daemon started")
+        self._main_task = asyncio.current_task()
 
         # Register signal handlers for graceful shutdown
         loop = asyncio.get_running_loop()
@@ -1117,6 +1263,8 @@ class RepeaterDaemon:
             # Run dispatcher (handles RX/TX via pymc_core)
             try:
                 await self.dispatcher.run_forever()
+            except asyncio.CancelledError:
+                logger.info("Dispatcher loop cancelled for shutdown")
             except KeyboardInterrupt:
                 logger.info("Shutting down...")
                 for frame_server in getattr(self, "companion_frame_servers", []):

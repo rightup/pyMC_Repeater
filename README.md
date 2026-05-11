@@ -55,16 +55,6 @@ The repeater supports two radio backends:
 
 The following hardware is currently supported out-of-the-box:
 
-Waveshare LoRaWAN/GNSS HAT (SPI Version Only)
-
-    Hardware: Waveshare SX1262 LoRa HAT (SPI interface - UART version not supported)
-    Platform: Raspberry Pi (or compatible single-board computer)
-    Frequency: 868MHz (EU) or 915MHz (US)
-    TX Power: Up to 22dBm
-    SPI Bus: SPI0
-    GPIO Pins: CS=21, Reset=18, Busy=20, IRQ=16
-    Note: Only the SPI version is supported. The UART version will not work.
-
 HackerGadgets uConsole
 
     Hardware: uConsole RTL-SDR/LoRa/GPS/RTC/USB Hub
@@ -101,6 +91,27 @@ HT-RA62 module
     TX Power: Up to 22dBm
     SPI Bus: SPI0
     GPIO Pins: CS=21, Reset=18, Busy=20, IRQ=16, use_dio3_tcxo=True, use_dio2_rf=True
+
+Zindello Industries UltraPeater 
+
+    Hardware: EBYTE E22/P 1W Module
+    Platform: Luckfox Pico Ultra/W  (NOT A PI DEVICE)
+    Frequency: 868MHz (EU) or 915Mhz (US/AU)
+    Tx Power: Up to 30dBm
+    SPI Bus: SPI0
+    GPIO Pins: CS=16, Reset=22, Busy=11, IRQ=10, TXEN=20 , RXEN=21 (E22 Only), EN=21 (E22P Only), TXLED=9, RXLED=1, use_dio2_rf=False, use_dio3_tcxo=True, use_gpiod_backend=True, gpio_chip=1
+
+Waveshare LoRaWAN/GNSS HAT (SPI Version Only)
+
+    NO LONGER RECOMMENDED
+    Note: May experience issues on "Narrow" (62.5KHz) settings due to a lack of TCXO
+    Hardware: Waveshare SX1262 LoRa HAT (SPI interface - UART version not supported)
+    Platform: Raspberry Pi (or compatible single-board computer)
+    Frequency: 868MHz (EU) or 915MHz (US)
+    TX Power: Up to 22dBm
+    SPI Bus: SPI0
+    GPIO Pins: CS=21, Reset=18, Busy=20, IRQ=16
+    Note: Only the SPI version is supported. The UART version will not work.
 
 ...
 
@@ -187,6 +198,18 @@ pip install -e .
 The configuration file is created and configured during installation at:
 ```
 /etc/pymc_repeater/config.yaml
+```
+
+### Optional pyMC_Glass integration
+The repeater now supports an additive `glass` config section for central control-plane integration.
+When enabled, it sends periodic `/inform` payloads to pyMC_Glass, receives queued commands, and reports command results on the next inform cycle.
+
+Minimal example:
+```yaml
+glass:
+  enabled: true
+  base_url: "http://localhost:8080"
+  inform_interval_seconds: 30
 ```
 
 To reconfigure radio and hardware settings after installation, run:

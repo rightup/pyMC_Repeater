@@ -126,6 +126,11 @@ def broadcast_stats(stats_data: dict):
             _connected_clients.discard(client)
 
 
+def has_connected_clients() -> bool:
+    """Return True when at least one authenticated websocket client is connected."""
+    return bool(_connected_clients)
+
+
 def _heartbeat_loop():
     """Background thread to send periodic pings to all connected clients"""
     global _heartbeat_running

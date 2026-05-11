@@ -37,6 +37,10 @@ class CompanionAPIEndpoints:
         self.config = config or {}
         self.config_manager = config_manager
 
+        http_cfg = self.config.get("http", {}) if isinstance(self.config, dict) else {}
+        self._sse_queue_maxsize = max(32, int(http_cfg.get("sse_queue_maxsize", 64)))
+        self._sse_keepalive_sec = max(5, int(http_cfg.get("sse_keepalive_sec", 15)))
+
         # SSE clients: each gets a thread-safe queue
         self._sse_clients: list[queue.Queue] = []
         self._sse_lock = threading.Lock()
@@ -666,7 +670,7 @@ class CompanionAPIEndpoints:
         cherrypy.response.headers["Connection"] = "keep-alive"
         cherrypy.response.headers["X-Accel-Buffering"] = "no"
 
-        client_queue: queue.Queue = queue.Queue(maxsize=256)
+        client_queue: queue.Queue = queue.Queue(maxsize=self._sse_queue_maxsize)
         with self._sse_lock:
             self._sse_clients.append(client_queue)
 
@@ -677,12 +681,12 @@ class CompanionAPIEndpoints:
 
                 while True:
                     try:
-                        item = client_queue.get(timeout=15.0)
+                        item = client_queue.get(timeout=float(self._sse_keepalive_sec))
                         yield f"data: {json.dumps(item)}\n\n"
                     except queue.Empty:
-                        # Keep-alive comment
-                        payload = {"event": "keepalive", "timestamp": int(time.time())}
-                        yield f"data: {json.dumps(payload)}\n\n"
+                        # Keep-alive comment frame keeps EventSource connected
+                        # without allocating additional JSON payload objects.
+                        yield ": keepalive\n\n"
             except GeneratorExit:
                 pass
             except Exception as exc:

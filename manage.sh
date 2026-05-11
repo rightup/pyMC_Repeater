@@ -4,11 +4,72 @@
 set -e
 
 INSTALL_DIR="/opt/pymc_repeater"
+VENV_DIR="$INSTALL_DIR/venv"
+VENV_PIP="$VENV_DIR/bin/pip"
+VENV_PYTHON="$VENV_DIR/bin/python"
 CONFIG_DIR="/etc/pymc_repeater"
 LOG_DIR="/var/log/pymc_repeater"
 SERVICE_USER="repeater"
 SERVICE_NAME="pymc-repeater"
 SILENT_MODE="${PYMC_SILENT:-${SILENT:-}}"
+
+# R2 Wheels Configuration improves install speed on ARM devices
+R2_BASE_URL="https://wheel.pymc.dev/pymc_build_deps"
+R2_ENABLED=1  # Set to 0 to disable R2 wheels and always build from source
+
+# ---------------------------------------------------------------------------
+# Virtual-environment helpers
+# ---------------------------------------------------------------------------
+
+# Create (or re-create) the dedicated venv for pymc_repeater
+ensure_venv() {
+    if [ ! -x "$VENV_PYTHON" ]; then
+        echo ">>> Creating virtual environment at $VENV_DIR ..."
+        python3 -m venv --system-site-packages "$VENV_DIR"
+        # Upgrade pip inside the venv
+        "$VENV_PIP" install --upgrade pip setuptools wheel >/dev/null 2>&1 || true
+    fi
+}
+
+# Migrate an existing system-pip install into the venv.
+# Idempotent: safe to call on every upgrade.
+migrate_to_venv() {
+    echo ">>> Checking for legacy system-pip installation..."
+
+    # 1. Ensure the venv exists
+    ensure_venv
+
+    # 2. Remove legacy PYTHONPATH from the service unit
+    local svc_unit="/etc/systemd/system/pymc-repeater.service"
+    if [ -f "$svc_unit" ]; then
+        if grep -q 'PYTHONPATH' "$svc_unit" 2>/dev/null; then
+            sed -i '/^Environment=.*PYTHONPATH/d' "$svc_unit"
+            echo "    ✓ Removed legacy PYTHONPATH from service unit"
+        fi
+        # 3. Fix WorkingDirectory if still pointing at old source
+        if grep -q 'WorkingDirectory=/opt/pymc_repeater' "$svc_unit" 2>/dev/null; then
+            sed -i 's|WorkingDirectory=/opt/pymc_repeater|WorkingDirectory=/var/lib/pymc_repeater|' "$svc_unit"
+            echo "    ✓ Fixed WorkingDirectory in service unit"
+        fi
+        # 4. Ensure ExecStart uses the venv python
+        if grep -q 'ExecStart=/usr/bin/python3' "$svc_unit" 2>/dev/null; then
+            sed -i "s|ExecStart=/usr/bin/python3|ExecStart=$VENV_PYTHON|" "$svc_unit"
+            echo "    ✓ Updated ExecStart to use venv python"
+        fi
+        systemctl daemon-reload
+    fi
+
+    # 5. Remove the package from system python (best-effort)
+    python3 -m pip uninstall -y pymc_repeater 2>/dev/null || true
+    python3 -m pip uninstall -y pymc_core 2>/dev/null || true
+    echo "    ✓ Cleaned up system-level packages (if any)"
+
+    # 6. Remove stale source trees that could shadow the venv package
+    if [ -d "$INSTALL_DIR/repeater" ]; then
+        rm -rf "$INSTALL_DIR/repeater"
+        echo "    ✓ Removed stale source tree from $INSTALL_DIR/repeater"
+    fi
+}
 
 is_silent_flag() {
     case "${1:-}" in
@@ -96,9 +157,15 @@ is_enabled() {
 
 # Function to get current version
 get_version() {
-    # Read version from the pip-installed package in dist-packages
-    python3 -c "from importlib.metadata import version; print(version('pymc_repeater'))" 2>/dev/null \
-        || echo "not installed"
+    # Read version from the pip-installed package in the venv
+    if [ -x "$VENV_PYTHON" ]; then
+        "$VENV_PYTHON" -c "from importlib.metadata import version; print(version('pymc_repeater'))" 2>/dev/null \
+            || echo "not installed"
+    else
+        # Fallback: try system python for pre-migration installs
+        python3 -c "from importlib.metadata import version; print(version('pymc_repeater'))" 2>/dev/null \
+            || echo "not installed"
+    fi
 }
 
 # Function to get service status for display
@@ -196,8 +263,10 @@ install_repeater() {
         return
     fi
 
-    # Welcome screen
-    $DIALOG --backtitle "pyMC Repeater Management" --title "Welcome" --msgbox "\nWelcome to pyMC Repeater Setup\n\nThis installer will configure your Linux system as a LoRa mesh network repeater.\n\nPress OK to continue..." 12 70
+    # Welcome screen (Bypass if the script was passd with the "install" option, assume we want a silent install)
+    if [[ "${1:-}" != "install" ]]; then
+        $DIALOG --backtitle "pyMC Repeater Management" --title "Welcome" --msgbox "\nWelcome to pyMC Repeater Setup\n\nThis installer will configure your Linux system as a LoRa mesh network repeater.\n\nPress OK to continue..." 12 70
+    fi
 
     # SPI Check - Universal approach that works on all boards (skip for CH341 USB-SPI adapter)
     SPI_MISSING=0
@@ -272,12 +341,16 @@ install_repeater() {
 
     echo "25"; echo "# Installing system dependencies..."
     apt-get update -qq
-    DEBIAN_FRONTEND=noninteractive apt-get install -y libffi-dev libusb-1.0-0 sudo jq pip python3-rrdtool wget swig build-essential python3-dev
+    DEBIAN_FRONTEND=noninteractive apt-get install -y libffi-dev libusb-1.0-0 sudo jq pip python3-venv python3-rrdtool wget swig build-essential python3-dev
     # Install polkit (package name varies by distro version)
     DEBIAN_FRONTEND=noninteractive apt-get install -y policykit-1 2>/dev/null \
         || DEBIAN_FRONTEND=noninteractive apt-get install -y polkitd pkexec 2>/dev/null \
         || echo "    Warning: Could not install polkit (sudo fallback will be used)"
-    pip install --break-system-packages setuptools_scm >/dev/null 2>&1 || true
+    # setuptools_scm needed for git version detection during build
+    pip install --break-system-packages setuptools_scm >/dev/null 2>&1 || python3 -m pip install --break-system-packages setuptools_scm >/dev/null 2>&1 || true
+
+    echo "28"; echo "# Creating virtual environment..."
+    ensure_venv
 
     # Install mikefarah yq v4 if not already installed
     if ! command -v yq &> /dev/null || [[ "$(yq --version 2>&1)" != *"mikefarah/yq"* ]]; then
@@ -316,8 +389,12 @@ install_repeater() {
     fi
 
     echo "65"; echo "# Setting permissions..."
-    chown -R "$SERVICE_USER:$SERVICE_USER" "$INSTALL_DIR" "$CONFIG_DIR" "$LOG_DIR" /var/lib/pymc_repeater
+    # Venv stays root-owned (pip runs as root); service user only needs read+execute
+    chown -R "$SERVICE_USER:$SERVICE_USER" "$CONFIG_DIR" "$LOG_DIR" /var/lib/pymc_repeater
     chmod 750 "$CONFIG_DIR" "$LOG_DIR" /var/lib/pymc_repeater
+    # Ensure manage.sh and support files in INSTALL_DIR are accessible
+    chown root:root "$INSTALL_DIR"
+    chmod 755 "$INSTALL_DIR"
     # Ensure the service user can create subdirectories in their home directory
     chmod 755 /var/lib/pymc_repeater
     # Pre-create the .config directory that the service will need
@@ -325,9 +402,15 @@ install_repeater() {
     chown -R "$SERVICE_USER:$SERVICE_USER" /var/lib/pymc_repeater/.config
 
     # Configure polkit for passwordless service restart
-    echo ">>> Configuring polkit for service management..."
-    mkdir -p /etc/polkit-1/rules.d
-    cat > /etc/polkit-1/rules.d/10-pymc-repeater.rules <<'EOF'
+
+    # Work out which version of polkit is installed
+
+    POLKIT_VERSION=$(pkaction --version 2>/dev/null | awk '{print $NF}')
+    if echo "$POLKIT_VERSION" | awk '{ exit ($1 > 0.105) ? 0 : 1 }'; then
+        echo "Polkit 0.106 or greater detected, using rules file"
+        echo ">>> Configuring polkit for service management..."
+        mkdir -p /etc/polkit-1/rules.d
+        cat > /etc/polkit-1/rules.d/10-pymc-repeater.rules <<'EOF'
 polkit.addRule(function(action, subject) {
     if (action.id == "org.freedesktop.systemd1.manage-units" &&
         action.lookup("unit") == "pymc-repeater.service" &&
@@ -336,7 +419,20 @@ polkit.addRule(function(action, subject) {
     }
 });
 EOF
-    chmod 0644 /etc/polkit-1/rules.d/10-pymc-repeater.rules
+        chmod 0644 /etc/polkit-1/rules.d/10-pymc-repeater.rules
+    else
+        echo "Polkit 0.105 or less detected, using pkla file"
+        mkdir -p /etc/polkit-1/localauthority/50-local.d
+        cat > /etc/polkit-1/localauthority/50-local.d/10-pymc-repeater.pkla <<'EOF'
+[Allow repeater to restart pymc-repeater service]
+Identity=unix-user:repeater
+Action=org.freedesktop.systemd1.manage-units
+ResultAny=yes
+ResultInactive=yes
+ResultActive=yes
+EOF
+        chmod 0644 /etc/polkit-1/localauthority/50-local.d/10-pymc-repeater.pkla
+    fi
 
     # Also configure sudoers as fallback for service restart
     echo ">>> Configuring sudoers for service management..."
@@ -355,35 +451,61 @@ EOF
 set -e
 CHANNEL="${1:-main}"
 PRETEND_VERSION="${2:-}"
+VENV_DIR="/opt/pymc_repeater/venv"
+VENV_PIP="$VENV_DIR/bin/pip"
+VENV_PYTHON="$VENV_DIR/bin/python"
 # Validate: only allow safe git ref characters
 if ! [[ "$CHANNEL" =~ ^[a-zA-Z0-9._/-]{1,80}$ ]]; then
     echo "Invalid channel name: $CHANNEL" >&2
     exit 1
 fi
-export PIP_ROOT_USER_ACTION=ignore
 # If caller supplied a version string, tell setuptools_scm to use it (sudo
 # strips env vars so it is passed as a positional argument instead).
 [ -n "$PRETEND_VERSION" ] && export SETUPTOOLS_SCM_PRETEND_VERSION="$PRETEND_VERSION"
-# Migration: remove legacy PYTHONPATH from service unit if present.
-# Old installs set PYTHONPATH=/opt/pymc_repeater which caused the service to
-# load from a stale source copy instead of the pip-installed dist-packages.
+# ---- Migration: ensure venv exists (handles upgrades from system-pip era) ----
+if [ ! -x "$VENV_PYTHON" ]; then
+    echo "[pymc-do-upgrade] Creating venv at $VENV_DIR ..."
+    python3 -m venv --system-site-packages "$VENV_DIR"
+    "$VENV_PIP" install --upgrade pip setuptools wheel >/dev/null 2>&1 || true
+fi
+# ---- Migration: clean up legacy service unit issues ----
 SVC_UNIT=/etc/systemd/system/pymc-repeater.service
 if grep -q 'PYTHONPATH' "$SVC_UNIT" 2>/dev/null; then
     sed -i '/^Environment=.*PYTHONPATH/d' "$SVC_UNIT"
     systemctl daemon-reload
 fi
-# Migration: fix WorkingDirectory if it still points at the old source checkout.
-# /opt/pymc_repeater contains a repeater/ subdirectory which shadows the
-# pip-installed package, causing updates to have no effect on the running process.
 if grep -q 'WorkingDirectory=/opt/pymc_repeater' "$SVC_UNIT" 2>/dev/null; then
     sed -i 's|WorkingDirectory=/opt/pymc_repeater|WorkingDirectory=/var/lib/pymc_repeater|' "$SVC_UNIT"
     systemctl daemon-reload
 fi
-exec python3 -m pip install \
-    --break-system-packages \
+if grep -q 'ExecStart=/usr/bin/python3' "$SVC_UNIT" 2>/dev/null; then
+    sed -i "s|ExecStart=/usr/bin/python3|ExecStart=$VENV_PYTHON|" "$SVC_UNIT"
+    systemctl daemon-reload
+fi
+# ---- Remove stale source trees that shadow the venv package ----
+[ -d /opt/pymc_repeater/repeater ] && rm -rf /opt/pymc_repeater/repeater
+# ---- Remove old system-level packages to avoid confusion ----
+python3 -m pip uninstall -y pymc_repeater 2>/dev/null || true
+python3 -m pip uninstall -y pymc_core 2>/dev/null || true
+# ---- Try R2 wheels first for faster OTA upgrades ----
+R2_BASE_URL="https://wheel.pymc.dev/pymc_build_deps"
+MACHINE_ARCH=$(uname -m)
+case "$MACHINE_ARCH" in
+    aarch64) ARCH_TAG="arm64"; PLATFORM_TAG="aarch64" ;;
+    armv7l|armv7) ARCH_TAG="armv7"; PLATFORM_TAG="armv7l" ;;
+    x86_64) ARCH_TAG="x86_64"; PLATFORM_TAG="x86_64" ;;
+    *) ARCH_TAG=""; PLATFORM_TAG="" ;;
+esac
+if [ -n "$ARCH_TAG" ]; then
+    PY_TAG=$("$VENV_PYTHON" -c 'import sys; v=f"cp{sys.version_info.major}{sys.version_info.minor}"; print(f"{v}-{v}")' 2>/dev/null || echo "cp311-cp311")
+    WHEEL_BASE="${R2_BASE_URL}/${ARCH_TAG}/${PLATFORM_TAG}/${PY_TAG}"
+    echo "[pymc-do-upgrade] Trying dependencies from R2 wheels..."
+    "$VENV_PIP" install --find-links "${WHEEL_BASE}/index.html" --no-cache-dir "pycryptodome>=3.23.0" "PyNaCl>=1.5.0" cffi "pyyaml>=6.0.0" 2>/dev/null || true
+fi
+# ---- Install pymc_repeater from git ----
+exec "$VENV_PIP" install \
+    --upgrade \
     --no-cache-dir \
-    --force-reinstall \
-    --ignore-installed \
     "pymc_repeater[hardware] @ git+https://github.com/rightup/pyMC_Repeater.git@${CHANNEL}"
 UPGRADEEOF
     chmod 0755 /usr/local/bin/pymc-do-upgrade
@@ -398,15 +520,12 @@ UPGRADEEOF
     clear
     echo "=== Installing Python Dependencies ==="
     echo ""
-    echo "Installing pymc_repeater and dependencies (including pymc_core from GitHub)..."
+    echo "Installing pymc_repeater and dependencies (including pymc_core from PyPI)..."
     echo "This may take a few minutes..."
     echo ""
 
     SCRIPT_DIR="$(dirname "$0")"
     cd "$SCRIPT_DIR"
-
-    # Suppress pip root user warnings
-    export PIP_ROOT_USER_ACTION=ignore
 
     # Calculate version from git for setuptools_scm
     if [ -d .git ]; then
@@ -417,19 +536,43 @@ UPGRADEEOF
     else
         export SETUPTOOLS_SCM_PRETEND_VERSION="1.0.5"
     fi
-
-    # Force binary wheels for slow-to-compile packages (much faster on Raspberry Pi)
-    export PIP_ONLY_BINARY=pycryptodome,cffi,PyNaCl,psutil
+    # We don't have any binary wheels available for these on a LuckFox, so we need to ignore them on that platform.
+    if ! grep -q "Luckfox Pico" /proc/device-tree/model 2>/dev/null; then
+        # Force binary wheels for slow-to-compile packages (much faster on Raspberry Pi)
+        export PIP_ONLY_BINARY=pycryptodome,cffi,PyNaCl,psutil
+    fi
     echo "Note: Using optimized binary wheels for faster installation"
     echo ""
 
-    # Remove old pymc_core first so no stale .py/.pyc files linger
-    python3 -m pip uninstall -y pymc_core 2>/dev/null || true
+    # Ensure venv exists
+    ensure_venv
 
-    # Install with --force-reinstall to ensure fresh pymc_core from GitHub
-    # --ignore-installed avoids failures on system-managed packages (e.g. PyYAML)
-    echo "Installing pymc_repeater with fresh dependencies from pyproject.toml..."
-    if python3 -m pip install --break-system-packages --no-cache-dir --force-reinstall --ignore-installed .[hardware]; then
+    echo "Installing pymc_repeater into venv ($VENV_DIR)..."
+    
+    # Attempt R2 wheels first for faster installation
+    if [ "$R2_ENABLED" -eq 1 ]; then
+        MACHINE_ARCH=$(uname -m)
+        case "$MACHINE_ARCH" in
+            aarch64) ARCH_TAG="arm64"; PLATFORM_TAG="aarch64" ;;
+            armv7l|armv7) ARCH_TAG="armv7"; PLATFORM_TAG="armv7l" ;;
+            x86_64) ARCH_TAG="x86_64"; PLATFORM_TAG="x86_64" ;;
+            *) ARCH_TAG=""; PLATFORM_TAG="" ;;
+        esac
+        if [ -n "$ARCH_TAG" ]; then
+            PY_TAG=$("$VENV_PYTHON" -c 'import sys; v=f"cp{sys.version_info.major}{sys.version_info.minor}"; print(f"{v}-{v}")' 2>/dev/null || echo "cp311-cp311")
+            WHEEL_BASE="${R2_BASE_URL}/${ARCH_TAG}/${PLATFORM_TAG}/${PY_TAG}"
+            echo "  Checking for R2 wheels (${ARCH_TAG}/${PLATFORM_TAG}/${PY_TAG})..."
+            echo "  Trying install from R2 pre-built wheels..."
+            "$VENV_PIP" install --find-links "${WHEEL_BASE}/index.html" --no-cache-dir "pycryptodome>=3.23.0" "PyNaCl>=1.5.0" cffi "pyyaml>=6.0.0" 2>/dev/null && R2_SUCCESS=1 || R2_SUCCESS=0
+            if [ "$R2_SUCCESS" -eq 1 ]; then
+                echo "  ✓ R2 wheels installed"
+            else
+                echo "  - R2 wheels unavailable for this platform/tag, falling back"
+            fi
+        fi
+    fi
+    
+    if "$VENV_PIP" install --upgrade --no-cache-dir .[hardware]; then
         echo ""
         echo "✓ Python package installation completed successfully!"
 
@@ -488,7 +631,9 @@ UPGRADEEOF
         fi
         echo "═══════════════════════════════════════════════════════════════"
         echo ""
-        read -p "Press Enter to return to main menu..." || true
+        if [[ "${1:-}" != "install" ]]; then #Headless install support
+            read -p "Press Enter to return to main menu..." || true
+        fi
     else
         show_error "Installation completed but service failed to start!\n\nCheck logs from the main menu for details."
     fi
@@ -601,12 +746,12 @@ upgrade_repeater() {
         echo "[3/9] Updating system dependencies..."
         apt-get update -qq
 
-        apt-get install -y libffi-dev libusb-1.0-0 sudo jq pip python3-rrdtool wget swig build-essential python3-dev
+        apt-get install -y libffi-dev libusb-1.0-0 sudo jq pip python3-venv python3-rrdtool wget swig build-essential python3-dev
         # Install polkit (package name varies by distro version)
         apt-get install -y policykit-1 2>/dev/null \
             || apt-get install -y polkitd pkexec 2>/dev/null \
             || echo "    Warning: Could not install polkit (sudo fallback will be used)"
-        pip install --break-system-packages setuptools_scm >/dev/null 2>&1 || true
+        pip install --break-system-packages setuptools_scm >/dev/null 2>&1 || python3 -m pip install --break-system-packages setuptools_scm >/dev/null 2>&1 || true
 
         # Install mikefarah yq v4 if not already installed
         if ! command -v yq &> /dev/null || [[ "$(yq --version 2>&1)" != *"mikefarah/yq"* ]]; then
@@ -654,15 +799,25 @@ upgrade_repeater() {
         echo "    ✓ User groups updated"
 
         echo "[6/9] Fixing permissions..."
-        chown -R "$SERVICE_USER:$SERVICE_USER" "$INSTALL_DIR" "$CONFIG_DIR" "$LOG_DIR" /var/lib/pymc_repeater 2>/dev/null || true
+        
+        # Venv stays root-owned (pip runs as root); service user only needs read+execute
+        chown -R "$SERVICE_USER:$SERVICE_USER" "$CONFIG_DIR" "$LOG_DIR" /var/lib/pymc_repeater 2>/dev/null || true
+        chown root:root "$INSTALL_DIR" 2>/dev/null || true
+        chmod 755 "$INSTALL_DIR" 2>/dev/null || true
         chmod 750 "$CONFIG_DIR" "$LOG_DIR" 2>/dev/null || true
         chmod 755 /var/lib/pymc_repeater 2>/dev/null || true
+        
         # Pre-create the .config directory that the service will need
         mkdir -p /var/lib/pymc_repeater/.config/pymc_repeater 2>/dev/null || true
         chown -R "$SERVICE_USER:$SERVICE_USER" /var/lib/pymc_repeater/.config 2>/dev/null || true
+        
         # Configure polkit for passwordless service restart
-        mkdir -p /etc/polkit-1/rules.d
-        cat > /etc/polkit-1/rules.d/10-pymc-repeater.rules <<'EOF'
+        POLKIT_VERSION=$(pkaction --version 2>/dev/null | awk '{print $NF}')
+        if echo "$POLKIT_VERSION" | awk '{ exit ($1 > 0.105) ? 0 : 1 }'; then
+            echo "Polkit 0.106 or greater detected, using rules file"
+            echo ">>> Configuring polkit for service management..."
+            mkdir -p /etc/polkit-1/rules.d
+            cat > /etc/polkit-1/rules.d/10-pymc-repeater.rules <<'EOF'
 polkit.addRule(function(action, subject) {
     if (action.id == "org.freedesktop.systemd1.manage-units" &&
         action.lookup("unit") == "pymc-repeater.service" &&
@@ -671,7 +826,20 @@ polkit.addRule(function(action, subject) {
     }
 });
 EOF
-        chmod 0644 /etc/polkit-1/rules.d/10-pymc-repeater.rules
+            chmod 0644 /etc/polkit-1/rules.d/10-pymc-repeater.rules
+        else
+            echo "Polkit 0.105 or less detected, using pkla file"
+            mkdir -p /etc/polkit-1/localauthority/50-local.d
+            cat > /etc/polkit-1/localauthority/50-local.d/10-pymc-repeater.pkla <<'EOF'
+[Allow repeater to restart pymc-repeater service]
+Identity=unix-user:repeater
+Action=org.freedesktop.systemd1.manage-units
+ResultAny=yes
+ResultInactive=yes
+ResultActive=yes
+EOF
+            chmod 0644 /etc/polkit-1/localauthority/50-local.d/10-pymc-repeater.pkla
+        fi
         # Also configure sudoers as fallback for service restart
         mkdir -p /etc/sudoers.d
         cat > /etc/sudoers.d/pymc-repeater <<'EOF'
@@ -687,36 +855,62 @@ EOF
 set -e
 CHANNEL="${1:-main}"
 PRETEND_VERSION="${2:-}"
+VENV_DIR="/opt/pymc_repeater/venv"
+VENV_PIP="$VENV_DIR/bin/pip"
+VENV_PYTHON="$VENV_DIR/bin/python"
 # Validate: only allow safe git ref characters
 if ! [[ "$CHANNEL" =~ ^[a-zA-Z0-9._/-]{1,80}$ ]]; then
     echo "Invalid channel name: $CHANNEL" >&2
     exit 1
 fi
-export PIP_ROOT_USER_ACTION=ignore
 # If caller supplied a version string, tell setuptools_scm to use it (sudo
 # strips env vars so it is passed as a positional argument instead).
 [ -n "$PRETEND_VERSION" ] && export SETUPTOOLS_SCM_PRETEND_VERSION="$PRETEND_VERSION"
-# Migration: remove legacy PYTHONPATH from service unit if present.
-# Old installs set PYTHONPATH=/opt/pymc_repeater which caused the service to
-# load from a stale source copy instead of the pip-installed dist-packages.
+# ---- Migration: ensure venv exists (handles upgrades from system-pip era) ----
+if [ ! -x "$VENV_PYTHON" ]; then
+    echo "[pymc-do-upgrade] Creating venv at $VENV_DIR ..."
+    python3 -m venv --system-site-packages "$VENV_DIR"
+    "$VENV_PIP" install --upgrade pip setuptools wheel >/dev/null 2>&1 || true
+fi
+# ---- Migration: clean up legacy service unit issues ----
 SVC_UNIT=/etc/systemd/system/pymc-repeater.service
 if grep -q 'PYTHONPATH' "$SVC_UNIT" 2>/dev/null; then
     sed -i '/^Environment=.*PYTHONPATH/d' "$SVC_UNIT"
     systemctl daemon-reload
 fi
-# Migration: fix WorkingDirectory if it still points at the old source checkout.
-# /opt/pymc_repeater contains a repeater/ subdirectory which shadows the
-# pip-installed package, causing updates to have no effect on the running process.
 if grep -q 'WorkingDirectory=/opt/pymc_repeater' "$SVC_UNIT" 2>/dev/null; then
     sed -i 's|WorkingDirectory=/opt/pymc_repeater|WorkingDirectory=/var/lib/pymc_repeater|' "$SVC_UNIT"
     systemctl daemon-reload
 fi
-exec python3 -m pip install \
-    --break-system-packages \
-    --no-cache-dir \
-    --force-reinstall \
-    --ignore-installed \
-    "pymc_repeater[hardware] @ git+https://github.com/rightup/pyMC_Repeater.git@${CHANNEL}"
+if grep -q 'ExecStart=/usr/bin/python3' "$SVC_UNIT" 2>/dev/null; then
+    sed -i "s|ExecStart=/usr/bin/python3|ExecStart=$VENV_PYTHON|" "$SVC_UNIT"
+    systemctl daemon-reload
+fi
+# ---- Remove stale source trees that shadow the venv package ----
+[ -d /opt/pymc_repeater/repeater ] && rm -rf /opt/pymc_repeater/repeater
+# ---- Remove old system-level packages to avoid confusion ----
+python3 -m pip uninstall -y pymc_repeater 2>/dev/null || true
+python3 -m pip uninstall -y pymc_core 2>/dev/null || true
+        # ---- Try R2 wheels first for faster OTA upgrades ----
+        R2_BASE_URL="https://wheel.pymc.dev/pymc_build_deps"
+        MACHINE_ARCH=$(uname -m)
+        case "$MACHINE_ARCH" in
+            aarch64) ARCH_TAG="arm64"; PLATFORM_TAG="aarch64" ;;
+            armv7l|armv7) ARCH_TAG="armv7"; PLATFORM_TAG="armv7l" ;;
+            x86_64) ARCH_TAG="x86_64"; PLATFORM_TAG="x86_64" ;;
+            *) ARCH_TAG=""; PLATFORM_TAG="" ;;
+        esac
+        if [ -n "$ARCH_TAG" ]; then
+            PY_TAG=$("$VENV_PYTHON" -c 'import sys; v=f"cp{sys.version_info.major}{sys.version_info.minor}"; print(f"{v}-{v}")' 2>/dev/null || echo "cp311-cp311")
+            WHEEL_BASE="${R2_BASE_URL}/${ARCH_TAG}/${PLATFORM_TAG}/${PY_TAG}"
+            echo "[pymc-do-upgrade] Trying dependencies from R2 wheels..."
+            "$VENV_PIP" install --find-links "${WHEEL_BASE}/index.html" --no-cache-dir "pycryptodome>=3.23.0" "PyNaCl>=1.5.0" cffi "pyyaml>=6.0.0" 2>/dev/null || true
+        fi
+        # ---- Install pymc_repeater from git ----
+        exec "$VENV_PIP" install \
+            --upgrade \
+            --no-cache-dir \
+            "pymc_repeater[hardware] @ git+https://github.com/rightup/pyMC_Repeater.git@${CHANNEL}"
 UPGRADEEOF
         chmod 0755 /usr/local/bin/pymc-do-upgrade
         echo "    ✓ Permissions updated"
@@ -727,16 +921,13 @@ UPGRADEEOF
 
         echo "=== Installing Python Dependencies ==="
         echo ""
-        echo "Updating pymc_repeater and dependencies (including pymc_core from GitHub)..."
+        echo "Updating pymc_repeater and dependencies (including pymc_core from PyPI)..."
         echo "This may take a few minutes..."
         echo ""
 
         # Install from source directory to properly resolve Git dependencies
         SCRIPT_DIR="$(dirname "$0")"
         cd "$SCRIPT_DIR"
-
-        # Suppress pip root user warnings
-        export PIP_ROOT_USER_ACTION=ignore
 
         # Calculate version from git for setuptools_scm
         if [ -d .git ]; then
@@ -748,18 +939,44 @@ UPGRADEEOF
             export SETUPTOOLS_SCM_PRETEND_VERSION="1.0.5"
         fi
 
-        # Force binary wheels for slow-to-compile packages (much faster on Raspberry Pi)
-        export PIP_ONLY_BINARY=pycryptodome,cffi,PyNaCl,psutil
+    # We don't have any binary wheels available for these on a LuckFox, so we need to ignore them on that platform.
+        if ! grep -q "Luckfox Pico" /proc/device-tree/model 2>/dev/null; then
+            # Force binary wheels for slow-to-compile packages (much faster on Raspberry Pi)
+            export PIP_ONLY_BINARY=pycryptodome,cffi,PyNaCl,psutil
+        fi
         echo "Note: Using optimized binary wheels for faster installation"
         echo ""
 
-        # Remove old pymc_core first so no stale .py/.pyc files linger
-        python3 -m pip uninstall -y pymc_core 2>/dev/null || true
+        # Migrate from system pip to venv (idempotent)
+        migrate_to_venv
 
-        # Install with --force-reinstall to ensure fresh pymc_core from GitHub
-        # --ignore-installed avoids failures on system-managed packages (e.g. PyYAML)
-        echo "Upgrading pymc_repeater with fresh dependencies from pyproject.toml..."
-        if python3 -m pip install --break-system-packages --no-cache-dir --force-reinstall --ignore-installed .[hardware]; then
+        # Install into the venv (clean, no system-packages flags needed)
+        echo "Upgrading pymc_repeater into venv ($VENV_DIR)..."
+        
+        # Attempt R2 wheels first for faster installation
+        if [ "$R2_ENABLED" -eq 1 ]; then
+            MACHINE_ARCH=$(uname -m)
+            case "$MACHINE_ARCH" in
+                aarch64) ARCH_TAG="arm64"; PLATFORM_TAG="aarch64" ;;
+                armv7l|armv7) ARCH_TAG="armv7"; PLATFORM_TAG="armv7l" ;;
+                x86_64) ARCH_TAG="x86_64"; PLATFORM_TAG="x86_64" ;;
+                *) ARCH_TAG=""; PLATFORM_TAG="" ;;
+            esac
+            if [ -n "$ARCH_TAG" ]; then
+                PY_TAG=$("$VENV_PYTHON" -c 'import sys; v=f"cp{sys.version_info.major}{sys.version_info.minor}"; print(f"{v}-{v}")' 2>/dev/null || echo "cp311-cp311")
+                WHEEL_BASE="${R2_BASE_URL}/${ARCH_TAG}/${PLATFORM_TAG}/${PY_TAG}"
+                echo "  Checking for R2 wheels (${ARCH_TAG}/${PLATFORM_TAG}/${PY_TAG})..."
+                echo "  Trying install from R2 pre-built wheels..."
+                "$VENV_PIP" install --find-links "${WHEEL_BASE}/index.html" --no-cache-dir "pycryptodome>=3.23.0" "PyNaCl>=1.5.0" cffi "pyyaml>=6.0.0" 2>/dev/null && R2_SUCCESS=1 || R2_SUCCESS=0
+                if [ "$R2_SUCCESS" -eq 1 ]; then
+                    echo "  ✓ R2 wheels installed"
+                else
+                    echo "  - R2 wheels unavailable for this platform/tag, falling back"
+                fi
+            fi
+        fi
+        
+        if "$VENV_PIP" install --upgrade --no-cache-dir .[hardware]; then
             echo ""
             echo "✓ Package and dependencies upgraded successfully!"
         else
@@ -878,7 +1095,8 @@ uninstall_repeater() {
         systemctl daemon-reload
 
         echo "50"; echo "# Removing polkit and sudoers rules..."
-        rm -f /etc/polkit-1/rules.d/10-pymc-repeater.rules
+        rm -f /etc/polkit-1/rules.d/10-pymc-repeater.rules || true
+        rm -f /etc/polkit-1/localauthority/50-local.d/10-pymc-repeater.pkla || true
         rm -f /etc/sudoers.d/pymc-repeater
         rm -f /usr/local/bin/pymc-do-upgrade
 
@@ -1127,7 +1345,7 @@ fi
 # Handle command line arguments
 case "$1" in
     "install")
-        install_repeater
+        install_repeater install
         exit 0
         ;;
     "upgrade")

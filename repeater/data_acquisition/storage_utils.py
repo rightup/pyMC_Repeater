@@ -10,7 +10,7 @@ class PacketRecord:
     """
     Data class for packet record format.
     Converts internal packet_record format to standardized publish format.
-    Reusable across MQTT, LetsMesh, and other handlers.
+    Reusable across MQTT and other handlers.
     """
 
     origin: str
@@ -38,6 +38,12 @@ class PacketRecord:
         """
         Create PacketRecord from internal packet_record format.
 
+        The ``duration`` field is sourced from ``packet_record['airtime_ms']``,
+        which RepeaterHandler._build_packet_record populates using the
+        Semtech-reference time-on-air formula on the active radio settings.
+        Records produced by older code paths that pre-date that field fall
+        back to 0 to preserve legacy behavior.
+
         Args:
             packet_record: Internal packet record dictionary
             origin: Node name
@@ -57,6 +63,8 @@ class PacketRecord:
         route_map = {1: "F", 2: "D"}
         route = route_map.get(packet_record.get("route", 0), str(packet_record.get("route", 0)))
 
+        airtime_ms = float(packet_record.get("airtime_ms", 0.0) or 0.0)
+
         return cls(
             origin=origin,
             origin_id=origin_id,
@@ -73,7 +81,7 @@ class PacketRecord:
             SNR=str(packet_record.get("snr", 0)),
             RSSI=str(packet_record.get("rssi", 0)),
             score=str(int(packet_record.get("score", 0) * 1000)),
-            duration="0",
+            duration=str(int(round(airtime_ms))),
             hash=packet_record.get("packet_hash", ""),
         )
 
