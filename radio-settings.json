@@ -322,6 +322,20 @@
       "use_dio2_rf": false,
       "use_dio3_tcxo": true,
       "preamble_length": 17
+    },
+    "pymc_usb": {
+      "name": "pymc_usb modem (USB-CDC)",
+      "description": "ESP32-S3 / nRF52 board running pymc_usb firmware as a USB-CDC LoRa modem. Pick this if the modem is plugged into the host's USB port (e.g. /dev/ttyACM0). Edit the 'pymc_usb' section after first-run to point at the right serial device.",
+      "radio_type": "pymc_usb",
+      "tx_power": 22,
+      "preamble_length": 16
+    },
+    "pymc_tcp": {
+      "name": "pymc_tcp modem (Wi-Fi / Ethernet)",
+      "description": "ESP32 board running pymc_usb firmware exposed as a TCP server over Wi-Fi or Ethernet. After first-run, set 'pymc_tcp.host' to the modem's LAN address or mDNS name (e.g. pymc-3e2834.local).",
+      "radio_type": "pymc_tcp",
+      "tx_power": 22,
+      "preamble_length": 16
     }
   }
 }
