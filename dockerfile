@@ -5,6 +5,8 @@ ARG USER=repeater
 ARG GROUP=repeater
 ARG PUID=15888
 ARG PGID=15888
+ARG PYMC_CORE_REF=dev
+ARG PYMC_CORE_SHA
 ARG TARGETARCH
 ARG YQ_VERSION=v4.40.5
 
@@ -64,8 +66,14 @@ COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 # Switch to the unprivileged runtime user
 USER ${USER}
 
-# Install package
-RUN pip install --no-cache-dir ".[rrd]"
+# Install the matching pyMC_core ref by resolved commit SHA, then install repeater
+# without re-resolving dependencies back to a cached branch tip.
+RUN test -n "${PYMC_CORE_SHA}" \
+    && echo "Installing pyMC_core ${PYMC_CORE_REF} @ ${PYMC_CORE_SHA}" \
+    && pip install --no-cache-dir "pymc_core[hardware] @ git+https://github.com/pyMC-dev/pyMC_core.git@${PYMC_CORE_SHA}" \
+    && python -c "import pathlib, tomllib; data = tomllib.loads(pathlib.Path('pyproject.toml').read_text()); deps = [d for d in data['project']['dependencies'] if not d.startswith('pymc_core')]; deps += data['project']['optional-dependencies']['rrd']; pathlib.Path('/tmp/pymc_repeater_requirements.txt').write_text('\n'.join(deps) + '\n')" \
+    && pip install --no-cache-dir -r /tmp/pymc_repeater_requirements.txt \
+    && pip install --no-cache-dir --no-deps .
 
 USER root
 

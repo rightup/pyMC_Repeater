@@ -365,10 +365,13 @@ sudo bash ./setup-radio-config.sh
 
 4. Configure the [docker compose](./docker-compose.yml) to your specific hardware and file paths. Be sure to comment-out or delete lines that aren't required for your hardware. Please note that your hardware devices might be at a different path than those listed in the docker compose file.
 
-5. Build and start the container.
+5. Pull and start the container. The example compose file defaults to
+   `pymcdev/pymc-repeater:dev`. Override `PYMC_REPEATER_IMAGE` if you want a
+   different channel or a fork image.
 
 ```bash
-docker compose up -d --force-recreate --build
+docker compose pull
+docker compose up -d --force-recreate
 ```
 
 ## Roadmap / Planned Features

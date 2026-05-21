@@ -5,18 +5,23 @@ on:
     branches:
       - main
       - dev
+  repository_dispatch:
+    types:
+      - rebuild-from-core
   workflow_dispatch:
     inputs:
       image_repository:
         description: "Docker image repository to publish to"
         required: false
-        default: "pymcdev/pymc-repeater"
+        default: ""
 
 jobs:
   docker:
     if: |
       github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'repository_dispatch' ||
       github.repository == 'pyMC-dev/pyMC_Repeater' ||
+      github.repository == 'rightup/pyMC_Repeater' ||
       github.repository == 'yellowcooln/pyMC_Repeater'
     runs-on: ubuntu-latest
     permissions:
@@ -27,6 +32,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.channel || github.ref_name }}
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -38,6 +44,58 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
+      - name: Determine build context
+        id: context
+        shell: bash
+        env:
+          INPUT_IMAGE_REPOSITORY: ${{ inputs.image_repository }}
+          PAYLOAD_CHANNEL: ${{ github.event.client_payload.channel }}
+          PAYLOAD_CORE_REF: ${{ github.event.client_payload.core_ref }}
+          PAYLOAD_CORE_SHA: ${{ github.event.client_payload.core_sha }}
+        run: |
+          set -euo pipefail
+
+          channel="${PAYLOAD_CHANNEL:-${GITHUB_REF_NAME}}"
+          case "${channel}" in
+            main|dev) ;;
+            *)
+              echo "Unsupported repeater channel: ${channel}" >&2
+              exit 1
+              ;;
+          esac
+
+          core_ref="${PAYLOAD_CORE_REF:-${channel}}"
+          if [ -n "${PAYLOAD_CORE_SHA}" ]; then
+            core_sha="${PAYLOAD_CORE_SHA}"
+          else
+            core_sha="$(git ls-remote https://github.com/pyMC-dev/pyMC_core.git "refs/heads/${core_ref}" | cut -f1)"
+          fi
+
+          if [ -z "${core_sha}" ]; then
+            echo "Failed to resolve pyMC_core ref ${core_ref}" >&2
+            exit 1
+          fi
+
+          if [ -n "${INPUT_IMAGE_REPOSITORY}" ]; then
+            image_repository="${INPUT_IMAGE_REPOSITORY}"
+          elif [ "${{ github.repository }}" = "yellowcooln/pyMC_Repeater" ]; then
+            image_repository="yellowcooln/pymc-repeater"
+          else
+            image_repository="pymcdev/pymc-repeater"
+          fi
+
+          repeater_sha="$(git rev-parse HEAD)"
+          repeater_short_sha="$(git rev-parse --short=7 HEAD)"
+
+          echo "Using image repository: ${image_repository}"
+          echo "Building repeater ${channel} against pyMC_core ${core_ref} @ ${core_sha}"
+          echo "channel=${channel}" >> "$GITHUB_OUTPUT"
+          echo "core_ref=${core_ref}" >> "$GITHUB_OUTPUT"
+          echo "core_sha=${core_sha}" >> "$GITHUB_OUTPUT"
+          echo "image_repository=${image_repository}" >> "$GITHUB_OUTPUT"
+          echo "repeater_sha=${repeater_sha}" >> "$GITHUB_OUTPUT"
+          echo "repeater_short_sha=${repeater_short_sha}" >> "$GITHUB_OUTPUT"
 
       - name: Compute package version
         id: package_version
@@ -52,30 +110,19 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Determine image repository
-        id: image_repo
-        shell: bash
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.image_repository }}" ]; then
-            image_repository="${{ inputs.image_repository }}"
-          elif [ "${{ github.repository }}" = "yellowcooln/pyMC_Repeater" ]; then
-            image_repository="yellowcooln/pymc-repeater"
-          else
-            image_repository="pymcdev/pymc-repeater"
-          fi
-
-          echo "Using image repository: ${image_repository}"
-          echo "image_repository=${image_repository}" >> "$GITHUB_OUTPUT"
-
       - name: Extract Docker metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ steps.image_repo.outputs.image_repository }}
+          images: ${{ steps.context.outputs.image_repository }}
           tags: |
-            type=raw,value=main,enable=${{ github.ref == 'refs/heads/main' }}
-            type=raw,value=dev,enable=${{ github.ref == 'refs/heads/dev' }}
-            type=sha,format=short
+            type=raw,value=${{ steps.context.outputs.channel }}
+            type=raw,value=sha-${{ steps.context.outputs.repeater_short_sha }}
+          labels: |
+            org.opencontainers.image.revision=${{ steps.context.outputs.repeater_sha }}
+            io.pymc.repeater.channel=${{ steps.context.outputs.channel }}
+            io.pymc.core.ref=${{ steps.context.outputs.core_ref }}
+            io.pymc.core.sha=${{ steps.context.outputs.core_sha }}
 
       - name: Build and push
         uses: docker/build-push-action@v6
@@ -86,6 +133,8 @@ jobs:
           push: true
           build-args: |
             PACKAGE_VERSION=${{ steps.package_version.outputs.version }}
+            PYMC_CORE_REF=${{ steps.context.outputs.core_ref }}
+            PYMC_CORE_SHA=${{ steps.context.outputs.core_sha }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
@@ -95,8 +144,8 @@ jobs:
         if: github.repository == 'pyMC-dev/pyMC_Repeater'
         env:
           DISPATCH_TOKEN: ${{ secrets.HA_ADDON_REPO_DISPATCH_TOKEN }}
-          CHANNEL: ${{ github.ref_name }}
-          REVISION: ${{ github.sha }}
+          CHANNEL: ${{ steps.context.outputs.channel }}
+          REVISION: ${{ steps.context.outputs.repeater_sha }}
         run: |
           if [ -z "${DISPATCH_TOKEN}" ]; then
             echo "HA_ADDON_REPO_DISPATCH_TOKEN is not set" >&2
