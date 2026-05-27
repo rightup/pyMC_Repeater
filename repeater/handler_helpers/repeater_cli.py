@@ -285,7 +285,7 @@ class MeshCLI:
             # Display current time
             import datetime
 
-            dt = datetime.datetime.now(datetime.UTC)
+            dt = datetime.datetime.now(datetime.timezone.utc)
             return f"{dt.hour:02d}:{dt.minute:02d} - {dt.day}/{dt.month}/{dt.year} UTC"
         elif command == "clock sync":
             # Clock sync happens automatically via sender_timestamp in protocol

@@ -32,10 +32,20 @@ def test_no_datetime_utc():
         except SyntaxError:
             continue
         for node in ast.walk(tree):
+            # catch: from datetime import UTC
             if isinstance(node, ast.ImportFrom) and node.module == "datetime":
                 if any(alias.name == "UTC" for alias in node.names):
                     rel = path.relative_to(_REPEATER_ROOT.parent)
                     violations.append(f"  {rel}:{node.lineno}")
+            # catch: datetime.UTC
+            if (
+                isinstance(node, ast.Attribute)
+                and node.attr == "UTC"
+                and isinstance(node.value, ast.Name)
+                and node.value.id == "datetime"
+            ):
+                rel = path.relative_to(_REPEATER_ROOT.parent)
+                violations.append(f"  {rel}:{node.lineno}")
 
     assert not violations, (
         "datetime.UTC (Python 3.11+) found in the following files — "
