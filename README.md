@@ -349,23 +349,32 @@ You can now run pyMC Repeater from within a [Docker Container](https://www.docke
 
 Here is what you'll need to do in order to get the container running:
 
-1. Copy the `config.yaml.example` to `config.yaml`
+1. Create the bind mount directories and copy the example config into the
+   Docker config directory.
 
 ```bash
-cp ./config.yaml.example ./config.yaml
+mkdir -p ./config ./data
+cp ./config.yaml.example ./config/config.yaml
 ```
 
 2. Run the configuration script and follow the prompts.
 
 ```bash
-sudo bash ./setup-radio-config.sh
+sudo bash ./setup-radio-config.sh ./config
 ```
 
-3. Modify the `config.yaml` file with a unique web UI password. This allows you to bypass the `/setup` page when logging for the first time. You can find the value under `repeater.security.admin_password`. Change to _anything_ besides the default of `admin123`.
+3. Modify `./config/config.yaml` with a unique web UI password. This allows you to bypass the `/setup` page when logging for the first time. You can find the value under `repeater.security.admin_password`. Change to _anything_ besides the default of `admin123`.
 
 4. Configure the [docker compose](./docker-compose.yml) to your specific hardware and file paths. Be sure to comment-out or delete lines that aren't required for your hardware. Please note that your hardware devices might be at a different path than those listed in the docker compose file.
 
-5. Pull and start the container. The example compose file defaults to
+5. Make the bind mount directories writable by the container user. The
+   published image runs as UID/GID `15888` by default.
+
+```bash
+sudo chown -R 15888:15888 ./config ./data
+```
+
+6. Pull and start the container. The example compose file defaults to
    `pymcdev/pymc-repeater:dev`. Override `PYMC_REPEATER_IMAGE` if you want a
    different channel or a fork image.
 

@@ -68,9 +68,13 @@ USER ${USER}
 
 # Install the matching pyMC_core ref by resolved commit SHA, then install repeater
 # without re-resolving dependencies back to a cached branch tip.
-RUN test -n "${PYMC_CORE_SHA}" \
-    && echo "Installing pyMC_core ${PYMC_CORE_REF} @ ${PYMC_CORE_SHA}" \
-    && pip install --no-cache-dir "pymc_core[hardware] @ git+https://github.com/pyMC-dev/pyMC_core.git@${PYMC_CORE_SHA}" \
+RUN core_sha="${PYMC_CORE_SHA}" \
+    && if [ -z "${core_sha}" ]; then \
+        core_sha="$(git ls-remote https://github.com/pyMC-dev/pyMC_core.git "refs/heads/${PYMC_CORE_REF}" | cut -f1)"; \
+    fi \
+    && test -n "${core_sha}" \
+    && echo "Installing pyMC_core ${PYMC_CORE_REF} @ ${core_sha}" \
+    && pip install --no-cache-dir "pymc_core[hardware] @ git+https://github.com/pyMC-dev/pyMC_core.git@${core_sha}" \
     && python -c "import pathlib, tomllib; data = tomllib.loads(pathlib.Path('pyproject.toml').read_text()); deps = [d for d in data['project']['dependencies'] if not d.startswith('pymc_core')]; deps += data['project']['optional-dependencies']['rrd']; pathlib.Path('/tmp/pymc_repeater_requirements.txt').write_text('\n'.join(deps) + '\n')" \
     && pip install --no-cache-dir -r /tmp/pymc_repeater_requirements.txt \
     && pip install --no-cache-dir --no-deps .
