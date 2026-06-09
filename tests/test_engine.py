@@ -1790,6 +1790,85 @@ class TestMissedEngineBranches:
         handler.storage.record_crc_errors.assert_called_once_with(5)
         assert handler._last_crc_error_count == 9
 
+    @pytest.mark.parametrize("radio_type", ["sx1262", "sx1262_ch341", "kiss"])
+    @pytest.mark.asyncio
+    async def test_record_crc_errors_async_non_pymc_radios_keep_startup_delta_behavior(
+        self, radio_type
+    ):
+        config = _make_config(radio_type=radio_type)
+        dispatcher = _make_dispatcher()
+        dispatcher.radio.crc_error_count = 145
+        with (
+            patch("repeater.engine.StorageCollector"),
+            patch("repeater.engine.RepeaterHandler._start_background_tasks"),
+        ):
+            from repeater.engine import RepeaterHandler
+
+            handler = RepeaterHandler(config, dispatcher, LOCAL_HASH)
+
+        assert handler._last_crc_error_count == 0
+
+        await handler._record_crc_errors_async()
+
+        handler.storage.record_crc_errors.assert_called_once_with(145)
+        assert handler._last_crc_error_count == 145
+
+    @pytest.mark.parametrize("radio_type", ["pymc_usb", "pymc_tcp"])
+    @pytest.mark.asyncio
+    async def test_record_crc_errors_async_pymc_modem_baselines_existing_device_stats(
+        self, radio_type
+    ):
+        config = _make_config(radio_type=radio_type)
+        dispatcher = _make_dispatcher()
+        dispatcher.radio.crc_error_count = 20_000
+        with (
+            patch("repeater.engine.StorageCollector"),
+            patch("repeater.engine.RepeaterHandler._start_background_tasks"),
+        ):
+            from repeater.engine import RepeaterHandler
+
+            handler = RepeaterHandler(config, dispatcher, LOCAL_HASH)
+
+        await handler._record_crc_errors_async()
+
+        handler.storage.record_crc_errors.assert_not_called()
+        assert handler._last_crc_error_count == 20_000
+
+        dispatcher.radio.crc_error_count = 20_003
+        await handler._record_crc_errors_async()
+
+        handler.storage.record_crc_errors.assert_called_once_with(3)
+        assert handler._last_crc_error_count == 20_003
+
+    @pytest.mark.asyncio
+    async def test_record_crc_errors_async_pymc_modem_baselines_delayed_device_stats(self):
+        config = _make_config(radio_type="pymc_tcp")
+        dispatcher = _make_dispatcher()
+        dispatcher.radio.crc_error_count = 0
+        with (
+            patch("repeater.engine.StorageCollector"),
+            patch("repeater.engine.RepeaterHandler._start_background_tasks"),
+        ):
+            from repeater.engine import RepeaterHandler
+
+            handler = RepeaterHandler(config, dispatcher, LOCAL_HASH)
+
+        await handler._record_crc_errors_async()
+        handler.storage.record_crc_errors.assert_not_called()
+        assert handler._last_crc_error_count is None
+
+        dispatcher.radio.crc_error_count = 145
+        await handler._record_crc_errors_async()
+
+        handler.storage.record_crc_errors.assert_not_called()
+        assert handler._last_crc_error_count == 145
+
+        dispatcher.radio.crc_error_count = 148
+        await handler._record_crc_errors_async()
+
+        handler.storage.record_crc_errors.assert_called_once_with(3)
+        assert handler._last_crc_error_count == 148
+
     @pytest.mark.asyncio
     async def test_record_noise_floor_async_caches_and_persists(self, handler):
         with patch.object(handler, "get_noise_floor", return_value=-117.5):

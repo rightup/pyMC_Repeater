@@ -135,7 +135,9 @@ class RepeaterHandler(BaseHandler):
         self.noise_floor_interval = NOISE_FLOOR_INTERVAL  # 30 seconds
         self._background_task = None
         self._cached_noise_floor = None
-        self._last_crc_error_count = 0  # Track radio counter for delta persistence
+        self._last_crc_error_count = (
+            None if self._is_pymc_modem_radio() else 0
+        )  # Track radio counter for delta persistence
 
         # Cache transport keys for efficient lookup
         self._transport_keys_cache = None
@@ -1406,6 +1408,18 @@ class RepeaterHandler(BaseHandler):
         except Exception as e:
             logger.error(f"Error recording noise floor: {e}")
 
+    def _is_pymc_modem_radio(self) -> bool:
+        """Return True when using PyMC modem transports with device-owned stats."""
+        radio_type = str(self.config.get("radio_type", "")).lower()
+        return radio_type in {"pymc_usb", "pymc_tcp"}
+
+    @staticmethod
+    def _get_radio_crc_error_count(radio) -> int:
+        try:
+            return int(getattr(radio, "crc_error_count", 0) or 0) if radio else 0
+        except (TypeError, ValueError):
+            return 0
+
     async def _record_crc_errors_async(self):
         """Persist CRC error delta from the radio hardware counter."""
         if not self.storage:
@@ -1413,7 +1427,15 @@ class RepeaterHandler(BaseHandler):
 
         try:
             radio = self.dispatcher.radio if self.dispatcher else None
-            current = getattr(radio, "crc_error_count", 0) if radio else 0
+            current = self._get_radio_crc_error_count(radio)
+            if self._last_crc_error_count is None:
+                if current <= 0:
+                    logger.debug("Waiting for PyMC modem CRC baseline")
+                    return
+                self._last_crc_error_count = current
+                logger.debug(f"Baselined PyMC modem CRC errors at {current}")
+                return
+
             delta = current - self._last_crc_error_count
             if delta > 0:
                 self.storage.record_crc_errors(delta)
