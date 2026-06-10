@@ -577,6 +577,10 @@ UPGRADEEOF
         echo "✓ Python package installation completed successfully!"
 
         # Reload systemd and start the service
+        # Ensure service unit file is installed (may have been skipped if gauge phase errored)
+        if [ ! -f "/etc/systemd/system/${SERVICE_NAME}.service" ]; then
+            cp "$SCRIPT_DIR/pymc-repeater.service" /etc/systemd/system/ 2>/dev/null ||             cp "$INSTALL_DIR/pymc-repeater.service" /etc/systemd/system/ || true
+        fi
         systemctl daemon-reload
         systemctl start "$SERVICE_NAME"
     else
@@ -670,6 +674,10 @@ reset_repeater() {
 	sleep 5
         # Reload systemd and start the service
 	echo "4/4 Restart the service"
+        # Ensure service unit file is installed
+        if [ ! -f "/etc/systemd/system/${SERVICE_NAME}.service" ]; then
+            cp "$SCRIPT_DIR/pymc-repeater.service" /etc/systemd/system/ 2>/dev/null ||             cp "$INSTALL_DIR/pymc-repeater.service" /etc/systemd/system/ || true
+        fi
         systemctl daemon-reload
         systemctl start "$SERVICE_NAME"
         # Show final results
