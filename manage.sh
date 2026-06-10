@@ -332,24 +332,30 @@ install_repeater() {
 
     (
     echo "10"; echo "# Adding user to hardware groups..."
+    echo "gauge: adding user to hardware groups" >&2
     for grp in plugdev dialout gpio i2c spi; do
         getent group "$grp" >/dev/null 2>&1 && usermod -a -G "$grp" "$SERVICE_USER" 2>/dev/null || true
     done
 
     echo "20"; echo "# Creating directories..."
+    echo "gauge: creating directories" >&2
     mkdir -p "$INSTALL_DIR" "$CONFIG_DIR" "$LOG_DIR" /var/lib/pymc_repeater
 
     echo "25"; echo "# Installing system dependencies..."
+    echo "gauge: running apt-get update" >&2
     apt-get update -qq
-    DEBIAN_FRONTEND=noninteractive apt-get install -y libffi-dev libusb-1.0-0 sudo jq pip python3-venv python3-rrdtool wget swig build-essential python3-dev i2c-tools
+    echo "gauge: running apt-get install" >&2
+    DEBIAN_FRONTEND=noninteractive apt-get install -y git libffi-dev libusb-1.0-0 sudo jq pip python3-venv python3-rrdtool wget swig build-essential python3-dev i2c-tools
     # Install polkit (package name varies by distro version)
     DEBIAN_FRONTEND=noninteractive apt-get install -y policykit-1 2>/dev/null \
         || DEBIAN_FRONTEND=noninteractive apt-get install -y polkitd pkexec 2>/dev/null \
         || echo "    Warning: Could not install polkit (sudo fallback will be used)"
     # setuptools_scm needed for git version detection during build
-    pip install --break-system-packages setuptools_scm >/dev/null 2>&1 || python3 -m pip install --break-system-packages setuptools_scm >/dev/null 2>&1 || true
+    echo "gauge: installing setuptools_scm" >&2
+    pip install --break-system-packages setuptools_scm >/dev/null 2>&1 || python3 -m pip install --break-system-packages setuptools_scm >/dev/null 2>&1 || echo "Warning: setuptools_scm install failed; version detection will fall back to default" >&2
 
     echo "28"; echo "# Creating virtual environment..."
+    echo "gauge: creating venv" >&2
     ensure_venv
 
     # Install mikefarah yq v4 if not already installed
@@ -362,10 +368,12 @@ install_repeater() {
         elif [[ "$(uname -m)" == "armv7"* ]]; then
             YQ_BINARY="yq_linux_arm"
         fi
-        wget -qO /usr/local/bin/yq "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/${YQ_BINARY}" 2>/dev/null && chmod +x /usr/local/bin/yq
+        echo "gauge: downloading yq" >&2
+        wget -qO /usr/local/bin/yq "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/${YQ_BINARY}" 2>/dev/null && chmod +x /usr/local/bin/yq || echo "Warning: yq download failed, config merge will be skipped" >&2
     fi
 
     echo "29"; echo "# Installing files..."
+    echo "gauge: installing files" >&2
     cp "$SCRIPT_DIR/manage.sh" "$INSTALL_DIR/" 2>/dev/null || true
     cp "$SCRIPT_DIR/pymc-repeater.service" "$INSTALL_DIR/" 2>/dev/null || true
     cp "$SCRIPT_DIR/radio-settings.json" /var/lib/pymc_repeater/ 2>/dev/null || true
@@ -379,7 +387,7 @@ install_repeater() {
 
     echo "55"; echo "# Installing systemd service..."
     cp "$SCRIPT_DIR/pymc-repeater.service" /etc/systemd/system/
-    systemctl daemon-reload
+    systemctl daemon-reload 2>/dev/null || echo "Warning: systemctl daemon-reload failed; service may not start correctly" >&2
 
     echo "58"; echo "# Installing udev rules for CH341..."
     if [ -f "$SCRIPT_DIR/../pyMC_core/99-ch341.rules" ]; then
@@ -511,13 +519,14 @@ UPGRADEEOF
     chmod 0755 /usr/local/bin/pymc-do-upgrade
 
     echo "75"; echo "# Starting service..."
-    systemctl enable "$SERVICE_NAME"
+    systemctl enable "$SERVICE_NAME" 2>/dev/null || echo "Warning: systemctl enable failed; service will not start on boot" >&2
 
     echo "90"; echo "# Installation files complete..."
-    ) | $DIALOG --backtitle "pyMC Repeater Management" --title "Installing" --gauge "Setting up pyMC Repeater..." 8 70 0
+    echo "gauge: complete" >&2
+    ) 2>/tmp/pymc-install-gauge.log | $DIALOG --backtitle "pyMC Repeater Management" --title "Installing" --gauge "Setting up pyMC Repeater..." 8 70 0
 
     # Install Python package outside of progress gauge for better error handling
-    clear
+    clear 2>/dev/null || true
     echo "=== Installing Python Dependencies ==="
     echo ""
     echo "Installing pymc_repeater and dependencies (including pymc_core from PyPI)..."
@@ -526,6 +535,7 @@ UPGRADEEOF
 
     SCRIPT_DIR="$(dirname "$0")"
     cd "$SCRIPT_DIR"
+    git config --global --add safe.directory "$(pwd)" 2>/dev/null || echo "Warning: could not set git safe.directory; version detection will fall back to default"
 
     # Calculate version from git for setuptools_scm
     if [ -d .git ]; then
@@ -581,8 +591,8 @@ UPGRADEEOF
         if [ ! -f "/etc/systemd/system/${SERVICE_NAME}.service" ]; then
             cp "$SCRIPT_DIR/pymc-repeater.service" /etc/systemd/system/ 2>/dev/null ||             cp "$INSTALL_DIR/pymc-repeater.service" /etc/systemd/system/ || true
         fi
-        systemctl daemon-reload
-        systemctl start "$SERVICE_NAME"
+        systemctl daemon-reload 2>/dev/null || echo "Warning: systemctl daemon-reload failed; service may not start correctly"
+        systemctl start "$SERVICE_NAME" 2>/dev/null || true
     else
         echo ""
         echo "✗ Python package installation failed!"
@@ -594,7 +604,7 @@ UPGRADEEOF
     sleep 2
     local ip_address=$(hostname -I | awk '{print $1}')
     if is_running; then
-        clear
+        clear 2>/dev/null || true
         echo "═══════════════════════════════════════════════════════════════"
         echo "        ✓ Installation Completed Successfully!"
         echo "═══════════════════════════════════════════════════════════════"
@@ -759,7 +769,7 @@ upgrade_repeater() {
         apt-get install -y policykit-1 2>/dev/null \
             || apt-get install -y polkitd pkexec 2>/dev/null \
             || echo "    Warning: Could not install polkit (sudo fallback will be used)"
-        pip install --break-system-packages setuptools_scm >/dev/null 2>&1 || python3 -m pip install --break-system-packages setuptools_scm >/dev/null 2>&1 || true
+        pip install --break-system-packages setuptools_scm >/dev/null 2>&1 || python3 -m pip install --break-system-packages setuptools_scm >/dev/null 2>&1 || echo "Warning: setuptools_scm install failed; version detection will fall back to default"
 
         # Install mikefarah yq v4 if not already installed
         if ! command -v yq &> /dev/null || [[ "$(yq --version 2>&1)" != *"mikefarah/yq"* ]]; then
@@ -770,7 +780,7 @@ upgrade_repeater() {
             elif [[ "$(uname -m)" == "armv7"* ]]; then
                 YQ_BINARY="yq_linux_arm"
             fi
-            wget -qO /usr/local/bin/yq "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/${YQ_BINARY}" && chmod +x /usr/local/bin/yq
+            wget -qO /usr/local/bin/yq "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/${YQ_BINARY}" 2>/dev/null && chmod +x /usr/local/bin/yq || echo "Warning: yq download failed, config merge will be skipped"
         fi
         echo "    ✓ Dependencies updated"
 
