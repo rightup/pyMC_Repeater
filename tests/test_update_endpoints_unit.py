@@ -378,6 +378,31 @@ def test_do_install_root_buildroot_helper_missing(isolated_state, monkeypatch):
     assert "Buildroot upgrade helper not found" in (st.error_message or "")
 
 
+def test_enable_openhop_service_root_and_non_root(isolated_state, monkeypatch):
+    calls = []
+
+    def _run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(ue.os.path, "exists", lambda p: False)
+    monkeypatch.setattr(ue.subprocess, "run", _run)
+
+    monkeypatch.setattr(ue.os, "geteuid", lambda: 0)
+    ue._enable_openhop_service()
+    assert calls[-1][0] == [ue._SYSTEMCTL_BIN, "enable", "openhop-repeater.service"]
+
+    monkeypatch.setattr(ue.os, "geteuid", lambda: 1000)
+    ue._enable_openhop_service()
+    assert calls[-1][0] == [
+        ue._SUDO_BIN,
+        ue._SUDO_SYSTEMCTL_BIN,
+        "enable",
+        "openhop-repeater.service",
+    ]
+    assert any("starts on boot" in line for line in isolated_state.progress_lines)
+
+
 def test_do_install_root_install_command_failure_sets_error(isolated_state, monkeypatch):
     st = isolated_state
     st.channel = "main"
@@ -387,6 +412,7 @@ def test_do_install_root_install_command_failure_sets_error(isolated_state, monk
     monkeypatch.setattr(ue, "is_buildroot", lambda: False)
     monkeypatch.setattr(ue, "_migrate_service_unit", lambda: None)
     monkeypatch.setattr(ue, "_disable_legacy_services", lambda: None)
+    monkeypatch.setattr(ue, "_enable_openhop_service", lambda: None)
     monkeypatch.setattr(ue.os.path, "isfile", lambda p: True)
     monkeypatch.setattr(ue.os.path, "isdir", lambda p: False)
 
@@ -417,6 +443,7 @@ def test_do_install_wrapper_success_then_restart_failure(isolated_state, monkeyp
     monkeypatch.setattr(ue.os, "geteuid", lambda: 1000)
     monkeypatch.setattr(ue, "is_buildroot", lambda: False)
     monkeypatch.setattr(ue, "_cleanup_stale_dist_info", lambda *args, **kwargs: None)
+    monkeypatch.setattr(ue, "_enable_openhop_service", lambda: None)
     monkeypatch.setattr(ue.time, "sleep", lambda _s: None)
     monkeypatch.setattr(ue.os.path, "isfile", lambda p: p == "/usr/local/bin/pymc-do-upgrade")
     monkeypatch.setattr(
@@ -450,6 +477,7 @@ def test_do_install_wrapper_success_container_path(isolated_state, monkeypatch):
     monkeypatch.setattr(ue, "is_container", lambda: True)
     monkeypatch.setattr(ue, "get_container_restart_message", lambda: "container will restart")
     monkeypatch.setattr(ue, "_cleanup_stale_dist_info", lambda *args, **kwargs: None)
+    monkeypatch.setattr(ue, "_enable_openhop_service", lambda: None)
     monkeypatch.setattr(ue.time, "sleep", lambda _s: None)
     monkeypatch.setattr(ue.os.path, "isfile", lambda p: p == "/usr/local/bin/pymc-do-upgrade")
     monkeypatch.setattr("repeater.service_utils.restart_service", lambda: (True, "ok"))

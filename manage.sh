@@ -579,7 +579,7 @@ EOF
     mkdir -p /etc/sudoers.d
     cat > /etc/sudoers.d/openhop-repeater <<'EOF'
 # Allow repeater user to manage the openhop-repeater service without password
-repeater ALL=(root) NOPASSWD: /usr/bin/systemctl restart openhop-repeater, /usr/bin/systemctl stop openhop-repeater, /usr/bin/systemctl start openhop-repeater, /usr/bin/systemctl status openhop-repeater, /usr/local/bin/pymc-do-upgrade
+repeater ALL=(root) NOPASSWD: /usr/bin/systemctl restart openhop-repeater, /usr/bin/systemctl stop openhop-repeater, /usr/bin/systemctl start openhop-repeater, /usr/bin/systemctl status openhop-repeater, /usr/bin/systemctl enable openhop-repeater, /usr/bin/systemctl enable openhop-repeater.service, /usr/local/bin/pymc-do-upgrade
 EOF
     chmod 0440 /etc/sudoers.d/openhop-repeater
 
@@ -610,6 +610,8 @@ if [ ! -x "$VENV_PYTHON" ]; then
 fi
 # ---- Migration: clean up legacy service unit issues ----
 SVC_UNIT=/etc/systemd/system/openhop-repeater.service
+# Ensure the migrated openHop service remains enabled across reboots.
+systemctl enable openhop-repeater.service >/dev/null 2>&1 || true
 if grep -q 'PYTHONPATH' "$SVC_UNIT" 2>/dev/null; then
     sed -i '/^Environment=.*PYTHONPATH/d' "$SVC_UNIT"
     systemctl daemon-reload
@@ -1016,7 +1018,7 @@ EOF
         mkdir -p /etc/sudoers.d
         cat > /etc/sudoers.d/openhop-repeater <<'EOF'
 # Allow repeater user to manage the openhop-repeater service without password
-repeater ALL=(root) NOPASSWD: /usr/bin/systemctl restart openhop-repeater, /usr/bin/systemctl stop openhop-repeater, /usr/bin/systemctl start openhop-repeater, /usr/bin/systemctl status openhop-repeater, /usr/local/bin/pymc-do-upgrade
+repeater ALL=(root) NOPASSWD: /usr/bin/systemctl restart openhop-repeater, /usr/bin/systemctl stop openhop-repeater, /usr/bin/systemctl start openhop-repeater, /usr/bin/systemctl status openhop-repeater, /usr/bin/systemctl enable openhop-repeater, /usr/bin/systemctl enable openhop-repeater.service, /usr/local/bin/pymc-do-upgrade
 EOF
         chmod 0440 /etc/sudoers.d/openhop-repeater
         # Install / refresh OTA upgrade wrapper
@@ -1046,6 +1048,8 @@ if [ ! -x "$VENV_PYTHON" ]; then
 fi
 # ---- Migration: clean up legacy service unit issues ----
 SVC_UNIT=/etc/systemd/system/openhop-repeater.service
+# Ensure the migrated openHop service remains enabled across reboots.
+systemctl enable openhop-repeater.service >/dev/null 2>&1 || true
 if grep -q 'PYTHONPATH' "$SVC_UNIT" 2>/dev/null; then
     sed -i '/^Environment=.*PYTHONPATH/d' "$SVC_UNIT"
     systemctl daemon-reload

@@ -52,9 +52,11 @@ CHECK_CACHE_TTL = 600  # 10 minutes
 _RM_BIN = "/bin/rm"
 _SED_BIN = "/usr/bin/sed"
 _SYSTEMCTL_BIN = "/bin/systemctl"
+_SUDO_SYSTEMCTL_BIN = "/usr/bin/systemctl"
 _SUDO_BIN = "/usr/bin/sudo"
 _INSTALL_DIR = "/opt/openhop_repeater"
 _LEGACY_PYMC_INSTALL_DIR = "/opt/pymc_repeater"
+_OPENHOP_SERVICE_UNIT = "openhop-repeater.service"
 
 _github_ssl_ctx: Optional[ssl.SSLContext] = None
 _disk_version_mismatch_logged: Optional[tuple] = None
@@ -846,6 +848,39 @@ def _migrate_service_unit() -> None:
         logger.warning(f"[Update] Service unit migration failed: {exc}")
 
 
+def _enable_openhop_service() -> None:
+    """Ensure the openHop systemd service remains enabled after OTA upgrades.
+
+    Web/OTA upgrades may stop and disable the legacy pymc unit while migrating
+    to openhop-repeater. Restarting the service after pip install is not enough:
+    a disabled unit will not come back after reboot. Keep this best-effort so an
+    enable failure does not mask an otherwise successful package upgrade.
+    """
+    if os.path.exists("/etc/pymc-image-build-id"):
+        logger.info("[Update] Buildroot image detected, skipping systemd enable.")
+        return
+
+    try:
+        cmd = [_SYSTEMCTL_BIN, "enable", _OPENHOP_SERVICE_UNIT]
+        if os.geteuid() != 0:
+            cmd = [_SUDO_BIN, _SUDO_SYSTEMCTL_BIN, "enable", _OPENHOP_SERVICE_UNIT]
+
+        result = subprocess.run(
+            cmd,
+            check=False,
+            capture_output=True,
+            text=True,
+        )  # nosec B603
+        if result.returncode == 0:
+            _state.append_line("[pyMC updater] Ensured openhop-repeater starts on boot")
+            logger.info("[Update] openhop-repeater service enabled.")
+        else:
+            stderr = (result.stderr or result.stdout or "").strip()
+            logger.warning(f"[Update] Could not enable openhop-repeater service: {stderr}")
+    except Exception as exc:
+        logger.warning(f"[Update] Could not enable openhop-repeater service: {exc}")
+
+
 def _migrate_pymc_install_dir() -> None:
     """Move legacy /opt/pymc_repeater into /opt/openhop_repeater when needed."""
     if not os.path.isdir(_LEGACY_PYMC_INSTALL_DIR):
@@ -962,6 +997,7 @@ def _do_install() -> None:
         _disable_legacy_services()
         _migrate_pymc_install_dir()
         _migrate_service_unit()
+        _enable_openhop_service()
 
         # Ensure venv exists (migration from system-pip era)
         if not os.path.isfile(_VENV_PYTHON):
@@ -1003,6 +1039,8 @@ def _do_install() -> None:
     success = _run(cmd, env=env)
 
     if success:
+        if not is_root:
+            _enable_openhop_service()
         _cleanup_stale_dist_info()
         _state.append_line("[pyMC updater] Restarting service in 3 seconds…")
         time.sleep(3)
