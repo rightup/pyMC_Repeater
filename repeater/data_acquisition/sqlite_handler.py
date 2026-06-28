@@ -992,13 +992,30 @@ class SQLiteHandler:
                 packets = conn.execute(
                     """
                     SELECT
-                        timestamp, type, route, length, rssi, snr, score,
-                        transmitted, is_duplicate, drop_reason, src_hash, dst_hash, path_hash,
-                        transport_codes, payload, payload_length,
-                        tx_delay_ms, packet_hash, original_path, forwarded_path,
-                        lbt_attempts, lbt_channel_busy
-                    FROM packets
-                    ORDER BY timestamp DESC
+                        p.timestamp, p.type, p.route, p.length, p.rssi, p.snr, p.score,
+                        p.transmitted, p.is_duplicate, p.drop_reason, p.src_hash, p.dst_hash, p.path_hash,
+                        p.transport_codes, p.payload, p.payload_length,
+                        p.tx_delay_ms, p.packet_hash, p.original_path, p.forwarded_path,
+                        p.lbt_attempts, p.lbt_channel_busy,
+                        cm.text AS companion_text,
+                        cm.txt_type AS companion_txt_type,
+                        cm.timestamp AS companion_timestamp,
+                        cm.is_channel AS companion_is_channel,
+                        cm.channel_idx AS companion_channel_idx,
+                        cm.path_len AS companion_path_len,
+                        hex(cm.sender_key) AS companion_sender_key,
+                        ch.name AS companion_channel_name
+                    FROM packets p
+                    LEFT JOIN companion_messages cm ON cm.id = (
+                        SELECT id FROM companion_messages
+                        WHERE packet_hash = p.packet_hash
+                        ORDER BY created_at DESC, id DESC
+                        LIMIT 1
+                    )
+                    LEFT JOIN companion_channels ch
+                        ON ch.companion_hash = cm.companion_hash
+                       AND ch.channel_idx = cm.channel_idx
+                    ORDER BY p.timestamp DESC
                     LIMIT ?
                 """,
                     (limit,),
@@ -1044,20 +1061,37 @@ class SQLiteHandler:
 
                 base_query = """
                     SELECT
-                        timestamp, type, route, length, rssi, snr, score,
-                        transmitted, is_duplicate, drop_reason, src_hash, dst_hash, path_hash,
-                        transport_codes, payload, payload_length,
-                        tx_delay_ms, packet_hash, original_path, forwarded_path,
-                        lbt_attempts, lbt_channel_busy
-                    FROM packets
+                        p.timestamp, p.type, p.route, p.length, p.rssi, p.snr, p.score,
+                        p.transmitted, p.is_duplicate, p.drop_reason, p.src_hash, p.dst_hash, p.path_hash,
+                        p.transport_codes, p.payload, p.payload_length,
+                        p.tx_delay_ms, p.packet_hash, p.original_path, p.forwarded_path,
+                        p.lbt_attempts, p.lbt_channel_busy,
+                        cm.text AS companion_text,
+                        cm.txt_type AS companion_txt_type,
+                        cm.timestamp AS companion_timestamp,
+                        cm.is_channel AS companion_is_channel,
+                        cm.channel_idx AS companion_channel_idx,
+                        cm.path_len AS companion_path_len,
+                        hex(cm.sender_key) AS companion_sender_key,
+                        ch.name AS companion_channel_name
+                    FROM packets p
+                    LEFT JOIN companion_messages cm ON cm.id = (
+                        SELECT id FROM companion_messages
+                        WHERE packet_hash = p.packet_hash
+                        ORDER BY created_at DESC, id DESC
+                        LIMIT 1
+                    )
+                    LEFT JOIN companion_channels ch
+                        ON ch.companion_hash = cm.companion_hash
+                       AND ch.channel_idx = cm.channel_idx
                 """
 
                 if where_clauses:
-                    query = f"{base_query} WHERE {' AND '.join(where_clauses)}"
+                    query = f"{base_query} WHERE {' AND '.join('p.' + clause for clause in where_clauses)}"
                 else:
                     query = base_query
 
-                query += " ORDER BY timestamp DESC LIMIT ? OFFSET ?"
+                query += " ORDER BY p.timestamp DESC LIMIT ? OFFSET ?"
                 params.append(limit)
                 params.append(offset)
 
@@ -1176,13 +1210,30 @@ class SQLiteHandler:
                 packet = conn.execute(
                     """
                     SELECT
-                        timestamp, type, route, length, rssi, snr, score,
-                        transmitted, is_duplicate, drop_reason, src_hash, dst_hash, path_hash,
-                        header, transport_codes, payload, payload_length,
-                        tx_delay_ms, packet_hash, original_path, forwarded_path, raw_packet,
-                        lbt_attempts, lbt_backoff_delays_ms, lbt_channel_busy
-                    FROM packets
-                    WHERE packet_hash = ?
+                        p.timestamp, p.type, p.route, p.length, p.rssi, p.snr, p.score,
+                        p.transmitted, p.is_duplicate, p.drop_reason, p.src_hash, p.dst_hash, p.path_hash,
+                        p.header, p.transport_codes, p.payload, p.payload_length,
+                        p.tx_delay_ms, p.packet_hash, p.original_path, p.forwarded_path, p.raw_packet,
+                        p.lbt_attempts, p.lbt_backoff_delays_ms, p.lbt_channel_busy,
+                        cm.text AS companion_text,
+                        cm.txt_type AS companion_txt_type,
+                        cm.timestamp AS companion_timestamp,
+                        cm.is_channel AS companion_is_channel,
+                        cm.channel_idx AS companion_channel_idx,
+                        cm.path_len AS companion_path_len,
+                        hex(cm.sender_key) AS companion_sender_key,
+                        ch.name AS companion_channel_name
+                    FROM packets p
+                    LEFT JOIN companion_messages cm ON cm.id = (
+                        SELECT id FROM companion_messages
+                        WHERE packet_hash = p.packet_hash
+                        ORDER BY created_at DESC, id DESC
+                        LIMIT 1
+                    )
+                    LEFT JOIN companion_channels ch
+                        ON ch.companion_hash = cm.companion_hash
+                       AND ch.channel_idx = cm.channel_idx
+                    WHERE p.packet_hash = ?
                 """,
                     (packet_hash,),
                 ).fetchone()
