@@ -45,10 +45,14 @@ class StorageCollector:
             config.get("mqtt_brokers", {}) or config.get("letsmesh", {}) or config.get("mqtt", {})
         ) and local_identity:
             try:
+                # Extract JWT expiry from repeater.security config (default 10 minutes for backward compatibility)
+                jwt_expiry_minutes = config.get("repeater", {}).get("security", {}).get("jwt_expiry_minutes", 10)
+
                 # Pass local_identity directly (supports both standard and firmware keys)
                 self.mqtt_handler = MeshCoreToMqttPusher(
                     local_identity=local_identity,
                     config=config,
+                    jwt_expiry_minutes=jwt_expiry_minutes,
                     stats_provider=self._get_live_stats,
                 )
                 self.mqtt_handler.connect()
