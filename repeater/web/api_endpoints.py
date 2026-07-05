@@ -3326,7 +3326,7 @@ class APIEndpoints:
             "latitude": 0.0,             # Latitude (-90 to 90)
             "longitude": 0.0,            # Longitude (-180 to 180)
             "max_flood_hops": 64,         # Max flood hops (0-64)
-            "flood_advert_interval_hours": 10,  # Flood advert interval (0 or 3-50)
+            "flood_advert_interval_hours": 10,  # Flood advert interval (0 or 3-168)
             "advert_interval_minutes": 120      # Local advert interval (0 or 1-10080)
         }
 
@@ -3461,8 +3461,8 @@ class APIEndpoints:
             # Update flood advert interval (hours)
             if "flood_advert_interval_hours" in data:
                 hours = int(data["flood_advert_interval_hours"])
-                if hours != 0 and (hours < 3 or hours > 50):
-                    return self._error("Flood advert interval must be 0 (off) or 3-50 hours")
+                if hours != 0 and (hours < 3 or hours > 168):
+                    return self._error("Flood advert interval must be 0 (off) or 3-168 hours")
                 self.config["repeater"]["send_advert_interval_hours"] = hours
                 applied.append(f"flood.advert.interval={hours}h")
 

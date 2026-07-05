@@ -231,7 +231,7 @@ class MeshCLI:
                 "  set guest.password <pw> Guest password\n"
                 "  set allow.read.only on|off  Read-only access\n"
                 "  set advert.interval <min>   60-240 minutes\n"
-                "  set flood.advert.interval <hr>  3-50 hours\n"
+                "  set flood.advert.interval <hr>  3-168 hours\n"
                 "  set flood.max <hops>   Max flood hops (max 64)\n"
                 "  set rxdelay <val>      RX delay base (>=0)\n"
                 "  set txdelay <val>      TX delay factor (>=0)\n"
@@ -519,8 +519,8 @@ class MeshCLI:
 
             elif key == "flood.advert.interval":
                 hours = int(value)
-                if (hours > 0 and hours < 3) or hours > 50:
-                    return "Error: interval range is 3-50 hours"
+                if (hours > 0 and hours < 3) or hours > 168:
+                    return "Error: interval range is 3-168 hours"
                 self.repeater_config["flood_advert_interval_hours"] = hours
                 self.save_config()
                 return "OK"

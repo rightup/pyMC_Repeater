@@ -203,7 +203,7 @@ def test_cli_set_commands_apply_and_validate_ranges():
     assert cli._cmd_set("advert.interval 60") == "OK"
 
     assert cli._cmd_set("flood.advert.interval 2").startswith("Error: interval range")
-    assert cli._cmd_set("flood.advert.interval 50") == "OK"
+    assert cli._cmd_set("flood.advert.interval 168") == "OK"
 
     assert cli._cmd_set("flood.max 65") == "Error: max 64"
     assert cli._cmd_set("flood.max 64") == "OK"
