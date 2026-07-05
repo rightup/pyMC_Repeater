@@ -45,9 +45,7 @@ class StorageCollector:
         letsmesh_config = config.get("letsmesh", {}) or {}
         mqtt_config = config.get("mqtt", {}) or {}
         has_brokers_configured = (
-            bool(mqtt_brokers_config.get("brokers"))
-            or bool(letsmesh_config)
-            or bool(mqtt_config)
+            bool(mqtt_brokers_config.get("brokers")) or bool(letsmesh_config) or bool(mqtt_config)
         )
         if has_brokers_configured and local_identity:
             try:
