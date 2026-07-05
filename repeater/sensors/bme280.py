@@ -1,13 +1,16 @@
 """
 BME280 temperature, humidity, and pressure sensor plug-in.
 
+If you're using docker, be sure to add the I2C group to group_add
+You can find that group ID by running `getent group i2c`
+
 Requires: pip install smbus2
 
 Config example:
   - type: bme280
     name: "ambient"
     enabled: true
-    auto_install_packages: false
+    auto_install_packages: true
     settings:
       i2c_address: 0x76
       bus_number: 1
@@ -23,7 +26,7 @@ from typing import Any, Dict, Optional
 from .base import SensorBase
 from .registry import SensorRegistry
 
-# Registers
+# Register addresses
 _REG_ID = 0xD0
 _REG_STATUS = 0xF3
 _REG_CTRL_HUM = 0xF2
