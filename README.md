@@ -520,7 +520,9 @@ pre-commit run --all-files
 ```
 
 Hardware support for LoRa radio drivers is included in the base installation
-through `openhop_core[hardware]`.
+through `openhop_core[hardware]` on Linux. On other platforms (e.g. macOS),
+`openhop_core` is installed without the hardware extra, since `spidev` and
+similar packages only build against the Linux SPI kernel headers.
 
 Pre-commit hooks will automatically:
 - Lint and auto-fix Python issues with Ruff
