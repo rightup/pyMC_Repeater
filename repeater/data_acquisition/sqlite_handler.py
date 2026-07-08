@@ -191,6 +191,14 @@ class SQLiteHandler:
                 conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_packets_transmitted ON packets(transmitted)"
                 )
+                # Covering index for the airtime/utilization charts. get_airtime_data
+                # and get_airtime_buckets range-scan and order by timestamp, selecting
+                # only these columns; keeping them all in the index lets SQLite serve
+                # the query index-only, avoiding a full scan of the (large) row heap.
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_packets_airtime "
+                    "ON packets(timestamp, length, payload_length, transmitted)"
+                )
                 conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_adverts_timestamp ON adverts(timestamp)"
                 )
