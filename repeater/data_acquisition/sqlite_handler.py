@@ -973,10 +973,16 @@ class SQLiteHandler:
                     (cutoff,),
                 ).fetchone()
 
+                # INDEXED BY forces the timestamp range scan. Without it the
+                # planner picks idx_packets_type / idx_packets_transmitted to get
+                # grouping for free, then heap-checks the timestamp filter across
+                # the entire table — turning a bounded window into a full scan
+                # (~5s vs ~0.1s at 1.5M rows). A small temp b-tree over the
+                # windowed rows is far cheaper.
                 types = conn.execute(
                     """
                     SELECT type, COUNT(*) as count
-                    FROM packets
+                    FROM packets INDEXED BY idx_packets_timestamp
                     WHERE timestamp > ?
                     GROUP BY type
                     ORDER BY count DESC
@@ -987,7 +993,7 @@ class SQLiteHandler:
                 drop_reasons = conn.execute(
                     """
                     SELECT drop_reason, COUNT(*) as count
-                    FROM packets
+                    FROM packets INDEXED BY idx_packets_timestamp
                     WHERE timestamp > ? AND transmitted = 0 AND drop_reason IS NOT NULL
                     GROUP BY drop_reason
                     ORDER BY count DESC
@@ -1314,10 +1320,12 @@ class SQLiteHandler:
             with self._connect() as conn:
                 conn.row_factory = sqlite3.Row
 
+                # See get_packet_stats: force the timestamp range scan so the
+                # windowed GROUP BY doesn't degrade into a full-table scan.
                 type_rows = conn.execute(
                     """
                     SELECT type, COUNT(*) as count
-                    FROM packets
+                    FROM packets INDEXED BY idx_packets_timestamp
                     WHERE timestamp > ?
                     GROUP BY type
                 """,
