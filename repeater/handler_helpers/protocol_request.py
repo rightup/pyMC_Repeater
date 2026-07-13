@@ -124,13 +124,22 @@ class ProtocolRequestHelper:
             if not handler_info:
                 return False
 
-            # Let core handler build response
-            response_packet = await handler_info["handler"](packet)
+            # Let the core handler decrypt and build a response. It returns a
+            # HandlerResult: authenticated is False when the one-byte dest hash
+            # collided with ours but the REQ did not decrypt for a local client —
+            # do not consume it, so the engine can still forward/re-flood it.
+            result = await handler_info["handler"](packet)
+            if not result.authenticated:
+                logger.debug(
+                    f"REQ dest 0x{dest_hash:02X} did not decrypt for a local identity "
+                    f"(hash collision), allowing forward"
+                )
+                return False
 
             # Send response after delay
-            if response_packet and self.packet_injector:
+            if result.response and self.packet_injector:
                 await asyncio.sleep(SERVER_RESPONSE_DELAY_MS / 1000.0)
-                await self.packet_injector(response_packet, wait_for_ack=False)
+                await self.packet_injector(result.response, wait_for_ack=False)
 
             packet.mark_do_not_retransmit()
             return True

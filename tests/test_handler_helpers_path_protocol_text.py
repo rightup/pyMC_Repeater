@@ -5,9 +5,72 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from openhop_core.node.handlers.result import HandlerResult
+from openhop_core.protocol import Identity, LocalIdentity
+from openhop_core.protocol.packet_builder import PacketBuilder
+
+from repeater.handler_helpers.acl import ACL, PERM_ACL_ADMIN, ClientInfo
 from repeater.handler_helpers.path import PathHelper
 from repeater.handler_helpers.protocol_request import ProtocolRequestHelper
 from repeater.handler_helpers.text import TextHelper
+
+# ---------------------------------------------------------------------------
+# Real-crypto collision scaffolding (BUG-053 "try all local candidates").
+#
+# A one-byte destination hash can collide: a packet addressed to a remote node
+# (or a forged packet) can share its first public-key byte with a local
+# identity. These helpers build genuinely-encrypted packets so we can prove the
+# repeater consumes only when a local identity actually decrypts, and otherwise
+# forwards.
+# ---------------------------------------------------------------------------
+
+TXT_TYPE_CLI_DATA = 1  # no delivery ACK -> deterministic (no background ACK task)
+
+
+def _distinct_identities(n=3):
+    """Return `n` identities whose public keys start with distinct bytes."""
+    ids, seen = [], set()
+    while len(ids) < n:
+        idn = LocalIdentity()
+        first = idn.get_public_key()[0]
+        if first in seen:
+            continue
+        seen.add(first)
+        ids.append(idn)
+    return ids
+
+
+class _SendDest:
+    """Minimal contact object accepted by PacketBuilder as a send destination."""
+
+    def __init__(self, pubkey: bytes):
+        self.public_key = pubkey.hex()
+        self.out_path = []
+        self.out_path_len = -1
+
+
+def _force_dest_hash(packet, hash_byte: int):
+    """Rewrite the on-air one-byte dest hash to simulate a prefix collision."""
+    packet.payload = bytearray(packet.payload)
+    packet.payload[0] = hash_byte
+    return packet
+
+
+def _acl_with_client(sender, local_identity=None):
+    """ACL holding `sender` as an admin client.
+
+    When `local_identity` is given, the real shared secret is precomputed —
+    the protocol-request handler reads `client.shared_secret` directly.
+    """
+    acl = ACL()
+    sender_pub = sender.get_public_key()
+    client = ClientInfo(Identity(sender_pub), permissions=PERM_ACL_ADMIN)
+    if local_identity is not None:
+        client.shared_secret = Identity(sender_pub).calc_shared_secret(
+            local_identity.get_private_key()
+        )
+    acl.clients[sender_pub] = client
+    return acl
 
 
 class _FakeId:
@@ -169,7 +232,7 @@ async def test_protocol_request_process_routes_and_marks_no_retransmit():
     response_packet = object()
 
     async def _core_handler(_packet):
-        return response_packet
+        return HandlerResult.consumed(response_packet)
 
     helper.handlers[dest] = {"handler": _core_handler}
     pkt = _ReqPacket(payload=bytes([dest, 0x01, 0x02]))
@@ -180,6 +243,50 @@ async def test_protocol_request_process_routes_and_marks_no_retransmit():
     assert handled is True
     pkt.mark_do_not_retransmit.assert_called_once()
     injector.assert_awaited_once_with(response_packet, wait_for_ack=False)
+
+
+@pytest.mark.asyncio
+async def test_protocol_request_forwards_on_dest_hash_collision():
+    """A REQ whose dest prefix collides with ours but does not decrypt for a
+    local client must not be consumed, so the engine can still forward it."""
+    injector = AsyncMock(return_value=True)
+    helper = ProtocolRequestHelper(identity_manager=MagicMock(), packet_injector=injector)
+
+    dest = 0x42
+
+    async def _core_handler(_packet):
+        # MAC failed for every same-hash candidate -> not for us.
+        return HandlerResult.not_for_us()
+
+    helper.handlers[dest] = {"handler": _core_handler}
+    pkt = _ReqPacket(payload=bytes([dest, 0x01, 0x02]))
+
+    handled = await helper.process_request_packet(pkt)
+
+    assert handled is False
+    pkt.mark_do_not_retransmit.assert_not_called()
+    injector.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_protocol_request_consumes_authenticated_without_response():
+    """A REQ that authenticates for us but yields no reply is still consumed."""
+    injector = AsyncMock(return_value=True)
+    helper = ProtocolRequestHelper(identity_manager=MagicMock(), packet_injector=injector)
+
+    dest = 0x42
+
+    async def _core_handler(_packet):
+        return HandlerResult.consumed()
+
+    helper.handlers[dest] = {"handler": _core_handler}
+    pkt = _ReqPacket(payload=bytes([dest, 0x01, 0x02]))
+
+    handled = await helper.process_request_packet(pkt)
+
+    assert handled is True
+    pkt.mark_do_not_retransmit.assert_called_once()
+    injector.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -330,7 +437,8 @@ async def test_text_helper_process_text_packet_routes_or_forwards():
     pkt_unknown = SimpleNamespace(payload=bytearray([0x55, 0x66]))
     assert await helper.process_text_packet(pkt_unknown) is False
 
-    h = AsyncMock()
+    # Handler decrypts successfully: consume and stop forwarding.
+    h = AsyncMock(return_value=HandlerResult.consumed())
     helper.handlers[0x10] = {"handler": h, "name": "id-a", "type": "repeater"}
     helper._on_message_received = AsyncMock()
     pkt = SimpleNamespace(payload=bytearray([0x10, 0x66]), mark_do_not_retransmit=MagicMock())
@@ -341,6 +449,26 @@ async def test_text_helper_process_text_packet_routes_or_forwards():
     h.assert_awaited_once_with(pkt)
     helper._on_message_received.assert_awaited_once()
     pkt.mark_do_not_retransmit.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_text_helper_process_text_packet_hash_collision_forwards():
+    """dest hash matches a local identity but decryption fails (collision): the
+    packet is not ours, so it must NOT be consumed and must be left to forward (#353)."""
+    helper = TextHelper(identity_manager=MagicMock(), acl_dict={})
+
+    # Handler could not decrypt for this identity.
+    h = AsyncMock(return_value=HandlerResult.not_for_us())
+    helper.handlers[0x10] = {"handler": h, "name": "id-a", "type": "repeater"}
+    helper._on_message_received = AsyncMock()
+    pkt = SimpleNamespace(payload=bytearray([0x10, 0x66]), mark_do_not_retransmit=MagicMock())
+
+    handled = await helper.process_text_packet(pkt)
+
+    assert handled is False
+    h.assert_awaited_once_with(pkt)
+    helper._on_message_received.assert_not_awaited()
+    pkt.mark_do_not_retransmit.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -438,3 +566,88 @@ async def test_text_helper_send_cli_reply_uses_direct_path_from_client():
     assert bytes(reply_packet.path) == b"\xaa\xbb"
     assert reply_packet.path_len == 2
     helper._send_packet.assert_awaited_once_with(reply_packet, wait_for_ack=False)
+
+
+# ---------------------------------------------------------------------------
+# Real-crypto collision integration tests (BUG-053).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_text_helper_real_crypto_consume_vs_collision_forward():
+    """A real, correctly-encrypted DM to a local room-server identity is consumed;
+    a DM encrypted for a remote node that merely collides on the one-byte dest
+    hash fails to decrypt and is left for the forwarding engine."""
+    local, sender, remote = _distinct_identities()
+    local_hash = local.get_public_key()[0]
+
+    helper = TextHelper(
+        identity_manager=MagicMock(),
+        acl_dict={local_hash: _acl_with_client(sender)},
+        packet_injector=AsyncMock(),
+    )
+    helper.register_identity("room-a", local, identity_type="room_server")
+    helper._on_message_received = AsyncMock()
+
+    # Genuine CLI_DATA DM to the local identity from a known sender.
+    genuine, _ = PacketBuilder.create_text_message(
+        _SendDest(local.get_public_key()),
+        sender,
+        "status",
+        message_type="flood",
+        txt_type=TXT_TYPE_CLI_DATA,
+    )
+    assert await helper.process_text_packet(genuine) is True
+    assert genuine.is_marked_do_not_retransmit()
+    helper._on_message_received.assert_awaited_once()
+
+    # DM encrypted for a REMOTE node whose one-byte dest hash collides with ours.
+    helper._on_message_received.reset_mock()
+    collision, _ = PacketBuilder.create_text_message(
+        _SendDest(remote.get_public_key()),
+        sender,
+        "not yours",
+        message_type="flood",
+        txt_type=TXT_TYPE_CLI_DATA,
+    )
+    _force_dest_hash(collision, local_hash)
+    assert await helper.process_text_packet(collision) is False
+    assert not collision.is_marked_do_not_retransmit()
+    helper._on_message_received.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_protocol_request_real_crypto_consume_vs_collision_forward():
+    """A real, correctly-encrypted REQ to a local identity is consumed and
+    answered; a REQ encrypted for a colliding remote node is left to forward."""
+    from openhop_core.node.handlers.protocol_request import REQ_TYPE_GET_STATUS
+
+    local, sender, remote = _distinct_identities()
+    local_hash = local.get_public_key()[0]
+
+    injector = AsyncMock(return_value=True)
+    helper = ProtocolRequestHelper(
+        identity_manager=MagicMock(),
+        packet_injector=injector,
+        acl_dict={local_hash: _acl_with_client(sender, local_identity=local)},
+    )
+    helper.register_identity("rep", local, identity_type="repeater")
+
+    genuine, _ = PacketBuilder.create_protocol_request(
+        _SendDest(local.get_public_key()), sender, REQ_TYPE_GET_STATUS
+    )
+    with patch(
+        "repeater.handler_helpers.protocol_request.asyncio.sleep", new_callable=AsyncMock
+    ):
+        assert await helper.process_request_packet(genuine) is True
+    assert genuine.is_marked_do_not_retransmit()
+    injector.assert_awaited()  # a response was transmitted
+
+    injector.reset_mock()
+    collision, _ = PacketBuilder.create_protocol_request(
+        _SendDest(remote.get_public_key()), sender, REQ_TYPE_GET_STATUS
+    )
+    _force_dest_hash(collision, local_hash)
+    assert await helper.process_request_packet(collision) is False
+    assert not collision.is_marked_do_not_retransmit()
+    injector.assert_not_awaited()

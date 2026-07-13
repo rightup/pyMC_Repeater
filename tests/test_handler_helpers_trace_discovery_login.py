@@ -4,11 +4,44 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+
+from openhop_core.node.handlers.result import HandlerResult
+from openhop_core.protocol import LocalIdentity
 from openhop_core.protocol.constants import PAYLOAD_TYPE_ANON_REQ, ROUTE_TYPE_DIRECT
+from openhop_core.protocol.packet_builder import PacketBuilder
 
 from repeater.handler_helpers.discovery import DiscoveryHelper
 from repeater.handler_helpers.login import LoginHelper
 from repeater.handler_helpers.trace import TraceHelper
+
+
+def _distinct_identities(n=3):
+    """Return `n` identities whose public keys start with distinct bytes."""
+    ids, seen = [], set()
+    while len(ids) < n:
+        idn = LocalIdentity()
+        first = idn.get_public_key()[0]
+        if first in seen:
+            continue
+        seen.add(first)
+        ids.append(idn)
+    return ids
+
+
+class _SendDest:
+    """Minimal contact object accepted by PacketBuilder as a send destination."""
+
+    def __init__(self, pubkey: bytes):
+        self.public_key = pubkey.hex()
+        self.out_path = []
+        self.out_path_len = -1
+
+
+def _force_dest_hash(packet, hash_byte: int):
+    """Rewrite the on-air one-byte dest hash to simulate a prefix collision."""
+    packet.payload = bytearray(packet.payload)
+    packet.payload[0] = hash_byte
+    return packet
 
 
 class DummyPacket:
@@ -489,7 +522,8 @@ def test_owner_and_features_callbacks_from_config():
 @pytest.mark.asyncio
 async def test_login_process_packet_routes_to_registered_handler_and_marks_no_retransmit():
     helper = LoginHelper(identity_manager=MagicMock(), packet_injector=AsyncMock())
-    login_handler = AsyncMock()
+    # Handler decrypts successfully: consume and stop forwarding.
+    login_handler = AsyncMock(return_value=HandlerResult.consumed())
     helper.handlers[0x62] = login_handler
 
     packet = SimpleNamespace(
@@ -503,6 +537,28 @@ async def test_login_process_packet_routes_to_registered_handler_and_marks_no_re
     assert handled is True
     login_handler.assert_awaited_once_with(packet)
     packet.mark_do_not_retransmit.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_login_process_packet_hash_collision_forwards():
+    """dest hash matches a local identity but decryption fails (collision): the
+    ANON_REQ is not ours, so it must NOT be consumed and must forward (#353)."""
+    helper = LoginHelper(identity_manager=MagicMock(), packet_injector=AsyncMock())
+    # Handler could not decrypt for this identity.
+    login_handler = AsyncMock(return_value=HandlerResult.not_for_us())
+    helper.handlers[0x62] = login_handler
+
+    packet = SimpleNamespace(
+        payload=bytearray([0x62, 0xAA]),
+        get_payload_type=lambda: 0x01,
+        mark_do_not_retransmit=MagicMock(),
+    )
+
+    handled = await helper.process_login_packet(packet)
+
+    assert handled is False
+    login_handler.assert_awaited_once_with(packet)
+    packet.mark_do_not_retransmit.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -545,3 +601,32 @@ def test_login_acl_access_and_client_listing():
 
     all_clients = helper.list_authenticated_clients()
     assert {c["id"] for c in all_clients} == {"a1", "b1", "b2"}
+
+
+@pytest.mark.asyncio
+async def test_login_helper_real_crypto_consume_vs_collision_forward():
+    """A real ANON_REQ login to a local room-server identity is consumed (a wrong
+    password still decrypts, so it is ours to reject); an ANON_REQ encrypted for a
+    remote node that collides on the one-byte dest hash is left for forwarding."""
+    local, sender, remote = _distinct_identities()
+    local_hash = local.get_public_key()[0]
+
+    helper = LoginHelper(identity_manager=MagicMock(), packet_injector=AsyncMock())
+    helper.register_identity(
+        "room-a",
+        local,
+        identity_type="room_server",
+        config={"settings": {"admin_password": "secret"}},
+    )
+    assert local_hash in helper.handlers  # registration succeeded
+
+    # Genuine login (wrong password still decrypts -> ours to reject, not forward).
+    genuine = PacketBuilder.create_login_packet(_SendDest(local.get_public_key()), sender, "nope")
+    assert await helper.process_login_packet(genuine) is True
+    assert genuine.is_marked_do_not_retransmit()
+
+    # Login encrypted for a remote node whose dest hash collides with ours.
+    collision = PacketBuilder.create_login_packet(_SendDest(remote.get_public_key()), sender, "nope")
+    _force_dest_hash(collision, local_hash)
+    assert await helper.process_login_packet(collision) is False
+    assert not collision.is_marked_do_not_retransmit()

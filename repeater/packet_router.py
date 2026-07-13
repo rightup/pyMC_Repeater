@@ -253,6 +253,41 @@ class PacketRouter:
             return {}
         return companion_bridges
 
+    async def _consume_via_local_candidates(
+        self, packet, metadata: dict, dest_hash, helper, process_method_name: str
+    ) -> bool:
+        """Try every local candidate that shares ``dest_hash`` and report consumption.
+
+        The on-air destination hash is only one byte, so several local identities
+        can share it. The candidates are the companion bridge registered at
+        ``dest_hash`` and the room-server / repeater identity registered in
+        ``helper`` (login, text, or protocol-request) at the same hash. Both are
+        offered the packet; the one whose key MAC-verifies it consumes it, the
+        other fails HMAC and no-ops.
+
+        Returns True only when at least one candidate authenticated (decrypted)
+        the packet. Consuming solely on authenticated handling is what lets a
+        one-byte prefix collision with a remote node — or a forged packet — fall
+        through to the forwarding engine instead of being swallowed.
+        """
+        companion_bridges = self._companion_bridges_for_packet(packet, metadata)
+        helper_handlers = getattr(helper, "handlers", {}) if helper else {}
+        has_companion = dest_hash is not None and dest_hash in companion_bridges
+        has_local_identity = dest_hash is not None and dest_hash in helper_handlers
+
+        consumed = False
+        if has_companion:
+            bridge_result = await companion_bridges[dest_hash].process_received_packet(packet)
+            if bridge_result.authenticated:
+                consumed = True
+        # Offer to the room-server / repeater identity when it shares the hash
+        # (collision) or when no local companion claims it at all (normal
+        # server-owned + remote-forward handling).
+        if helper and (has_local_identity or not has_companion):
+            if await getattr(helper, process_method_name)(packet):
+                consumed = True
+        return consumed
+
     def _record_for_ui(self, packet, metadata: dict) -> None:
         """Record an injection-only packet for the web UI (storage + recent_packets)."""
         handler = getattr(self.daemon, "repeater_handler", None)
@@ -474,33 +509,18 @@ class PacketRouter:
                     logger.debug(f"Companion bridge advert error: {e}")
 
         elif payload_type == LoginServerHandler.payload_type():
-            # Route to the local identity that owns this login. The on-air dest
-            # hash is only one byte, so a companion and a room-server identity
-            # can share it; decryption is the only real disambiguator. When both
-            # are registered under the same hash, offer the packet to both — the
-            # owner whose key decrypts replies, the other fails HMAC and no-ops.
-            # When dest is remote (not handled), login_helper passes it to the
-            # engine so DIRECT/FLOOD ANON_REQ can be forwarded. Our own injected
-            # ANON_REQ is suppressed by the engine's duplicate (mark_seen) check.
+            # Route ANON_REQ/login to the local identity that owns it. The on-air
+            # dest hash is only one byte, so a companion and a room-server identity
+            # can share it; decryption is the only real disambiguator. Offer the
+            # packet to every local candidate and consume only when one decrypts —
+            # a remote (or forged) ANON_REQ that merely collides on the prefix is
+            # then forwarded by the engine. Our own injected ANON_REQ is suppressed
+            # by the engine's duplicate (mark_seen) check.
             dest_hash = packet.payload[0] if packet.payload else None
-            companion_bridges = self._companion_bridges_for_packet(packet, metadata)
-            login_helper = self.daemon.login_helper
-            login_handlers = getattr(login_helper, "handlers", {}) if login_helper else {}
-
-            has_companion = dest_hash is not None and dest_hash in companion_bridges
-            has_room_server = dest_hash is not None and dest_hash in login_handlers
-
-            if has_companion:
-                await companion_bridges[dest_hash].process_received_packet(packet)
+            if await self._consume_via_local_candidates(
+                packet, metadata, dest_hash, self.daemon.login_helper, "process_login_packet"
+            ):
                 processed_by_injection = True
-            # Offer to login_helper when a room-server identity shares this hash
-            # (collision) or when no local companion claims it at all (normal
-            # repeater/room-server login + remote-forward handling).
-            if login_helper and (has_room_server or not has_companion):
-                handled = await login_helper.process_login_packet(packet)
-                if handled:
-                    processed_by_injection = True
-            if processed_by_injection:
                 self._record_for_ui(packet, metadata)
 
         elif payload_type == AckHandler.payload_type():
@@ -529,24 +549,15 @@ class PacketRouter:
         elif payload_type == TextMessageHandler.payload_type():
             # Same one-byte dest-hash collision handling as the login path above:
             # a companion and a room-server text identity can share a hash, and
-            # only decryption tells them apart. Offer to both when both are
-            # registered so a companion never shadows a room-server message.
+            # only decryption tells them apart. Offer to every local candidate and
+            # consume only when one decrypts, so a companion never shadows a
+            # room-server message and a prefix collision with a remote node still
+            # forwards.
             dest_hash = packet.payload[0] if packet.payload else None
-            companion_bridges = self._companion_bridges_for_packet(packet, metadata)
-            text_helper = self.daemon.text_helper
-            text_handlers = getattr(text_helper, "handlers", {}) if text_helper else {}
-
-            has_companion = dest_hash is not None and dest_hash in companion_bridges
-            has_text_identity = dest_hash is not None and dest_hash in text_handlers
-
-            if has_companion:
-                await companion_bridges[dest_hash].process_received_packet(packet)
+            if await self._consume_via_local_candidates(
+                packet, metadata, dest_hash, self.daemon.text_helper, "process_text_packet"
+            ):
                 processed_by_injection = True
-            if text_helper and (has_text_identity or not has_companion):
-                handled = await text_helper.process_text_packet(packet)
-                if handled:
-                    processed_by_injection = True
-            if processed_by_injection:
                 self._record_for_ui(packet, metadata)
 
         elif payload_type == PathHandler.payload_type():
@@ -654,26 +665,33 @@ class PacketRouter:
                 self._record_for_ui(packet, metadata)
 
         elif payload_type == ProtocolRequestHandler.payload_type():
+            # Same one-byte dest-hash collision handling as the login/text paths:
+            # a companion and a server (ACL) identity can share a hash and only
+            # decryption tells them apart. Offer to every local candidate and
+            # consume only when one authenticates the REQ; otherwise leave it for
+            # the engine.
             dest_hash = packet.payload[0] if packet.payload else None
-            companion_bridges = self._companion_bridges_for_packet(packet, metadata)
-            if dest_hash is not None and dest_hash in companion_bridges:
-                await companion_bridges[dest_hash].process_received_packet(packet)
+            if await self._consume_via_local_candidates(
+                packet,
+                metadata,
+                dest_hash,
+                self.daemon.protocol_request_helper,
+                "process_request_packet",
+            ):
                 processed_by_injection = True
                 self._record_for_ui(packet, metadata)
-            elif self.daemon.protocol_request_helper:
-                handled = await self.daemon.protocol_request_helper.process_request_packet(packet)
-                if handled:
+            else:
+                companion_bridges = self._companion_bridges_for_packet(packet, metadata)
+                if companion_bridges and _is_direct_final_hop(packet):
+                    # DIRECT with empty path: we're the final hop and cannot forward,
+                    # so deliver to all bridges for anon matching and consume regardless.
+                    for bridge in companion_bridges.values():
+                        try:
+                            await bridge.process_received_packet(packet)
+                        except Exception as e:
+                            logger.debug(f"Companion bridge REQ (final hop) error: {e}")
                     processed_by_injection = True
                     self._record_for_ui(packet, metadata)
-            elif companion_bridges and _is_direct_final_hop(packet):
-                # DIRECT with empty path: we're the final hop; deliver to all bridges for anon matching
-                for bridge in companion_bridges.values():
-                    try:
-                        await bridge.process_received_packet(packet)
-                    except Exception as e:
-                        logger.debug(f"Companion bridge REQ (final hop) error: {e}")
-                processed_by_injection = True
-                self._record_for_ui(packet, metadata)
 
         elif payload_type == GroupTextHandler.payload_type():
             # GRP_TXT: pass to all companions (they filter by channel); still forward.

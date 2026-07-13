@@ -235,8 +235,18 @@ class TextHelper:
                     f"dest=0x{dest_hash:02X}, src=0x{src_hash:02X}"
                 )
 
-                # Let handler decrypt the message first
-                await handler_info["handler"](packet)
+                # Let the handler attempt decryption. It authenticates only when
+                # the message actually decrypted for this identity. Otherwise the
+                # dest hash collided with ours (common with a 1-byte hash) but the
+                # packet is not really for us — do not consume it, so the engine can
+                # still forward/re-flood it (#353).
+                result = await handler_info["handler"](packet)
+                if not result.authenticated:
+                    logger.debug(
+                        f"TXT_MSG dest 0x{dest_hash:02X} did not decrypt for "
+                        f"'{handler_info['name']}' (hash collision), allowing forward"
+                    )
+                    return False
 
                 # Call placeholder for custom processing
                 await self._on_message_received(
