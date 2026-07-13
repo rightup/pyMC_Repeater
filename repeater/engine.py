@@ -1067,22 +1067,18 @@ class RepeaterHandler(BaseHandler):
         packet_len = packet.get_raw_length()
         airtime_ms = self.airtime_mgr.calculate_airtime(packet_len)
 
-        route_type = packet.header & PH_ROUTE_MASK
+        if packet.is_route_flood():
+            delay_factor = self.tx_delay_factor
+        elif packet.is_route_direct():
+            delay_factor = self.direct_tx_delay_factor
+        else:
+            delay_factor = self.direct_tx_delay_factor
 
-        # Base delay calculations
-        # this part took me along time to get right well i hope i got it right ;-)
-
-        if route_type == ROUTE_TYPE_FLOOD:
-            # Flood packets: random(0-5) * (airtime * 52/50 / 2) * tx_delay_factor
-            # This creates collision avoidance with tunable delay
-            base_delay_ms = (airtime_ms * 52 / 50) / 2.0  # From C++ implementation
-            random_mult = secrets.randbelow(5001) / 1000.0
-            delay_ms = base_delay_ms * random_mult * self.tx_delay_factor
-            delay_s = delay_ms / 1000.0
-        else:  # DIRECT
-            # Direct packets: use direct_tx_delay_factor (already in seconds)
-            # direct_tx_delay_factor is stored as seconds in config
-            delay_s = self.direct_tx_delay_factor
+        # MeshCore uses the same random window for flood and direct variants:
+        # choose a value from 0 through 5 * airtime * factor.
+        base_delay_ms = airtime_ms * delay_factor
+        random_mult = secrets.randbelow(5001) / 1000.0
+        delay_s = (base_delay_ms * random_mult) / 1000.0
 
         # Apply score-based delay adjustment ONLY if delay >= 50ms threshold
         # (matching C++ reactive behavior in Dispatcher::calcRxDelay)
@@ -1104,7 +1100,7 @@ class RepeaterHandler(BaseHandler):
 
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
-                f"Route={'FLOOD' if route_type == ROUTE_TYPE_FLOOD else 'DIRECT'}, "
+                f"Route={'FLOOD' if packet.is_route_flood() else 'DIRECT'}, "
                 f"len={packet_len}B, airtime={airtime_ms:.1f}ms, delay={delay_s:.3f}s"
             )
 

@@ -584,7 +584,7 @@ class TestPacketScore:
 
 
 class TestTxDelay:
-    """TX delay: flood random, direct fixed, score adjustment, cap."""
+    """TX delay: route-aware random window, score adjustment, cap."""
 
     def test_flood_delay_non_negative(self, handler):
         pkt = _make_flood_packet()
@@ -597,13 +597,42 @@ class TestTxDelay:
         delay = handler._calculate_tx_delay(pkt, snr=0.0)
         assert delay <= 5.0
 
-    def test_direct_delay_uses_factor(self, handler):
-        handler.direct_tx_delay_factor = 1.23
-        pkt = _make_direct_packet()
-        delay = handler._calculate_tx_delay(pkt, snr=0.0)
-        # Direct packets use direct_tx_delay_factor directly (in seconds)
-        # Score adjustment may change it, but base should be 1.23 when score is off
-        assert delay == pytest.approx(1.23, abs=0.01)
+    @pytest.mark.parametrize(
+        "builder, factor_attr",
+        [
+            (_make_flood_packet, "tx_delay_factor"),
+            (_make_transport_flood_packet, "tx_delay_factor"),
+            (_make_direct_packet, "direct_tx_delay_factor"),
+            (_make_transport_direct_packet, "direct_tx_delay_factor"),
+        ],
+    )
+    def test_route_variants_use_random_window(self, handler, builder, factor_attr):
+        setattr(handler, factor_attr, 1.23)
+        pkt = builder()
+        expected = handler.airtime_mgr.calculate_airtime(pkt.get_raw_length()) * 1.23 * 5 / 1000.0
+
+        with patch("repeater.engine.secrets.randbelow", return_value=5000):
+            delay = handler._calculate_tx_delay(pkt, snr=0.0)
+
+        assert delay == pytest.approx(expected, rel=0.001, abs=0.001)
+
+    @pytest.mark.parametrize(
+        "builder, factor_attr",
+        [
+            (_make_flood_packet, "tx_delay_factor"),
+            (_make_transport_flood_packet, "tx_delay_factor"),
+            (_make_direct_packet, "direct_tx_delay_factor"),
+            (_make_transport_direct_packet, "direct_tx_delay_factor"),
+        ],
+    )
+    def test_route_variants_can_delay_to_zero(self, handler, builder, factor_attr):
+        setattr(handler, factor_attr, 1.23)
+        pkt = builder()
+
+        with patch("repeater.engine.secrets.randbelow", return_value=0):
+            delay = handler._calculate_tx_delay(pkt, snr=0.0)
+
+        assert delay == 0.0
 
     def test_score_adjustment_reduces_delay(self, handler):
         handler.use_score_for_tx = True
@@ -634,11 +663,15 @@ class TestTxDelay:
         delay = handler._calculate_tx_delay(pkt, snr=0.0)
         assert delay == 0.0
 
-    def test_transport_direct_uses_direct_delay(self, handler):
+    def test_transport_direct_uses_random_window(self, handler):
         handler.direct_tx_delay_factor = 0.77
         pkt = _make_transport_direct_packet()
-        delay = handler._calculate_tx_delay(pkt, snr=0.0)
-        assert delay == pytest.approx(0.77, abs=0.01)
+        expected = handler.airtime_mgr.calculate_airtime(pkt.get_raw_length()) * 0.77 * 5 / 1000.0
+
+        with patch("repeater.engine.secrets.randbelow", return_value=5000):
+            delay = handler._calculate_tx_delay(pkt, snr=0.0)
+
+        assert delay == pytest.approx(expected, rel=0.001, abs=0.001)
 
 
 # ===================================================================
