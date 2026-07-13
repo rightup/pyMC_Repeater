@@ -22,6 +22,7 @@ from openhop_core.protocol.constants import (
     ROUTE_TYPE_TRANSPORT_DIRECT,
     ROUTE_TYPE_TRANSPORT_FLOOD,
 )
+from openhop_core.protocol.packet_utils import PathUtils
 
 # ---------------------------------------------------------------------------
 # Helpers — build minimal config / mocks needed by RepeaterHandler.__init__
@@ -500,6 +501,13 @@ class TestValidatePacket:
         valid, reason = handler.validate_packet(pkt)
         assert valid is True
 
+    def test_reserved_four_byte_path_width_fails(self, handler):
+        pkt = _make_flood_packet(path=bytes([LOCAL_HASH] * 4))
+        pkt.path_len = (3 << 6) | 1
+        valid, reason = handler.validate_packet(pkt)
+        assert valid is False
+        assert "reserved" in reason.lower()
+
     def test_none_packet(self, handler):
         valid, reason = handler.validate_packet(None)
         assert valid is False
@@ -749,6 +757,42 @@ class TestFloodLoopDetection:
         pkt = _make_flood_packet(path=bytes([0x33, LOCAL_HASH, 0x44]))
         result = handler.flood_forward(pkt)
         assert result is None
+
+    @pytest.mark.parametrize(
+        "loop_detect, hash_size, threshold",
+        [
+            ("minimal", 1, 4),
+            ("minimal", 2, 2),
+            ("minimal", 3, 1),
+            ("moderate", 1, 2),
+            ("moderate", 2, 1),
+            ("moderate", 3, 1),
+            ("strict", 1, 1),
+            ("strict", 2, 1),
+            ("strict", 3, 1),
+        ],
+    )
+    def test_loop_threshold_depends_on_hash_width(self, handler, loop_detect, hash_size, threshold):
+        handler.config["mesh"]["loop_detect"] = loop_detect
+        handler.reload_runtime_config()
+        handler.local_hash_bytes = bytes([LOCAL_HASH, 0xCD, 0xEF])
+
+        local_hash = handler.local_hash_bytes[:hash_size]
+
+        below_payload = bytes([hash_size, threshold, 0x01])
+        below_path = local_hash * max(threshold - 1, 0)
+        below_pkt = _make_flood_packet(path=below_path, payload=below_payload)
+        below_pkt.path_len = PathUtils.encode_path_len(hash_size, max(threshold - 1, 0))
+        below_result = handler.flood_forward(below_pkt)
+        assert below_result is not None
+
+        at_payload = bytes([hash_size, threshold, 0x02])
+        at_path = local_hash * threshold
+        at_pkt = _make_flood_packet(path=at_path, payload=at_payload)
+        at_pkt.path_len = PathUtils.encode_path_len(hash_size, threshold)
+        at_result = handler.flood_forward(at_pkt)
+        assert at_result is None
+        assert "loop" in (at_pkt.drop_reason or "").lower()
 
 
 # ===================================================================

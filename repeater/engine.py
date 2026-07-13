@@ -34,13 +34,12 @@ LOOP_DETECT_MINIMAL = "minimal"
 LOOP_DETECT_MODERATE = "moderate"
 LOOP_DETECT_STRICT = "strict"
 
-# Thresholds for flood loop detection (hash-size-aware: 1, 2, or 3 bytes per hop).
-# Count how many times our own hash already exists in the incoming FLOOD path.
-# If occurrences >= threshold, treat as loop and drop.
+# Thresholds for flood loop detection, keyed by loop mode and path-hash width.
+# MeshCore treats 4-byte hashes as reserved, so only 1-3 byte widths are valid here.
 LOOP_DETECT_MAX_COUNTERS = {
-    LOOP_DETECT_MINIMAL: 4,
-    LOOP_DETECT_MODERATE: 2,
-    LOOP_DETECT_STRICT: 1,
+    LOOP_DETECT_MINIMAL: {1: 4, 2: 2, 3: 1},
+    LOOP_DETECT_MODERATE: {1: 2, 2: 1, 3: 1},
+    LOOP_DETECT_STRICT: {1: 1, 2: 1, 3: 1},
 }
 
 
@@ -778,6 +777,9 @@ class RepeaterHandler(BaseHandler):
         if not packet or not packet.payload:
             return False, "Empty payload"
 
+        if packet.get_path_hash_size() > 3:
+            return False, "Reserved path hash size is invalid"
+
         if len(packet.path or []) >= MAX_PATH_SIZE:
             return (
                 False,
@@ -806,11 +808,15 @@ class RepeaterHandler(BaseHandler):
         if mode == LOOP_DETECT_OFF:
             return False
 
-        max_counter = LOOP_DETECT_MAX_COUNTERS.get(mode)
-        if max_counter is None:
+        max_counters = LOOP_DETECT_MAX_COUNTERS.get(mode)
+        if max_counters is None:
             return False
 
         hash_size = packet.get_path_hash_size()
+        if hash_size not in max_counters:
+            return False
+
+        max_counter = max_counters[hash_size]
         hop_count = packet.get_path_hash_count()
         path = packet.path or bytearray()
         local_hash = self.local_hash_bytes[:hash_size]
