@@ -4,7 +4,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from repeater.companion.constants import STATS_TYPE_CORE, STATS_TYPE_PACKETS, STATS_TYPE_RADIO
-from repeater.main import RepeaterDaemon, main as repeater_main
+from repeater.main import RepeaterDaemon
+from repeater.main import main as repeater_main
 
 
 class _FakeIdentity:
