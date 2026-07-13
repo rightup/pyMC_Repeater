@@ -253,7 +253,17 @@ class LoginHelper:
             handler = self.handlers.get(dest_hash)
             if handler:
                 logger.debug(f"Routing login to identity: hash=0x{dest_hash:02X}")
-                await handler(packet)
+                # The handler authenticates only when the request decrypted for
+                # this identity. Otherwise the dest hash collided with ours but the
+                # ANON_REQ is not really for us — do not consume it, so the engine
+                # can still forward/re-flood it (#353).
+                result = await handler(packet)
+                if not result.authenticated:
+                    logger.debug(
+                        f"ANON_REQ dest 0x{dest_hash:02X} did not decrypt for a local "
+                        f"identity (hash collision), allowing forward"
+                    )
+                    return False
                 packet.mark_do_not_retransmit()
                 return True
             else:

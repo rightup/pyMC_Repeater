@@ -28,6 +28,7 @@ from openhop_core.node.handlers.login_server import LoginServerHandler
 from openhop_core.node.handlers.path import PathHandler
 from openhop_core.node.handlers.protocol_request import ProtocolRequestHandler
 from openhop_core.node.handlers.protocol_response import ProtocolResponseHandler
+from openhop_core.node.handlers.result import HandlerResult
 from openhop_core.node.handlers.text import TextMessageHandler
 from openhop_core.node.handlers.trace import TraceHandler
 from openhop_core.protocol.constants import ROUTE_TYPE_DIRECT
@@ -832,6 +833,84 @@ class TestPacketRouterRoutingBranches(unittest.IsolatedAsyncioTestCase):
         await router._route_packet(pkt)
         b1.process_received_packet.assert_awaited_once()
         daemon.repeater_handler.assert_not_awaited()
+
+    async def test_route_protocol_request_companion_collision_forwards(self):
+        """A REQ whose dest prefix matches a companion but does not decrypt for
+        it must be forwarded, not swallowed."""
+        daemon = _make_daemon()
+        b1 = _make_bridge()
+        # Collision: the packet is not really for this companion.
+        b1.process_received_packet = AsyncMock(return_value=HandlerResult.not_for_us())
+        daemon.companion_bridges = {0x01: b1}
+        router = PacketRouter(daemon)
+        pkt = _make_packet(ProtocolRequestHandler.payload_type())
+        pkt.header = 0x00  # transport-flood: not a direct final hop
+        pkt.path = bytearray([0xAA])
+        pkt.payload = bytes([0x01, 0xBB])
+        await router._route_packet(pkt)
+        b1.process_received_packet.assert_awaited_once()
+        # Not consumed -> handed to the forwarding engine.
+        daemon.repeater_handler.assert_awaited_once()
+
+    async def test_route_text_companion_collision_forwards(self):
+        """A TXT_MSG whose dest prefix matches a companion but does not decrypt
+        for it must be forwarded, not swallowed."""
+        daemon = _make_daemon()
+        b1 = _make_bridge()
+        b1.process_received_packet = AsyncMock(return_value=HandlerResult.not_for_us())
+        daemon.companion_bridges = {0x01: b1}
+        router = PacketRouter(daemon)
+        pkt = _make_packet(TextMessageHandler.payload_type())
+        pkt.header = 0x00
+        pkt.path = bytearray([0xAA])
+        pkt.payload = bytes([0x01, 0xBB])
+        await router._route_packet(pkt)
+        b1.process_received_packet.assert_awaited_once()
+        daemon.repeater_handler.assert_awaited_once()
+
+    async def test_route_text_tries_all_candidates_room_server_wins(self):
+        """A companion and a room-server text identity share a hash. The router
+        must try both; when the companion fails to decrypt but the room server
+        authenticates, the packet is consumed (not forwarded)."""
+        daemon = _make_daemon()
+        companion = _make_bridge()
+        companion.process_received_packet = AsyncMock(return_value=HandlerResult.not_for_us())
+        daemon.companion_bridges = {0x42: companion}
+        daemon.text_helper = MagicMock()
+        daemon.text_helper.handlers = {0x42: {"name": "room-a"}}
+        daemon.text_helper.process_text_packet = AsyncMock(return_value=True)
+        daemon.repeater_handler.storage = MagicMock()
+        daemon.repeater_handler.record_packet_only = MagicMock()
+        router = PacketRouter(daemon)
+        pkt = _make_packet(TextMessageHandler.payload_type())
+        pkt.header = 0x00
+        pkt.path = bytearray([0xAA])
+        pkt.payload = bytes([0x42, 0xBB])
+        await router._route_packet(pkt)
+        # Both local candidates were tried; the room server consumed it.
+        companion.process_received_packet.assert_awaited_once()
+        daemon.text_helper.process_text_packet.assert_awaited_once()
+        daemon.repeater_handler.assert_not_awaited()
+
+    async def test_route_text_all_local_candidates_fail_forwards(self):
+        """When neither the companion nor the room-server identity at the hash
+        authenticates, the packet is left for the forwarding engine."""
+        daemon = _make_daemon()
+        companion = _make_bridge()
+        companion.process_received_packet = AsyncMock(return_value=HandlerResult.not_for_us())
+        daemon.companion_bridges = {0x42: companion}
+        daemon.text_helper = MagicMock()
+        daemon.text_helper.handlers = {0x42: {"name": "room-a"}}
+        daemon.text_helper.process_text_packet = AsyncMock(return_value=False)
+        router = PacketRouter(daemon)
+        pkt = _make_packet(TextMessageHandler.payload_type())
+        pkt.header = 0x00
+        pkt.path = bytearray([0xAA])
+        pkt.payload = bytes([0x42, 0xBB])
+        await router._route_packet(pkt)
+        companion.process_received_packet.assert_awaited_once()
+        daemon.text_helper.process_text_packet.assert_awaited_once()
+        daemon.repeater_handler.assert_awaited_once()
 
     async def test_route_group_text_delivers_and_forwards(self):
         daemon = _make_daemon()
