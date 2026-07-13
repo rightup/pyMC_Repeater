@@ -265,6 +265,30 @@ async def test_send_advert_branches_and_success_path():
 
 
 @pytest.mark.asyncio
+async def test_send_advert_returns_false_when_dispatch_rejects():
+    daemon = RepeaterDaemon(_base_config(), radio=object())
+    daemon.dispatcher = SimpleNamespace(
+        send_packet=AsyncMock(return_value=False),
+        packet_filter=SimpleNamespace(track_packet=MagicMock()),
+    )
+    daemon.local_identity = _FakeIdentity(b"\x21" + b"x" * 31)
+    daemon.config["repeater"]["mode"] = "forward"
+    daemon.repeater_handler = SimpleNamespace(mark_seen=MagicMock())
+    daemon.gps_service = SimpleNamespace(
+        get_repeater_location=lambda: {"latitude": 9.1, "longitude": 8.2, "source": "gps"}
+    )
+
+    packet = SimpleNamespace(calculate_packet_hash=lambda: b"\xab" * 16)
+    with patch("openhop_core.protocol.PacketBuilder.create_advert", return_value=packet):
+        ok = await daemon.send_advert()
+
+    assert ok is False
+    daemon.dispatcher.send_packet.assert_awaited_once_with(packet, wait_for_ack=False)
+    daemon.repeater_handler.mark_seen.assert_not_called()
+    daemon.dispatcher.packet_filter.track_packet.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_send_advert_applies_transport_scope_when_default_region_set():
     from openhop_core.protocol.constants import ROUTE_TYPE_FLOOD, ROUTE_TYPE_TRANSPORT_FLOOD
 

@@ -109,6 +109,40 @@ async def test_room_server_add_post_returns_false_on_db_insert_failure():
     assert ok is False
 
 
+@pytest.mark.asyncio
+async def test_room_server_send_advert_callback_returns_false_on_inject_failure():
+    config = {
+        "identities": {
+            "room_servers": [
+                {
+                    "name": "room-alpha",
+                    "settings": {"node_name": "Room Alpha", "latitude": 1.0, "longitude": 2.0},
+                }
+            ]
+        }
+    }
+
+    injector = AsyncMock(return_value=False)
+    rs = RoomServer(
+        room_hash=0x34,
+        room_name="room-alpha",
+        local_identity=_FakeIdentity(b"R" * 32),
+        sqlite_handler=_FakeDB(),
+        packet_injector=injector,
+        acl=_FakeACL(),
+        config_path="/tmp/room.yaml",
+        config=config,
+        config_manager=SimpleNamespace(),
+    )
+
+    packet = SimpleNamespace()
+    with patch("openhop_core.protocol.PacketBuilder.create_advert", return_value=packet):
+        ok = await rs.cli.send_advert_callback()
+
+    assert ok is False
+    injector.assert_awaited_once()
+
+
 def test_room_server_init_caps_max_posts_to_hard_limit():
     rs = _make_room_server(max_posts=MAX_UNSYNCED_POSTS + 50)
     assert rs.max_posts == MAX_UNSYNCED_POSTS

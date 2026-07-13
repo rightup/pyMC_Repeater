@@ -1271,10 +1271,17 @@ class RepeaterDaemon:
                 scope_label="advert",
             )
 
-            # Send via dispatcher
-            await self.dispatcher.send_packet(packet, wait_for_ack=False)
+            injector = getattr(getattr(self, "router", None), "inject_packet", None)
+            if callable(injector):
+                sent = await injector(packet, wait_for_ack=False)
+            else:
+                sent = await self.dispatcher.send_packet(packet, wait_for_ack=False)
 
-            if self.repeater_handler:
+            if not sent:
+                logger.error("Failed to send advert: packet transmission was rejected")
+                return False
+
+            if not callable(injector) and self.repeater_handler:
                 self.repeater_handler.mark_seen(packet)
                 pkt_hash = packet.calculate_packet_hash().hex()[:16]
                 self.dispatcher.packet_filter.track_packet(pkt_hash)

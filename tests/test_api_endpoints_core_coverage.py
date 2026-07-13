@@ -1546,6 +1546,39 @@ def test_room_server_advert_applies_default_region_scope():
     dispatcher.send_packet.assert_awaited_once_with(packet, wait_for_ack=False)
 
 
+def test_room_server_advert_returns_false_when_send_rejected():
+    from openhop_core.protocol.constants import ROUTE_TYPE_FLOOD
+
+    api = _make_api({"mesh": {"default_region": "alpha"}, "repeater": {}})
+    dispatcher = SimpleNamespace(send_packet=AsyncMock(return_value=False))
+    api.daemon_instance = SimpleNamespace(dispatcher=dispatcher, repeater_handler=None)
+
+    packet = SimpleNamespace(
+        header=ROUTE_TYPE_FLOOD,
+        transport_codes=[0, 0],
+        get_payload_type=lambda: 3,
+        get_payload=lambda: b"room_server_advert_payload",
+    )
+
+    with (
+        patch("openhop_core.protocol.PacketBuilder.create_advert", return_value=packet),
+        patch("openhop_core.protocol.transport_keys.get_auto_key_for", return_value=b"\x01" * 16),
+        patch("openhop_core.protocol.transport_keys.calc_transport_code", return_value=0xCAFE),
+    ):
+        result = asyncio.run(
+            api._send_room_server_advert_async(
+                identity=SimpleNamespace(),
+                node_name="RoomAlpha",
+                latitude=1.0,
+                longitude=2.0,
+                disable_fwd=False,
+            )
+        )
+
+    assert result is False
+    dispatcher.send_packet.assert_awaited_once_with(packet, wait_for_ack=False)
+
+
 def test_set_mode_and_set_duty_cycle_paths(cherrypy_ctx):
     request, _ = cherrypy_ctx
     api = _make_api({"repeater": {}, "duty_cycle": {}})

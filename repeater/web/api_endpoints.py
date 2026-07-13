@@ -5977,11 +5977,18 @@ class APIEndpoints:
                 scope_label="room server advert",
             )
 
-            # Send via dispatcher
-            await self.daemon_instance.dispatcher.send_packet(packet, wait_for_ack=False)
+            injector = getattr(getattr(self.daemon_instance, "router", None), "inject_packet", None)
+            if callable(injector):
+                sent = await injector(packet, wait_for_ack=False)
+            else:
+                sent = await self.daemon_instance.dispatcher.send_packet(packet, wait_for_ack=False)
 
-            # Mark as seen to prevent re-forwarding
-            if self.daemon_instance.repeater_handler:
+            if not sent:
+                logger.error("Failed to send room server advert: packet transmission was rejected")
+                return False
+
+            # Mark as seen only when bypassing the engine and sending directly.
+            if not callable(injector) and self.daemon_instance.repeater_handler:
                 self.daemon_instance.repeater_handler.mark_seen(packet)
                 logger.debug(f"Marked room server advert '{node_name}' as seen in duplicate cache")
 

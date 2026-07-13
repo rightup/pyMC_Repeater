@@ -136,7 +136,10 @@ class RoomServer:
                 )
 
                 # Send via packet injector
-                await packet_injector(packet, wait_for_ack=False)
+                sent = await packet_injector(packet, wait_for_ack=False)
+                if not sent:
+                    logger.error(f"Room '{room_name}': Failed to send advert")
+                    return False
 
                 logger.info(
                     f"Room '{room_name}': Sent flood advert '{node_name}' at ({latitude:.6f}, {longitude:.6f})"
