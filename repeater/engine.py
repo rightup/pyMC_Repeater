@@ -1080,8 +1080,7 @@ class RepeaterHandler(BaseHandler):
         random_mult = secrets.randbelow(5001) / 1000.0
         delay_s = (base_delay_ms * random_mult) / 1000.0
 
-        # Apply score-based delay adjustment ONLY if delay >= 50ms threshold
-        # (matching C++ reactive behavior in Dispatcher::calcRxDelay)
+        # OpenHop's optional score gate is applied only after the 50 ms threshold.
         if delay_s >= 0.05 and self.use_score_for_tx:
             score = self.calculate_packet_score(snr, packet_len)
             # Higher score = shorter delay: max(0.2, 1.0 - score)
