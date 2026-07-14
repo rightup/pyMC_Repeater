@@ -546,6 +546,19 @@ class TestPacketRouterRoutingBranches(unittest.IsolatedAsyncioTestCase):
         daemon.deliver_control_data.assert_awaited_once()
         daemon.repeater_handler.assert_awaited_once()
 
+    async def test_route_control_marks_do_not_retransmit_when_discovery_disabled(self):
+        """With discovery disabled (discovery_helper is None), control packets must
+        still be marked do-not-retransmit so the engine does not relay them. MeshCore
+        never forwards control packets regardless of whether discovery is enabled."""
+        daemon = _make_daemon()
+        daemon.discovery_helper = None
+        daemon.deliver_control_data = AsyncMock()
+        router = PacketRouter(daemon)
+        pkt = _make_packet(ControlHandler.payload_type())
+        pkt.path_len = 0
+        await router._route_packet(pkt)
+        pkt.mark_do_not_retransmit.assert_called_once()
+
     async def test_route_advert_delivers_to_helpers_and_engine(self):
         daemon = _make_daemon()
         daemon.advert_helper = MagicMock()

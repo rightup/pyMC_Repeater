@@ -475,10 +475,17 @@ class PacketRouter:
                 # as routing hashes and log bogus duplicate rows.
 
         elif payload_type == ControlHandler.payload_type():
+            # MeshCore never relays control packets: the direct high-bit discovery
+            # subset is explicitly released (Mesh.cpp), and any other control
+            # payload hits the switch default that does not flood-route unknown
+            # types. Mark do-not-retransmit unconditionally so a repeater with
+            # discovery disabled still does not forward control/discovery traffic
+            # to the engine. Discovery responses are injected as their own TX, so
+            # this does not suppress them.
+            packet.mark_do_not_retransmit()
             # Process control/discovery packet
             if self.daemon.discovery_helper:
                 await self.daemon.discovery_helper.control_handler(packet)
-                packet.mark_do_not_retransmit()
             # Deliver to companions via daemon (frame servers push PUSH_CODE_CONTROL_DATA 0x8E)
             deliver = getattr(self.daemon, "deliver_control_data", None)
             if deliver:
