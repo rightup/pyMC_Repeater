@@ -101,6 +101,7 @@ class _FakeACL:
 class _PathPacket:
     def __init__(self, payload: bytes):
         self.payload = bytearray(payload)
+        self.mark_do_not_retransmit = MagicMock()
 
 
 class _ReqPacket:
@@ -124,7 +125,8 @@ async def test_path_helper_updates_client_out_path_on_valid_decrypt():
     ):
         handled = await helper.process_path_packet(packet)
 
-    assert handled is False
+    assert handled is True
+    packet.mark_do_not_retransmit.assert_called_once_with()
     assert client.out_path_len == 2
     assert bytes(client.out_path) == b"\x99\x88"
     assert isinstance(client.last_activity, int)
@@ -216,6 +218,24 @@ async def test_path_helper_returns_false_for_non_matching_or_invalid_inputs():
 
     with patch("openhop_core.protocol.crypto.CryptoUtils.mac_then_decrypt", return_value=None):
         assert await helper.process_path_packet(_PathPacket(payload=b"\x11\x22\xaa\xbb")) is False
+
+    # A valid MAC with an invalid or truncated PATH envelope is not local
+    # ownership; the forwarding engine must remain eligible to handle it.
+    with patch(
+        "openhop_core.protocol.crypto.CryptoUtils.mac_then_decrypt",
+        return_value=b"\x7f\x99\x88\x01",
+    ):
+        invalid_packet = _PathPacket(payload=b"\x11\x22\xaa\xbb\xcc")
+        assert await helper.process_path_packet(invalid_packet) is False
+        invalid_packet.mark_do_not_retransmit.assert_not_called()
+
+    with patch(
+        "openhop_core.protocol.crypto.CryptoUtils.mac_then_decrypt",
+        return_value=b"\x02\x99",
+    ):
+        truncated_packet = _PathPacket(payload=b"\x11\x22\xaa\xbb\xcc")
+        assert await helper.process_path_packet(truncated_packet) is False
+        truncated_packet.mark_do_not_retransmit.assert_not_called()
 
 
 @pytest.mark.asyncio

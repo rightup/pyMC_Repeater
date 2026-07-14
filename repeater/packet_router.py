@@ -563,27 +563,30 @@ class PacketRouter:
         elif payload_type == PathHandler.payload_type():
             # Always let PathHelper inspect/decrypt PATH first so out_path and bundled ACK state
             # are updated even when companion routing fan-out also happens for this packet.
+            consumed = False
             if self.daemon.path_helper:
                 try:
-                    await self.daemon.path_helper.process_path_packet(packet)
+                    consumed = (
+                        await self.daemon.path_helper.process_path_packet(packet)
+                    ) is True
                 except Exception as e:
                     logger.debug(f"Path helper processing error: {e}")
-            # The unconditional call above already covers PATH addressed to a
-            # local server identity (room server/repeater), so its out_path and
-            # any embedded ACK are handled before bridge delivery — the
-            # all-bridges branch below no longer swallows path returns for them.
+            # The helper/bridge results decide ownership: a direct middle hop
+            # that cannot authenticate remains eligible for engine forwarding,
+            # while a local MAC-authenticated PATH is consumed below.
             dest_hash = packet.payload[0] if packet.payload else None
             companion_bridges = self._companion_bridges_for_packet(packet, metadata)
             if dest_hash is not None and dest_hash in companion_bridges:
                 if self._should_deliver_path_to_companions(packet):
-                    await companion_bridges[dest_hash].process_received_packet(packet)
-                # Do not set processed_by_injection so packet also reaches engine for DIRECT forwarding when we're a middle hop.
+                    result = await companion_bridges[dest_hash].process_received_packet(packet)
+                    consumed = consumed or getattr(result, "authenticated", False) is True
             elif companion_bridges and self._should_deliver_path_to_companions(packet):
                 # Dest not in bridges: path-return with ephemeral dest (e.g. multi-hop login).
                 # Deliver to all bridges; each will try to decrypt and ignore if not relevant.
                 for bridge in companion_bridges.values():
                     try:
-                        await bridge.process_received_packet(packet)
+                        result = await bridge.process_received_packet(packet)
+                        consumed = consumed or getattr(result, "authenticated", False) is True
                     except Exception as e:
                         logger.debug(f"Companion bridge PATH error: {e}")
                 logger.debug(
@@ -591,20 +594,25 @@ class PacketRouter:
                     dest_hash or 0,
                     len(companion_bridges),
                 )
-                # Do not set processed_by_injection so packet also reaches engine for DIRECT forwarding when we're a middle hop.
+            if consumed:
+                # A local MAC-authenticated PATH belongs to this node. Do not
+                # let the forwarding engine retransmit it, but retain it for UI.
+                processed_by_injection = True
+                self._record_for_ui(packet, metadata)
 
         elif payload_type == LoginResponseHandler.payload_type():
             # PAYLOAD_TYPE_RESPONSE (0x01): payload is dest_hash(1)+src_hash(1)+encrypted.
             # Deliver to the bridge that is the destination, or to all bridges when the
             # response is addressed to this repeater (path-based reply: firmware sends
             # to first hop instead of original requester).
-            # Do not set processed_by_injection so packet also reaches engine for DIRECT forwarding when we're a middle hop.
+            consumed = False
             dest_hash = packet.payload[0] if packet.payload and len(packet.payload) >= 1 else None
             companion_bridges = self._companion_bridges_for_packet(packet, metadata)
             local_hash = getattr(self.daemon, "local_hash", None)
             if dest_hash is not None and dest_hash in companion_bridges:
                 try:
-                    await companion_bridges[dest_hash].process_received_packet(packet)
+                    result = await companion_bridges[dest_hash].process_received_packet(packet)
+                    consumed = consumed or getattr(result, "authenticated", False) is True
                     logger.info(
                         "RESPONSE dest=0x%02x delivered to companion bridge",
                         dest_hash,
@@ -615,7 +623,8 @@ class PacketRouter:
                 # Response addressed to this repeater (e.g. path-based reply to first hop)
                 for bridge in companion_bridges.values():
                     try:
-                        await bridge.process_received_packet(packet)
+                        result = await bridge.process_received_packet(packet)
+                        consumed = consumed or getattr(result, "authenticated", False) is True
                     except Exception as e:
                         logger.debug(f"Companion bridge RESPONSE error: {e}")
                 logger.info(
@@ -629,7 +638,8 @@ class PacketRouter:
                 # not relevant (firmware-like behavior, works with multiple companion bridges).
                 for bridge in companion_bridges.values():
                     try:
-                        await bridge.process_received_packet(packet)
+                        result = await bridge.process_received_packet(packet)
+                        consumed = consumed or getattr(result, "authenticated", False) is True
                     except Exception as e:
                         logger.debug(f"Companion bridge RESPONSE error: {e}")
                 logger.debug(
@@ -637,8 +647,12 @@ class PacketRouter:
                     dest_hash or 0,
                     len(companion_bridges),
                 )
-            if companion_bridges and _is_direct_final_hop(packet):
-                # DIRECT with empty path: we're the final hop; don't pass to engine (it would drop with "Direct: no path")
+            if consumed:
+                processed_by_injection = True
+                self._record_for_ui(packet, metadata)
+            elif companion_bridges and _is_direct_final_hop(packet):
+                # DIRECT with empty path is engine release hygiene: there is
+                # no next hop, even when no local identity authenticated it.
                 processed_by_injection = True
                 self._record_for_ui(packet, metadata)
 
@@ -683,8 +697,8 @@ class PacketRouter:
             else:
                 companion_bridges = self._companion_bridges_for_packet(packet, metadata)
                 if companion_bridges and _is_direct_final_hop(packet):
-                    # DIRECT with empty path: we're the final hop and cannot forward,
-                    # so deliver to all bridges for anon matching and consume regardless.
+                    # OpenHop release hygiene: an empty-path DIRECT has no next hop,
+                    # so consume after offering it to bridges even without MAC ownership.
                     for bridge in companion_bridges.values():
                         try:
                             await bridge.process_received_packet(packet)

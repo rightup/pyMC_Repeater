@@ -32,6 +32,7 @@ class PathHelper:
         from openhop_core.protocol.crypto import CryptoUtils
         from openhop_core.protocol.packet_utils import PathUtils
 
+        authenticated = False
         try:
             if len(packet.payload) < 2:
                 return False
@@ -83,28 +84,38 @@ class PathHelper:
                 logger.debug("Decrypted PATH data too short")
                 return False
             path_len_byte = decrypted[0]
-            if PathUtils.is_valid_path_len(path_len_byte):
-                path_byte_len = PathUtils.get_path_byte_len(path_len_byte)
-                path_hops = PathUtils.get_path_hash_count(path_len_byte)
-            else:
-                # Legacy fallback for malformed/old packets: treat first byte as raw path bytes.
-                path_byte_len = path_len_byte
-                path_hops = path_byte_len
+            if not PathUtils.is_valid_path_len(path_len_byte):
+                logger.debug(f"Invalid PATH length encoding: 0x{path_len_byte:02X}")
+                return False
+            path_byte_len = PathUtils.get_path_byte_len(path_len_byte)
+            path_hops = PathUtils.get_path_hash_count(path_len_byte)
 
-            if len(decrypted) < 1 + path_byte_len:
+            # Firmware (Mesh.cpp) reads the extra_type byte unconditionally after
+            # the path and consumes (markDoNotRetransmit) even when it is absent.
+            # We are stricter: a MAC-verified PATH with a valid path_len but no
+            # extra_type byte is treated as not-for-us and left forwardable, since
+            # it can only be a malformed packet. This is the safer divergence.
+            extra_start = 1 + path_byte_len
+            if len(decrypted) < extra_start + 1:
                 logger.debug(
-                    f"PATH data truncated: need {1 + path_byte_len} bytes, got {len(decrypted)}"
+                    f"PATH data truncated: need {extra_start + 1} bytes, got {len(decrypted)}"
                 )
                 return False
 
             path_data = decrypted[1 : 1 + path_byte_len]
 
+            # The destination hash selected a local identity and the MAC
+            # verified with one of its clients. From here on, consume the
+            # packet even if a bookkeeping or notification side effect fails.
+            authenticated = True
+            packet.mark_do_not_retransmit()
+
             # Update client's out_path (same as C++ memcpy); out_path_len keeps
             # the encoded byte so direct sends put it on the wire as-is.
             client.out_path = bytearray(path_data)
-            client.out_path_len = (
-                path_len_byte if PathUtils.is_valid_path_len(path_len_byte) else path_byte_len
-            )
+            # path_len_byte is guaranteed valid here (invalid encodings returned
+            # above), so store it verbatim for direct sends.
+            client.out_path_len = path_len_byte
             client.last_activity = int(time.time())
 
             logger.info(
@@ -115,7 +126,6 @@ class PathHelper:
 
             # Handle bundled ACK in PATH extra section.
             ack_crc = None
-            extra_start = 1 + path_byte_len
             if len(decrypted) > extra_start:
                 extra_type = decrypted[extra_start] & 0x0F
                 extra_payload = decrypted[extra_start + 1 :]
@@ -127,9 +137,8 @@ class PathHelper:
 
             if ack_crc is not None:
                 await self._register_ack_crc(ack_crc)
-            # Don't mark as do_not_retransmit - let it forward normally
-            return False
+            return authenticated
 
         except Exception as e:
             logger.error(f"Error processing PATH packet: {e}", exc_info=True)
-            return False
+            return authenticated

@@ -49,6 +49,7 @@ def _make_daemon():
     """Minimal daemon that satisfies PacketRouter without touching hardware."""
     daemon = MagicMock()
     daemon.repeater_handler = AsyncMock(return_value=True)
+    daemon.repeater_handler.record_packet_only = MagicMock()
     daemon.trace_helper = None
     daemon.discovery_helper = None
     daemon.advert_helper = None
@@ -774,6 +775,37 @@ class TestPacketRouterRoutingBranches(unittest.IsolatedAsyncioTestCase):
         await router._route_packet(pkt)
         daemon.path_helper.process_path_packet.assert_awaited_once_with(pkt)
 
+    async def test_authenticated_flood_path_skips_engine(self):
+        daemon = _make_daemon()
+        daemon.path_helper = MagicMock()
+        daemon.path_helper.process_path_packet = AsyncMock(return_value=True)
+        bridge = _make_bridge()
+        bridge.process_received_packet = AsyncMock(return_value=HandlerResult.consumed())
+        daemon.companion_bridges = {0x01: bridge}
+        router = PacketRouter(daemon)
+        pkt = _make_packet(PathHandler.payload_type())
+        pkt.payload = bytes([0x01, 0x22])
+
+        await router._route_packet(pkt)
+
+        bridge.process_received_packet.assert_awaited_once_with(pkt)
+        daemon.repeater_handler.assert_not_awaited()
+
+    async def test_unauthenticated_flood_path_reaches_engine(self):
+        daemon = _make_daemon()
+        daemon.path_helper = MagicMock()
+        daemon.path_helper.process_path_packet = AsyncMock(return_value=False)
+        bridge = _make_bridge()
+        bridge.process_received_packet = AsyncMock(return_value=HandlerResult.not_for_us())
+        daemon.companion_bridges = {0x01: bridge}
+        router = PacketRouter(daemon)
+        pkt = _make_packet(PathHandler.payload_type())
+        pkt.payload = bytes([0x01, 0x22])
+
+        await router._route_packet(pkt)
+
+        daemon.repeater_handler.assert_awaited_once()
+
     async def test_route_path_dedupes_companion_delivery(self):
         daemon = _make_daemon()
         bridge = _make_bridge()
@@ -801,6 +833,33 @@ class TestPacketRouterRoutingBranches(unittest.IsolatedAsyncioTestCase):
         await router._route_packet(pkt)
         b1.process_received_packet.assert_awaited_once()
         daemon.repeater_handler.assert_not_awaited()
+
+    async def test_authenticated_flood_response_skips_engine(self):
+        daemon = _make_daemon()
+        bridge = _make_bridge()
+        bridge.process_received_packet = AsyncMock(return_value=HandlerResult.consumed())
+        daemon.companion_bridges = {0x01: bridge}
+        router = PacketRouter(daemon)
+        pkt = _make_packet(LoginResponseHandler.payload_type())
+        pkt.payload = bytes([0x01, 0x22])
+
+        await router._route_packet(pkt)
+
+        bridge.process_received_packet.assert_awaited_once_with(pkt)
+        daemon.repeater_handler.assert_not_awaited()
+
+    async def test_unauthenticated_flood_response_reaches_engine(self):
+        daemon = _make_daemon()
+        bridge = _make_bridge()
+        bridge.process_received_packet = AsyncMock(return_value=HandlerResult.not_for_us())
+        daemon.companion_bridges = {0x01: bridge}
+        router = PacketRouter(daemon)
+        pkt = _make_packet(LoginResponseHandler.payload_type())
+        pkt.payload = bytes([0x01, 0x22])
+
+        await router._route_packet(pkt)
+
+        daemon.repeater_handler.assert_awaited_once()
 
     async def test_route_protocol_response_final_hop_skips_engine(self):
         daemon = _make_daemon()
