@@ -220,11 +220,12 @@ class TestFloodForward:
         result = handler.flood_forward(pkt)
         assert result is None
 
-    def test_path_at_max_rejected(self, handler):
-        pkt = _make_flood_packet(path=bytes(range(MAX_PATH_SIZE)))
+    def test_flood_at_max_hops_rejected(self, handler):
+        """A one-byte flood path at its 63-hop encoding limit cannot grow."""
+        pkt = _make_flood_packet(path=bytes(range(MAX_PATH_SIZE - 1)))
         result = handler.flood_forward(pkt)
         assert result is None
-        assert "Path length" in pkt.drop_reason
+        assert "cannot append" in pkt.drop_reason
 
     def test_do_not_retransmit_dropped(self, handler):
         pkt = _make_flood_packet()
@@ -490,11 +491,13 @@ class TestValidatePacket:
         assert valid is False
         assert "Empty" in reason
 
-    def test_path_at_max_fails(self, handler):
+    def test_maximum_valid_path_passes_validation(self, handler):
+        """A 32-hop, two-byte path occupies all 64 valid path bytes."""
         pkt = _make_flood_packet(path=bytes(range(MAX_PATH_SIZE)))
+        pkt.path_len = PathUtils.encode_path_len(2, 32)
         valid, reason = handler.validate_packet(pkt)
-        assert valid is False
-        assert "MAX_PATH_SIZE" in reason
+        assert valid is True
+        assert reason == ""
 
     def test_path_one_below_max_passes(self, handler):
         pkt = _make_flood_packet(path=bytes(range(MAX_PATH_SIZE - 1)))
@@ -916,7 +919,8 @@ class TestGetDropReason:
         assert "Empty" in reason
 
     def test_path_too_long_reason(self, handler):
-        pkt = _make_flood_packet(path=bytes(range(MAX_PATH_SIZE)))
+        pkt = _make_flood_packet(path=bytes(range(MAX_PATH_SIZE + 2)))
+        pkt.path_len = PathUtils.encode_path_len(2, 33)
         reason = handler._get_drop_reason(pkt)
         assert "Path too long" in reason
 
@@ -1317,7 +1321,7 @@ GOOD_PACKETS = [
 ]
 
 
-# ---- 20 BAD packets: all should be dropped / return None ----
+# ---- 19 BAD packets: all should be dropped / return None ----
 BAD_PACKETS = [
     # (id, description, builder)
     (
@@ -1331,12 +1335,6 @@ BAD_PACKETS = [
         "payload = None",
         lambda: (lambda p: (setattr(p, "payload", None), p)[-1])(_make_flood_packet()),
         "Empty payload",
-    ),
-    (
-        "bad_path_at_max",
-        "Path exactly MAX_PATH_SIZE — no room to append",
-        lambda: _make_flood_packet(payload=b"\x01", path=bytes(range(MAX_PATH_SIZE))),
-        "Path length",
     ),
     (
         "bad_flood_path_near_max",

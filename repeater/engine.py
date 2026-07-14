@@ -725,7 +725,7 @@ class RepeaterHandler(BaseHandler):
         if not packet or not packet.payload:
             return "Empty payload"
 
-        if len(packet.path or []) >= MAX_PATH_SIZE:
+        if len(packet.path or []) > MAX_PATH_SIZE:
             return "Path too long"
 
         route_type = packet.header & PH_ROUTE_MASK
@@ -780,7 +780,7 @@ class RepeaterHandler(BaseHandler):
         if packet.get_path_hash_size() > 3:
             return False, "Reserved path hash size is invalid"
 
-        if len(packet.path or []) >= MAX_PATH_SIZE:
+        if len(packet.path or []) > MAX_PATH_SIZE:
             return (
                 False,
                 f"Path length {len(packet.path or [])} exceeds MAX_PATH_SIZE ({MAX_PATH_SIZE})",
