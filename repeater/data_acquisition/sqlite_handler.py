@@ -403,6 +403,7 @@ class SQLiteHandler:
                                 out_path_len INTEGER NOT NULL DEFAULT -1,
                                 out_path BLOB,
                                 last_advert_timestamp INTEGER NOT NULL DEFAULT 0,
+                                last_advert_packet BLOB,
                                 lastmod INTEGER NOT NULL DEFAULT 0,
                                 gps_lat REAL NOT NULL DEFAULT 0,
                                 gps_lon REAL NOT NULL DEFAULT 0,
@@ -609,6 +610,27 @@ class SQLiteHandler:
                             "ADD COLUMN sender_prefix TEXT NOT NULL DEFAULT ''"
                         )
                         logger.info("Added sender_prefix column to companion_messages table")
+                    conn.execute(
+                        "INSERT INTO migrations (migration_name, applied_at) VALUES (?, ?)",
+                        (migration_name, time.time()),
+                    )
+                    logger.info(f"Migration '{migration_name}' applied successfully")
+
+                # Migration 11: Preserve the exact verified ADVERT wire packet
+                # for MeshCore-compatible CMD_EXPORT_CONTACT after restart.
+                migration_name = "add_last_advert_packet_to_companion_contacts"
+                existing = conn.execute(
+                    "SELECT migration_name FROM migrations WHERE migration_name = ?",
+                    (migration_name,),
+                ).fetchone()
+                if not existing:
+                    cursor = conn.execute("PRAGMA table_info(companion_contacts)")
+                    columns = [column[1] for column in cursor.fetchall()]
+                    if "last_advert_packet" not in columns:
+                        conn.execute(
+                            "ALTER TABLE companion_contacts ADD COLUMN last_advert_packet BLOB"
+                        )
+                        logger.info("Added last_advert_packet column to companion_contacts")
                     conn.execute(
                         "INSERT INTO migrations (migration_name, applied_at) VALUES (?, ?)",
                         (migration_name, time.time()),
@@ -2990,7 +3012,8 @@ class SQLiteHandler:
                 cursor = conn.execute(
                     """
                     SELECT pubkey, name, adv_type, flags, out_path_len, out_path,
-                           last_advert_timestamp, lastmod, gps_lat, gps_lon, sync_since
+                           last_advert_timestamp, last_advert_packet,
+                           lastmod, gps_lat, gps_lon, sync_since
                     FROM companion_contacts WHERE companion_hash = ?
                 """,
                     (companion_hash,),
@@ -3019,6 +3042,7 @@ class SQLiteHandler:
                         c.get("out_path_len", -1),
                         c.get("out_path", b""),
                         c.get("last_advert_timestamp", 0),
+                        c.get("last_advert_packet"),
                         c.get("lastmod", 0),
                         c.get("gps_lat", 0.0),
                         c.get("gps_lon", 0.0),
@@ -3032,8 +3056,9 @@ class SQLiteHandler:
                         """
                         INSERT INTO companion_contacts
                         (companion_hash, pubkey, name, adv_type, flags, out_path_len, out_path,
-                         last_advert_timestamp, lastmod, gps_lat, gps_lon, sync_since, updated_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         last_advert_timestamp, last_advert_packet,
+                         lastmod, gps_lat, gps_lon, sync_since, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                         rows,
                     )
@@ -3052,14 +3077,16 @@ class SQLiteHandler:
                     """
                     INSERT INTO companion_contacts
                     (companion_hash, pubkey, name, adv_type, flags, out_path_len, out_path,
-                     last_advert_timestamp, lastmod, gps_lat, gps_lon, sync_since, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     last_advert_timestamp, last_advert_packet,
+                     lastmod, gps_lat, gps_lon, sync_since, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(companion_hash, pubkey)
                     DO UPDATE SET
                         name=excluded.name, adv_type=excluded.adv_type,
                         flags=excluded.flags, out_path_len=excluded.out_path_len,
                         out_path=excluded.out_path,
                         last_advert_timestamp=excluded.last_advert_timestamp,
+                        last_advert_packet=excluded.last_advert_packet,
                         lastmod=excluded.lastmod, gps_lat=excluded.gps_lat,
                         gps_lon=excluded.gps_lon, sync_since=excluded.sync_since,
                         updated_at=excluded.updated_at
@@ -3073,6 +3100,7 @@ class SQLiteHandler:
                         contact.get("out_path_len", -1),
                         contact.get("out_path", b""),
                         contact.get("last_advert_timestamp", 0),
+                        contact.get("last_advert_packet"),
                         contact.get("lastmod", 0),
                         contact.get("gps_lat", 0.0),
                         contact.get("gps_lon", 0.0),
