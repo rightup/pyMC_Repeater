@@ -3358,12 +3358,17 @@ class SQLiteHandler:
         previous SELECT + INSERT round-trip (two statements, two SD-card reads)
         with a single atomic statement.
 
-        When ``max_messages`` is set, the oldest rows beyond that retention limit
-        are trimmed after a successful insert (power-user ``offline_queue_size``).
+        When ``max_messages`` is set, capacity follows MeshCore's offline queue
+        policy: evict the oldest channel message first and never displace a
+        retained direct message. The insert and any eviction share one
+        transaction.
 
-        Returns True if inserted, False if the message was a duplicate (skipped).
+        Returns True if the message is retained, False if it is a duplicate or
+        the protected queue cannot make room for it.
         """
         try:
+            if max_messages is not None and max_messages <= 0:
+                return False
             packet_hash = msg.get("packet_hash") or None
             if isinstance(packet_hash, bytes):
                 packet_hash = packet_hash.decode("utf-8", errors="replace") if packet_hash else None
@@ -3372,6 +3377,7 @@ class SQLiteHandler:
             if not isinstance(sender_prefix, str):
                 sender_prefix = bytes(sender_prefix or b"").hex()
             with self._connect() as conn:
+                conn.execute("SAVEPOINT companion_message_push")
                 cursor = conn.execute(
                     """
                     INSERT OR IGNORE INTO companion_messages
@@ -3394,22 +3400,49 @@ class SQLiteHandler:
                     ),
                 )
                 inserted = cursor.rowcount > 0
-                if inserted and max_messages is not None:
-                    # Keep the newest `max_messages` rows; drop older overflow.
-                    conn.execute(
-                        """
-                        DELETE FROM companion_messages
-                        WHERE companion_hash = ? AND id NOT IN (
+                if not inserted:
+                    conn.execute("RELEASE SAVEPOINT companion_message_push")
+                    conn.commit()
+                    return False
+                if max_messages is not None:
+                    count = conn.execute(
+                        "SELECT COUNT(*) FROM companion_messages WHERE companion_hash = ?",
+                        (companion_hash,),
+                    ).fetchone()[0]
+                    while count > max_messages:
+                        oldest_channel = conn.execute(
+                            """
                             SELECT id FROM companion_messages
-                            WHERE companion_hash = ?
-                            ORDER BY created_at DESC, id DESC
-                            LIMIT ?
+                            WHERE companion_hash = ? AND is_channel = 1
+                            ORDER BY created_at ASC, id ASC LIMIT 1
+                            """,
+                            (companion_hash,),
+                        ).fetchone()
+                        if oldest_channel is None:
+                            # The just-inserted row is not retainable without
+                            # sacrificing a direct message. Keep every prior
+                            # row intact, including any channel rows already
+                            # considered while satisfying a lowered limit.
+                            conn.execute("ROLLBACK TO SAVEPOINT companion_message_push")
+                            conn.execute("RELEASE SAVEPOINT companion_message_push")
+                            conn.commit()
+                            return False
+                        if oldest_channel[0] == cursor.lastrowid:
+                            # A new channel message is itself the only
+                            # evictable row; retain the protected directs and
+                            # report that the incoming message was rejected.
+                            conn.execute("ROLLBACK TO SAVEPOINT companion_message_push")
+                            conn.execute("RELEASE SAVEPOINT companion_message_push")
+                            conn.commit()
+                            return False
+                        conn.execute(
+                            "DELETE FROM companion_messages WHERE id = ?",
+                            (oldest_channel[0],),
                         )
-                        """,
-                        (companion_hash, companion_hash, max_messages),
-                    )
+                        count -= 1
+                conn.execute("RELEASE SAVEPOINT companion_message_push")
                 conn.commit()
-                return inserted
+                return True
         except Exception as e:
             logger.error(f"Failed to push companion message: {e}")
             return False

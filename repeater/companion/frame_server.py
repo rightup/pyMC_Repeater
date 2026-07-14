@@ -76,13 +76,19 @@ class CompanionFrameServer(_BaseFrameServer):
         if retention == 0:
             self.bridge.message_queue.pop_last()
             return
-        await asyncio.to_thread(
+        persisted = await asyncio.to_thread(
             self.sqlite_handler.companion_push_message,
             self.companion_hash,
             msg_dict,
             retention,
         )
-        self.bridge.message_queue.pop_last()
+        if persisted:
+            self.bridge.message_queue.pop_last()
+        else:
+            logger.debug(
+                "Companion %s: retaining message in memory after SQLite queue rejection",
+                self.companion_hash,
+            )
 
     def _sync_next_from_persistence(self) -> Optional[QueuedMessage]:
         """Retrieve next message from SQLite when bridge queue is empty."""

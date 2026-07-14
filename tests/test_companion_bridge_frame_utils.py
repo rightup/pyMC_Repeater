@@ -5,7 +5,7 @@ from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from openhop_core.companion.constants import RESP_CODE_NO_MORE_MESSAGES
+from openhop_core.companion.constants import PUSH_CODE_MSG_WAITING, RESP_CODE_NO_MORE_MESSAGES
 
 from repeater.companion.bridge import RepeaterCompanionBridge, _to_json_safe
 from repeater.companion.frame_server import CompanionFrameServer
@@ -199,6 +199,24 @@ async def test_frame_server_no_more_messages_response_when_empty():
         await srv._cmd_sync_next_message(b"")
         # RESP_CODE_NO_MORE_MESSAGES is encoded as a single-byte frame.
         assert srv._write_frame.call_args[0][0] == bytes([RESP_CODE_NO_MORE_MESSAGES])
+
+
+@pytest.mark.asyncio
+async def test_rejected_queue_callback_skips_sqlite_persistence_but_notifies_client():
+    server = object.__new__(CompanionFrameServer)
+    server._persist_companion_message = AsyncMock()
+    server._enqueue_frame = MagicMock()
+
+    await server._on_message_received(
+        b"\x01" * 32,
+        "rejected",
+        1,
+        0,
+        queued=False,
+    )
+
+    server._persist_companion_message.assert_not_awaited()
+    server._enqueue_frame.assert_called_once_with(bytes([PUSH_CODE_MSG_WAITING]))
 
 
 def test_companion_utils_validation_and_normalization():

@@ -176,9 +176,54 @@ class TestSqliteRetentionTrim:
 
     def test_trims_to_max_messages(self, tmp_path):
         h = self._handler(tmp_path)
-        for i in range(5):
-            self._push(h, "0x01", i, max_messages=3)
-        assert len(h.companion_load_messages("0x01")) == 3
+        results = [self._push(h, "0x01", i, max_messages=3) for i in range(5)]
+        assert results == [True, True, True, False, False]
+        assert [m["text"] for m in h.companion_load_messages("0x01")] == ["m0", "m1", "m2"]
+
+    def test_evicts_oldest_channel_message_before_direct_message(self, tmp_path):
+        h = self._handler(tmp_path)
+        direct_one = {"text": "direct one", "packet_hash": "d1", "is_channel": False}
+        channel_one = {"text": "channel one", "packet_hash": "c1", "is_channel": True}
+        direct_two = {"text": "direct two", "packet_hash": "d2", "is_channel": False}
+
+        assert h.companion_push_message("0x01", direct_one, max_messages=2)
+        assert h.companion_push_message("0x01", channel_one, max_messages=2)
+        assert h.companion_push_message("0x01", direct_two, max_messages=2)
+
+        messages = h.companion_load_messages("0x01")
+        assert [m["text"] for m in messages] == ["direct one", "direct two"]
+        assert [m["is_channel"] for m in messages] == [0, 0]
+
+    def test_rejects_channel_when_queue_contains_only_direct_messages(self, tmp_path):
+        h = self._handler(tmp_path)
+        for packet_hash in ("d1", "d2"):
+            assert h.companion_push_message(
+                "0x01", {"text": packet_hash, "packet_hash": packet_hash}, max_messages=2
+            )
+
+        assert not h.companion_push_message(
+            "0x01", {"text": "channel", "packet_hash": "c1", "is_channel": True}, max_messages=2
+        )
+        assert [m["text"] for m in h.companion_load_messages("0x01")] == ["d1", "d2"]
+
+    def test_rejected_insert_keeps_existing_channels_when_limit_is_lowered(self, tmp_path):
+        h = self._handler(tmp_path)
+        existing = [
+            {"text": "direct one", "packet_hash": "d1", "is_channel": False},
+            {"text": "channel one", "packet_hash": "c1", "is_channel": True},
+            {"text": "direct two", "packet_hash": "d2", "is_channel": False},
+        ]
+        for message in existing:
+            assert h.companion_push_message("0x01", message)
+
+        assert not h.companion_push_message(
+            "0x01", {"text": "incoming", "packet_hash": "d3"}, max_messages=2
+        )
+        assert [m["text"] for m in h.companion_load_messages("0x01")] == [
+            "direct one",
+            "channel one",
+            "direct two",
+        ]
 
     def test_none_keeps_all(self, tmp_path):
         h = self._handler(tmp_path)
@@ -380,6 +425,14 @@ class TestPersistSkipWhenOff:
         fs = self._frame_server(7)
         asyncio.run(fs._persist_companion_message({"text": "x"}))
         fs.sqlite_handler.companion_push_message.assert_called_once_with("0x01", {"text": "x"}, 7)
+
+    def test_keeps_memory_message_when_sqlite_rejects_it(self):
+        import asyncio
+
+        fs = self._frame_server(7)
+        fs.sqlite_handler.companion_push_message.return_value = False
+        asyncio.run(fs._persist_companion_message({"text": "x"}))
+        fs.bridge.message_queue.pop_last.assert_not_called()
 
 
 class TestImportRepeaterContactsCap:
