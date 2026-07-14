@@ -343,3 +343,38 @@ def test_advert_reload_config_and_cleanup_old_state_bounds_memory():
     assert "old" not in helper._recent_advert_hashes
     assert "pk" not in helper._penalty_until
     assert "oldpk" not in helper._bucket_state
+
+
+def test_advert_limiter_missing_sections_defaults_disabled():
+    helper = AdvertHelper(local_identity=None, storage=None, config={"repeater": {}})
+
+    assert helper._adaptive_enabled is False
+    assert helper._rate_limit_enabled is False
+    assert helper._penalty_enabled is False
+
+
+def test_advert_limiter_partial_sections_without_enabled_remain_disabled_after_reload():
+    helper = AdvertHelper(local_identity=None, storage=None, config={"repeater": {}})
+    helper.config = {
+        "repeater": {
+            "advert_adaptive": {
+                # enabled intentionally omitted
+                "thresholds": {"normal": 2, "busy": 7, "congested": 12}
+            },
+            "advert_rate_limit": {
+                # enabled intentionally omitted
+                "bucket_capacity": 3,
+                "refill_tokens": 2,
+            },
+            "advert_penalty_box": {
+                # enabled intentionally omitted
+                "violation_threshold": 2,
+            },
+        }
+    }
+
+    helper.reload_config()
+
+    assert helper._adaptive_enabled is False
+    assert helper._rate_limit_enabled is False
+    assert helper._penalty_enabled is False
