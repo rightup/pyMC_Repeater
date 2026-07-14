@@ -327,7 +327,7 @@ class _BrokerConnection:
         """MQTT connection callback"""
         rc_value = int(getattr(rc, "value", rc)) if rc is not None else -1
         if rc_value == 0:
-            logger.info(f"Connected to {self.broker['name']}")
+            logger.debug(f"Connected to {self.broker['name']}")
             self._running = True
             self._reconnect_attempts = 0  # Reset counter on success
             # Successful connect can race with a previously scheduled timer; cancel it.
@@ -362,7 +362,7 @@ class _BrokerConnection:
         self._running = False
 
         if self._shutdown_requested:
-            logger.info(f"Clean disconnect from {self.broker['name']}")
+            logger.debug(f"Clean disconnect from {self.broker['name']}")
             if self._on_disconnect_callback:
                 self._on_disconnect_callback(self.broker["name"])
             return
@@ -381,7 +381,7 @@ class _BrokerConnection:
             if was_running:  # Only reconnect if we were intentionally connected
                 self._schedule_reconnect(reason=error_msg)
         else:
-            logger.info(f"Clean disconnect from {self.broker['name']}")
+            logger.debug(f"Clean disconnect from {self.broker['name']}")
 
         if self._on_disconnect_callback:
             self._on_disconnect_callback(self.broker["name"])
@@ -398,7 +398,7 @@ class _BrokerConnection:
         delay = min(5 * (2**self._reconnect_attempts), self._max_reconnect_delay)
         self._reconnect_attempts += 1
 
-        logger.info(
+        logger.debug(
             f"Scheduling reconnect to {self.broker['name']} in {delay}s (attempt {self._reconnect_attempts}, reason: {reason})"
         )
         self._reconnect_timer = threading.Timer(delay, lambda: self._attempt_reconnect(reason))
@@ -418,7 +418,7 @@ class _BrokerConnection:
             return
 
         try:
-            logger.info(f"Attempting reconnection to {self.broker['name']} (reason: {reason})...")
+            logger.debug(f"Attempting reconnection to {self.broker['name']} (reason: {reason})...")
 
             # Stop the loop if it's still running (websocket mode requires clean restart)
             try:
@@ -598,7 +598,7 @@ class _BrokerConnection:
         if not self._running:
             return
 
-        logger.info(f"JWT token expiring soon for {self.broker['name']}, refreshing...")
+        logger.debug(f"JWT token expiring soon for {self.broker['name']}, refreshing...")
         self._running = False
         self._jwt_refresh_timer = None
 
