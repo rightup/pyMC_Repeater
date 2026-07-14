@@ -497,7 +497,7 @@ class _BrokerConnection:
         # Set JWT credentials before CONNECT handshake
         self._set_credentials()
 
-        logger.info(
+        logger.debug(
             f"Connecting to {self.broker['name']} "
             f"({protocol}://{self.broker['host']}:{self.broker['port']}) ..."
         )
