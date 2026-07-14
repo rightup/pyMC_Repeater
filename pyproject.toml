@@ -46,7 +46,7 @@ dependencies = [
 [project.optional-dependencies]
 # SX1262/SPI support (Linux only; required for Raspberry Pi HATs)
 hardware = [
-    "openhop_core[hardware] @ git+https://github.com/openhop-dev/openhop_core.git@dev",
+    "openhop_core[hardware] @ git+https://github.com/openhop-dev/openhop_core.git@fix/all-the-things-core",
 ]
 # RRD metrics (Performance Metrics chart); system librrd required (e.g. apt install rrdtool)
 rrd = [
