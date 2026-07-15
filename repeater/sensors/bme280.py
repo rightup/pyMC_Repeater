@@ -74,9 +74,7 @@ class BME280Sensor(SensorBase):
 
         self.i2c_address = int(self.settings.get("i2c_address", 0x76))
         self.bus_number = int(self.settings.get("bus_number", 1))
-        self.read_timeout_seconds = float(
-            self.settings.get("read_timeout_seconds", 1.0)
-        )
+        self.read_timeout_seconds = float(self.settings.get("read_timeout_seconds", 1.0))
 
         self.available = False
         self._cal: Optional[Calibration] = None
@@ -97,9 +95,7 @@ class BME280Sensor(SensorBase):
 
             chip = bus.read_byte_data(self.i2c_address, _REG_ID)
             if chip != self.CHIP_ID:
-                raise RuntimeError(
-                    f"Unexpected chip ID 0x{chip:02X} (expected 0x60)"
-                )
+                raise RuntimeError(f"Unexpected chip ID 0x{chip:02X} (expected 0x60)")
 
             self._cal = self._read_calibration(bus)
             self.available = True
@@ -171,7 +167,7 @@ class BME280Sensor(SensorBase):
         c = self._cal
         if c is None:
             return 0.0, 0.0
-            
+
         var1 = ((adc_t / 16384.0) - (c.T1 / 1024.0)) * c.T2
         var2 = (((adc_t / 131072.0) - (c.T1 / 8192.0)) ** 2) * c.T3
 
@@ -191,10 +187,7 @@ class BME280Sensor(SensorBase):
         var2 += var1 * c.P5 * 2.0
         var2 = var2 / 4.0 + c.P4 * 65536.0
 
-        var1 = (
-            (c.P3 * var1 * var1 / 524288.0)
-            + (c.P2 * var1)
-        ) / 524288.0
+        var1 = ((c.P3 * var1 * var1 / 524288.0) + (c.P2 * var1)) / 524288.0
 
         var1 = (1.0 + var1 / 32768.0) * c.P1
 
@@ -219,26 +212,13 @@ class BME280Sensor(SensorBase):
 
         humidity = t_fine - 76800.0
 
-        humidity = (
-            adc_h
-            - (c.H4 * 64.0 + c.H5 / 16384.0 * humidity)
-        ) * (
+        humidity = (adc_h - (c.H4 * 64.0 + c.H5 / 16384.0 * humidity)) * (
             c.H2
             / 65536.0
-            * (
-                1.0
-                + c.H6 / 67108864.0 * humidity
-                * (
-                    1.0
-                    + c.H3 / 67108864.0 * humidity
-                )
-            )
+            * (1.0 + c.H6 / 67108864.0 * humidity * (1.0 + c.H3 / 67108864.0 * humidity))
         )
 
-        humidity *= (
-            1.0
-            - c.H1 * humidity / 524288.0
-        )
+        humidity *= 1.0 - c.H1 * humidity / 524288.0
 
         return max(0.0, min(100.0, humidity))
 
@@ -263,17 +243,9 @@ class BME280Sensor(SensorBase):
 
             data = bus.read_i2c_block_data(self.i2c_address, _REG_DATA, 8)
 
-            adc_p = (
-                (data[0] << 12)
-                | (data[1] << 4)
-                | (data[2] >> 4)
-            )
+            adc_p = (data[0] << 12) | (data[1] << 4) | (data[2] >> 4)
 
-            adc_t = (
-                (data[3] << 12)
-                | (data[4] << 4)
-                | (data[5] >> 4)
-            )
+            adc_t = (data[3] << 12) | (data[4] << 4) | (data[5] >> 4)
 
             adc_h = (data[6] << 8) | data[7]
 

@@ -568,10 +568,10 @@ def test_bme280_sensor_reads_temperature_humidity_pressure(monkeypatch):
                 return 0x60
 
             if register == 0xA1:
-                return 75      # H1
+                return 75  # H1
 
             if register == 0xF3:
-                return 0x00    # status
+                return 0x00  # status
 
             return 0
 
@@ -581,30 +581,42 @@ def test_bme280_sensor_reads_temperature_humidity_pressure(monkeypatch):
                 # Calibration registers (realistic values)
                 return [
                     # Temperature calibration
-                    0x70, 0x6B,  # T1 = 27504
-                    0x43, 0x67,  # T2 = 26435
-                    0x18, 0xFC,  # T3 = -1000
-
+                    0x70,
+                    0x6B,  # T1 = 27504
+                    0x43,
+                    0x67,  # T2 = 26435
+                    0x18,
+                    0xFC,  # T3 = -1000
                     # Pressure calibration
-                    0x7D, 0x8E,  # P1 = 36477
-                    0x43, 0xD6,  # P2 = -10685
-                    0xD0, 0x0B,  # P3 = 3024
-                    0x27, 0x0B,  # P4 = 2855
-                    0x8C, 0x00,  # P5 = 140
-                    0xF9, 0xFF,  # P6 = -7
-                    0x8C, 0x3C,  # P7 = 15500
-                    0xF8, 0xC6,  # P8 = -14600
-                    0x70, 0x17,  # P9 = 6000
+                    0x7D,
+                    0x8E,  # P1 = 36477
+                    0x43,
+                    0xD6,  # P2 = -10685
+                    0xD0,
+                    0x0B,  # P3 = 3024
+                    0x27,
+                    0x0B,  # P4 = 2855
+                    0x8C,
+                    0x00,  # P5 = 140
+                    0xF9,
+                    0xFF,  # P6 = -7
+                    0x8C,
+                    0x3C,  # P7 = 15500
+                    0xF8,
+                    0xC6,  # P8 = -14600
+                    0x70,
+                    0x17,  # P9 = 6000
                 ]
 
             if register == 0xE1:
                 return [
-                    0x6A, 0x01,  # H2 = 362
-                    0x00,        # H3 = 0
-                    0x14,        # E4
-                    0x25,        # E5
-                    0x03,        # E6
-                    0x1E,        # H6 = 30
+                    0x6A,
+                    0x01,  # H2 = 362
+                    0x00,  # H3 = 0
+                    0x14,  # E4
+                    0x25,  # E5
+                    0x03,  # E6
+                    0x1E,  # H6 = 30
                 ]
             if register == 0xF3:
                 # status register (not busy)
@@ -613,13 +625,16 @@ def test_bme280_sensor_reads_temperature_humidity_pressure(monkeypatch):
             if register == 0xF7:
                 return [
                     # Pressure
-                    0x65, 0x5A, 0xC0,
-
+                    0x65,
+                    0x5A,
+                    0xC0,
                     # Temperature
-                    0x80, 0x00, 0x00,
-
+                    0x80,
+                    0x00,
+                    0x00,
                     # Humidity
-                    0x66, 0x80,
+                    0x66,
+                    0x80,
                 ]
 
             return [0] * length
