@@ -21,6 +21,7 @@ from repeater.companion.utils import (
     trim_companion_contacts_to_fit,
     validate_companion_config_capacity,
 )
+from repeater.main import RepeaterDaemon
 
 # openhop_core defaults (CompanionBridge / ContactStore)
 _DEFAULT_MAX_CONTACTS = 1000
@@ -60,6 +61,46 @@ class TestParseCompanionBridgeKwargs:
     def test_invalid_max_contacts(self):
         with pytest.raises(ValueError):
             parse_companion_bridge_kwargs({"max_contacts": -1})
+
+
+class TestCompanionRadioCapabilities:
+    def test_reads_active_radio_state_and_known_sx1262_limit(self):
+        radio = SimpleNamespace(
+            frequency=868_000_000,
+            bandwidth=125_000,
+            spreading_factor=7,
+            coding_rate=8,
+            tx_power=14,
+        )
+        daemon = RepeaterDaemon.__new__(RepeaterDaemon)
+        daemon.config = {"radio_type": "sx1262", "radio": {"frequency": 915_000_000}}
+        daemon.repeater_handler = SimpleNamespace(radio_config={"frequency": 915_000_000})
+        daemon.radio = radio
+
+        assert RepeaterDaemon._get_companion_radio_settings(daemon) == {
+            "frequency": 868_000_000,
+            "bandwidth": 125_000,
+            "spreading_factor": 7,
+            "coding_rate": 8,
+            "tx_power": 14,
+        }
+        assert RepeaterDaemon._get_companion_max_tx_power_dbm(daemon) == 22
+
+    def test_prefers_backend_declared_maximum(self):
+        daemon = RepeaterDaemon.__new__(RepeaterDaemon)
+        daemon.config = {"radio_type": "sx1262"}
+        daemon.repeater_handler = SimpleNamespace(radio_config={})
+        daemon.radio = SimpleNamespace(max_tx_power_dbm=19)
+
+        assert RepeaterDaemon._get_companion_max_tx_power_dbm(daemon) == 19
+
+    def test_uses_configured_limit_when_backend_cannot_declare_one(self):
+        daemon = RepeaterDaemon.__new__(RepeaterDaemon)
+        daemon.config = {"radio_type": "kiss"}
+        daemon.repeater_handler = SimpleNamespace(radio_config={"max_tx_power_dbm": 15})
+        daemon.radio = SimpleNamespace()
+
+        assert RepeaterDaemon._get_companion_max_tx_power_dbm(daemon) == 15
 
 
 class TestEffectiveMaxContacts:

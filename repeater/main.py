@@ -559,6 +559,75 @@ class RepeaterDaemon:
         total_identities = len(self.identity_manager.list_identities())
         logger.info(f"Identity manager loaded {total_identities} total identities")
 
+    def _get_companion_radio_settings(self) -> dict:
+        """Return the current repeater radio settings for virtual companions.
+
+        The values are read-only to companion sessions.  Prefer attributes of
+        the active backend, then retain the configured value when a backend
+        cannot expose that field.
+        """
+        config = (
+            self.repeater_handler.radio_config
+            if self.repeater_handler
+            else self.config.get("radio", {})
+        )
+        settings = dict(config) if isinstance(config, dict) else {}
+        radio = self.radio
+        if radio is None:
+            return settings
+
+        for config_key, attr in (
+            ("frequency", "frequency"),
+            ("bandwidth", "bandwidth"),
+            ("spreading_factor", "spreading_factor"),
+            ("coding_rate", "coding_rate"),
+            ("tx_power", "tx_power"),
+        ):
+            value = getattr(radio, attr, None)
+            if value is not None:
+                settings[config_key] = value
+        return settings
+
+    def _get_companion_max_tx_power_dbm(self):
+        """Return the active backend's TX limit when it declares one.
+
+        SX1262 backends have an enforced 22 dBm driver limit.  Other backends
+        can expose a ``get_max_tx_power_dbm`` method, a
+        ``max_tx_power_dbm`` attribute, or a validated deployment setting.
+        Returning ``None`` lets Core use its generic protocol fallback.
+        """
+        radio = self.radio
+        getter = getattr(radio, "get_max_tx_power_dbm", None)
+        if callable(getter):
+            try:
+                value = getter()
+                if value is not None:
+                    return int(value)
+            except (TypeError, ValueError):
+                logger.warning("Radio reported an invalid maximum TX power")
+            except Exception as e:
+                logger.warning("Could not get radio maximum TX power: %s", e)
+
+        value = getattr(radio, "max_tx_power_dbm", None)
+        if value is not None:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                logger.warning("Radio reported an invalid maximum TX power: %r", value)
+
+        settings = self._get_companion_radio_settings()
+        value = settings.get("max_tx_power_dbm", settings.get("max_tx_power"))
+        if value is not None:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                logger.warning("Configured maximum TX power is invalid: %r", value)
+
+        radio_type = str(self.config.get("radio_type", "")).lower().strip()
+        if radio_type in {"sx1262", "sx1262_ch341"}:
+            return 22
+        return None
+
     async def _load_companion_identities(self) -> None:
         """Load companion identities from config and create CompanionBridge + frame server for each."""
         from openhop_core import LocalIdentity
@@ -674,6 +743,8 @@ class RepeaterDaemon:
                     ),
                     node_name=node_name,
                     radio_config=radio_config,
+                    radio_settings_getter=self._get_companion_radio_settings,
+                    max_tx_power_getter=self._get_companion_max_tx_power_dbm,
                     sqlite_handler=sqlite_handler,
                     companion_hash=companion_hash_str,
                     on_prefs_saved=_make_sync_node_name_to_config(name),
@@ -893,6 +964,8 @@ class RepeaterDaemon:
             ),
             node_name=node_name,
             radio_config=radio_config,
+            radio_settings_getter=self._get_companion_radio_settings,
+            max_tx_power_getter=self._get_companion_max_tx_power_dbm,
             sqlite_handler=sqlite_handler,
             companion_hash=companion_hash_str,
             **bridge_kwargs,
