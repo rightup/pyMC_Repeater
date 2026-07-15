@@ -1,6 +1,5 @@
 import asyncio
 import functools
-import inspect
 import logging
 import os
 import signal
@@ -731,14 +730,14 @@ class RepeaterDaemon:
     async def _restore_companion_state(
         self, sqlite_handler, bridge, companion_hash_str: str, name: str
     ) -> None:
-        """Restore persisted contacts/channels/messages from SQLite into a bridge.
+        """Restore persisted contacts and channels from SQLite into a bridge.
 
         Each load is cross-checked against the table's row count for this
         companion and retried once on mismatch; raises CompanionStateLoadError
         when persisted rows exist but cannot be loaded, so the companion fails
         init loudly instead of starting with an empty store.
         """
-        from openhop_core.companion.models import Channel, QueuedMessage
+        from openhop_core.companion.models import Channel
 
         contact_rows, contact_count = await _load_companion_rows_verified(
             sqlite_handler.companion_load_contacts,
@@ -790,63 +789,15 @@ class RepeaterDaemon:
                     row.get("name", ""),
                 )
 
-        # Preload queued messages, bounded by offline_queue_size (0 disables
-        # offline storage entirely).
-        loaded_messages = 0
-        message_count = 0
-        retention = getattr(bridge.message_queue, "max_size", None)
-        if retention != 0:
-            message_rows, message_count = await _load_companion_rows_verified(
-                sqlite_handler.companion_load_messages,
-                sqlite_handler.companion_count_messages,
-                "messages",
-                companion_hash_str,
-                name,
-                limit=retention or 100,
-            )
-            loaded_messages = len(message_rows)
-            # openhop_core < the sender_prefix change (paired with fd43d86) has no
-            # QueuedMessage.sender_prefix; drop the prefix there instead of failing init.
-            supports_sender_prefix = "sender_prefix" in inspect.signature(QueuedMessage).parameters
-            if message_rows and not supports_sender_prefix:
-                logger.warning(
-                    "Companion %s ('%s'): installed openhop_core QueuedMessage has no "
-                    "sender_prefix field; persisted sender prefixes will be dropped "
-                    "(update openhop_core to restore signed room-post authors)",
-                    companion_hash_str,
-                    name,
-                )
-            for msg_dict in message_rows:
-                sk = msg_dict.get("sender_key", b"")
-                if isinstance(sk, str):
-                    sk = bytes.fromhex(sk)
-                sp = msg_dict.get("sender_prefix", b"")
-                if isinstance(sp, str):
-                    sp = bytes.fromhex(sp) if sp else b""
-                msg_kwargs = dict(
-                    sender_key=sk,
-                    txt_type=msg_dict.get("txt_type", 0),
-                    timestamp=msg_dict.get("timestamp", 0),
-                    text=msg_dict.get("text", ""),
-                    is_channel=bool(msg_dict.get("is_channel", False)),
-                    channel_idx=msg_dict.get("channel_idx", 0),
-                    path_len=msg_dict.get("path_len", 0),
-                )
-                if supports_sender_prefix:
-                    msg_kwargs["sender_prefix"] = sp
-                bridge.message_queue.push(QueuedMessage(**msg_kwargs))
-
         logger.info(
-            "Companion %s ('%s'): restored %d/%d contact(s), %d/%d channel(s), "
-            "%d/%d message(s) from SQLite",
+            "Companion %s ('%s'): restored %d/%d contact(s), %d/%d channel(s); "
+            "queued messages remain in SQLite",
             companion_hash_str,
             name,
             len(contact_rows),
             contact_count,
             len(channel_rows),
             channel_count,
-            loaded_messages,
-            message_count,
         )
 
     async def add_companion_from_config(self, comp_config: dict) -> None:
