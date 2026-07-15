@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+from collections.abc import Mapping
 from enum import Enum
 from typing import Any, Callable, Optional
 
@@ -69,6 +70,8 @@ class RepeaterCompanionBridge(CompanionBridge):
         authenticate_callback: Optional[Callable[..., tuple[bool, int]]] = None,
         initial_contacts: Optional[Any] = None,
         *,
+        radio_settings_getter: Optional[Callable[[], Mapping[str, Any]]] = None,
+        max_tx_power_getter: Optional[Callable[[], Optional[int]]] = None,
         sqlite_handler=None,
         companion_hash: str = "",
         on_prefs_saved: Optional[Callable[[str], None]] = None,
@@ -87,6 +90,8 @@ class RepeaterCompanionBridge(CompanionBridge):
             radio_config=radio_config,
             authenticate_callback=authenticate_callback,
             initial_contacts=initial_contacts,
+            radio_settings_getter=radio_settings_getter,
+            max_tx_power_getter=max_tx_power_getter,
         )
 
     def _save_prefs(self) -> None:

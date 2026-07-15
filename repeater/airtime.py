@@ -3,6 +3,8 @@ import math
 import time
 from typing import Tuple
 
+from openhop_core.protocol.packet_utils import coding_rate_denominator
+
 logger = logging.getLogger("AirtimeManager")
 
 
@@ -55,7 +57,9 @@ class AirtimeManager:
         """
         sf = spreading_factor or self.spreading_factor
         bw_hz = bandwidth_hz or self.bandwidth
-        cr = coding_rate or self.coding_rate
+        # Configs and radio drivers use either the denominator form (5..8) or
+        # the legacy index form (1..4); normalize before the Semtech formula.
+        cr = coding_rate_denominator(coding_rate or self.coding_rate)
         preamble_len = preamble_len or self.preamble_length
         crc = 1 if crc_enabled else 0
         h = 0 if explicit_header else 1  # H=0 for explicit, H=1 for implicit

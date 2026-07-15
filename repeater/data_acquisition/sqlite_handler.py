@@ -403,6 +403,7 @@ class SQLiteHandler:
                                 out_path_len INTEGER NOT NULL DEFAULT -1,
                                 out_path BLOB,
                                 last_advert_timestamp INTEGER NOT NULL DEFAULT 0,
+                                last_advert_packet BLOB,
                                 lastmod INTEGER NOT NULL DEFAULT 0,
                                 gps_lat REAL NOT NULL DEFAULT 0,
                                 gps_lon REAL NOT NULL DEFAULT 0,
@@ -609,6 +610,27 @@ class SQLiteHandler:
                             "ADD COLUMN sender_prefix TEXT NOT NULL DEFAULT ''"
                         )
                         logger.info("Added sender_prefix column to companion_messages table")
+                    conn.execute(
+                        "INSERT INTO migrations (migration_name, applied_at) VALUES (?, ?)",
+                        (migration_name, time.time()),
+                    )
+                    logger.info(f"Migration '{migration_name}' applied successfully")
+
+                # Migration 11: Preserve the exact verified ADVERT wire packet
+                # for MeshCore-compatible CMD_EXPORT_CONTACT after restart.
+                migration_name = "add_last_advert_packet_to_companion_contacts"
+                existing = conn.execute(
+                    "SELECT migration_name FROM migrations WHERE migration_name = ?",
+                    (migration_name,),
+                ).fetchone()
+                if not existing:
+                    cursor = conn.execute("PRAGMA table_info(companion_contacts)")
+                    columns = [column[1] for column in cursor.fetchall()]
+                    if "last_advert_packet" not in columns:
+                        conn.execute(
+                            "ALTER TABLE companion_contacts ADD COLUMN last_advert_packet BLOB"
+                        )
+                        logger.info("Added last_advert_packet column to companion_contacts")
                     conn.execute(
                         "INSERT INTO migrations (migration_name, applied_at) VALUES (?, ?)",
                         (migration_name, time.time()),
@@ -2990,7 +3012,8 @@ class SQLiteHandler:
                 cursor = conn.execute(
                     """
                     SELECT pubkey, name, adv_type, flags, out_path_len, out_path,
-                           last_advert_timestamp, lastmod, gps_lat, gps_lon, sync_since
+                           last_advert_timestamp, last_advert_packet,
+                           lastmod, gps_lat, gps_lon, sync_since
                     FROM companion_contacts WHERE companion_hash = ?
                 """,
                     (companion_hash,),
@@ -3019,6 +3042,7 @@ class SQLiteHandler:
                         c.get("out_path_len", -1),
                         c.get("out_path", b""),
                         c.get("last_advert_timestamp", 0),
+                        c.get("last_advert_packet"),
                         c.get("lastmod", 0),
                         c.get("gps_lat", 0.0),
                         c.get("gps_lon", 0.0),
@@ -3032,8 +3056,9 @@ class SQLiteHandler:
                         """
                         INSERT INTO companion_contacts
                         (companion_hash, pubkey, name, adv_type, flags, out_path_len, out_path,
-                         last_advert_timestamp, lastmod, gps_lat, gps_lon, sync_since, updated_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         last_advert_timestamp, last_advert_packet,
+                         lastmod, gps_lat, gps_lon, sync_since, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                         rows,
                     )
@@ -3052,14 +3077,16 @@ class SQLiteHandler:
                     """
                     INSERT INTO companion_contacts
                     (companion_hash, pubkey, name, adv_type, flags, out_path_len, out_path,
-                     last_advert_timestamp, lastmod, gps_lat, gps_lon, sync_since, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     last_advert_timestamp, last_advert_packet,
+                     lastmod, gps_lat, gps_lon, sync_since, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(companion_hash, pubkey)
                     DO UPDATE SET
                         name=excluded.name, adv_type=excluded.adv_type,
                         flags=excluded.flags, out_path_len=excluded.out_path_len,
                         out_path=excluded.out_path,
                         last_advert_timestamp=excluded.last_advert_timestamp,
+                        last_advert_packet=excluded.last_advert_packet,
                         lastmod=excluded.lastmod, gps_lat=excluded.gps_lat,
                         gps_lon=excluded.gps_lon, sync_since=excluded.sync_since,
                         updated_at=excluded.updated_at
@@ -3073,6 +3100,7 @@ class SQLiteHandler:
                         contact.get("out_path_len", -1),
                         contact.get("out_path", b""),
                         contact.get("last_advert_timestamp", 0),
+                        contact.get("last_advert_packet"),
                         contact.get("lastmod", 0),
                         contact.get("gps_lat", 0.0),
                         contact.get("gps_lon", 0.0),
@@ -3330,12 +3358,17 @@ class SQLiteHandler:
         previous SELECT + INSERT round-trip (two statements, two SD-card reads)
         with a single atomic statement.
 
-        When ``max_messages`` is set, the oldest rows beyond that retention limit
-        are trimmed after a successful insert (power-user ``offline_queue_size``).
+        When ``max_messages`` is set, capacity follows MeshCore's offline queue
+        policy: evict the oldest channel message first and never displace a
+        retained direct message. The insert and any eviction share one
+        transaction.
 
-        Returns True if inserted, False if the message was a duplicate (skipped).
+        Returns True if the message is retained, False if it is a duplicate or
+        the protected queue cannot make room for it.
         """
         try:
+            if max_messages is not None and max_messages <= 0:
+                return False
             packet_hash = msg.get("packet_hash") or None
             if isinstance(packet_hash, bytes):
                 packet_hash = packet_hash.decode("utf-8", errors="replace") if packet_hash else None
@@ -3344,6 +3377,7 @@ class SQLiteHandler:
             if not isinstance(sender_prefix, str):
                 sender_prefix = bytes(sender_prefix or b"").hex()
             with self._connect() as conn:
+                conn.execute("SAVEPOINT companion_message_push")
                 cursor = conn.execute(
                     """
                     INSERT OR IGNORE INTO companion_messages
@@ -3366,22 +3400,49 @@ class SQLiteHandler:
                     ),
                 )
                 inserted = cursor.rowcount > 0
-                if inserted and max_messages is not None:
-                    # Keep the newest `max_messages` rows; drop older overflow.
-                    conn.execute(
-                        """
-                        DELETE FROM companion_messages
-                        WHERE companion_hash = ? AND id NOT IN (
+                if not inserted:
+                    conn.execute("RELEASE SAVEPOINT companion_message_push")
+                    conn.commit()
+                    return False
+                if max_messages is not None:
+                    count = conn.execute(
+                        "SELECT COUNT(*) FROM companion_messages WHERE companion_hash = ?",
+                        (companion_hash,),
+                    ).fetchone()[0]
+                    while count > max_messages:
+                        oldest_channel = conn.execute(
+                            """
                             SELECT id FROM companion_messages
-                            WHERE companion_hash = ?
-                            ORDER BY created_at DESC, id DESC
-                            LIMIT ?
+                            WHERE companion_hash = ? AND is_channel = 1
+                            ORDER BY created_at ASC, id ASC LIMIT 1
+                            """,
+                            (companion_hash,),
+                        ).fetchone()
+                        if oldest_channel is None:
+                            # The just-inserted row is not retainable without
+                            # sacrificing a direct message. Keep every prior
+                            # row intact, including any channel rows already
+                            # considered while satisfying a lowered limit.
+                            conn.execute("ROLLBACK TO SAVEPOINT companion_message_push")
+                            conn.execute("RELEASE SAVEPOINT companion_message_push")
+                            conn.commit()
+                            return False
+                        if oldest_channel[0] == cursor.lastrowid:
+                            # A new channel message is itself the only
+                            # evictable row; retain the protected directs and
+                            # report that the incoming message was rejected.
+                            conn.execute("ROLLBACK TO SAVEPOINT companion_message_push")
+                            conn.execute("RELEASE SAVEPOINT companion_message_push")
+                            conn.commit()
+                            return False
+                        conn.execute(
+                            "DELETE FROM companion_messages WHERE id = ?",
+                            (oldest_channel[0],),
                         )
-                        """,
-                        (companion_hash, companion_hash, max_messages),
-                    )
+                        count -= 1
+                conn.execute("RELEASE SAVEPOINT companion_message_push")
                 conn.commit()
-                return inserted
+                return True
         except Exception as e:
             logger.error(f"Failed to push companion message: {e}")
             return False

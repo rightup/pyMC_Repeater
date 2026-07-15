@@ -97,6 +97,21 @@ def test_long_range_preset_has_higher_airtime_than_fast_preset_for_same_payload(
     assert long_mgr.calculate_airtime(payload_len) > fast_mgr.calculate_airtime(payload_len)
 
 
+def test_legacy_coding_rate_index_matches_denominator_form():
+    """A config using the legacy index form (1..4) must compute the same
+    airtime as the equivalent denominator form (5..8), not undercount
+    payload symbols by multiplying with the raw index."""
+    for index, denom in ((1, 5), (2, 6), (3, 7), (4, 8)):
+        by_index = _make_mgr(sf=10, bw_hz=250000, cr=index, preamble=8)
+        by_denom = _make_mgr(sf=10, bw_hz=250000, cr=denom, preamble=8)
+        for payload_len in (16, 64, 128):
+            assert math.isclose(
+                by_index.calculate_airtime(payload_len),
+                by_denom.calculate_airtime(payload_len),
+                rel_tol=1e-9,
+            )
+
+
 @pytest.mark.parametrize("_title,sf,bw_hz,cr", ALL_PRESETS, ids=ALL_PRESET_IDS)
 def test_can_transmit_blocks_after_budget_exhausted_for_each_preset(_title, sf, bw_hz, cr):
     mgr = _make_mgr(sf, bw_hz, cr, preamble=8, max_airtime_per_minute=600)

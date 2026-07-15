@@ -33,6 +33,36 @@ from openhop_core.protocol.constants import (
 
 LOCAL_HASH_BYTES = bytes([0xAB, 0xCD, 0xEF])
 
+# Literal frames from MeshCore Packet::writeTo.  Do not build these through
+# PathUtils or Packet.write_to(): their encoded path_len bytes are independent
+# compatibility fixtures for the actual radio wire format.
+FIRMWARE_MAX_DIRECT_PATH_VECTORS = (
+    pytest.param(
+        1,
+        b"\x0a\x3f" + b"\xab" + b"\x11" * 62 + b"\xa1",
+        b"\x0a\x3e" + b"\x11" * 62 + b"\xa1",
+        id="direct-1-byte-63-hop-0x3f",
+    ),
+    pytest.param(
+        2,
+        b"\x0a\x60" + b"\xab\xcd" + b"\x11" * 62 + b"\xa2",
+        b"\x0a\x5f" + b"\x11" * 62 + b"\xa2",
+        id="direct-2-byte-32-hop-0x60",
+    ),
+    pytest.param(
+        3,
+        b"\x0a\x95" + b"\xab\xcd\xef" + b"\x11" * 60 + b"\xa3",
+        b"\x0a\x94" + b"\x11" * 60 + b"\xa3",
+        id="direct-3-byte-21-hop-0x95",
+    ),
+    pytest.param(
+        2,
+        b"\x0b\x34\x12\x78\x56\x60" + b"\xab\xcd" + b"\x11" * 62 + b"\xa4",
+        b"\x0b\x34\x12\x78\x56\x5f" + b"\x11" * 62 + b"\xa4",
+        id="transport-direct-2-byte-32-hop-0x60",
+    ),
+)
+
 
 def _make_flood_packet(
     path_bytes: bytes, hash_size: int, hash_count: int, payload: bytes = b"\x01\x02\x03\x04"
@@ -415,32 +445,44 @@ class TestFloodForwardMultiByte:
         assert pkt2.get_path_hash_count() == 2
         assert pkt2.get_path_hashes() == [b"\x11\x22", b"\xab\xcd"]
 
-    def test_flood_rejects_at_max_hops_2_byte(self):
-        """At 32 hops (2-byte mode), flood_forward should drop the packet."""
-        h = _make_handler(path_hash_mode=1, local_hash_bytes=bytes([0xAB, 0xCD, 0xEF]))
-        path = bytes([0x00, 0x01] * 32)  # 32 hops × 2 bytes = 64 bytes
-        pkt = _make_flood_packet(path, hash_size=2, hash_count=32)
+    @pytest.mark.parametrize("hash_size,hop_count", [(2, 32), (3, 21)])
+    def test_flood_rejects_when_append_exceeds_firmware_byte_capacity(self, hash_size, hop_count):
+        """MeshCore drops flood packets whose next hop would exceed 64 bytes."""
+        h = _make_handler(path_hash_mode=hash_size - 1, local_hash_bytes=bytes([0xAB, 0xCD, 0xEF]))
+        pkt = _make_flood_packet(
+            bytes([0x11]) * (hash_size * hop_count),
+            hash_size=hash_size,
+            hash_count=hop_count,
+        )
         result = h.flood_forward(pkt)
+
         assert result is None
         assert pkt.drop_reason is not None
 
-    def test_flood_rejects_at_max_hops_3_byte(self):
-        """At 21 hops (3-byte mode), adding one more would exceed MAX_PATH_SIZE."""
-        h = _make_handler(path_hash_mode=2, local_hash_bytes=bytes([0xAB, 0xCD, 0xEF]))
-        path = bytes([0x00, 0x01, 0x02] * 21)  # 21 hops × 3 bytes = 63 bytes
-        pkt = _make_flood_packet(path, hash_size=3, hash_count=21)
-        result = h.flood_forward(pkt)
-        assert result is None
-        assert pkt.drop_reason is not None
+    def test_one_byte_63_hop_flood_is_protectively_rejected_before_count_wraps(self):
+        """Avoid MeshCore's current 63 -> 64 count-field wrap edge case."""
+        h = _make_handler(path_hash_mode=0, local_hash_bytes=LOCAL_HASH_BYTES)
+        pkt = _make_flood_packet(b"\x11" * 63, hash_size=1, hash_count=63)
 
-    def test_flood_allows_below_max_2_byte(self):
-        """At 31 hops (2-byte), one more should succeed."""
-        h = _make_handler(path_hash_mode=1, local_hash_bytes=bytes([0xAB, 0xCD, 0xEF]))
-        path = bytes(range(62))  # 31 hops × 2 bytes
-        pkt = _make_flood_packet(path, hash_size=2, hash_count=31)
         result = h.flood_forward(pkt)
+
+        assert result is None
+        assert pkt.drop_reason == "Path hop count at maximum (63), cannot append"
+
+    @pytest.mark.parametrize("hash_size,hop_count", [(1, 62), (2, 31), (3, 20)])
+    def test_flood_allows_one_below_capacity(self, hash_size, hop_count):
+        """Flood forwarding may append one hop when the resulting path fits."""
+        h = _make_handler(path_hash_mode=hash_size - 1, local_hash_bytes=bytes([0xAB, 0xCD, 0xEF]))
+        pkt = _make_flood_packet(
+            bytes([0x11]) * (hash_size * hop_count),
+            hash_size=hash_size,
+            hash_count=hop_count,
+        )
+
+        result = h.flood_forward(pkt)
+
         assert result is not None
-        assert result.get_path_hash_count() == 32
+        assert result.get_path_hash_count() == hop_count + 1
 
     def test_flood_rejects_empty_payload(self):
         h = _make_handler(path_hash_mode=0)
@@ -458,6 +500,50 @@ class TestFloodForwardMultiByte:
 
 class TestDirectForwardMultiByte:
     """Test RepeaterHandler.direct_forward with real multi-byte Packet objects."""
+
+    @pytest.mark.parametrize(
+        "hash_size,firmware_wire,expected_forwarded_wire", FIRMWARE_MAX_DIRECT_PATH_VECTORS
+    )
+    def test_firmware_maximum_direct_path_forwards_to_exact_wire_vector(
+        self, hash_size, firmware_wire, expected_forwarded_wire
+    ):
+        """Parse and forward literal MeshCore direct packets at each maximum."""
+        h = _make_handler(path_hash_mode=hash_size - 1, local_hash_bytes=LOCAL_HASH_BYTES)
+        pkt = Packet()
+        pkt.read_from(firmware_wire)
+
+        result = h.process_packet(pkt, snr=5.0)
+
+        assert result is not None
+        forwarded_packet, _ = result
+        assert forwarded_packet.write_to() == expected_forwarded_wire
+
+    @pytest.mark.parametrize("hash_size,hop_count", [(1, 63), (2, 32), (3, 21)])
+    def test_maximum_valid_direct_path_consumes_its_next_hop(self, hash_size, hop_count):
+        """A direct path at capacity is valid because forwarding shortens it."""
+        h = _make_handler(path_hash_mode=hash_size - 1, local_hash_bytes=LOCAL_HASH_BYTES)
+        path_len = hash_size * hop_count
+        path = LOCAL_HASH_BYTES[:hash_size] + bytes([0x11]) * (path_len - hash_size)
+        pkt = _make_direct_packet(path, hash_size=hash_size, hash_count=hop_count)
+
+        result = h.direct_forward(pkt)
+
+        assert result is not None
+        assert result.get_path_hash_count() == hop_count - 1
+        assert len(result.path) == path_len - hash_size
+
+    @pytest.mark.parametrize("hash_size,hop_count", [(2, 33), (3, 22)])
+    def test_oversized_direct_path_is_rejected(self, hash_size, hop_count):
+        """Encodings whose path bytes exceed 64 are invalid for every route."""
+        h = _make_handler(path_hash_mode=hash_size - 1, local_hash_bytes=LOCAL_HASH_BYTES)
+        path_len = hash_size * hop_count
+        path = LOCAL_HASH_BYTES[:hash_size] + bytes([0x11]) * (path_len - hash_size)
+        pkt = _make_direct_packet(path, hash_size=hash_size, hash_count=hop_count)
+
+        result = h.direct_forward(pkt)
+
+        assert result is None
+        assert "exceeds MAX_PATH_SIZE" in (pkt.drop_reason or "")
 
     def test_1_byte_match_strips_first_hop(self):
         h = _make_handler(path_hash_mode=0, local_hash_bytes=bytes([0xAB, 0xCD, 0xEF]))

@@ -13,7 +13,7 @@ from typing import Any, Dict, List
 
 from openhop_core.hardware.signal_utils import snr_register_to_db
 from openhop_core.node.handlers.trace import TraceHandler
-from openhop_core.protocol.constants import MAX_PATH_SIZE, ROUTE_TYPE_DIRECT
+from openhop_core.protocol.constants import MAX_PATH_SIZE
 from openhop_core.protocol.packet_utils import PathUtils
 
 logger = logging.getLogger("TraceHelper")
@@ -78,7 +78,7 @@ class TraceHelper:
         """
         try:
             # Only process direct route trace packets (SNR path uses len(packet.path))
-            if packet.get_route_type() != ROUTE_TYPE_DIRECT or len(packet.path) >= MAX_PATH_SIZE:
+            if not packet.is_route_direct() or len(packet.path) >= MAX_PATH_SIZE:
                 return
 
             # Parse the trace payload
