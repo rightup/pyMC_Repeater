@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from openhop_core.companion.constants import PUSH_CODE_MSG_WAITING, RESP_CODE_NO_MORE_MESSAGES
+from openhop_core.companion.models import MessageEvent
 
 from repeater.companion.bridge import RepeaterCompanionBridge, _to_json_safe
 from repeater.companion.frame_server import CompanionFrameServer
@@ -241,12 +242,14 @@ async def test_rejected_queue_callback_skips_sqlite_persistence_but_notifies_cli
     server._persist_companion_message = AsyncMock()
     server._enqueue_frame = MagicMock()
 
-    await server._on_message_received(
-        b"\x01" * 32,
-        "rejected",
-        1,
-        0,
-        queued=False,
+    await server._on_message_event(
+        MessageEvent(
+            sender_key=b"\x01" * 32,
+            text="rejected",
+            timestamp=1,
+            txt_type=0,
+            queued=False,
+        )
     )
 
     server._persist_companion_message.assert_not_awaited()

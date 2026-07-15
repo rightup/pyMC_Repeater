@@ -57,9 +57,9 @@ class CompanionFrameServer(_BaseFrameServer):
     async def start(self) -> None:
         """Start persistence before accepting companion client connections."""
         if self.sqlite_handler:
-            self.bridge.on_message_received(self._on_message_received)
-            self.bridge.on_channel_message_received(self._on_channel_message_received)
-            self.bridge.on_channel_data_received(self._on_channel_data_received)
+            self.bridge.on_message_event(self._on_message_event)
+            self.bridge.on_channel_message_event(self._on_channel_message_event)
+            self.bridge.on_channel_data_event(self._on_channel_data_event)
         await super().start()
 
     # -----------------------------------------------------------------
