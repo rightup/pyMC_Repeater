@@ -1,7 +1,30 @@
 import logging
-from typing import Any, Dict, Optional, Tuple
+from dataclasses import dataclass
+from typing import Any, Dict, Iterable, Optional, Tuple
 
 logger = logging.getLogger("IdentityManager")
+
+
+class IdentityConfigurationError(RuntimeError):
+    """A configured local identity cannot be represented safely."""
+
+
+@dataclass(frozen=True)
+class IdentitySpec:
+    """A parsed-but-unregistered local identity from configuration."""
+
+    name: str
+    identity: Any  # openhop_core LocalIdentity (or compatible)
+    config: dict
+    identity_type: str  # "repeater" | "room_server" | "companion"
+
+    @property
+    def label(self) -> str:
+        return f"{self.identity_type}:{self.name}"
+
+    @property
+    def hash_byte(self) -> int:
+        return self.identity.get_public_key()[0]
 
 
 class IdentityManager:
@@ -37,6 +60,40 @@ class IdentityManager:
             )
 
         return None
+
+    def validate_specs(self, specs: Iterable[IdentitySpec]) -> None:
+        """Raise ``IdentityConfigurationError`` on any name or hash collision.
+
+        Each spec is checked against the currently registered identities (via
+        :meth:`registration_error`) and against the other specs in the batch,
+        without mutating any state. Local protocol routing and companion
+        persistence are keyed by the first public-key byte, so a one-byte
+        prefix collision cannot be represented even though the full keys
+        differ, and names must be unique because callers use them to locate
+        the configured service.
+        """
+        batch_hashes: Dict[int, IdentitySpec] = {}
+        batch_names: Dict[str, IdentitySpec] = {}
+
+        for spec in specs:
+            error = self.registration_error(spec.name, spec.identity)
+            if error:
+                raise IdentityConfigurationError(error)
+            existing = batch_names.get(spec.name)
+            if existing is not None:
+                raise IdentityConfigurationError(
+                    f"Local identity name '{spec.name}' conflicts with existing "
+                    f"identity '{existing.label}'"
+                )
+            existing = batch_hashes.get(spec.hash_byte)
+            if existing is not None:
+                raise IdentityConfigurationError(
+                    f"Local identity '{spec.label}' (hash=0x{spec.hash_byte:02X}) "
+                    f"conflicts with '{existing.label}'; local identities must "
+                    "have unique one-byte public-key prefixes"
+                )
+            batch_names[spec.name] = spec
+            batch_hashes[spec.hash_byte] = spec
 
     def validate_identity(self, name: str, identity) -> bool:
         """Log and report whether an identity can be registered without mutation."""

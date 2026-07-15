@@ -31,7 +31,7 @@ from repeater.handler_helpers import (
     TextHelper,
     TraceHelper,
 )
-from repeater.identity_manager import IdentityManager
+from repeater.identity_manager import IdentityConfigurationError, IdentityManager, IdentitySpec
 from repeater.packet_router import PacketRouter
 from repeater.sensors import SensorManager
 from repeater.utils_packet import create_scoped_advert_packet
@@ -42,10 +42,6 @@ from openhop_core.protocol.constants import PAYLOAD_TYPE_RAW_CUSTOM
 logger = logging.getLogger("RepeaterDaemon")
 
 _COMPANION_LOAD_RETRY_DELAY_SEC = 0.5
-
-
-class IdentityConfigurationError(RuntimeError):
-    """A configured local identity cannot be represented safely."""
 
 
 async def _load_companion_rows_verified(
@@ -109,6 +105,10 @@ class RepeaterDaemon:
         self.router = None
         self.companion_bridges: dict[int, object] = {}
         self.companion_frame_servers: list = []
+        # Parsed once during the startup preflight; the identity loaders reuse
+        # them so config parsing (and its warnings) does not run twice.
+        self._room_server_specs: list[IdentitySpec] | None = None
+        self._companion_specs: list[IdentitySpec] | None = None
         self._shutdown_started = False
         self._main_task = None
         self.radio_status = "unknown"
@@ -124,7 +124,7 @@ class RepeaterDaemon:
         _log_buffer.setLevel(getattr(logging, log_level))
         root_logger.addHandler(_log_buffer)
 
-    def _configured_identity_specs(self, identity_type: str) -> list[tuple]:
+    def _configured_identity_specs(self, identity_type: str) -> list[IdentitySpec]:
         """Build valid configured local identities without registering them.
 
         Invalid optional room-server or companion entries retain the existing
@@ -181,58 +181,35 @@ class RepeaterDaemon:
                 logger.error("Failed to create %s identity '%s': %s", label.lower(), name, error)
                 continue
 
-            specs.append((name, identity, identity_config, identity_type))
+            specs.append(
+                IdentitySpec(
+                    name=name,
+                    identity=identity,
+                    config=identity_config,
+                    identity_type=identity_type,
+                )
+            )
 
         return specs
 
-    def _validate_identity_specs(
-        self, specs: list[tuple], *, include_registered: bool = True
-    ) -> None:
-        """Reject duplicate local names or one-byte public-key prefixes."""
-        hashes: dict[int, str] = {}
-        names: dict[str, str] = {}
-
-        if include_registered and self.identity_manager:
-            for hash_byte, (_, _, _) in getattr(self.identity_manager, "identities", {}).items():
-                registered_name = getattr(self.identity_manager, "registered_hashes", {}).get(
-                    hash_byte, "unknown"
-                )
-                hashes[hash_byte] = registered_name
-                if ":" in registered_name:
-                    names[registered_name.split(":", 1)[1]] = registered_name
-
-            for registered_name, (_, _, identity_type) in getattr(
-                self.identity_manager, "named_identities", {}
-            ).items():
-                names.setdefault(registered_name, identity_type)
-
-        for name, identity, _, identity_type in specs:
-            label = f"{identity_type}:{name}"
-            hash_byte = identity.get_public_key()[0]
-            existing_name = names.get(name)
-            if existing_name:
-                raise IdentityConfigurationError(
-                    f"Local identity name '{name}' conflicts with existing identity "
-                    f"'{existing_name}'"
-                )
-            existing_hash = hashes.get(hash_byte)
-            if existing_hash:
-                raise IdentityConfigurationError(
-                    f"Local identity '{label}' (hash=0x{hash_byte:02X}) conflicts "
-                    f"with '{existing_hash}'; local identities must have unique "
-                    "one-byte public-key prefixes"
-                )
-            names[name] = label
-            hashes[hash_byte] = label
-
     def _preflight_configured_local_identities(self, local_identity) -> None:
-        """Validate every configured local identity before stateful setup begins."""
+        """Validate every configured local identity before stateful setup begins.
+
+        The parsed room-server and companion specs are cached so the identity
+        loaders reuse them instead of re-parsing the config (and re-logging
+        every invalid entry). Collision rules live in
+        ``IdentityManager.validate_specs``; at this point the manager holds no
+        registered identities, so this is a pure batch check.
+        """
+        self._room_server_specs = self._configured_identity_specs("room_server")
+        self._companion_specs = self._configured_identity_specs("companion")
         specs = [
-            ("repeater", local_identity, self.config, "repeater"),
-            *self._configured_identity_specs("room_server"),
-            *self._configured_identity_specs("companion"),
+            IdentitySpec("repeater", local_identity, self.config, "repeater"),
+            *self._room_server_specs,
+            *self._companion_specs,
         ]
-        self._validate_identity_specs(specs, include_registered=False)
+        manager = self.identity_manager or IdentityManager(self.config)
+        manager.validate_specs(specs)
 
     async def initialize(self):
 
@@ -626,16 +603,19 @@ class RepeaterDaemon:
             raise
 
     async def _load_additional_identities(self):
-        room_specs = self._configured_identity_specs("room_server")
-        self._validate_identity_specs(room_specs)
+        room_specs = self._room_server_specs
+        if room_specs is None:
+            room_specs = self._configured_identity_specs("room_server")
+        self.identity_manager.validate_specs(room_specs)
 
-        for name, room_identity, room_config, _ in room_specs:
+        for spec in room_specs:
+            name, room_identity = spec.name, spec.identity
             try:
                 # Register with the manager and all helpers
                 success = self._register_identity_everywhere(
                     name=name,
                     identity=room_identity,
-                    config=room_config,
+                    config=spec.config,
                     identity_type="room_server",
                 )
 
@@ -732,13 +712,15 @@ class RepeaterDaemon:
         """Load companion identities from config and create CompanionBridge + frame server for each."""
         from repeater.companion import CompanionFrameServer, RepeaterCompanionBridge
 
-        companion_specs = self._configured_identity_specs("companion")
+        companion_specs = self._companion_specs
+        if companion_specs is None:
+            companion_specs = self._configured_identity_specs("companion")
         if not companion_specs:
             return
 
         # Validate the complete companion set before any bridge can restore or
         # mutate a hash-keyed SQLite namespace, or any TCP server can bind.
-        self._validate_identity_specs(companion_specs)
+        self.identity_manager.validate_specs(companion_specs)
 
         sqlite_handler = None
         if self.repeater_handler and self.repeater_handler.storage:
@@ -754,7 +736,8 @@ class RepeaterDaemon:
             else self.config.get("radio", {})
         )
 
-        for name, identity, comp_config, _ in companion_specs:
+        for spec in companion_specs:
+            name, identity, comp_config = spec.name, spec.identity, spec.config
             try:
                 settings = comp_config.get("settings") or {}
                 pubkey = identity.get_public_key()

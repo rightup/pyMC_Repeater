@@ -1,3 +1,4 @@
+import logging
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -66,6 +67,28 @@ async def test_companion_set_collision_is_rejected_before_bridge_or_server_creat
     server_cls.assert_not_called()
     assert daemon.companion_bridges == {}
     assert daemon.companion_frame_servers == []
+
+
+@pytest.mark.asyncio
+async def test_invalid_config_entry_logs_once_across_preflight_and_load(caplog):
+    """Preflight parses the config once and the loaders reuse the cached
+    specs, so an invalid entry produces exactly one error per startup."""
+    daemon = RepeaterDaemon(
+        _config(companions=({"name": "bad", "identity_key": "not-hex"},)),
+        radio=object(),
+    )
+    daemon.identity_manager = IdentityManager({})
+    local_identity = _SeedFirstByteIdentity(b"\x10" * 32)
+
+    with (
+        patch("openhop_core.LocalIdentity", _SeedFirstByteIdentity),
+        caplog.at_level(logging.ERROR, logger="RepeaterDaemon"),
+    ):
+        daemon._preflight_configured_local_identities(local_identity)
+        await daemon._load_companion_identities()
+
+    invalid_key_logs = [r for r in caplog.records if "invalid hex" in r.getMessage()]
+    assert len(invalid_key_logs) == 1
 
 
 @pytest.mark.asyncio

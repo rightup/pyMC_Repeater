@@ -147,6 +147,7 @@ class TestCompanionInitSurfacesLoadFailure:
             },
         }
         daemon = RepeaterDaemon(config, radio=object())
+        daemon.identity_manager = IdentityManager({})
         daemon.router = SimpleNamespace(inject_packet=AsyncMock())
         daemon.repeater_handler = SimpleNamespace(
             storage=SimpleNamespace(sqlite_handler=sqlite), radio_config={}
