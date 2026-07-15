@@ -93,18 +93,16 @@ class BME280Sensor(SensorBase):
 
             self._smbus2 = smbus2
 
-            with smbus2.SMBus(self.bus_number) as bus:
-                chip = bus.read_byte_data(self.i2c_address, _REG_ID)
+            bus = smbus2.SMBus(self.bus_number)
 
-                if chip != self.CHIP_ID:
-                    raise RuntimeError(
-                        f"Unexpected chip ID 0x{chip:02X} (expected 0x60)"
-                    )
+            chip = bus.read_byte_data(self.i2c_address, _REG_ID)
+            if chip != self.CHIP_ID:
+                raise RuntimeError(
+                    f"Unexpected chip ID 0x{chip:02X} (expected 0x60)"
+                )
 
-                self._cal = self._read_calibration(bus)
-
+            self._cal = self._read_calibration(bus)
             self.available = True
-
             self.log.info(
                 "BME280 initialized (addr=0x%02X, bus=%d)",
                 self.i2c_address,
@@ -245,23 +243,22 @@ class BME280Sensor(SensorBase):
         if not self.available:
             raise RuntimeError("BME280 device not available")
 
+        bus = self._smbus2.SMBus(self.bus_number)
         try:
-            with self._smbus2.SMBus(self.bus_number) as bus:
+            # Humidity oversampling x1
+            bus.write_byte_data(self.i2c_address, _REG_CTRL_HUM, 0x01)
 
-                # Humidity oversampling x1
-                bus.write_byte_data(self.i2c_address, _REG_CTRL_HUM, 0x01)
+            # Temperature x1, Pressure x1, Forced mode
+            bus.write_byte_data(self.i2c_address, _REG_CTRL_MEAS, 0x25)
 
-                # Temperature x1, Pressure x1, Forced mode
-                bus.write_byte_data(self.i2c_address, _REG_CTRL_MEAS, 0x25)
+            deadline = time.time() + self.read_timeout_seconds
 
-                deadline = time.time() + self.read_timeout_seconds
+            while bus.read_byte_data(self.i2c_address, _REG_STATUS) & 0x08:
+                if time.time() > deadline:
+                    raise RuntimeError("Timed out waiting for measurement")
+                time.sleep(0.005)
 
-                while bus.read_byte_data(self.i2c_address, _REG_STATUS) & 0x08:
-                    if time.time() > deadline:
-                        raise RuntimeError("Timed out waiting for measurement")
-                    time.sleep(0.005)
-
-                data = bus.read_i2c_block_data(self.i2c_address, _REG_DATA, 8)
+            data = bus.read_i2c_block_data(self.i2c_address, _REG_DATA, 8)
 
             adc_p = (
                 (data[0] << 12)
@@ -291,3 +288,5 @@ class BME280Sensor(SensorBase):
             raise
         except Exception as exc:
             raise RuntimeError(f"BME280 read failed: {exc}") from exc
+        finally:
+            bus.close()
