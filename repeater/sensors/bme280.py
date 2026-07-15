@@ -166,11 +166,12 @@ class BME280Sensor(SensorBase):
             H6=h6,
         )
 
-    def _compensate_temperature(self, adc_t: int):
+    def _compensate_temperature(self, adc_t: int) -> tuple[float, float]:
         """Return (temperature_c, t_fine)."""
         c = self._cal
-        assert c is not None
-
+        if c is None:
+            return 0.0, 0.0
+            
         var1 = ((adc_t / 16384.0) - (c.T1 / 1024.0)) * c.T2
         var2 = (((adc_t / 131072.0) - (c.T1 / 8192.0)) ** 2) * c.T3
 
@@ -182,7 +183,8 @@ class BME280Sensor(SensorBase):
     def _compensate_pressure(self, adc_p: int, t_fine: float) -> float:
         """Return pressure in hPa."""
         c = self._cal
-        assert c is not None
+        if c is None:
+            return 0.0
 
         var1 = t_fine / 2.0 - 64000.0
         var2 = var1 * var1 * c.P6 / 32768.0
@@ -212,7 +214,8 @@ class BME280Sensor(SensorBase):
     def _compensate_humidity(self, adc_h: int, t_fine: float) -> float:
         """Return relative humidity in percent."""
         c = self._cal
-        assert c is not None
+        if c is None:
+            return 0.0
 
         humidity = t_fine - 76800.0
 
