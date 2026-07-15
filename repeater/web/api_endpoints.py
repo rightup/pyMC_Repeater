@@ -87,6 +87,8 @@ POLICY_GROUP_KINDS = {
 # GET    /api/packet_stats?hours=24 - Get packet statistics
 # GET    /api/packet_type_stats?hours=24 - Get packet type statistics
 # GET    /api/route_stats?hours=24 - Get route statistics
+# GET    /api/neighbor_links?active_within_seconds=900 - Get in-memory observed upstream neighbour links
+# GET    /api/neighbor_link_history?peer_hash=AB&path_hash_size=1&hours=24&limit=1000 - Get observed upstream history from packets table
 # GET    /api/recent_packets?limit=100 - Get recent packets
 # GET    /api/filtered_packets?type=4&route=1&start_timestamp=X&end_timestamp=Y&limit=1000 - Get filtered packets
 # GET    /api/packet_by_hash?packet_hash=abc123 - Get specific packet by hash
@@ -3074,6 +3076,73 @@ class APIEndpoints:
             return self._success(stats)
         except Exception as e:
             logger.error(f"Error getting route stats: {e}")
+            return self._error(e)
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    def neighbor_links(self, active_within_seconds=90, limit=500):
+        try:
+            handler = getattr(self.daemon_instance, "repeater_handler", None)
+            tracker = (
+                getattr(handler, "neighbour_link_tracker", None) if handler is not None else None
+            )
+            if tracker is None or not hasattr(tracker, "snapshot"):
+                return self._error("Repeater handler not initialized")
+
+            active_window = float(active_within_seconds)
+            row_limit = int(limit)
+            if row_limit < 1:
+                raise ValueError("limit must be >= 1")
+
+            links = tracker.snapshot(active_within_seconds=active_window)
+            links = links[:row_limit]
+            return self._success(
+                {
+                    "links": links,
+                    "active_within_seconds": active_window,
+                    "limit": row_limit,
+                    "count": len(links),
+                }
+            )
+        except ValueError as e:
+            return self._error(f"Invalid parameter format: {e}")
+        except Exception as e:
+            logger.error(f"Error getting neighbor links: {e}")
+            return self._error(e)
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    def neighbor_link_history(self, peer_hash=None, path_hash_size=None, hours=24, limit=1000):
+        try:
+            if not peer_hash:
+                return self._error("peer_hash parameter required")
+            if path_hash_size is None:
+                return self._error("path_hash_size parameter required")
+
+            size = int(path_hash_size)
+            window_hours = int(hours)
+            row_limit = int(limit)
+
+            rows = self._get_storage().get_neighbor_link_history(
+                peer_hash=str(peer_hash),
+                path_hash_size=size,
+                hours=window_hours,
+                limit=row_limit,
+            )
+            return self._success(
+                {
+                    "peer_hash": str(peer_hash).upper(),
+                    "path_hash_size": size,
+                    "hours": window_hours,
+                    "limit": row_limit,
+                    "rows": rows,
+                    "count": len(rows),
+                }
+            )
+        except ValueError as e:
+            return self._error(f"Invalid parameter format: {e}")
+        except Exception as e:
+            logger.error(f"Error getting neighbor link history: {e}")
             return self._error(e)
 
     @cherrypy.expose

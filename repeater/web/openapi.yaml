@@ -961,6 +961,83 @@ paths:
               schema:
                 type: object
 
+  /neighbor_links:
+    get:
+      tags: [Packets]
+      summary: Get observed neighbour link snapshots
+      description: Returns observation-only neighbour link metrics by upstream peer hash.
+      parameters:
+        - name: active_within_seconds
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 90
+            minimum: 1
+          description: Mark links as active when last-seen age is within this threshold.
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 500
+            minimum: 1
+            maximum: 5000
+          description: Maximum number of link snapshots to return.
+      responses:
+        '200':
+          description: Neighbour link snapshots
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NeighborLinksResponse'
+
+  /neighbor_link_history:
+    get:
+      tags: [Packets]
+      summary: Get neighbour link packet history
+      description: Returns historical packet observations for a single upstream peer hash.
+      parameters:
+        - name: peer_hash
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Upstream peer hash to query.
+        - name: path_hash_size
+          in: query
+          required: true
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 3
+          description: Path hash size in bytes for the peer hash.
+        - name: hours
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 24
+            minimum: 1
+            maximum: 168
+          description: Time window in hours.
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 1000
+            minimum: 1
+            maximum: 5000
+          description: Maximum rows to return.
+      responses:
+        '200':
+          description: Neighbour link history
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NeighborLinkHistoryResponse'
+
   # ============================================================================
   # Charts & RRD Endpoints
   # ============================================================================
@@ -4307,6 +4384,116 @@ components:
         error:
           type: string
           description: Error message
+
+    NeighborLinkSnapshot:
+      type: object
+      properties:
+        peer_hash:
+          type: string
+        path_hash_size:
+          type: integer
+          minimum: 1
+          maximum: 3
+        sample_count:
+          type: integer
+        duplicate_sample_count:
+          type: integer
+        first_seen:
+          type: integer
+        last_seen:
+          type: integer
+        age_seconds:
+          type: number
+        active:
+          type: boolean
+        last_rssi:
+          type: number
+        last_snr:
+          type: number
+        last_score:
+          type: number
+        ewma_rssi:
+          type: number
+        ewma_snr:
+          type: number
+        ewma_score:
+          type: number
+        best_score:
+          type: number
+        worst_score:
+          type: number
+
+    NeighborLinksData:
+      type: object
+      properties:
+        links:
+          type: array
+          items:
+            $ref: '#/components/schemas/NeighborLinkSnapshot'
+        active_within_seconds:
+          type: integer
+        count:
+          type: integer
+
+    NeighborLinksResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        data:
+          $ref: '#/components/schemas/NeighborLinksData'
+
+    NeighborLinkHistoryRow:
+      type: object
+      properties:
+        timestamp:
+          type: integer
+        rssi:
+          type: number
+          nullable: true
+        snr:
+          type: number
+          nullable: true
+        score:
+          type: number
+          nullable: true
+        is_duplicate:
+          type: boolean
+        packet_hash:
+          type: string
+        packet_type:
+          type: integer
+        route_type:
+          type: integer
+        path_hop_count:
+          type: integer
+          nullable: true
+
+    NeighborLinkHistoryData:
+      type: object
+      properties:
+        peer_hash:
+          type: string
+        path_hash_size:
+          type: integer
+        hours:
+          type: integer
+        limit:
+          type: integer
+        rows:
+          type: array
+          items:
+            $ref: '#/components/schemas/NeighborLinkHistoryRow'
+        count:
+          type: integer
+
+    NeighborLinkHistoryResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        data:
+          $ref: '#/components/schemas/NeighborLinkHistoryData'
 
     LbtDiagnosticsResponse:
       type: object

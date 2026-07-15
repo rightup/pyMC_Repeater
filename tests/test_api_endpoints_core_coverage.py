@@ -720,6 +720,53 @@ def test_packet_and_route_stats_endpoints(cherrypy_ctx):
     storage.get_route_stats.assert_called_once_with(hours=6)
 
 
+def test_neighbor_links_endpoint_returns_snapshot(cherrypy_ctx):
+    del cherrypy_ctx
+    api = _make_api()
+    tracker = SimpleNamespace(
+        snapshot=MagicMock(
+            return_value=[
+                {"peer_hash": "AB", "sample_count": 2},
+                {"peer_hash": "CD", "sample_count": 1},
+            ]
+        )
+    )
+    repeater_handler = SimpleNamespace(neighbour_link_tracker=tracker)
+    api.daemon_instance = SimpleNamespace(repeater_handler=repeater_handler)
+
+    result = api.neighbor_links(active_within_seconds="120", limit="1")
+
+    assert result["success"] is True
+    assert result["data"]["count"] == 1
+    assert result["data"]["active_within_seconds"] == 120.0
+    assert result["data"]["limit"] == 1
+    assert result["data"]["links"][0]["peer_hash"] == "AB"
+    tracker.snapshot.assert_called_once_with(active_within_seconds=120.0)
+
+
+def test_neighbor_link_history_endpoint_filters_by_hash_and_size(cherrypy_ctx):
+    del cherrypy_ctx
+    api = _make_api()
+    rows = [{"packet_hash": "A1", "path_hop_count": 3}]
+    storage = SimpleNamespace(get_neighbor_link_history=MagicMock(return_value=rows))
+    _attach_storage(api, storage)
+
+    result = api.neighbor_link_history(peer_hash="ab", path_hash_size="2", hours="12", limit="50")
+
+    assert result["success"] is True
+    assert result["data"]["peer_hash"] == "AB"
+    assert result["data"]["path_hash_size"] == 2
+    assert result["data"]["hours"] == 12
+    assert result["data"]["limit"] == 50
+    assert result["data"]["rows"] == rows
+    storage.get_neighbor_link_history.assert_called_once_with(
+        peer_hash="ab",
+        path_hash_size=2,
+        hours=12,
+        limit=50,
+    )
+
+
 def test_recent_packets_and_bulk_packets(cherrypy_ctx):
     del cherrypy_ctx
     api = _make_api()

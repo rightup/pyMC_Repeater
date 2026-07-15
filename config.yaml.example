@@ -41,6 +41,14 @@ repeater:
   # Changing this value has no effect on current packet processing.
   score_threshold: 0.3
 
+  # Observation-only upstream neighbour link metrics.
+  # These metrics are currently not used for forwarding, dedupe, TX delay,
+  # route selection, or packet acceptance decisions yet ;-0.
+  neighbour_link_metrics_enabled: true
+  neighbour_link_ewma_alpha: 0.20
+  neighbour_link_ttl_seconds: 86400
+  neighbour_link_max_entries: 512
+
   # Automatic advertisement interval in hours
   # The repeater will send an advertisement packet at this interval
   # Set to 0 to disable automatic adverts (manual only via web interface)

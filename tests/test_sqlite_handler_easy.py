@@ -200,6 +200,114 @@ def test_store_packet_returns_inserted_row_id(tmp_path):
     assert row[3] == 3
 
 
+def test_packets_table_has_upstream_columns_and_index(tmp_path):
+    h = _make_handler(tmp_path)
+
+    with h._connect() as conn:
+        cols = conn.execute("PRAGMA table_info(packets)").fetchall()
+        col_names = {col[1] for col in cols}
+        idx_rows = conn.execute("PRAGMA index_list(packets)").fetchall()
+        idx_names = {row[1] for row in idx_rows}
+
+    assert "upstream_hash" in col_names
+    assert "upstream_hash_size" in col_names
+    assert "idx_packets_upstream_time" in idx_names
+
+
+def test_store_packet_persists_upstream_fields(tmp_path):
+    h = _make_handler(tmp_path)
+
+    packet_id = h.store_packet(
+        {
+            "timestamp": 200.0,
+            "type": 1,
+            "route": 1,
+            "length": 9,
+            "transmitted": False,
+            "packet_hash": "pkt-upstream",
+            "upstream_hash": "AB",
+            "upstream_hash_size": 2,
+            "original_path": ["CD", "AB"],
+        }
+    )
+
+    row = h.get_packet_by_id(int(packet_id))
+    assert row is not None
+    assert row["upstream_hash"] == "AB"
+    assert row["upstream_hash_size"] == 2
+
+
+def test_neighbor_link_history_uses_packets_table_and_filters_hash_and_size(tmp_path):
+    h = _make_handler(tmp_path)
+    base_ts = 1_700_000_000.0
+
+    h.store_packet(
+        {
+            "timestamp": base_ts,
+            "type": 4,
+            "route": 1,
+            "length": 10,
+            "rssi": -80,
+            "snr": 3.5,
+            "score": 0.4,
+            "is_duplicate": False,
+            "packet_hash": "match-1",
+            "upstream_hash": "AA",
+            "upstream_hash_size": 1,
+            "original_path": ["10", "AA"],
+        }
+    )
+    h.store_packet(
+        {
+            "timestamp": base_ts + 1.0,
+            "type": 5,
+            "route": 1,
+            "length": 11,
+            "rssi": -82,
+            "snr": 2.5,
+            "score": 0.35,
+            "is_duplicate": True,
+            "packet_hash": "match-2",
+            "upstream_hash": "AA",
+            "upstream_hash_size": 1,
+            "original_path": ["20", "30", "AA"],
+        }
+    )
+    # Same hash but different width: must not be merged.
+    h.store_packet(
+        {
+            "timestamp": base_ts + 2.0,
+            "type": 6,
+            "route": 1,
+            "length": 12,
+            "packet_hash": "wrong-width",
+            "upstream_hash": "AA",
+            "upstream_hash_size": 2,
+            "original_path": ["00AA"],
+        }
+    )
+    # Different hash: must be filtered out.
+    h.store_packet(
+        {
+            "timestamp": base_ts + 3.0,
+            "type": 7,
+            "route": 1,
+            "length": 13,
+            "packet_hash": "wrong-hash",
+            "upstream_hash": "BB",
+            "upstream_hash_size": 1,
+            "original_path": ["BB"],
+        }
+    )
+
+    rows = h.get_neighbor_link_history(peer_hash="aa", path_hash_size=1, hours=50000, limit=100)
+
+    assert [row["packet_hash"] for row in rows] == ["match-1", "match-2"]
+    assert rows[0]["path_hop_count"] == 2
+    assert rows[1]["path_hop_count"] == 3
+    assert rows[1]["is_duplicate"] is True
+
+
 def test_recent_packet_queries_include_ids_and_preserve_duplicate_hash_rows(tmp_path):
     h = _make_handler(tmp_path)
 

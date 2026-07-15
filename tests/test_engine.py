@@ -15,6 +15,7 @@ import pytest
 from openhop_core.protocol import Packet, PacketBuilder
 from openhop_core.protocol.constants import (
     MAX_PATH_SIZE,
+    PAYLOAD_TYPE_TRACE,
     PH_ROUTE_MASK,
     PH_TYPE_SHIFT,
     ROUTE_TYPE_DIRECT,
@@ -168,6 +169,28 @@ def _make_transport_direct_packet(
     pkt.path = bytearray(path)
     pkt.path_len = len(path)
     pkt.transport_codes = list(transport_codes)
+    return pkt
+
+
+def _make_hashed_flood_packet(path_hashes: list[str], hash_size: int = 1, payload_type: int = 0x01):
+    path_bytes = bytearray()
+    for hash_hex in path_hashes:
+        path_bytes.extend(bytes.fromhex(hash_hex))
+
+    pkt = _make_flood_packet(
+        payload=b"\xaa\xbb\xcc", path=bytes(path_bytes), payload_type=payload_type
+    )
+    pkt.path_len = PathUtils.encode_path_len(hash_size, len(path_hashes))
+    return pkt
+
+
+def _make_hashed_transport_flood_packet(path_hashes: list[str], hash_size: int = 1):
+    path_bytes = bytearray()
+    for hash_hex in path_hashes:
+        path_bytes.extend(bytes.fromhex(hash_hex))
+
+    pkt = _make_transport_flood_packet(payload=b"\x10\x20\x30", path=bytes(path_bytes))
+    pkt.path_len = PathUtils.encode_path_len(hash_size, len(path_hashes))
     return pkt
 
 
@@ -1008,6 +1031,187 @@ class TestStatistics:
         with patch.object(handler, "storage", None):
             stats = handler.get_stats()
         assert stats["local_hash"] == f"0x{LOCAL_HASH:02x}"
+
+
+@pytest.mark.asyncio
+class TestNeighbourLinkObservation:
+    @staticmethod
+    def _observe_with_tracker(handler, pkt, *, rssi: float, snr: float, is_duplicate: bool) -> None:
+        route_type = pkt.header & PH_ROUTE_MASK
+        payload_type = pkt.get_payload_type() if hasattr(pkt, "get_payload_type") else None
+        score = handler.calculate_packet_score(
+            snr,
+            len(pkt.payload or b""),
+            handler.radio_config["spreading_factor"],
+        )
+        handler.neighbour_link_tracker.observe(
+            pkt,
+            route_type=route_type,
+            payload_type=payload_type,
+            rssi=rssi,
+            snr=snr,
+            score=score,
+            is_duplicate=is_duplicate,
+        )
+
+    async def test_received_flood_with_non_empty_path_creates_link_for_final_hash(self, handler):
+        handler.config["repeater"]["mode"] = "monitor"
+        pkt = _make_hashed_flood_packet(["11", "22", "33"], hash_size=1)
+
+        await handler(pkt, {"rssi": -77, "snr": 5.5}, local_transmission=False)
+
+        snapshot = handler.neighbour_link_tracker.snapshot()
+        assert len(snapshot) == 1
+        assert snapshot[0]["peer_hash"] == "33"
+        assert snapshot[0]["path_hash_size"] == 1
+
+    async def test_uses_last_path_element_not_first_for_upstream_peer(self, handler):
+        handler.config["repeater"]["mode"] = "monitor"
+        pkt = _make_hashed_flood_packet(["AA", "BB", "CC"], hash_size=1)
+
+        await handler(pkt, {"rssi": -80, "snr": 1.0}, local_transmission=False)
+
+        snapshot = handler.neighbour_link_tracker.snapshot()
+        assert snapshot[0]["peer_hash"] == "CC"
+        assert snapshot[0]["peer_hash"] != "AA"
+
+    async def test_empty_path_flood_creates_no_neighbour_link(self, handler):
+        handler.config["repeater"]["mode"] = "monitor"
+        pkt = _make_hashed_flood_packet([], hash_size=1)
+
+        await handler(pkt, {"rssi": -70, "snr": 2.0}, local_transmission=False)
+
+        assert handler.neighbour_link_tracker.snapshot() == []
+
+    async def test_direct_packets_create_no_neighbour_link(self, handler):
+        handler.config["repeater"]["mode"] = "monitor"
+        pkt = _make_direct_packet(path=bytes([LOCAL_HASH, 0x44]))
+
+        await handler(pkt, {"rssi": -70, "snr": 2.0}, local_transmission=False)
+
+        assert handler.neighbour_link_tracker.snapshot() == []
+
+    async def test_trace_packets_create_no_neighbour_link(self, handler):
+        handler.config["repeater"]["mode"] = "monitor"
+        pkt = _make_hashed_flood_packet(["11", "22"], hash_size=1, payload_type=PAYLOAD_TYPE_TRACE)
+
+        await handler(pkt, {"rssi": -70, "snr": 2.0}, local_transmission=False)
+
+        assert handler.neighbour_link_tracker.snapshot() == []
+
+    async def test_local_transmissions_create_no_neighbour_link(self, handler):
+        handler.config["repeater"]["mode"] = "no_tx"
+        pkt = _make_hashed_flood_packet(["11", "22"], hash_size=1)
+
+        await handler(pkt, {"rssi": -70, "snr": 2.0}, local_transmission=True)
+
+        assert handler.neighbour_link_tracker.snapshot() == []
+
+    async def test_transport_flood_is_observed(self, handler):
+        handler.config["repeater"]["mode"] = "monitor"
+        pkt = _make_hashed_transport_flood_packet(["19", "2A", "3B"], hash_size=1)
+
+        await handler(pkt, {"rssi": -60, "snr": 4.0}, local_transmission=False)
+
+        snapshot = handler.neighbour_link_tracker.snapshot()
+        assert len(snapshot) == 1
+        assert snapshot[0]["peer_hash"] == "3B"
+
+    async def test_existing_packet_score_calculation_is_reused_unchanged(self, handler):
+        handler.config["repeater"]["mode"] = "monitor"
+        pkt = _make_hashed_flood_packet(["55"], hash_size=1)
+        with patch.object(handler, "calculate_packet_score", return_value=0.42) as score_mock:
+            await handler(pkt, {"rssi": -81.0, "snr": 3.25}, local_transmission=False)
+
+        score_mock.assert_any_call(
+            3.25,
+            len(pkt.payload or b""),
+            handler.radio_config["spreading_factor"],
+        )
+        assert score_mock.call_count >= 1
+        snapshot = handler.neighbour_link_tracker.snapshot()
+        assert snapshot[0]["last_score"] == pytest.approx(0.42)
+
+    def test_first_sample_initializes_ewma_directly(self, handler):
+        pkt = _make_hashed_flood_packet(["66"], hash_size=1)
+        self._observe_with_tracker(handler, pkt, rssi=-90.0, snr=7.0, is_duplicate=False)
+
+        snapshot = handler.neighbour_link_tracker.snapshot()
+        assert snapshot[0]["ewma_rssi"] == pytest.approx(-90.0)
+        assert snapshot[0]["ewma_snr"] == pytest.approx(7.0)
+        assert snapshot[0]["ewma_score"] == pytest.approx(snapshot[0]["last_score"])
+
+    def test_later_samples_apply_configured_ewma_alpha(self, handler):
+        handler.config["repeater"]["neighbour_link_ewma_alpha"] = 0.5
+        handler.reload_runtime_config()
+
+        pkt = _make_hashed_flood_packet(["77"], hash_size=1)
+        self._observe_with_tracker(handler, pkt, rssi=-100.0, snr=1.0, is_duplicate=False)
+        self._observe_with_tracker(handler, pkt, rssi=-80.0, snr=5.0, is_duplicate=False)
+
+        snapshot = handler.neighbour_link_tracker.snapshot()
+        assert snapshot[0]["ewma_rssi"] == pytest.approx(-90.0)
+        assert snapshot[0]["ewma_snr"] == pytest.approx(3.0)
+
+    def test_duplicate_samples_increment_duplicate_sample_count(self, handler):
+        pkt = _make_hashed_flood_packet(["88"], hash_size=1)
+        self._observe_with_tracker(handler, pkt, rssi=-75.0, snr=2.0, is_duplicate=False)
+        handler.record_duplicate(pkt, rssi=-74, snr=1.5)
+
+        snapshot = handler.neighbour_link_tracker.snapshot()
+        assert snapshot[0]["sample_count"] == 2
+        assert snapshot[0]["duplicate_sample_count"] == 1
+
+    def test_different_path_hash_widths_do_not_merge(self, handler):
+        pkt_1b = _make_hashed_flood_packet(["AB"], hash_size=1)
+        pkt_2b = _make_hashed_flood_packet(["00AB"], hash_size=2)
+
+        self._observe_with_tracker(handler, pkt_1b, rssi=-70.0, snr=3.0, is_duplicate=False)
+        self._observe_with_tracker(handler, pkt_2b, rssi=-71.0, snr=3.1, is_duplicate=False)
+
+        snapshot = handler.neighbour_link_tracker.snapshot()
+        assert len(snapshot) == 2
+        keys = {(row["path_hash_size"], row["peer_hash"]) for row in snapshot}
+        assert keys == {(1, "AB"), (2, "00AB")}
+
+    def test_link_state_is_bounded(self, handler):
+        handler.config["repeater"]["neighbour_link_max_entries"] = 2
+        handler.config["repeater"]["neighbour_link_ttl_seconds"] = 86400
+        handler.reload_runtime_config()
+
+        for peer in ("10", "20", "30"):
+            pkt = _make_hashed_flood_packet([peer], hash_size=1)
+            self._observe_with_tracker(handler, pkt, rssi=-70.0, snr=2.0, is_duplicate=False)
+
+        snapshot = handler.neighbour_link_tracker.snapshot()
+        assert len(snapshot) == 2
+        peers = {row["peer_hash"] for row in snapshot}
+        assert peers == {"20", "30"}
+
+    def test_expired_links_are_removed_using_monotonic_time(self, handler):
+        handler.config["repeater"]["neighbour_link_ttl_seconds"] = 1
+        handler.reload_runtime_config()
+
+        pkt = _make_hashed_flood_packet(["44"], hash_size=1)
+        self._observe_with_tracker(handler, pkt, rssi=-65.0, snr=6.0, is_duplicate=False)
+
+        with handler.neighbour_link_tracker.lock:
+            for link in handler.neighbour_link_tracker.links.values():
+                link.last_seen_monotonic = time.monotonic() - 5.0
+
+        assert handler.neighbour_link_tracker.snapshot() == []
+
+    def test_snapshot_returns_plain_data_not_live_mapping(self, handler):
+        pkt = _make_hashed_flood_packet(["99"], hash_size=1)
+        self._observe_with_tracker(handler, pkt, rssi=-64.0, snr=6.0, is_duplicate=False)
+
+        snapshot = handler.neighbour_link_tracker.snapshot()
+        snapshot[0]["sample_count"] = 999
+        snapshot[0]["peer_hash"] = "MUTATED"
+
+        fresh = handler.neighbour_link_tracker.snapshot()
+        assert fresh[0]["sample_count"] != 999
+        assert fresh[0]["peer_hash"] == "99"
 
 
 # ===================================================================
