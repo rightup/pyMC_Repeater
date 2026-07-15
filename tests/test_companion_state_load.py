@@ -14,6 +14,7 @@ import pytest
 
 import repeater.main as main_module
 from repeater.companion.utils import CompanionStateLoadError
+from repeater.identity_manager import IdentityManager
 from repeater.main import RepeaterDaemon, _load_companion_rows_verified
 
 _HASH = "0xab"
@@ -187,7 +188,7 @@ class TestCompanionInitSurfacesLoadFailure:
     async def test_add_companion_from_config_raises(self):
         sqlite = self._failing_sqlite()
         daemon = self._daemon_with_companion(sqlite)
-        daemon.identity_manager = SimpleNamespace(named_identities={})
+        daemon.identity_manager = IdentityManager({})
         comp_config = {"name": "hot-comp", "identity_key": "22" * 32, "settings": {}}
         with (
             patch("repeater.companion.RepeaterCompanionBridge") as bridge_cls,

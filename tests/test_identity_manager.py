@@ -26,6 +26,17 @@ def test_identity_manager_register_lookup_and_collision_paths():
     assert mgr.register_identity("beta", id_b_collision, {"k": 2}, "room_server") is False
 
 
+def test_identity_manager_rejects_duplicate_names_without_mutating_state():
+    mgr = IdentityManager(config={})
+    id_a = _FakeIdentity(bytes([0x11]) + b"A" * 31)
+    id_b = _FakeIdentity(bytes([0x22]) + b"B" * 31)
+
+    assert mgr.register_identity("alpha", id_a, {}, "repeater") is True
+    assert "already registered" in mgr.registration_error("alpha", id_b)
+    assert mgr.validate_identity("alpha", id_b) is False
+    assert mgr.get_identity_by_hash(0x22) is None
+
+
 def test_identity_manager_list_and_type_filtering():
     mgr = IdentityManager(config={})
     id_a = _FakeIdentity(bytes([0x22]) + b"A" * 31)

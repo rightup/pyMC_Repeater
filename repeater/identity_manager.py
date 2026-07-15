@@ -11,16 +11,46 @@ class IdentityManager:
         self.named_identities: Dict[str, Tuple[Any, dict, str]] = {}
         self.registered_hashes: Dict[int, str] = {}
 
-    def register_identity(self, name: str, identity, config: dict, identity_type: str):
+    def registration_error(self, name: str, identity) -> Optional[str]:
+        """Return a reason this identity cannot be registered, or ``None``.
+
+        Local protocol routing and companion persistence are keyed by the first
+        byte of the public key.  A collision therefore cannot be represented
+        safely, even though the full public keys differ.  Names must also be
+        unique because callers use them to locate the configured service.
+        """
         hash_byte = identity.get_public_key()[0]
 
         if hash_byte in self.identities:
             existing_name = self.registered_hashes.get(hash_byte, "unknown")
-            logger.error(
-                f"Hash collision! Identity '{name}' (hash=0x{hash_byte:02X}) "
-                f"conflicts with existing identity '{existing_name}'"
+            return (
+                f"Identity '{name}' (hash=0x{hash_byte:02X}) conflicts with "
+                f"existing identity '{existing_name}'"
             )
+
+        if name in self.named_identities:
+            existing_identity, _, existing_type = self.named_identities[name]
+            existing_hash = existing_identity.get_public_key()[0]
+            return (
+                f"Identity name '{name}' is already registered for "
+                f"{existing_type} (hash=0x{existing_hash:02X})"
+            )
+
+        return None
+
+    def validate_identity(self, name: str, identity) -> bool:
+        """Log and report whether an identity can be registered without mutation."""
+        error = self.registration_error(name, identity)
+        if error:
+            logger.error("Identity registration rejected: %s", error)
             return False
+        return True
+
+    def register_identity(self, name: str, identity, config: dict, identity_type: str):
+        if not self.validate_identity(name, identity):
+            return False
+
+        hash_byte = identity.get_public_key()[0]
 
         self.identities[hash_byte] = (identity, config, identity_type)
         self.named_identities[name] = (identity, config, identity_type)
