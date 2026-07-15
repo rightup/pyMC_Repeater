@@ -15,10 +15,12 @@ or:
 """
 
 import asyncio
+import hashlib
 import time
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from openhop_core.companion import CompanionBridge
 from openhop_core.node.handlers.ack import AckHandler
 from openhop_core.node.handlers.advert import AdvertHandler
 from openhop_core.node.handlers.control import ControlHandler
@@ -31,7 +33,12 @@ from openhop_core.node.handlers.protocol_response import ProtocolResponseHandler
 from openhop_core.node.handlers.result import HandlerResult
 from openhop_core.node.handlers.text import TextMessageHandler
 from openhop_core.node.handlers.trace import TraceHandler
-from openhop_core.protocol.constants import ROUTE_TYPE_DIRECT
+from openhop_core.protocol.constants import (
+    PAYLOAD_TYPE_GRP_DATA,
+    ROUTE_TYPE_DIRECT,
+    ROUTE_TYPE_FLOOD,
+)
+from openhop_core.protocol import LocalIdentity, PacketBuilder
 
 from repeater.packet_router import (
     PacketRouter,
@@ -282,6 +289,71 @@ class TestInFlightCap(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(mock_evaluate.call_count, 1)
         bridge.process_received_packet.assert_awaited_once()
+        daemon.repeater_handler.assert_awaited_once()
+
+    async def test_route_grp_data_fans_out_to_companions_and_forwards(self):
+        """GRP_DATA reaches each companion for channel matching, then reaches the engine."""
+        daemon = _make_daemon()
+        first_bridge = _make_bridge()
+        second_bridge = _make_bridge()
+        daemon.companion_bridges = {0x01: first_bridge, 0x02: second_bridge}
+        router = PacketRouter(daemon)
+        pkt = _make_packet(PAYLOAD_TYPE_GRP_DATA)
+        # Firmware wire vector: GRP_DATA (0x06), version 0, FLOOD (0x01).
+        pkt.header = (PAYLOAD_TYPE_GRP_DATA << 2) | ROUTE_TYPE_FLOOD
+        self.assertEqual(pkt.header, 0x19)
+
+        await router._route_packet(pkt)
+
+        first_bridge.process_received_packet.assert_awaited_once_with(pkt)
+        second_bridge.process_received_packet.assert_awaited_once_with(pkt)
+        daemon.repeater_handler.assert_awaited_once()
+
+    async def test_route_grp_data_decrypts_in_a_companion_and_forwards(self):
+        """A firmware-format GRP_DATA packet is both delivered locally and forwarded."""
+        channel_secret = b"\x11" * 32
+
+        async def inject_packet(packet, wait_for_ack=False):
+            return True
+
+        bridge = CompanionBridge(LocalIdentity(), inject_packet, node_name="Test")
+        assert bridge.set_channel(0, "Public", channel_secret)
+        packet = PacketBuilder.create_group_data_packet(
+            PAYLOAD_TYPE_GRP_DATA,
+            channel_hash=hashlib.sha256(channel_secret).digest()[0],
+            channel_secret=channel_secret,
+            plaintext=b"\x34\x12\x02\xaa\xbb",
+            secret=channel_secret,
+        )
+        self.assertEqual(packet.header, 0x19)
+
+        daemon = _make_daemon()
+        daemon.companion_bridges = {0x01: bridge}
+        router = PacketRouter(daemon)
+
+        await router._route_packet(packet)
+
+        queued = bridge.sync_next_message()
+        self.assertIsNotNone(queued)
+        self.assertTrue(queued.is_channel)
+        self.assertEqual(queued.channel_idx, 0)
+        self.assertEqual(queued.channel_data_type, 0x1234)
+        self.assertEqual(queued.channel_data_payload, b"\xaa\xbb")
+        daemon.repeater_handler.assert_awaited_once()
+
+    async def test_route_direct_grp_data_intermediate_skips_companion_delivery(self):
+        """A direct GRP_DATA packet with a remaining hop is only offered to the engine."""
+        daemon = _make_daemon()
+        bridge = _make_bridge()
+        daemon.companion_bridges = {0x01: bridge}
+        router = PacketRouter(daemon)
+        packet = _make_packet(PAYLOAD_TYPE_GRP_DATA)
+        packet.header = (PAYLOAD_TYPE_GRP_DATA << 2) | ROUTE_TYPE_DIRECT
+        packet.path = bytearray([0x42])
+
+        await router._route_packet(packet)
+
+        bridge.process_received_packet.assert_not_awaited()
         daemon.repeater_handler.assert_awaited_once()
 
     async def test_non_injected_handler_false_is_logged(self):

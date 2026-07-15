@@ -37,6 +37,8 @@ from repeater.sensors import SensorManager
 from repeater.utils_packet import create_scoped_advert_packet
 from repeater.web.http_server import HTTPStatsServer, _log_buffer
 
+from openhop_core.protocol.constants import PAYLOAD_TYPE_RAW_CUSTOM
+
 logger = logging.getLogger("RepeaterDaemon")
 
 _COMPANION_LOAD_RETRY_DELAY_SEC = 0.5
@@ -283,6 +285,10 @@ class RepeaterDaemon:
             # All received packets flow through router → helpers → repeater engine
             self.dispatcher.register_fallback_handler(self._router_callback)
             logger.info("Packet router registered as fallback (catches all packets)")
+
+            # Final-hop RAW_CUSTOM is local-only. Direct packets with remaining
+            # hops are handed to the router; flood RAW_CUSTOM is discarded.
+            self._register_raw_custom_handler()
 
             # Set default path hash mode for flood 0-hop packets (adverts, etc.)
             path_hash_mode = self.config.get("mesh", {}).get("path_hash_mode", 0)
@@ -951,6 +957,34 @@ class RepeaterDaemon:
                 fs.push_rx_raw(snr, rssi, data)
             except Exception as e:
                 logger.debug("Push RX raw to companion: %s", e)
+
+    def _register_raw_custom_handler(self) -> None:
+        """Register firmware-compatible RAW_CUSTOM handling ahead of fallback routing."""
+        if self.dispatcher:
+            self.dispatcher.register_handler(
+                PAYLOAD_TYPE_RAW_CUSTOM, self._on_raw_data_for_companions
+            )
+
+    async def _on_raw_data_for_companions(self, packet) -> None:
+        """Deliver final direct RAW_CUSTOM packets and route direct intermediate hops."""
+        if not packet.is_route_direct():
+            return
+
+        if getattr(packet, "path", None):
+            await self._router_callback(packet)
+            return
+
+        handler = self.repeater_handler
+        if handler:
+            if handler.is_duplicate(packet):
+                return
+            handler.mark_seen(packet)
+
+        for bridge in self.companion_bridges.values():
+            try:
+                await bridge.process_received_packet(packet)
+            except Exception as e:
+                logger.debug("Companion bridge RAW_CUSTOM error: %s", e)
 
     def _register_duplicate_logging_hook(self, dedupe_enabled: bool) -> None:
         """Register pre-dedup duplicate logging only when dispatcher dedupe is active."""

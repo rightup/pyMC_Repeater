@@ -15,6 +15,7 @@ from openhop_core.node.handlers.protocol_response import ProtocolResponseHandler
 from openhop_core.node.handlers.text import TextMessageHandler
 from openhop_core.node.handlers.trace import TraceHandler
 from openhop_core.protocol.constants import (
+    PAYLOAD_TYPE_GRP_DATA,
     PH_ROUTE_MASK,
     ROUTE_TYPE_DIRECT,
     ROUTE_TYPE_TRANSPORT_DIRECT,
@@ -65,6 +66,14 @@ def _is_direct_final_hop(packet) -> bool:
         return False
     path = getattr(packet, "path", None)
     return not path or len(path) == 0
+
+
+def _is_direct_intermediate_hop(packet) -> bool:
+    """True for a direct packet that still has one or more routing hops."""
+    route = getattr(packet, "header", 0) & PH_ROUTE_MASK
+    return route in (ROUTE_TYPE_DIRECT, ROUTE_TYPE_TRANSPORT_DIRECT) and not _is_direct_final_hop(
+        packet
+    )
 
 
 def _is_expected_drop_reason(reason: str | None) -> bool:
@@ -573,9 +582,7 @@ class PacketRouter:
             consumed = False
             if self.daemon.path_helper:
                 try:
-                    consumed = (
-                        await self.daemon.path_helper.process_path_packet(packet)
-                    ) is True
+                    consumed = (await self.daemon.path_helper.process_path_packet(packet)) is True
                 except Exception as e:
                     logger.debug(f"Path helper processing error: {e}")
             # The helper/bridge results decide ownership: a direct middle hop
@@ -724,6 +731,18 @@ class PacketRouter:
                         await bridge.process_received_packet(packet)
                     except Exception as e:
                         logger.debug(f"Companion bridge GRP_TXT error: {e}")
+
+        elif payload_type == PAYLOAD_TYPE_GRP_DATA:
+            # MeshCore forwards direct packets with remaining hops before payload
+            # handling. Otherwise, companions authenticate and filter channels.
+            if not _is_direct_intermediate_hop(packet):
+                companion_bridges = self._companion_bridges_for_packet(packet, metadata)
+                if companion_bridges:
+                    for bridge in companion_bridges.values():
+                        try:
+                            await bridge.process_received_packet(packet)
+                        except Exception as e:
+                            logger.debug(f"Companion bridge GRP_DATA error: {e}")
 
         # Only pass to repeater engine if not already processed by injection
         # Skip engine for packets we injected for TX (already sent; avoid double-send/double-count)
