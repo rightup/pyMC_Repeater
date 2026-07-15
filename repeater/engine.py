@@ -10,10 +10,13 @@ from openhop_core.node.handlers.base import BaseHandler
 from openhop_core.protocol import Packet
 from openhop_core.protocol.constants import (
     MAX_PATH_SIZE,
+    PAYLOAD_TYPE_ACK,
     PAYLOAD_TYPE_ADVERT,
     PAYLOAD_TYPE_ANON_REQ,
+    PAYLOAD_TYPE_MULTIPART,
     PAYLOAD_TYPE_TRACE,
     PH_ROUTE_MASK,
+    PH_TYPE_SHIFT,
     ROUTE_TYPE_DIRECT,
     ROUTE_TYPE_FLOOD,
     ROUTE_TYPE_TRANSPORT_DIRECT,
@@ -1036,6 +1039,84 @@ class RepeaterHandler(BaseHandler):
 
         return packet
 
+    # Multipart ACKs are spaced ~300ms apart per remaining fragment, matching
+    # MeshCore's forwardMultipartDirect (`(remaining + 1) * 300`).
+    MULTIPART_ACK_SPACING_MS = 300
+
+    def forward_multipart_direct(
+        self, packet: Packet, packet_hash: Optional[str] = None
+    ) -> Optional[Tuple[Packet, float]]:
+        """Forward a MULTIPART packet the way MeshCore's forwardMultipartDirect does.
+
+        MeshCore never relays the multipart wrapper as an ordinary directed
+        packet.  Only a multipart-ACK at an intermediate direct hop is relayed,
+        and it is relayed by regenerating the embedded ACK as a plain DIRECT ACK
+        (the wrapper byte stripped) rather than repeating the wrapper.  Every
+        other multipart case — flood routing, a final hop, or a non-ACK embedded
+        type — is dropped.  Returns ``(ack_packet, delay_seconds)`` when a
+        regenerated ACK should be sent, otherwise ``None``.
+
+        INVARIANT: purely synchronous, mirroring flood_forward / direct_forward —
+        the is_duplicate + mark_seen pair must stay atomic within the event loop.
+        """
+        # MeshCore only forwards multipart on the direct-route branch; the flood
+        # switch case updates ACK state locally but never re-routes it.
+        if not packet.is_route_direct():
+            packet.drop_reason = "Multipart: not direct-routed"
+            return None
+
+        valid, reason = self.validate_packet(packet)
+        if not valid:
+            packet.drop_reason = reason
+            return None
+
+        if packet.is_marked_do_not_retransmit():
+            packet.drop_reason = packet.drop_reason or "Marked do not retransmit"
+            return None
+
+        payload = packet.payload or b""
+        remaining = payload[0] >> 4
+        embedded_type = payload[0] & 0x0F
+        # Only multipart-ACKs are relayed; MeshCore leaves other types for future
+        # use and does not forward them.
+        if embedded_type != PAYLOAD_TYPE_ACK or len(payload) < 5:
+            packet.drop_reason = "Multipart: unsupported embedded type"
+            return None
+
+        hash_size = packet.get_path_hash_size()
+        hop_count = packet.get_path_hash_count()
+
+        # We must be the next hop (a final-hop multipart has no remaining path and
+        # is handled locally, not forwarded).
+        if not packet.path or len(packet.path) < hash_size:
+            packet.drop_reason = "Direct: no path"
+            return None
+        if bytes(packet.path[:hash_size]) != self.local_hash_bytes[:hash_size]:
+            packet.drop_reason = "Direct: not for us"
+            return None
+
+        # Rebuild the received wrapper as the plain DIRECT ACK MeshCore would emit:
+        # drop the multipart header byte and force the ACK payload/route type. The
+        # path is left intact for the seen-check, then this node is removed from it,
+        # matching forwardMultipartDirect's hasSeen()/removeSelfFromPath() order.
+        packet.payload = bytearray(payload[1:])
+        packet.payload_len = len(packet.payload)
+        packet.header = (PAYLOAD_TYPE_ACK << PH_TYPE_SHIFT) | ROUTE_TYPE_DIRECT
+
+        # Dedupe on the regenerated ACK form (full path) before removing ourselves,
+        # so a repeated multipart ACK — or an equivalent plain ACK — is not relayed
+        # twice.  The pre-computed hash belongs to the original wrapper, so recompute.
+        if self.is_duplicate(packet):
+            packet.drop_reason = "Duplicate"
+            return None
+        self.mark_seen(packet)
+
+        packet.path = bytearray(packet.path[hash_size:])
+        packet.path_len = PathUtils.encode_path_len(hash_size, hop_count - 1)
+
+        delay_s = ((remaining + 1) * self.MULTIPART_ACK_SPACING_MS) / 1000.0
+        return packet, delay_s
+
     @staticmethod
     def calculate_packet_score(snr: float, packet_len: int, spreading_factor: int = 8) -> float:
 
@@ -1119,6 +1200,13 @@ class RepeaterHandler(BaseHandler):
         from 3 per forwarded packet to 1.
         """
         route_type = packet.header & PH_ROUTE_MASK
+
+        # MeshCore routes multipart traffic through its own branch, never the
+        # generic flood/direct path — it regenerates embedded ACKs and drops
+        # everything else.  Its delay is fixed by the fragment count, so return
+        # the (packet, delay) pair directly instead of _calculate_tx_delay.
+        if packet.get_payload_type() == PAYLOAD_TYPE_MULTIPART:
+            return self.forward_multipart_direct(packet, packet_hash=packet_hash)
 
         if route_type == ROUTE_TYPE_FLOOD or route_type == ROUTE_TYPE_TRANSPORT_FLOOD:
             fwd_pkt = self.flood_forward(packet, packet_hash=packet_hash)
