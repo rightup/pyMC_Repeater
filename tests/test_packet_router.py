@@ -27,6 +27,7 @@ from openhop_core.node.handlers.control import ControlHandler
 from openhop_core.node.handlers.group_text import GroupTextHandler
 from openhop_core.node.handlers.login_response import LoginResponseHandler
 from openhop_core.node.handlers.login_server import LoginServerHandler
+from openhop_core.node.handlers.multipart import MultipartAckHandler
 from openhop_core.node.handlers.path import PathHandler
 from openhop_core.node.handlers.protocol_request import ProtocolRequestHandler
 from openhop_core.node.handlers.protocol_response import ProtocolResponseHandler
@@ -37,8 +38,9 @@ from openhop_core.protocol.constants import (
     PAYLOAD_TYPE_GRP_DATA,
     ROUTE_TYPE_DIRECT,
     ROUTE_TYPE_FLOOD,
+    ROUTE_TYPE_TRANSPORT_DIRECT,
 )
-from openhop_core.protocol import LocalIdentity, PacketBuilder
+from openhop_core.protocol import LocalIdentity, Packet, PacketBuilder
 
 from repeater.packet_router import (
     PacketRouter,
@@ -1065,6 +1067,193 @@ class TestPacketRouterRoutingBranches(unittest.IsolatedAsyncioTestCase):
         await router._route_packet(pkt)
         b1.process_received_packet.assert_awaited_once()
         daemon.repeater_handler.assert_awaited_once()
+
+    async def test_direct_intermediate_bypasses_all_local_payload_handlers(self):
+        """Direct intermediate hops must reach the engine before local payload handling."""
+        payload_types = (
+            AdvertHandler.payload_type(),
+            LoginServerHandler.payload_type(),
+            TextMessageHandler.payload_type(),
+            PathHandler.payload_type(),
+            LoginResponseHandler.payload_type(),
+            ProtocolRequestHandler.payload_type(),
+            GroupTextHandler.payload_type(),
+            PAYLOAD_TYPE_GRP_DATA,
+        )
+        for route_type in (ROUTE_TYPE_DIRECT, ROUTE_TYPE_TRANSPORT_DIRECT):
+            for payload_type in payload_types:
+                with self.subTest(route_type=route_type, payload_type=payload_type):
+                    daemon = _make_daemon()
+                    bridge = _make_bridge()
+                    daemon.companion_bridges = {0x01: bridge}
+                    daemon.advert_helper = MagicMock(process_advert_packet=AsyncMock())
+                    daemon.login_helper = MagicMock(
+                        handlers={0x01: object()}, process_login_packet=AsyncMock(return_value=True)
+                    )
+                    daemon.text_helper = MagicMock(
+                        handlers={0x01: object()}, process_text_packet=AsyncMock(return_value=True)
+                    )
+                    daemon.path_helper = MagicMock(process_path_packet=AsyncMock(return_value=True))
+                    daemon.protocol_request_helper = MagicMock(
+                        handlers={0x01: object()},
+                        process_request_packet=AsyncMock(return_value=True),
+                    )
+                    router = PacketRouter(daemon)
+                    packet = _make_packet(payload_type)
+                    packet.header = (payload_type << 2) | route_type
+                    packet.path = bytearray([0x42])
+                    packet.payload = bytes([0x01, 0x02, 0x03, 0x04])
+
+                    await router._route_packet(packet)
+
+                    bridge.process_received_packet.assert_not_awaited()
+                    daemon.advert_helper.process_advert_packet.assert_not_awaited()
+                    daemon.login_helper.process_login_packet.assert_not_awaited()
+                    daemon.text_helper.process_text_packet.assert_not_awaited()
+                    daemon.path_helper.process_path_packet.assert_not_awaited()
+                    daemon.protocol_request_helper.process_request_packet.assert_not_awaited()
+                    daemon.repeater_handler.assert_awaited_once_with(packet, unittest.mock.ANY)
+
+    async def test_direct_intermediate_firmware_vectors_bypass_local_text_candidates(self):
+        """Decoded direct and transport-direct wire vectors skip local text handling."""
+        # header | [transport codes] | path_len | remaining path | payload
+        vectors = (
+            b"\x0a\x01\x42\x01\x02\x03\x04",
+            b"\x0b\x34\x12\x78\x56\x01\x42\x01\x02\x03\x04",
+        )
+        for wire in vectors:
+            with self.subTest(wire=wire.hex()):
+                daemon = _make_daemon()
+                bridge = _make_bridge()
+                daemon.companion_bridges = {0x01: bridge}
+                daemon.text_helper = MagicMock(
+                    handlers={0x01: object()}, process_text_packet=AsyncMock(return_value=True)
+                )
+                router = PacketRouter(daemon)
+                packet = Packet()
+                packet.read_from(wire)
+
+                await router._route_packet(packet)
+
+                bridge.process_received_packet.assert_not_awaited()
+                daemon.text_helper.process_text_packet.assert_not_awaited()
+                daemon.repeater_handler.assert_awaited_once_with(packet, unittest.mock.ANY)
+
+    async def test_final_direct_firmware_vectors_deliver_to_local_companion(self):
+        """Decoded zero-hop direct vectors reach their local companion rather than forwarding."""
+        # header | [transport codes] | path_len=0 | dest hash | source hash | payload
+        vectors = (
+            b"\x0a\x00\x01\x02\x03\x04",
+            b"\x0b\x34\x12\x78\x56\x00\x01\x02\x03\x04",
+        )
+        for wire in vectors:
+            with self.subTest(wire=wire.hex()):
+                daemon = _make_daemon()
+                bridge = _make_bridge()
+                bridge.process_received_packet = AsyncMock(return_value=HandlerResult.consumed())
+                daemon.companion_bridges = {0x01: bridge}
+                router = PacketRouter(daemon)
+                packet = Packet()
+                packet.read_from(wire)
+
+                await router._route_packet(packet)
+
+                bridge.process_received_packet.assert_awaited_once_with(packet)
+                daemon.repeater_handler.assert_not_awaited()
+
+    async def test_direct_intermediate_ack_notifies_waiter_without_companion_delivery(self):
+        """MeshCore's early ACK notification does not make an intermediate hop a recipient."""
+        daemon = _make_daemon()
+        bridge = _make_bridge()
+        daemon.companion_bridges = {0x01: bridge}
+        router = PacketRouter(daemon)
+        packet = _make_packet(AckHandler.payload_type())
+        packet.header = (AckHandler.payload_type() << 2) | ROUTE_TYPE_DIRECT
+        packet.path = bytearray([0x42])
+        packet.payload = bytes.fromhex("4dabaf95") + b"\x00\x7f"
+
+        await router._route_packet(packet)
+
+        daemon.dispatcher._register_ack_received.assert_awaited_once_with(0x95AFAB4D)
+        bridge.process_received_packet.assert_not_awaited()
+        daemon.repeater_handler.assert_awaited_once()
+
+    async def test_direct_intermediate_control_high_bit_is_released_without_local_delivery(self):
+        """A high-bit CONTROL packet with remaining direct hops is not locally processed."""
+        daemon = _make_daemon()
+        daemon.discovery_helper = MagicMock(control_handler=AsyncMock())
+        daemon.deliver_control_data = AsyncMock()
+        router = PacketRouter(daemon)
+        packet = _make_packet(ControlHandler.payload_type())
+        packet.header = (ControlHandler.payload_type() << 2) | ROUTE_TYPE_DIRECT
+        packet.path = bytearray([0x42])
+        packet.payload = b"\x90\x00\x01\x00\x00\x00"
+
+        await router._route_packet(packet)
+
+        daemon.discovery_helper.control_handler.assert_not_awaited()
+        daemon.deliver_control_data.assert_not_awaited()
+        packet.mark_do_not_retransmit.assert_not_called()
+        daemon.repeater_handler.assert_not_awaited()
+
+    async def test_direct_intermediate_control_without_high_bit_reaches_engine(self):
+        """Only high-bit CONTROL is zero-hop-only; other direct control remains routing traffic."""
+        daemon = _make_daemon()
+        daemon.discovery_helper = MagicMock(control_handler=AsyncMock())
+        daemon.deliver_control_data = AsyncMock()
+        router = PacketRouter(daemon)
+        packet = _make_packet(ControlHandler.payload_type())
+        packet.header = (ControlHandler.payload_type() << 2) | ROUTE_TYPE_DIRECT
+        packet.path = bytearray([0x42])
+        packet.payload = b"\x01\x00"
+
+        await router._route_packet(packet)
+
+        daemon.discovery_helper.control_handler.assert_not_awaited()
+        daemon.deliver_control_data.assert_not_awaited()
+        packet.mark_do_not_retransmit.assert_not_called()
+        daemon.repeater_handler.assert_awaited_once()
+
+    async def test_direct_intermediate_multipart_ack_does_not_notify_local_waiter(self):
+        """A direct intermediate MULTIPART ACK remains forwarding traffic, not a local ACK."""
+        daemon = _make_daemon()
+        router = PacketRouter(daemon)
+        packet = _make_packet(MultipartAckHandler.payload_type())
+        packet.header = (MultipartAckHandler.payload_type() << 2) | ROUTE_TYPE_DIRECT
+        packet.path = bytearray([0x42])
+        packet.payload = b"\x03" + bytes.fromhex("4dabaf95")
+
+        await router._route_packet(packet)
+
+        daemon.dispatcher._register_ack_received.assert_not_awaited()
+        daemon.repeater_handler.assert_awaited_once()
+
+    async def test_direct_intermediate_trace_uses_trace_handler(self):
+        """TRACE keeps its MeshCore-specific forwarding path ahead of generic direct routing."""
+        daemon = _make_daemon()
+        daemon.trace_helper = MagicMock(process_trace_packet=AsyncMock())
+        router = PacketRouter(daemon)
+        packet = _make_packet(TraceHandler.payload_type())
+        packet.header = (TraceHandler.payload_type() << 2) | ROUTE_TYPE_DIRECT
+        packet.path = bytearray([0x42])
+
+        await router._route_packet(packet)
+
+        daemon.trace_helper.process_trace_packet.assert_awaited_once_with(packet)
+        daemon.repeater_handler.assert_not_awaited()
+
+    async def test_direct_intermediate_trace_without_helper_is_released(self):
+        """TRACE remains MeshCore-owned even if a helper is unavailable during startup."""
+        daemon = _make_daemon()
+        daemon.trace_helper = None
+        router = PacketRouter(daemon)
+        packet = _make_packet(TraceHandler.payload_type())
+        packet.header = (TraceHandler.payload_type() << 2) | ROUTE_TYPE_DIRECT
+        packet.path = bytearray([0x42])
+
+        await router._route_packet(packet)
+
+        daemon.repeater_handler.assert_not_awaited()
 
 
 class TestInjectedTxRawEcho(unittest.IsolatedAsyncioTestCase):

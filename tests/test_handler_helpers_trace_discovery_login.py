@@ -7,7 +7,11 @@ import pytest
 
 from openhop_core.node.handlers.result import HandlerResult
 from openhop_core.protocol import LocalIdentity
-from openhop_core.protocol.constants import PAYLOAD_TYPE_ANON_REQ, ROUTE_TYPE_DIRECT
+from openhop_core.protocol.constants import (
+    PAYLOAD_TYPE_ANON_REQ,
+    ROUTE_TYPE_DIRECT,
+    ROUTE_TYPE_TRANSPORT_DIRECT,
+)
 from openhop_core.protocol.packet_builder import PacketBuilder
 
 from repeater.handler_helpers.discovery import DiscoveryHelper
@@ -57,6 +61,9 @@ class DummyPacket:
 
     def get_route_type(self):
         return self.header
+
+    def is_route_direct(self):
+        return self.header in (ROUTE_TYPE_DIRECT, ROUTE_TYPE_TRANSPORT_DIRECT)
 
     def get_payload_type(self):
         return 0x09
@@ -121,7 +128,7 @@ async def test_trace_helper_process_sets_pending_ping_and_forwards():
     tag = 77
     evt = helper.register_ping(tag, 0x42)
 
-    packet = DummyPacket(path=b"\x01", payload=b"\xaa\xbb\xcc")
+    packet = DummyPacket(route=ROUTE_TYPE_TRANSPORT_DIRECT, path=b"\x01", payload=b"\xaa\xbb\xcc")
     helper._forward_trace_packet = AsyncMock()
     helper._extract_path_info = MagicMock(return_value=([], []))
     helper._should_forward_trace = MagicMock(return_value=True)
@@ -626,7 +633,9 @@ async def test_login_helper_real_crypto_consume_vs_collision_forward():
     assert genuine.is_marked_do_not_retransmit()
 
     # Login encrypted for a remote node whose dest hash collides with ours.
-    collision = PacketBuilder.create_login_packet(_SendDest(remote.get_public_key()), sender, "nope")
+    collision = PacketBuilder.create_login_packet(
+        _SendDest(remote.get_public_key()), sender, "nope"
+    )
     _force_dest_hash(collision, local_hash)
     assert await helper.process_login_packet(collision) is False
     assert not collision.is_marked_do_not_retransmit()

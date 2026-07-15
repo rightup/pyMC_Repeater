@@ -467,8 +467,26 @@ class PacketRouter:
             "timestamp": getattr(packet, "timestamp", 0),
         }
 
+        # MeshCore routes direct packets with remaining hops before normal
+        # payload dispatch. Only TRACE, high-bit CONTROL, and early ACK handling
+        # have special behavior at an intermediate hop.
+        direct_intermediate = _is_direct_intermediate_hop(packet)
+        if direct_intermediate:
+            if payload_type == TraceHandler.payload_type():
+                processed_by_injection = True
+                if not getattr(packet, "_injected_for_tx", False) and self.daemon.trace_helper:
+                    await self.daemon.trace_helper.process_trace_packet(packet)
+            elif payload_type == ControlHandler.payload_type():
+                if packet.payload and (packet.payload[0] & 0x80):
+                    # Direct high-bit CONTROL is accepted only at zero hops.
+                    processed_by_injection = True
+            elif payload_type == AckHandler.payload_type():
+                if len(getattr(packet, "payload", b"")) >= 4:
+                    ack_crc = int.from_bytes(packet.payload[:4], "little")
+                    await self._register_ack_with_dispatcher(ack_crc, "ACK")
+
         # Route to specific handlers for parsing only
-        if payload_type == TraceHandler.payload_type():
+        elif payload_type == TraceHandler.payload_type():
             # Locally injected TRACE requests are TX-only and re-enter the router so
             # companion delivery can still happen. They are not inbound RF responses,
             # so skip TraceHelper parsing to avoid matching pending ping tags against
