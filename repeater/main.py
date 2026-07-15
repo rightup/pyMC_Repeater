@@ -31,7 +31,7 @@ from repeater.handler_helpers import (
     TextHelper,
     TraceHelper,
 )
-from repeater.identity_manager import IdentityManager
+from repeater.identity_manager import IdentityConfigurationError, IdentityManager, IdentitySpec
 from repeater.packet_router import PacketRouter
 from repeater.sensors import SensorManager
 from repeater.utils_packet import create_scoped_advert_packet
@@ -105,6 +105,10 @@ class RepeaterDaemon:
         self.router = None
         self.companion_bridges: dict[int, object] = {}
         self.companion_frame_servers: list = []
+        # Parsed once during the startup preflight; the identity loaders reuse
+        # them so config parsing (and its warnings) does not run twice.
+        self._room_server_specs: list[IdentitySpec] | None = None
+        self._companion_specs: list[IdentitySpec] | None = None
         self._shutdown_started = False
         self._main_task = None
         self.radio_status = "unknown"
@@ -119,6 +123,93 @@ class RepeaterDaemon:
         root_logger = logging.getLogger()
         _log_buffer.setLevel(getattr(logging, log_level))
         root_logger.addHandler(_log_buffer)
+
+    def _configured_identity_specs(self, identity_type: str) -> list[IdentitySpec]:
+        """Build valid configured local identities without registering them.
+
+        Invalid optional room-server or companion entries retain the existing
+        skip-and-log behavior.  Valid entries are returned for collision
+        validation before they can create helper, database, or TCP state.
+        """
+        from openhop_core import LocalIdentity
+
+        config_key = {
+            "room_server": "room_servers",
+            "companion": "companions",
+        }[identity_type]
+        configs = self.config.get("identities", {}).get(config_key) or []
+        specs = []
+
+        for identity_config in configs:
+            name = identity_config.get("name")
+            identity_key = identity_config.get("identity_key")
+            label = "Companion" if identity_type == "companion" else "Room server"
+
+            if not name or not identity_key:
+                logger.warning("Skipping %s config: missing name or identity_key", label.lower())
+                continue
+
+            try:
+                if isinstance(identity_key, str):
+                    key_hex = (
+                        normalize_companion_identity_key(identity_key)
+                        if identity_type == "companion"
+                        else identity_key
+                    )
+                    identity_key_bytes = bytes.fromhex(key_hex)
+                elif isinstance(identity_key, bytes):
+                    identity_key_bytes = identity_key
+                else:
+                    logger.error("%s '%s' identity_key has unknown type", label, name)
+                    continue
+            except ValueError as error:
+                logger.error("%s '%s' identity_key invalid hex: %s", label, name, error)
+                continue
+
+            if len(identity_key_bytes) not in (32, 64):
+                logger.error(
+                    "%s '%s' identity_key must be 32 bytes (hex) or 64 bytes "
+                    "(MeshCore firmware key)",
+                    label,
+                    name,
+                )
+                continue
+
+            try:
+                identity = LocalIdentity(seed=identity_key_bytes)
+            except Exception as error:
+                logger.error("Failed to create %s identity '%s': %s", label.lower(), name, error)
+                continue
+
+            specs.append(
+                IdentitySpec(
+                    name=name,
+                    identity=identity,
+                    config=identity_config,
+                    identity_type=identity_type,
+                )
+            )
+
+        return specs
+
+    def _preflight_configured_local_identities(self, local_identity) -> None:
+        """Validate every configured local identity before stateful setup begins.
+
+        The parsed room-server and companion specs are cached so the identity
+        loaders reuse them instead of re-parsing the config (and re-logging
+        every invalid entry). Collision rules live in
+        ``IdentityManager.validate_specs``; at this point the manager holds no
+        registered identities, so this is a pure batch check.
+        """
+        self._room_server_specs = self._configured_identity_specs("room_server")
+        self._companion_specs = self._configured_identity_specs("companion")
+        specs = [
+            IdentitySpec("repeater", local_identity, self.config, "repeater"),
+            *self._room_server_specs,
+            *self._companion_specs,
+        ]
+        manager = self.identity_manager or IdentityManager(self.config)
+        manager.validate_specs(specs)
 
     async def initialize(self):
 
@@ -242,11 +333,11 @@ class RepeaterDaemon:
             logger.info("Dispatcher initialized")
             logger.info("Dispatcher dedupe enabled: %s", dedupe_enabled)
 
-            # Initialize Identity Manager for additional identities (e.g., room servers)
+            # Track every local identity, including the default repeater.
             self.identity_manager = IdentityManager(self.config)
             logger.info("Identity manager initialized")
 
-            # Set up default repeater identity (not managed by identity manager)
+            # Set up the default repeater identity.
             identity_key = self.config.get("repeater", {}).get("identity_key")
             if not identity_key:
                 logger.error("No identity key found in configuration. Cannot init repeater.")
@@ -255,6 +346,19 @@ class RepeaterDaemon:
             local_identity = LocalIdentity(seed=identity_key)
             self.local_identity = local_identity
             self.dispatcher.local_identity = local_identity
+
+            # A one-byte public-key prefix selects local routing, companion
+            # bridges, and companion SQLite namespaces.  Reject all configured
+            # collisions before helpers, databases, or companion TCP servers
+            # have any state to overwrite.
+            self._preflight_configured_local_identities(local_identity)
+            if not self.identity_manager.register_identity(
+                name="repeater",
+                identity=local_identity,
+                config=self.config,
+                identity_type="repeater",
+            ):
+                raise IdentityConfigurationError("Failed to register repeater identity")
 
             pubkey = local_identity.get_public_key()
             self.local_hash = pubkey[0]
@@ -499,49 +603,19 @@ class RepeaterDaemon:
             raise
 
     async def _load_additional_identities(self):
-        from openhop_core import LocalIdentity
+        room_specs = self._room_server_specs
+        if room_specs is None:
+            room_specs = self._configured_identity_specs("room_server")
+        self.identity_manager.validate_specs(room_specs)
 
-        identities_config = self.config.get("identities", {})
-
-        # Load room server identities
-        room_servers = identities_config.get("room_servers") or []
-        for room_config in room_servers:
+        for spec in room_specs:
+            name, room_identity = spec.name, spec.identity
             try:
-                name = room_config.get("name")
-                identity_key = room_config.get("identity_key")
-
-                if not name or not identity_key:
-                    logger.warning("Skipping room server config: missing name or identity_key")
-                    continue
-
-                # Convert identity_key to bytes if it's a hex string
-                if isinstance(identity_key, bytes):
-                    identity_key_bytes = identity_key
-                elif isinstance(identity_key, str):
-                    try:
-                        identity_key_bytes = bytes.fromhex(identity_key)
-                        if len(identity_key_bytes) not in (32, 64):
-                            logger.error(
-                                f"Identity key for '{name}' is invalid length: {len(identity_key_bytes)} bytes (expected 32 or 64)"
-                            )
-                            continue
-                    except ValueError as e:
-                        logger.error(f"Identity key for '{name}' is not valid hex: {e}")
-                        continue
-                else:
-                    logger.error(
-                        f"Identity key for '{name}' has unknown type: {type(identity_key)}"
-                    )
-                    continue
-
-                # Create the identity
-                room_identity = LocalIdentity(seed=identity_key_bytes)
-
                 # Register with the manager and all helpers
                 success = self._register_identity_everywhere(
                     name=name,
                     identity=room_identity,
-                    config=room_config,
+                    config=spec.config,
                     identity_type="room_server",
                 )
 
@@ -551,7 +625,13 @@ class RepeaterDaemon:
                         f"Loaded room server '{name}': hash=0x{room_hash:02x}, "
                         f"address={room_identity.get_address_bytes().hex()}"
                     )
+                else:
+                    raise IdentityConfigurationError(
+                        f"Failed to register room server identity '{name}'"
+                    )
 
+            except IdentityConfigurationError:
+                raise
             except Exception as e:
                 logger.error(f"Failed to load room server identity '{name}': {e}")
 
@@ -630,18 +710,22 @@ class RepeaterDaemon:
 
     async def _load_companion_identities(self) -> None:
         """Load companion identities from config and create CompanionBridge + frame server for each."""
-        from openhop_core import LocalIdentity
-
         from repeater.companion import CompanionFrameServer, RepeaterCompanionBridge
 
-        companions_config = self.config.get("identities", {}).get("companions") or []
-        if not companions_config:
+        companion_specs = self._companion_specs
+        if companion_specs is None:
+            companion_specs = self._configured_identity_specs("companion")
+        if not companion_specs:
             return
+
+        # Validate the complete companion set before any bridge can restore or
+        # mutate a hash-keyed SQLite namespace, or any TCP server can bind.
+        self.identity_manager.validate_specs(companion_specs)
 
         sqlite_handler = None
         if self.repeater_handler and self.repeater_handler.storage:
             sqlite_handler = self.repeater_handler.storage.sqlite_handler
-        if not sqlite_handler and companions_config:
+        if not sqlite_handler:
             logger.warning(
                 "Companion persistence disabled: no storage (contacts/channels will not survive restart or disconnect)"
             )
@@ -652,37 +736,10 @@ class RepeaterDaemon:
             else self.config.get("radio", {})
         )
 
-        for comp_config in companions_config:
+        for spec in companion_specs:
+            name, identity, comp_config = spec.name, spec.identity, spec.config
             try:
-                name = comp_config.get("name")
-                identity_key = comp_config.get("identity_key")
                 settings = comp_config.get("settings") or {}
-
-                if not name or not identity_key:
-                    logger.warning("Skipping companion config: missing name or identity_key")
-                    continue
-
-                if isinstance(identity_key, str):
-                    try:
-                        identity_key_bytes = bytes.fromhex(
-                            normalize_companion_identity_key(identity_key)
-                        )
-                    except ValueError as e:
-                        logger.error(f"Companion '{name}' identity_key invalid hex: {e}")
-                        continue
-                elif isinstance(identity_key, bytes):
-                    identity_key_bytes = identity_key
-                else:
-                    logger.error(f"Companion '{name}' identity_key has unknown type")
-                    continue
-
-                if len(identity_key_bytes) not in (32, 64):
-                    logger.error(
-                        f"Companion '{name}' identity_key must be 32 bytes (hex) or 64 bytes (MeshCore firmware key)"
-                    )
-                    continue
-
-                identity = LocalIdentity(seed=identity_key_bytes)
                 pubkey = identity.get_public_key()
                 companion_hash = pubkey[0]
                 companion_hash_str = f"0x{companion_hash:02x}"
@@ -783,12 +840,18 @@ class RepeaterDaemon:
                 await frame_server.start()
                 self.companion_frame_servers.append(frame_server)
 
-                self.identity_manager.register_identity(
+                if not self.identity_manager.register_identity(
                     name=name,
                     identity=identity,
                     config=comp_config,
                     identity_type="companion",
-                )
+                ):
+                    # The complete set was prevalidated above.  A failure here
+                    # signals a concurrent/configuration error and must not be
+                    # silently treated as a running companion.
+                    raise IdentityConfigurationError(
+                        f"Failed to register companion identity '{name}'"
+                    )
 
                 limits = format_companion_bridge_limits(bridge_kwargs)
                 logger.info(
@@ -801,6 +864,8 @@ class RepeaterDaemon:
                 logger.error("%s", e)
             except CompanionStateLoadError as e:
                 logger.error("Companion init aborted: %s", e)
+            except IdentityConfigurationError:
+                raise
             except Exception as e:
                 logger.error(f"Failed to load companion '{name}': {e}", exc_info=True)
 
@@ -919,6 +984,12 @@ class RepeaterDaemon:
         companion_hash = pubkey[0]
         companion_hash_str = f"0x{companion_hash:02x}"
 
+        if self.identity_manager is None:
+            raise RuntimeError("Identity manager must be initialized before adding a companion")
+        registration_error = self.identity_manager.registration_error(name, identity)
+        if registration_error:
+            raise ValueError(f"Cannot add companion: {registration_error}")
+
         if companion_hash in self.companion_bridges:
             raise ValueError(f"Companion with hash 0x{companion_hash:02x} already loaded")
 
@@ -997,12 +1068,13 @@ class RepeaterDaemon:
         await frame_server.start()
         self.companion_frame_servers.append(frame_server)
 
-        self.identity_manager.register_identity(
+        if not self.identity_manager.register_identity(
             name=name,
             identity=identity,
             config=comp_config,
             identity_type="companion",
-        )
+        ):
+            raise IdentityConfigurationError(f"Failed to register companion identity '{name}'")
 
         limits = format_companion_bridge_limits(bridge_kwargs)
         logger.info(
