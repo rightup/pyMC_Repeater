@@ -2,7 +2,7 @@
 
 import asyncio
 import sqlite3
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -57,6 +57,31 @@ def _bridge(sqlite_handler) -> RepeaterCompanionBridge:
         sqlite_handler=sqlite_handler,
         companion_hash=COMPANION_HASH,
     )
+
+
+@pytest.mark.asyncio
+async def test_message_before_first_client_connection_survives_restart(tmp_path):
+    handler = SQLiteHandler(tmp_path)
+    bridge = _bridge(handler)
+    server = CompanionFrameServer(bridge, COMPANION_HASH, port=0, sqlite_handler=handler)
+    with patch("repeater.companion.frame_server._BaseFrameServer.start", AsyncMock()):
+        await server.start()
+    assert server._client_writer is None
+    await bridge._handle_new_message(
+        {
+            "contact_pubkey": "01" * 32,
+            "message_text": "before-first-connect",
+            "timestamp": 123,
+            "txt_type": 0,
+        }
+    )
+    assert bridge.message_queue.is_empty()
+
+    restarted_handler = SQLiteHandler(tmp_path)
+    message = restarted_handler.companion_pop_message(COMPANION_HASH)
+    assert message is not None
+    assert message["text"] == "before-first-connect"
+    assert message["timestamp"] == 123
 
 
 def test_bulk_save_load_preserves_raw_advert_blob_and_upsert_replaces_it(tmp_path):

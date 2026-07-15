@@ -54,6 +54,14 @@ class CompanionFrameServer(_BaseFrameServer):
         )
         self.sqlite_handler = sqlite_handler
 
+    async def start(self) -> None:
+        """Start persistence before accepting companion client connections."""
+        if self.sqlite_handler:
+            self.bridge.on_message_received(self._on_message_received)
+            self.bridge.on_channel_message_received(self._on_channel_message_received)
+            self.bridge.on_channel_data_received(self._on_channel_data_received)
+        await super().start()
+
     # -----------------------------------------------------------------
     # Persistence hook overrides
     # -----------------------------------------------------------------
