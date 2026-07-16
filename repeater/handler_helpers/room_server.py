@@ -27,7 +27,10 @@ PUSH_TIMEOUT_BASE_MS = 4000
 PUSH_ACK_TIMEOUT_FACTOR_MS = 2000
 
 # Safety limits and protections
-MAX_MESSAGE_LENGTH = 160  # Match C++ MAX_POST_TEXT_LEN (151 bytes for text)
+# Match C++ MAX_POST_TEXT_LEN from examples/simple_room_server/MyMesh.h:
+# #define MAX_POST_TEXT_LEN (160-9) -- 160-byte encrypted text budget minus the
+# 9-byte prefix (4-byte timestamp + 1-byte flags/attempt + 4-byte author pubkey prefix).
+MAX_POST_TEXT_LEN = 151
 MAX_POSTS_PER_CLIENT_PER_MINUTE = 10  # Prevent spam
 MAX_CLIENTS_PER_ROOM = 50  # From ACL default
 MAX_PUSH_FAILURES = 3  # Evict after this many consecutive failures
@@ -45,6 +48,19 @@ RETRY_BACKOFF_SCHEDULE = [0, 30, 300, 3600]  # 0s, 30s, 5min, 1hr
 _global_push_limiter = None
 _global_push_lock = asyncio.Lock()
 GLOBAL_MIN_GAP_BETWEEN_MESSAGES = 1.1  # 1.1s  minimum gap between transmissions
+
+
+def _truncate_utf8(text: str, max_bytes: int) -> str:
+    """Truncate ``text`` to at most ``max_bytes`` of its UTF-8 encoding.
+
+    Cuts at a codepoint boundary so a partial multi-byte sequence is never
+    emitted (matches firmware's byte-length text budget, but stays
+    UTF-8-safe rather than the firmware's raw ``strncpy``).
+    """
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return text
+    return encoded[:max_bytes].decode("utf-8", errors="ignore")
 
 
 class GlobalRateLimiter:
@@ -234,13 +250,15 @@ class RoomServer:
     ) -> bool:
 
         try:
-            # SAFETY: Validate message length
-            if len(message_text) > MAX_MESSAGE_LENGTH:
+            # SAFETY: Validate message length (byte length, matching firmware's
+            # MAX_POST_TEXT_LEN text budget), cutting at a UTF-8 codepoint boundary.
+            encoded_len = len(message_text.encode("utf-8"))
+            if encoded_len > MAX_POST_TEXT_LEN:
                 logger.warning(
                     f"Room '{self.room_name}': Message from {client_pubkey[:4].hex()} "
-                    f"exceeds max length ({len(message_text)} > {MAX_MESSAGE_LENGTH}), truncating"
+                    f"exceeds max length ({encoded_len} > {MAX_POST_TEXT_LEN} bytes), truncating"
                 )
-                message_text = message_text[:MAX_MESSAGE_LENGTH]
+                message_text = _truncate_utf8(message_text, MAX_POST_TEXT_LEN)
 
             # SAFETY: Rate limit per client
             client_key = client_pubkey.hex()
@@ -362,7 +380,13 @@ class RoomServer:
             author_prefix = author_pubkey[:4]
 
             # Plaintext: timestamp(4) + flags(1) + author_prefix(4) + text
-            message_bytes = post["message_text"].encode("utf-8")
+            # SAFETY: Clamp at push time too, in case a legacy stored post
+            # (from before this limit was enforced on write) exceeds
+            # MAX_POST_TEXT_LEN bytes -- truncate at a UTF-8 codepoint boundary.
+            message_text = post["message_text"]
+            if len(message_text.encode("utf-8")) > MAX_POST_TEXT_LEN:
+                message_text = _truncate_utf8(message_text, MAX_POST_TEXT_LEN)
+            message_bytes = message_text.encode("utf-8")
             plaintext = (
                 timestamp.to_bytes(4, "little") + bytes([flags]) + author_prefix + message_bytes
             )

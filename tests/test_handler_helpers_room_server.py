@@ -5,10 +5,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from repeater.handler_helpers.room_server import (
+    MAX_POST_TEXT_LEN,
     MAX_UNSYNCED_POSTS,
     TXT_TYPE_PLAIN,
     TXT_TYPE_SIGNED_PLAIN,
     RoomServer,
+    _truncate_utf8,
 )
 
 
@@ -91,12 +93,77 @@ async def test_room_server_add_post_truncates_and_rate_limits_client():
     first_ok = await rs.add_post(client_key, long_msg, sender_timestamp=5)
     assert first_ok is True
     args = db.insert_room_message.call_args.kwargs
-    assert len(args["message_text"]) == 160
+    assert len(args["message_text"].encode("utf-8")) == MAX_POST_TEXT_LEN
 
     # Force client to appear at post-per-minute limit.
     rs.client_post_times[client_key.hex()] = [time.time() - 1] * 10
     second_ok = await rs.add_post(client_key, "blocked", sender_timestamp=6)
     assert second_ok is False
+
+
+@pytest.mark.asyncio
+async def test_room_server_add_post_ascii_over_limit_stores_exactly_max_bytes():
+    db = _FakeDB()
+    rs = _make_room_server(db=db)
+
+    long_msg = "a" * 200  # ASCII: 1 byte per char, well over MAX_POST_TEXT_LEN
+    ok = await rs.add_post(b"G" * 32, long_msg, sender_timestamp=1)
+    assert ok is True
+
+    stored = db.insert_room_message.call_args.kwargs["message_text"]
+    assert len(stored.encode("utf-8")) == MAX_POST_TEXT_LEN
+    assert stored == "a" * MAX_POST_TEXT_LEN
+
+
+@pytest.mark.asyncio
+async def test_room_server_add_post_multibyte_utf8_truncates_on_codepoint_boundary():
+    db = _FakeDB()
+    rs = _make_room_server(db=db)
+
+    # Each emoji is 4 bytes in UTF-8; padding forces the cut to land mid-emoji
+    # if truncation were byte-naive instead of codepoint-aware.
+    padding = "a" * (MAX_POST_TEXT_LEN - 2)
+    msg = padding + "\U0001f600\U0001f600\U0001f600"  # grinning face emoji x3
+    assert len(msg.encode("utf-8")) > MAX_POST_TEXT_LEN
+
+    ok = await rs.add_post(b"H" * 32, msg, sender_timestamp=2)
+    assert ok is True
+
+    stored = db.insert_room_message.call_args.kwargs["message_text"]
+    encoded = stored.encode("utf-8")
+    assert len(encoded) <= MAX_POST_TEXT_LEN
+    # Must decode cleanly (no partial multi-byte sequence) and round-trip.
+    assert encoded.decode("utf-8") == stored
+
+
+@pytest.mark.asyncio
+async def test_room_server_add_post_exact_limit_text_untouched():
+    db = _FakeDB()
+    rs = _make_room_server(db=db)
+
+    msg = "y" * MAX_POST_TEXT_LEN
+    ok = await rs.add_post(b"I" * 32, msg, sender_timestamp=3)
+    assert ok is True
+
+    stored = db.insert_room_message.call_args.kwargs["message_text"]
+    assert stored == msg
+    assert len(stored.encode("utf-8")) == MAX_POST_TEXT_LEN
+
+
+def test_truncate_utf8_helper_boundary_cases():
+    # Under the limit: untouched.
+    assert _truncate_utf8("short", 151) == "short"
+
+    # Exactly at the limit: untouched.
+    exact = "z" * 151
+    assert _truncate_utf8(exact, 151) == exact
+
+    # Multi-byte straddling the boundary: cuts cleanly, decodes, stays <= limit.
+    text = ("b" * 149) + "\U0001f600\U0001f600"  # 149 + 4 + 4 = 157 bytes
+    result = _truncate_utf8(text, 151)
+    encoded = result.encode("utf-8")
+    assert len(encoded) <= 151
+    assert encoded.decode("utf-8") == result
 
 
 @pytest.mark.asyncio
@@ -190,6 +257,47 @@ async def test_room_server_push_post_to_client_success_direct_route_sets_path_an
         client.id.get_public_key(), post["post_timestamp"]
     )
     rs.global_limiter.release.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_room_server_push_post_to_client_clamps_oversized_legacy_stored_text():
+    """A post stored before the write-time limit was enforced (or otherwise
+    over MAX_POST_TEXT_LEN bytes) must still be clamped at push time so the
+    outgoing frame's text portion never exceeds the firmware's budget."""
+    db = _FakeDB()
+    db.get_client_sync.return_value = {"push_failures": 0}
+    injector = AsyncMock(return_value=True)
+    rs = _make_room_server(db=db, injector=injector)
+    rs.global_limiter = SimpleNamespace(acquire=AsyncMock(), release=MagicMock())
+    rs._handle_ack_received = AsyncMock()
+
+    client = _FakeClient(pubkey=b"E" * 32, out_path=b"\xaa\xbb", out_path_len=2)
+    oversized_text = "q" * (MAX_POST_TEXT_LEN + 50)
+    post = {
+        "author_pubkey": (b"F" * 32).hex(),
+        "message_text": oversized_text,
+        "post_timestamp": 1234.5,
+    }
+
+    packet = SimpleNamespace(path=bytearray(), path_len=0)
+    with (
+        patch(
+            "repeater.handler_helpers.room_server.CryptoUtils.sha256",
+            return_value=b"\x01\x02\x03\x04abcd",
+        ),
+        patch(
+            "repeater.handler_helpers.room_server.PacketBuilder.create_datagram",
+            return_value=packet,
+        ) as create_datagram,
+    ):
+        ok = await rs.push_post_to_client(client, post)
+
+    assert ok is True
+    plaintext = create_datagram.call_args.kwargs["plaintext"]
+    # Prefix is timestamp(4) + flags(1) + author_prefix(4) = 9 bytes.
+    text_portion = plaintext[9:]
+    assert len(text_portion) == MAX_POST_TEXT_LEN
+    assert text_portion.decode("utf-8") == "q" * MAX_POST_TEXT_LEN
 
 
 @pytest.mark.asyncio
