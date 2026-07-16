@@ -1233,7 +1233,7 @@ class TestNeighbourLinkObservation:
         payload_type = pkt.get_payload_type() if hasattr(pkt, "get_payload_type") else None
         score = handler.calculate_packet_score(
             snr,
-            len(pkt.payload or b""),
+            pkt.get_raw_length() if hasattr(pkt, "get_raw_length") else 0,
             handler.radio_config["spreading_factor"],
         )
         handler.neighbour_link_tracker.observe(
@@ -1309,18 +1309,22 @@ class TestNeighbourLinkObservation:
         assert len(snapshot) == 1
         assert snapshot[0]["peer_hash"] == "3B"
 
-    async def test_existing_packet_score_calculation_is_reused_unchanged(self, handler):
+    async def test_neighbour_link_score_uses_shared_flood_metrics(self, handler):
         handler.config["repeater"]["mode"] = "monitor"
         pkt = _make_hashed_flood_packet(["55"], hash_size=1)
-        with patch.object(handler, "calculate_packet_score", return_value=0.42) as score_mock:
+        with patch("repeater.engine.flood_rx_metrics") as metrics_mock:
+            metrics_mock.return_value = MagicMock(score=0.42)
             await handler(pkt, {"rssi": -81.0, "snr": 3.25}, local_transmission=False)
 
-        score_mock.assert_any_call(
+        metrics_mock.assert_any_call(
+            pkt.get_raw_length(),
             3.25,
-            len(pkt.payload or b""),
             handler.radio_config["spreading_factor"],
+            handler.radio_config["bandwidth"],
+            handler.radio_config["coding_rate"],
+            handler.radio_config["preamble_length"],
         )
-        assert score_mock.call_count >= 1
+        assert metrics_mock.call_count >= 1
         snapshot = handler.neighbour_link_tracker.snapshot()
         assert snapshot[0]["last_score"] == pytest.approx(0.42)
 

@@ -226,7 +226,7 @@ class TraceHelper:
             "score": (
                 self.repeater_handler.calculate_packet_score(
                     getattr(packet, "snr", 0.0),
-                    len(packet.payload or b""),
+                    packet.get_raw_length() if hasattr(packet, "get_raw_length") else 0,
                     self.repeater_handler.radio_config.get("spreading_factor", 8),
                 )
                 if self.repeater_handler
