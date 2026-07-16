@@ -3376,7 +3376,7 @@ class SQLiteHandler:
                            path_len, sender_prefix, snr, rssi, channel_data_type,
                            channel_data_payload
                     FROM companion_messages WHERE companion_hash = ?
-                    ORDER BY created_at ASC LIMIT ?
+                    ORDER BY id ASC LIMIT ?
                 """,
                     (companion_hash, limit),
                 )
@@ -3454,41 +3454,45 @@ class SQLiteHandler:
                     conn.commit()
                     return False
                 if max_messages is not None:
+                    last_id = cursor.lastrowid
                     count = conn.execute(
                         "SELECT COUNT(*) FROM companion_messages WHERE companion_hash = ?",
                         (companion_hash,),
                     ).fetchone()[0]
-                    while count > max_messages:
-                        oldest_channel = conn.execute(
+                    excess = count - max_messages
+                    if excess > 0:
+                        # Eviction is ordered by id (an AUTOINCREMENT rowid, so
+                        # insertion order) rather than created_at, keeping the
+                        # policy immune to backwards clock steps. The incoming
+                        # row is excluded so it is never evicted to make room
+                        # for itself.
+                        evictable = conn.execute(
                             """
-                            SELECT id FROM companion_messages
-                            WHERE companion_hash = ? AND is_channel = 1
-                            ORDER BY created_at ASC, id ASC LIMIT 1
+                            SELECT COUNT(*) FROM companion_messages
+                            WHERE companion_hash = ? AND is_channel = 1 AND id != ?
                             """,
-                            (companion_hash,),
-                        ).fetchone()
-                        if oldest_channel is None:
-                            # The just-inserted row is not retainable without
-                            # sacrificing a direct message. Keep every prior
-                            # row intact, including any channel rows already
-                            # considered while satisfying a lowered limit.
-                            conn.execute("ROLLBACK TO SAVEPOINT companion_message_push")
-                            conn.execute("RELEASE SAVEPOINT companion_message_push")
-                            conn.commit()
-                            return False
-                        if oldest_channel[0] == cursor.lastrowid:
-                            # A new channel message is itself the only
-                            # evictable row; retain the protected directs and
-                            # report that the incoming message was rejected.
+                            (companion_hash, last_id),
+                        ).fetchone()[0]
+                        if evictable < excess:
+                            # Not enough channel rows to make room without
+                            # displacing a retained direct message. Undo the
+                            # insert and every would-be eviction as one unit,
+                            # keeping every prior row intact.
                             conn.execute("ROLLBACK TO SAVEPOINT companion_message_push")
                             conn.execute("RELEASE SAVEPOINT companion_message_push")
                             conn.commit()
                             return False
                         conn.execute(
-                            "DELETE FROM companion_messages WHERE id = ?",
-                            (oldest_channel[0],),
+                            """
+                            DELETE FROM companion_messages
+                            WHERE id IN (
+                                SELECT id FROM companion_messages
+                                WHERE companion_hash = ? AND is_channel = 1 AND id != ?
+                                ORDER BY id ASC LIMIT ?
+                            )
+                            """,
+                            (companion_hash, last_id, excess),
                         )
-                        count -= 1
                 conn.execute("RELEASE SAVEPOINT companion_message_push")
                 conn.commit()
                 return True
@@ -3507,7 +3511,7 @@ class SQLiteHandler:
                            path_len, sender_prefix, snr, rssi, channel_data_type,
                            channel_data_payload
                     FROM companion_messages WHERE companion_hash = ?
-                    ORDER BY created_at ASC LIMIT 1
+                    ORDER BY id ASC LIMIT 1
                 """,
                     (companion_hash,),
                 )
