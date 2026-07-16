@@ -330,6 +330,11 @@ class RepeaterDaemon:
                 self.config.get("repeater", {}).get("dispatcher_dedupe_enabled", False)
             )
             self.dispatcher = Dispatcher(self.radio, dedupe_enabled=dedupe_enabled)
+            # Flood reception-quality delay base (MeshCore "set rxdelay");
+            # 0 keeps flood processing immediate, the firmware default.
+            self.dispatcher.rx_delay_base = float(
+                self.config.get("delays", {}).get("rx_delay_base", 0.0)
+            )
             logger.info("Dispatcher initialized")
             logger.info("Dispatcher dedupe enabled: %s", dedupe_enabled)
 

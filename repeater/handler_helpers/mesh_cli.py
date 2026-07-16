@@ -570,7 +570,9 @@ class MeshCLI:
             return f"> {loop_detect}"
 
         elif param == "rxdelay":
-            delay = self.repeater_config.get("rx_delay_base", 0.0)
+            # The flood RX delay base lives in the delays section (the value
+            # the dispatcher and web API use), not the repeater section.
+            delay = self.config.get("delays", {}).get("rx_delay_base", 0.0)
             return f"> {delay}"
 
         elif param == "txdelay":
@@ -741,7 +743,7 @@ class MeshCLI:
                 delay = float(value)
                 if delay < 0:
                     return "Error: cannot be negative"
-                self.repeater_config["rx_delay_base"] = delay
+                self.config.setdefault("delays", {})["rx_delay_base"] = delay
                 saved, _ = self.config_manager.save_to_file()
                 self.config_manager.live_update_daemon(["repeater", "delays"])
                 return "OK"

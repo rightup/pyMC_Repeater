@@ -22,7 +22,7 @@ from openhop_core.protocol.constants import (
     ROUTE_TYPE_TRANSPORT_DIRECT,
     ROUTE_TYPE_TRANSPORT_FLOOD,
 )
-from openhop_core.protocol.packet_utils import PacketHeaderUtils, PathUtils
+from openhop_core.protocol.packet_utils import PacketHeaderUtils, PathUtils, packet_score
 
 from repeater.airtime import AirtimeManager
 from repeater.data_acquisition import StorageCollector
@@ -1119,29 +1119,9 @@ class RepeaterHandler(BaseHandler):
 
     @staticmethod
     def calculate_packet_score(snr: float, packet_len: int, spreading_factor: int = 8) -> float:
-
-        # SNR thresholds per SF (from MeshCore RadioLibWrappers.cpp)
-        snr_thresholds = {7: -7.5, 8: -10.0, 9: -12.5, 10: -15.0, 11: -17.5, 12: -20.0}
-
-        if spreading_factor < 7:
-            return 0.0
-
-        threshold = snr_thresholds.get(spreading_factor, -10.0)
-
-        # Below threshold = no chance of success
-        if snr < threshold:
-            return 0.0
-
-        # Success rate based on SNR above threshold
-        success_rate_based_on_snr = (snr - threshold) / 10.0
-
-        # Collision penalty: longer packets more likely to collide (max 256 bytes)
-        collision_penalty = 1.0 - (packet_len / 256.0)
-
-        # Combined score
-        score = success_rate_based_on_snr * collision_penalty
-
-        return max(0.0, min(1.0, score))
+        """Reception-quality score in [0, 1] via the shared core scorer
+        (MeshCore RadioLibWrappers packetScoreInt)."""
+        return packet_score(snr, spreading_factor, packet_len)
 
     def _calculate_tx_delay(self, packet: Packet, snr: float = 0.0) -> float:
 
