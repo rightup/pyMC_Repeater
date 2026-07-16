@@ -37,6 +37,7 @@ from repeater.sensors import SensorManager
 from repeater.utils_packet import create_scoped_advert_packet
 from repeater.web.http_server import HTTPStatsServer, _log_buffer
 
+from openhop_core.companion.radio_capabilities import resolve_max_tx_power_dbm
 from openhop_core.protocol.constants import PAYLOAD_TYPE_RAW_CUSTOM
 
 logger = logging.getLogger("RepeaterDaemon")
@@ -330,6 +331,11 @@ class RepeaterDaemon:
                 self.config.get("repeater", {}).get("dispatcher_dedupe_enabled", False)
             )
             self.dispatcher = Dispatcher(self.radio, dedupe_enabled=dedupe_enabled)
+            # Flood reception-quality delay base (MeshCore "set rxdelay");
+            # 0 keeps flood processing immediate, the firmware default.
+            self.dispatcher.rx_delay_base = float(
+                self.config.get("delays", {}).get("rx_delay_base", 0.0)
+            )
             logger.info("Dispatcher initialized")
             logger.info("Dispatcher dedupe enabled: %s", dedupe_enabled)
 
@@ -671,42 +677,12 @@ class RepeaterDaemon:
     def _get_companion_max_tx_power_dbm(self):
         """Return the active backend's TX limit when it declares one.
 
-        SX1262 backends have an enforced 22 dBm driver limit.  Other backends
-        can expose a ``get_max_tx_power_dbm`` method, a
-        ``max_tx_power_dbm`` attribute, or a validated deployment setting.
+        The backend can expose a ``get_max_tx_power_dbm`` method, a
+        ``max_tx_power_dbm`` attribute (SX1262 backends declare their 22 dBm
+        driver limit this way), or a validated deployment setting.
         Returning ``None`` lets Core use its generic protocol fallback.
         """
-        radio = self.radio
-        getter = getattr(radio, "get_max_tx_power_dbm", None)
-        if callable(getter):
-            try:
-                value = getter()
-                if value is not None:
-                    return int(value)
-            except (TypeError, ValueError):
-                logger.warning("Radio reported an invalid maximum TX power")
-            except Exception as e:
-                logger.warning("Could not get radio maximum TX power: %s", e)
-
-        value = getattr(radio, "max_tx_power_dbm", None)
-        if value is not None:
-            try:
-                return int(value)
-            except (TypeError, ValueError):
-                logger.warning("Radio reported an invalid maximum TX power: %r", value)
-
-        settings = self._get_companion_radio_settings()
-        value = settings.get("max_tx_power_dbm", settings.get("max_tx_power"))
-        if value is not None:
-            try:
-                return int(value)
-            except (TypeError, ValueError):
-                logger.warning("Configured maximum TX power is invalid: %r", value)
-
-        radio_type = str(self.config.get("radio_type", "")).lower().strip()
-        if radio_type in {"sx1262", "sx1262_ch341"}:
-            return 22
-        return None
+        return resolve_max_tx_power_dbm(self.radio, self._get_companion_radio_settings())
 
     async def _load_companion_identities(self) -> None:
         """Load companion identities from config and create CompanionBridge + frame server for each."""

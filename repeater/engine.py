@@ -10,16 +10,19 @@ from openhop_core.node.handlers.base import BaseHandler
 from openhop_core.protocol import Packet
 from openhop_core.protocol.constants import (
     MAX_PATH_SIZE,
+    PAYLOAD_TYPE_ACK,
     PAYLOAD_TYPE_ADVERT,
     PAYLOAD_TYPE_ANON_REQ,
+    PAYLOAD_TYPE_MULTIPART,
     PAYLOAD_TYPE_TRACE,
     PH_ROUTE_MASK,
+    PH_TYPE_SHIFT,
     ROUTE_TYPE_DIRECT,
     ROUTE_TYPE_FLOOD,
     ROUTE_TYPE_TRANSPORT_DIRECT,
     ROUTE_TYPE_TRANSPORT_FLOOD,
 )
-from openhop_core.protocol.packet_utils import PacketHeaderUtils, PathUtils
+from openhop_core.protocol.packet_utils import PacketHeaderUtils, PathUtils, packet_score
 
 from repeater.airtime import AirtimeManager
 from repeater.data_acquisition import StorageCollector
@@ -75,6 +78,14 @@ class RepeaterHandler(BaseHandler):
         self.max_duplicates_per_packet = 20
         self.tx_delay_factor = config.get("delays", {}).get("tx_delay_factor", 1.0)
         self.direct_tx_delay_factor = config.get("delays", {}).get("direct_tx_delay_factor", 0.5)
+        # These are airtime multipliers, not seconds: TX delay is a random value in
+        # [0, 5 * airtime * factor] (matching MeshCore getRetransmitDelay). Flood and
+        # direct share the formula and differ only in the factor.
+        logger.info(
+            "TX delay factors (airtime multipliers, not seconds): "
+            f"flood random 0-5*airtime*F (F={self.tx_delay_factor}), "
+            f"direct random 0-5*airtime*F (F={self.direct_tx_delay_factor})"
+        )
         self.use_score_for_tx = config.get("repeater", {}).get("use_score_for_tx", False)
         self.score_threshold = config.get("repeater", {}).get("score_threshold", 0.3)
         self.max_flood_hops = config.get("repeater", {}).get("max_flood_hops", 64)
@@ -1082,31 +1093,89 @@ class RepeaterHandler(BaseHandler):
 
         return packet
 
+    # Multipart ACKs are spaced ~300ms apart per remaining fragment, matching
+    # MeshCore's forwardMultipartDirect (`(remaining + 1) * 300`).
+    MULTIPART_ACK_SPACING_MS = 300
+
+    def forward_multipart_direct(
+        self, packet: Packet, packet_hash: Optional[str] = None
+    ) -> Optional[Tuple[Packet, float]]:
+        """Forward a MULTIPART packet the way MeshCore's forwardMultipartDirect does.
+
+        MeshCore never relays the multipart wrapper as an ordinary directed
+        packet.  Only a multipart-ACK at an intermediate direct hop is relayed,
+        and it is relayed by regenerating the embedded ACK as a plain DIRECT ACK
+        (the wrapper byte stripped) rather than repeating the wrapper.  Every
+        other multipart case — flood routing, a final hop, or a non-ACK embedded
+        type — is dropped.  Returns ``(ack_packet, delay_seconds)`` when a
+        regenerated ACK should be sent, otherwise ``None``.
+
+        INVARIANT: purely synchronous, mirroring flood_forward / direct_forward —
+        the is_duplicate + mark_seen pair must stay atomic within the event loop.
+        """
+        # MeshCore only forwards multipart on the direct-route branch; the flood
+        # switch case updates ACK state locally but never re-routes it.
+        if not packet.is_route_direct():
+            packet.drop_reason = "Multipart: not direct-routed"
+            return None
+
+        valid, reason = self.validate_packet(packet)
+        if not valid:
+            packet.drop_reason = reason
+            return None
+
+        if packet.is_marked_do_not_retransmit():
+            packet.drop_reason = packet.drop_reason or "Marked do not retransmit"
+            return None
+
+        payload = packet.payload or b""
+        remaining = payload[0] >> 4
+        embedded_type = payload[0] & 0x0F
+        # Only multipart-ACKs are relayed; MeshCore leaves other types for future
+        # use and does not forward them.
+        if embedded_type != PAYLOAD_TYPE_ACK or len(payload) < 5:
+            packet.drop_reason = "Multipart: unsupported embedded type"
+            return None
+
+        hash_size = packet.get_path_hash_size()
+        hop_count = packet.get_path_hash_count()
+
+        # We must be the next hop (a final-hop multipart has no remaining path and
+        # is handled locally, not forwarded).
+        if not packet.path or len(packet.path) < hash_size:
+            packet.drop_reason = "Direct: no path"
+            return None
+        if bytes(packet.path[:hash_size]) != self.local_hash_bytes[:hash_size]:
+            packet.drop_reason = "Direct: not for us"
+            return None
+
+        # Rebuild the received wrapper as the plain DIRECT ACK MeshCore would emit:
+        # drop the multipart header byte and force the ACK payload/route type. The
+        # path is left intact for the seen-check, then this node is removed from it,
+        # matching forwardMultipartDirect's hasSeen()/removeSelfFromPath() order.
+        packet.payload = bytearray(payload[1:])
+        packet.payload_len = len(packet.payload)
+        packet.header = (PAYLOAD_TYPE_ACK << PH_TYPE_SHIFT) | ROUTE_TYPE_DIRECT
+
+        # Dedupe on the regenerated ACK form (full path) before removing ourselves,
+        # so a repeated multipart ACK — or an equivalent plain ACK — is not relayed
+        # twice.  The pre-computed hash belongs to the original wrapper, so recompute.
+        if self.is_duplicate(packet):
+            packet.drop_reason = "Duplicate"
+            return None
+        self.mark_seen(packet)
+
+        packet.path = bytearray(packet.path[hash_size:])
+        packet.path_len = PathUtils.encode_path_len(hash_size, hop_count - 1)
+
+        delay_s = ((remaining + 1) * self.MULTIPART_ACK_SPACING_MS) / 1000.0
+        return packet, delay_s
+
     @staticmethod
     def calculate_packet_score(snr: float, packet_len: int, spreading_factor: int = 8) -> float:
-
-        # SNR thresholds per SF (from MeshCore RadioLibWrappers.cpp)
-        snr_thresholds = {7: -7.5, 8: -10.0, 9: -12.5, 10: -15.0, 11: -17.5, 12: -20.0}
-
-        if spreading_factor < 7:
-            return 0.0
-
-        threshold = snr_thresholds.get(spreading_factor, -10.0)
-
-        # Below threshold = no chance of success
-        if snr < threshold:
-            return 0.0
-
-        # Success rate based on SNR above threshold
-        success_rate_based_on_snr = (snr - threshold) / 10.0
-
-        # Collision penalty: longer packets more likely to collide (max 256 bytes)
-        collision_penalty = 1.0 - (packet_len / 256.0)
-
-        # Combined score
-        score = success_rate_based_on_snr * collision_penalty
-
-        return max(0.0, min(1.0, score))
+        """Reception-quality score in [0, 1] via the shared core scorer
+        (MeshCore RadioLibWrappers packetScoreInt)."""
+        return packet_score(snr, spreading_factor, packet_len)
 
     def _calculate_tx_delay(self, packet: Packet, snr: float = 0.0) -> float:
 
@@ -1165,6 +1234,13 @@ class RepeaterHandler(BaseHandler):
         from 3 per forwarded packet to 1.
         """
         route_type = packet.header & PH_ROUTE_MASK
+
+        # MeshCore routes multipart traffic through its own branch, never the
+        # generic flood/direct path — it regenerates embedded ACKs and drops
+        # everything else.  Its delay is fixed by the fragment count, so return
+        # the (packet, delay) pair directly instead of _calculate_tx_delay.
+        if packet.get_payload_type() == PAYLOAD_TYPE_MULTIPART:
+            return self.forward_multipart_direct(packet, packet_hash=packet_hash)
 
         if route_type == ROUTE_TYPE_FLOOD or route_type == ROUTE_TYPE_TRANSPORT_FLOOD:
             fwd_pkt = self.flood_forward(packet, packet_hash=packet_hash)

@@ -491,10 +491,12 @@ sx1262:
   is_waveshare: false
 
 delays:
-  # TX delay factor for flood mode (multiplier)
+  # Flood TX delay: airtime multiplier, NOT seconds. The actual pre-transmit
+  # delay is a random value in [0, 5 * packet_airtime * factor] seconds.
   tx_delay_factor: 1.0
 
-  # TX delay factor for direct mode (faster)
+  # Direct TX delay: same random 0-5*airtime*factor window, usually lower so
+  # directed traffic clears faster.
   direct_tx_delay_factor: 0.5
 
 duty_cycle:

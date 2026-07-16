@@ -48,6 +48,7 @@ _EXPECTED_DROP_REASON_PREFIXES = (
     "Empty payload",
     "Path too long",
     "Invalid advert packet",
+    "Multipart",
 )
 
 

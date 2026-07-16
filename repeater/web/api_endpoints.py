@@ -3937,8 +3937,8 @@ class APIEndpoints:
             "bandwidth": 62500,          # Bandwidth in Hz (valid: 7.8, 10.4, 15.6, 20.8, 31.25, 41.7, 62.5, 125, 250, 500 kHz)
             "spreading_factor": 8,       # Spreading factor (5-12)
             "coding_rate": 8,            # Coding rate (5-8 for 4/5 to 4/8)
-            "tx_delay_factor": 1.0,      # TX delay factor (0.0-5.0)
-            "direct_tx_delay_factor": 0.5,  # Direct TX delay (0.0-5.0)
+            "tx_delay_factor": 1.0,      # Flood TX delay airtime multiplier (0.0-5.0)
+            "direct_tx_delay_factor": 0.5,  # Direct TX delay airtime multiplier (0.0-5.0)
             "rx_delay_base": 0.0,        # RX delay base (>= 0)
             "node_name": "MyNode",       # Node name
             "owner_info": "Owner text",   # Owner info text

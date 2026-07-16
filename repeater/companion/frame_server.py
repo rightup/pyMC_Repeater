@@ -116,6 +116,10 @@ class CompanionFrameServer(_BaseFrameServer):
             is_channel=bool(msg_dict.get("is_channel", False)),
             channel_idx=msg_dict.get("channel_idx", 0),
             path_len=msg_dict.get("path_len", 0),
+            snr=float(msg_dict.get("snr") or 0.0),
+            rssi=int(msg_dict.get("rssi") or 0),
+            channel_data_type=int(msg_dict.get("channel_data_type") or 0),
+            channel_data_payload=bytes(msg_dict.get("channel_data_payload") or b""),
             sender_prefix=sender_prefix,
         )
 

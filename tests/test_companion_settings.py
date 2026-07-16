@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import logging
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+
+from openhop_core.companion import CompanionBridge
+from openhop_core.protocol import LocalIdentity
 
 from repeater.companion.utils import (
     COMPANION_SETTINGS_ALLOWLIST,
@@ -65,12 +68,16 @@ class TestParseCompanionBridgeKwargs:
 
 class TestCompanionRadioCapabilities:
     def test_reads_active_radio_state_and_known_sx1262_limit(self):
+        # The SX1262 driver declares its 22 dBm limit as a backend attribute
+        # (SX1262Radio.max_tx_power_dbm); the daemon no longer string-matches
+        # radio_type to recover it.
         radio = SimpleNamespace(
             frequency=868_000_000,
             bandwidth=125_000,
             spreading_factor=7,
             coding_rate=8,
             tx_power=14,
+            max_tx_power_dbm=22,
         )
         daemon = RepeaterDaemon.__new__(RepeaterDaemon)
         daemon.config = {"radio_type": "sx1262", "radio": {"frequency": 915_000_000}}
@@ -101,6 +108,28 @@ class TestCompanionRadioCapabilities:
         daemon.radio = SimpleNamespace()
 
         assert RepeaterDaemon._get_companion_max_tx_power_dbm(daemon) == 15
+
+    def test_backend_class_attribute_reaches_self_info_max_tx_power(self):
+        # A driver declares its limit as a class attribute (as SX1262Radio
+        # does); no radio_type string match is involved.
+        class _FakeRadio:
+            max_tx_power_dbm = 20
+
+        daemon = RepeaterDaemon.__new__(RepeaterDaemon)
+        daemon.config = {"radio_type": "sx1262_ch341"}
+        daemon.repeater_handler = SimpleNamespace(radio_config={})
+        daemon.radio = _FakeRadio()
+
+        assert RepeaterDaemon._get_companion_max_tx_power_dbm(daemon) == 20
+
+        # The daemon getter is what a bridge is wired with at load time; the
+        # value must surface through the companion SELF_INFO max-tx-power path.
+        bridge = CompanionBridge(
+            LocalIdentity(),
+            AsyncMock(return_value=True),
+            max_tx_power_getter=daemon._get_companion_max_tx_power_dbm,
+        )
+        assert bridge.get_max_tx_power_dbm() == 20
 
 
 class TestEffectiveMaxContacts:
@@ -281,6 +310,51 @@ class TestSqliteRetentionTrim:
         assert len(h.companion_load_messages("0x01")) == 2
         assert len(h.companion_load_messages("0x02")) == 3
 
+    def test_evicts_insertion_oldest_when_clock_steps_backwards(self, tmp_path, monkeypatch):
+        from repeater.data_acquisition import sqlite_handler
+
+        h = self._handler(tmp_path)
+        for i in range(3):
+            assert h.companion_push_message(
+                "0x01",
+                {"text": f"c{i}", "packet_hash": f"c{i}", "is_channel": True},
+                max_messages=3,
+            )
+
+        # The incoming row records a created_at older than every existing row.
+        # Insertion-order (id) eviction must drop the oldest existing row and
+        # keep the new push, rather than treating the incoming row as oldest.
+        monkeypatch.setattr(sqlite_handler.time, "time", lambda: 1.0)
+        assert h.companion_push_message(
+            "0x01",
+            {"text": "c3", "packet_hash": "c3", "is_channel": True},
+            max_messages=3,
+        )
+
+        assert [m["text"] for m in h.companion_load_messages("0x01")] == ["c1", "c2", "c3"]
+
+    def test_lowered_limit_evicts_multiple_channels_in_one_push(self, tmp_path):
+        h = self._handler(tmp_path)
+        seed = [
+            {"text": "d1", "packet_hash": "d1", "is_channel": False},
+            {"text": "d2", "packet_hash": "d2", "is_channel": False},
+            {"text": "c1", "packet_hash": "c1", "is_channel": True},
+            {"text": "c2", "packet_hash": "c2", "is_channel": True},
+            {"text": "c3", "packet_hash": "c3", "is_channel": True},
+        ]
+        for message in seed:
+            assert h.companion_push_message("0x01", message)
+
+        assert h.companion_push_message(
+            "0x01",
+            {"text": "c4", "packet_hash": "c4", "is_channel": True},
+            max_messages=4,
+        )
+
+        messages = h.companion_load_messages("0x01")
+        assert [m["text"] for m in messages] == ["d1", "d2", "c3", "c4"]
+        assert [m["is_channel"] for m in messages] == [0, 0, 1, 1]
+
 
 class TestSenderPrefixPersistence:
     """sender_prefix (signed room-post author prefix) survives the SQLite round-trip."""
@@ -337,7 +411,9 @@ class TestSenderPrefixPersistence:
         conn = sqlite3.connect(str(h.sqlite_path))
         conn.execute(
             "DELETE FROM migrations "
-            "WHERE migration_name = 'add_sender_prefix_to_companion_messages'"
+            "WHERE migration_name IN ("
+            "'add_sender_prefix_to_companion_messages', "
+            "'add_signal_and_channel_data_to_companion_messages')"
         )
         conn.execute("ALTER TABLE companion_messages RENAME TO companion_messages_old")
         conn.execute(

@@ -210,6 +210,47 @@ def test_cmd_set_updates_and_validation_errors():
     assert cli._cmd_set("unknown.key 1") == "unknown config: unknown.key"
 
 
+def test_cmd_set_txdelay_writes_delays_section():
+    cfg = _base_config()
+    stale_repeater_value = cfg["repeater"]["tx_delay_factor"]
+    mgr = _cfg_mgr()
+    cli = MeshCLI("/tmp/cfg.yaml", cfg, mgr)
+
+    assert cli._cmd_set("txdelay 2.0") == "OK"
+    assert cfg["delays"]["tx_delay_factor"] == 2.0
+    assert cfg["repeater"]["tx_delay_factor"] == stale_repeater_value
+    mgr.live_update_daemon.assert_called_with(["repeater", "delays"])
+
+
+def test_cmd_set_direct_txdelay_writes_delays_section():
+    cfg = _base_config()
+    stale_repeater_value = cfg["repeater"]["direct_tx_delay_factor"]
+    mgr = _cfg_mgr()
+    cli = MeshCLI("/tmp/cfg.yaml", cfg, mgr)
+
+    assert cli._cmd_set("direct.txdelay 0.75") == "OK"
+    assert cfg["delays"]["direct_tx_delay_factor"] == 0.75
+    assert cfg["repeater"]["direct_tx_delay_factor"] == stale_repeater_value
+    mgr.live_update_daemon.assert_called_with(["repeater", "delays"])
+
+
+def test_cmd_get_txdelay_and_direct_txdelay_prefer_delays_section():
+    cfg = _base_config()
+    # repeater section still carries stale values; the delays section wins.
+    cfg["delays"] = {"tx_delay_factor": 4.4, "direct_tx_delay_factor": 0.9}
+    cli = MeshCLI("/tmp/cfg.yaml", cfg, _cfg_mgr())
+
+    assert cli._cmd_get("txdelay") == "> 4.4"
+    assert cli._cmd_get("direct.txdelay") == "> 0.9"
+
+
+def test_cmd_get_txdelay_and_direct_txdelay_default_without_delays_section():
+    cli = MeshCLI("/tmp/cfg.yaml", _base_config(), _cfg_mgr())
+
+    assert cli._cmd_get("txdelay") == "> 1.0"
+    assert cli._cmd_get("direct.txdelay") == "> 0.5"
+
+
 def test_misc_commands_and_routes():
     cli = MeshCLI("/tmp/cfg.yaml", _base_config(), _cfg_mgr(), enable_regions=True)
 

@@ -8,6 +8,7 @@ airtime duty-cycle, TX mode (forward/monitor/no_tx), and config reloading.
 
 import asyncio
 import base64
+import logging
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -15,6 +16,8 @@ import pytest
 from openhop_core.protocol import Packet, PacketBuilder
 from openhop_core.protocol.constants import (
     MAX_PATH_SIZE,
+    PAYLOAD_TYPE_ACK,
+    PAYLOAD_TYPE_MULTIPART,
     PAYLOAD_TYPE_TRACE,
     PH_ROUTE_MASK,
     PH_TYPE_SHIFT,
@@ -30,6 +33,10 @@ from openhop_core.protocol.packet_utils import PathUtils
 # ---------------------------------------------------------------------------
 
 LOCAL_HASH = 0xAB  # repeater's own 1-byte path hash
+
+# MULTIPART is not forwarded generically — it has its own MeshCore branch
+# (forward_multipart_direct), covered by TestForwardMultipartDirect.
+_GENERIC_FORWARD_PAYLOAD_TYPES = [pt for pt in range(16) if pt != PAYLOAD_TYPE_MULTIPART]
 
 
 def _make_config(**overrides) -> dict:
@@ -92,19 +99,26 @@ def _make_dispatcher(radio=None):
     return dispatcher
 
 
-@pytest.fixture()
-def handler():
-    """Create a RepeaterHandler with mocked external dependencies."""
-    config = _make_config()
-    dispatcher = _make_dispatcher()
+def _make_handler_with_hash(local_hash_bytes: bytes):
+    """Create a RepeaterHandler whose local path hash is exactly local_hash_bytes."""
     with (
         patch("repeater.engine.StorageCollector"),
         patch("repeater.engine.RepeaterHandler._start_background_tasks"),
     ):
         from repeater.engine import RepeaterHandler
 
-        h = RepeaterHandler(config, dispatcher, LOCAL_HASH)
-    return h
+        return RepeaterHandler(
+            _make_config(),
+            _make_dispatcher(),
+            local_hash_bytes[0],
+            local_hash_bytes=local_hash_bytes,
+        )
+
+
+@pytest.fixture()
+def handler():
+    """Create a RepeaterHandler with mocked external dependencies."""
+    return _make_handler_with_hash(bytes([LOCAL_HASH]))
 
 
 def _make_flood_packet(
@@ -368,6 +382,176 @@ class TestDirectForward:
         pkt = _make_direct_packet(path=bytes([LOCAL_HASH, 0xCC, 0xDD]))
         handler.direct_forward(pkt)
         assert pkt.path_len == len(pkt.path) == 2
+
+
+# ===================================================================
+# 2b. forward_multipart_direct — MeshCore forwardMultipartDirect parity
+# ===================================================================
+
+
+def _make_multipart_ack_packet(
+    crc: bytes = b"\x4d\xab\xaf\x95",
+    remaining: int = 2,
+    path: bytes = None,
+    route: int = ROUTE_TYPE_DIRECT,
+    embedded_type: int = PAYLOAD_TYPE_ACK,
+) -> Packet:
+    """Build a MULTIPART wrapper: [remaining<<4 | embedded_type] followed by a CRC."""
+    if path is None:
+        path = bytes([LOCAL_HASH, 0xCC])
+    pkt = Packet()
+    pkt.header = route | (PAYLOAD_TYPE_MULTIPART << PH_TYPE_SHIFT)
+    pkt.payload = bytearray(bytes([(remaining << 4) | embedded_type]) + crc)
+    pkt.payload_len = len(pkt.payload)
+    pkt.path = bytearray(path)
+    pkt.path_len = len(path)
+    return pkt
+
+
+class TestForwardMultipartDirect:
+    """forward_multipart_direct mirrors MeshCore: regenerate the embedded ACK,
+    drop every other multipart case."""
+
+    def test_intermediate_multipart_ack_regenerates_plain_direct_ack(self, handler):
+        pkt = _make_multipart_ack_packet(remaining=2, path=bytes([LOCAL_HASH, 0xCC]))
+        result = handler.forward_multipart_direct(pkt)
+        assert result is not None
+        ack, delay = result
+        # Wrapper byte stripped, forced to a plain DIRECT ACK.
+        assert ack.get_payload_type() == PAYLOAD_TYPE_ACK
+        assert ack.get_route_type() == ROUTE_TYPE_DIRECT
+        assert bytes(ack.payload) == b"\x4d\xab\xaf\x95"
+        # This node removed from the path.
+        assert list(ack.path) == [0xCC]
+        assert ack.path_len == PathUtils.encode_path_len(1, 1)
+        # (remaining + 1) * 300 ms fragment spacing.
+        assert delay == pytest.approx(0.9)
+
+    def test_delay_scales_with_remaining_fragments(self, handler):
+        pkt = _make_multipart_ack_packet(remaining=0, path=bytes([LOCAL_HASH, 0xCC]))
+        _, delay = handler.forward_multipart_direct(pkt)
+        assert delay == pytest.approx(0.3)
+
+    def test_transport_direct_multipart_ack_regenerates_plain_direct_ack(self, handler):
+        pkt = _make_multipart_ack_packet(crc=b"\x11\x22\x33\x44", route=ROUTE_TYPE_TRANSPORT_DIRECT)
+        ack, _ = handler.forward_multipart_direct(pkt)
+        # MeshCore forces ROUTE_TYPE_DIRECT on the regenerated ACK.
+        assert ack.get_route_type() == ROUTE_TYPE_DIRECT
+        assert bytes(ack.payload) == b"\x11\x22\x33\x44"
+
+    def test_flood_multipart_not_forwarded(self, handler):
+        pkt = _make_multipart_ack_packet(route=ROUTE_TYPE_FLOOD)
+        result = handler.forward_multipart_direct(pkt)
+        assert result is None
+        assert "not direct-routed" in pkt.drop_reason
+
+    def test_final_hop_multipart_not_forwarded(self, handler):
+        pkt = _make_multipart_ack_packet(path=b"")
+        pkt.path_len = 0
+        result = handler.forward_multipart_direct(pkt)
+        assert result is None
+        assert "no path" in pkt.drop_reason
+
+    def test_wrong_next_hop_multipart_dropped(self, handler):
+        pkt = _make_multipart_ack_packet(path=bytes([0xFF, 0xCC]))
+        result = handler.forward_multipart_direct(pkt)
+        assert result is None
+        assert "not for us" in pkt.drop_reason
+
+    def test_non_ack_embedded_type_not_forwarded(self, handler):
+        pkt = _make_multipart_ack_packet(embedded_type=0x02)  # PAYLOAD_TYPE_TXT_MSG
+        result = handler.forward_multipart_direct(pkt)
+        assert result is None
+        assert "unsupported embedded type" in pkt.drop_reason
+
+    def test_short_multipart_ack_not_forwarded(self, handler):
+        pkt = _make_multipart_ack_packet(crc=b"\x01\x02\x03")  # only 4-byte payload
+        result = handler.forward_multipart_direct(pkt)
+        assert result is None
+        assert "unsupported embedded type" in pkt.drop_reason
+
+    def test_duplicate_multipart_ack_dropped(self, handler):
+        handler.forward_multipart_direct(_make_multipart_ack_packet())
+        pkt2 = _make_multipart_ack_packet()  # same CRC + path → same regenerated ACK
+        result = handler.forward_multipart_direct(pkt2)
+        assert result is None
+        assert pkt2.drop_reason == "Duplicate"
+
+    def test_dedup_key_is_regenerated_ack_before_pop(self, handler):
+        """The seen key is the plain-ACK form with the full path, matching
+        MeshCore's hasSeen()-before-removeSelfFromPath() order."""
+        pkt = _make_multipart_ack_packet(path=bytes([LOCAL_HASH, 0xCC]))
+        expected = Packet()
+        expected.header = ROUTE_TYPE_DIRECT | (PAYLOAD_TYPE_ACK << PH_TYPE_SHIFT)
+        expected.payload = bytearray(b"\x4d\xab\xaf\x95")
+        expected.payload_len = 4
+        expected.path = bytearray([LOCAL_HASH, 0xCC])
+        expected.path_len = 2
+        key = expected.calculate_packet_hash().hex().upper()
+
+        handler.forward_multipart_direct(pkt)
+        assert key in handler.seen_packets
+
+    def test_marked_do_not_retransmit_multipart_dropped(self, handler):
+        pkt = _make_multipart_ack_packet()
+        pkt.mark_do_not_retransmit()
+        result = handler.forward_multipart_direct(pkt)
+        assert result is None
+
+    def test_process_packet_dispatches_multipart(self, handler):
+        pkt = _make_multipart_ack_packet(remaining=1, path=bytes([LOCAL_HASH, 0xCC]))
+        result = handler.process_packet(pkt, snr=5.0)
+        assert result is not None
+        ack, delay = result
+        assert ack.get_payload_type() == PAYLOAD_TYPE_ACK
+        assert delay == pytest.approx(0.6)
+
+
+# Literal MeshCore-format frames (Packet::writeTo layout: header, optional 4-byte
+# transport codes, encoded path_len, path bytes, payload).  A multipart-ACK
+# payload is `[remaining<<4 | PAYLOAD_TYPE_ACK]` + 4-byte CRC; forwardMultipartDirect
+# strips that wrapper byte and re-emits a plain DIRECT ACK with this node removed
+# from the path.  These are independent wire fixtures — do NOT rebuild them through
+# Packet.write_to()/PathUtils.  remaining=2 in every case → (2+1)*300ms = 0.9s.
+FIRMWARE_MULTIPART_ACK_VECTORS = (
+    # header 0x2A = ROUTE_DIRECT | MULTIPART<<2; path_len 0x02 = 1-byte/2-hop;
+    # path AB CC (AB = us); payload 23=remaining2|ACK + CRC 95AFAB4D.
+    # out: header 0x0E = ACK<<2 | ROUTE_DIRECT; path_len 0x01; path CC; CRC.
+    pytest.param(
+        bytes([0xAB]),
+        bytes.fromhex("2A02ABCC234DABAF95"),
+        bytes.fromhex("0E01CC4DABAF95"),
+        id="direct-1-byte-2-hop",
+    ),
+    # 2-byte path width: path_len 0x42 = 2-byte/2-hop; path ABCD (us) + 1122.
+    pytest.param(
+        bytes([0xAB, 0xCD, 0xEF]),
+        bytes.fromhex("2A42ABCD1122234DABAF95"),
+        bytes.fromhex("0E4111224DABAF95"),
+        id="direct-2-byte-2-hop",
+    ),
+    # header 0x2B = ROUTE_TRANSPORT_DIRECT | MULTIPART<<2; transport codes
+    # 34127856; the regenerated ACK is forced to plain DIRECT (codes dropped).
+    pytest.param(
+        bytes([0xAB]),
+        bytes.fromhex("2B3412785602ABCC234DABAF95"),
+        bytes.fromhex("0E01CC4DABAF95"),
+        id="transport-direct-1-byte-2-hop",
+    ),
+)
+
+
+@pytest.mark.parametrize("local_hash_bytes, wire_in, wire_out", FIRMWARE_MULTIPART_ACK_VECTORS)
+def test_forward_multipart_matches_firmware_wire_vectors(local_hash_bytes, wire_in, wire_out):
+    """Parse a firmware-format multipart frame and assert the exact relayed ACK bytes."""
+    handler = _make_handler_with_hash(local_hash_bytes)
+    pkt = Packet()
+    pkt.read_from(wire_in)
+    result = handler.forward_multipart_direct(pkt)
+    assert result is not None
+    ack, delay = result
+    assert ack.write_to() == wire_out
+    assert delay == pytest.approx(0.9)
 
 
 # ===================================================================
@@ -688,6 +872,14 @@ class TestTxDelay:
         pkt = _make_flood_packet()
         delay = handler._calculate_tx_delay(pkt, snr=0.0)
         assert delay == 0.0
+
+    def test_startup_log_states_delay_factor_semantics(self, caplog):
+        with caplog.at_level(logging.INFO, logger="RepeaterHandler"):
+            _make_handler_with_hash(bytes([LOCAL_HASH]))
+        assert any(
+            "TX delay factors" in record.message and "airtime multipliers" in record.message
+            for record in caplog.records
+        )
 
     def test_transport_direct_uses_random_window(self, handler):
         handler.direct_tx_delay_factor = 0.77
@@ -1848,6 +2040,36 @@ class TestPacketInjectionRouting:
         sent_pkt = handler.dispatcher.send_packet.call_args.args[0]
         assert bytes(sent_pkt.path) == b"\x44\x55"
 
+    async def test_injected_multipart_ack_forwards_regenerated_plain_ack(self, handler):
+        """An intermediate hop relays a multipart ACK as a plain DIRECT ACK off the wire."""
+        self._prepare_fast_tx(handler)
+
+        pkt = _inject_from_wire(
+            _make_multipart_ack_packet(
+                crc=b"\x4d\xab\xaf\x95", remaining=2, path=bytes([LOCAL_HASH, 0x44])
+            )
+        )
+
+        with patch("repeater.engine.asyncio.sleep", new_callable=AsyncMock):
+            await handler(pkt, {"snr": 3.0, "rssi": -82}, local_transmission=False)
+
+        assert handler.dispatcher.send_packet.call_count == 1
+        sent_pkt = handler.dispatcher.send_packet.call_args.args[0]
+        assert sent_pkt.get_payload_type() == PAYLOAD_TYPE_ACK
+        assert sent_pkt.get_route_type() == ROUTE_TYPE_DIRECT
+        assert bytes(sent_pkt.payload) == b"\x4d\xab\xaf\x95"
+        assert bytes(sent_pkt.path) == b"\x44"
+
+    async def test_injected_multipart_ack_flood_is_dropped(self, handler):
+        """MeshCore never flood-routes multipart; an intermediate hop drops it."""
+        self._prepare_fast_tx(handler)
+        pkt = _inject_from_wire(_make_multipart_ack_packet(route=ROUTE_TYPE_FLOOD, path=b"\x11"))
+
+        with patch("repeater.engine.asyncio.sleep", new_callable=AsyncMock):
+            await handler(pkt, {"snr": 3.0, "rssi": -82}, local_transmission=False)
+
+        assert handler.dispatcher.send_packet.call_count == 0
+
     async def test_direct_for_other_node_is_dropped(self, handler):
         pkt = _inject_from_wire(_make_direct_packet(payload=b"\xaa\xbb", path=b"\xfe\x44"))
         metadata = {"snr": 2.0, "rssi": -90}
@@ -1915,7 +2137,7 @@ class TestPacketInjectionRouting:
         assert len(original["duplicates"]) == 1
         assert original["duplicates"][0]["drop_reason"] == "Duplicate"
 
-    @pytest.mark.parametrize("payload_type", range(16))
+    @pytest.mark.parametrize("payload_type", _GENERIC_FORWARD_PAYLOAD_TYPES)
     async def test_all_payload_types_flood_injection_forwards(self, handler, payload_type):
         self._prepare_fast_tx(handler)
         pkt = _inject_from_wire(
@@ -1937,7 +2159,7 @@ class TestPacketInjectionRouting:
         assert sent_pkt.get_payload_type() == payload_type
         assert sent_pkt.path[-1] == LOCAL_HASH
 
-    @pytest.mark.parametrize("payload_type", range(16))
+    @pytest.mark.parametrize("payload_type", _GENERIC_FORWARD_PAYLOAD_TYPES)
     async def test_all_payload_types_direct_injection_forwards(self, handler, payload_type):
         self._prepare_fast_tx(handler)
         pkt = _inject_from_wire(
@@ -1959,7 +2181,7 @@ class TestPacketInjectionRouting:
         assert sent_pkt.get_payload_type() == payload_type
         assert bytes(sent_pkt.path) == b"\x44\x55"
 
-    @pytest.mark.parametrize("payload_type", range(16))
+    @pytest.mark.parametrize("payload_type", _GENERIC_FORWARD_PAYLOAD_TYPES)
     async def test_all_payload_types_transport_flood_injection_forwards(
         self, handler, payload_type
     ):
@@ -1985,7 +2207,7 @@ class TestPacketInjectionRouting:
         assert sent_pkt.get_payload_type() == payload_type
         assert sent_pkt.transport_codes == [0x1111, 0x2222]
 
-    @pytest.mark.parametrize("payload_type", range(16))
+    @pytest.mark.parametrize("payload_type", _GENERIC_FORWARD_PAYLOAD_TYPES)
     async def test_all_payload_types_transport_direct_injection_forwards(
         self, handler, payload_type
     ):

@@ -272,6 +272,15 @@ class ConfigManager:
                         self.daemon.advert_helper.reload_config()
                         logger.info("Reloaded AdvertHelper config")
 
+            # Re-apply the flood reception delay base when delays changed
+            if "delays" in sections and self.daemon and getattr(self.daemon, "dispatcher", None):
+                delays_cfg = self.daemon.config.get("delays", {})
+                self.daemon.dispatcher.rx_delay_base = float(delays_cfg.get("rx_delay_base", 0.0))
+                logger.info(
+                    f"Reloaded flood RX delay base: delays.rx_delay_base="
+                    f"{self.daemon.dispatcher.rx_delay_base}"
+                )
+
             # Re-apply dispatcher path hash mode when mesh section changed
             if "mesh" in sections and self.daemon and hasattr(self.daemon, "dispatcher"):
                 mesh_cfg = self.daemon.config.get("mesh", {})
