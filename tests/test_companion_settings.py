@@ -337,7 +337,9 @@ class TestSenderPrefixPersistence:
         conn = sqlite3.connect(str(h.sqlite_path))
         conn.execute(
             "DELETE FROM migrations "
-            "WHERE migration_name = 'add_sender_prefix_to_companion_messages'"
+            "WHERE migration_name IN ("
+            "'add_sender_prefix_to_companion_messages', "
+            "'add_signal_and_channel_data_to_companion_messages')"
         )
         conn.execute("ALTER TABLE companion_messages RENAME TO companion_messages_old")
         conn.execute(

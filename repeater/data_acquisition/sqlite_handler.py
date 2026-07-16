@@ -437,6 +437,10 @@ class SQLiteHandler:
                                 channel_idx INTEGER NOT NULL DEFAULT 0,
                                 path_len INTEGER NOT NULL DEFAULT 0,
                                 sender_prefix TEXT NOT NULL DEFAULT '',
+                                snr REAL,
+                                rssi INTEGER,
+                                channel_data_type INTEGER,
+                                channel_data_payload BLOB,
                                 packet_hash TEXT,
                                 created_at REAL NOT NULL
                             )
@@ -631,6 +635,41 @@ class SQLiteHandler:
                             "ALTER TABLE companion_contacts ADD COLUMN last_advert_packet BLOB"
                         )
                         logger.info("Added last_advert_packet column to companion_contacts")
+                    conn.execute(
+                        "INSERT INTO migrations (migration_name, applied_at) VALUES (?, ?)",
+                        (migration_name, time.time()),
+                    )
+                    logger.info(f"Migration '{migration_name}' applied successfully")
+
+                # Migration 12: Add signal metadata and channel-data columns to
+                # companion_messages.  Without snr/channel_data_type/
+                # channel_data_payload, a message replayed from SQLite rebuilds
+                # with a zero SNR byte and a binary channel-data (GRP_DATA) frame
+                # collapses to an empty channel-text frame.
+                migration_name = "add_signal_and_channel_data_to_companion_messages"
+                existing = conn.execute(
+                    "SELECT migration_name FROM migrations WHERE migration_name = ?",
+                    (migration_name,),
+                ).fetchone()
+                if not existing:
+                    cursor = conn.execute("PRAGMA table_info(companion_messages)")
+                    columns = [column[1] for column in cursor.fetchall()]
+                    if "snr" not in columns:
+                        conn.execute("ALTER TABLE companion_messages ADD COLUMN snr REAL")
+                        logger.info("Added snr column to companion_messages table")
+                    if "rssi" not in columns:
+                        conn.execute("ALTER TABLE companion_messages ADD COLUMN rssi INTEGER")
+                        logger.info("Added rssi column to companion_messages table")
+                    if "channel_data_type" not in columns:
+                        conn.execute(
+                            "ALTER TABLE companion_messages ADD COLUMN channel_data_type INTEGER"
+                        )
+                        logger.info("Added channel_data_type column to companion_messages table")
+                    if "channel_data_payload" not in columns:
+                        conn.execute(
+                            "ALTER TABLE companion_messages ADD COLUMN channel_data_payload BLOB"
+                        )
+                        logger.info("Added channel_data_payload column to companion_messages table")
                     conn.execute(
                         "INSERT INTO migrations (migration_name, applied_at) VALUES (?, ?)",
                         (migration_name, time.time()),
@@ -3334,7 +3373,8 @@ class SQLiteHandler:
                 cursor = conn.execute(
                     """
                     SELECT sender_key, txt_type, timestamp, text, is_channel, channel_idx,
-                           path_len, sender_prefix
+                           path_len, sender_prefix, snr, rssi, channel_data_type,
+                           channel_data_payload
                     FROM companion_messages WHERE companion_hash = ?
                     ORDER BY created_at ASC LIMIT ?
                 """,
@@ -3343,6 +3383,10 @@ class SQLiteHandler:
                 rows = [dict(row) for row in cursor.fetchall()]
                 for msg in rows:
                     msg["sender_prefix"] = bytes.fromhex(msg.get("sender_prefix") or "")
+                    msg["snr"] = float(msg.get("snr") or 0.0)
+                    msg["rssi"] = int(msg.get("rssi") or 0)
+                    msg["channel_data_type"] = int(msg.get("channel_data_type") or 0)
+                    msg["channel_data_payload"] = bytes(msg.get("channel_data_payload") or b"")
                 return rows
         except Exception as e:
             logger.error(f"Failed to load companion messages for {companion_hash}: {e}")
@@ -3382,8 +3426,9 @@ class SQLiteHandler:
                     """
                     INSERT OR IGNORE INTO companion_messages
                     (companion_hash, sender_key, txt_type, timestamp, text,
-                     is_channel, channel_idx, path_len, sender_prefix, packet_hash, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     is_channel, channel_idx, path_len, sender_prefix, snr, rssi,
+                     channel_data_type, channel_data_payload, packet_hash, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         companion_hash,
@@ -3395,6 +3440,10 @@ class SQLiteHandler:
                         msg.get("channel_idx", 0),
                         msg.get("path_len", 0),
                         sender_prefix,
+                        float(msg.get("snr") or 0.0),
+                        int(msg.get("rssi") or 0),
+                        int(msg.get("channel_data_type") or 0),
+                        bytes(msg.get("channel_data_payload") or b""),
                         packet_hash,
                         time.time(),
                     ),
@@ -3455,7 +3504,8 @@ class SQLiteHandler:
                 cursor = conn.execute(
                     """
                     SELECT id, sender_key, txt_type, timestamp, text, is_channel, channel_idx,
-                           path_len, sender_prefix
+                           path_len, sender_prefix, snr, rssi, channel_data_type,
+                           channel_data_payload
                     FROM companion_messages WHERE companion_hash = ?
                     ORDER BY created_at ASC LIMIT 1
                 """,
@@ -3466,6 +3516,10 @@ class SQLiteHandler:
                     return None
                 msg = dict(row)
                 msg["sender_prefix"] = bytes.fromhex(msg.get("sender_prefix") or "")
+                msg["snr"] = float(msg.get("snr") or 0.0)
+                msg["rssi"] = int(msg.get("rssi") or 0)
+                msg["channel_data_type"] = int(msg.get("channel_data_type") or 0)
+                msg["channel_data_payload"] = bytes(msg.get("channel_data_payload") or b"")
                 conn.execute("DELETE FROM companion_messages WHERE id = ?", (msg["id"],))
                 conn.commit()
                 return {k: v for k, v in msg.items() if k != "id"}
