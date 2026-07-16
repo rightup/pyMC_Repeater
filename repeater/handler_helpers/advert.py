@@ -15,6 +15,8 @@ from typing import Dict, Optional, Tuple
 
 from openhop_core.node.handlers.advert import AdvertHandler
 
+from repeater.engine import DropReason
+
 logger = logging.getLogger("AdvertHelper")
 
 
@@ -551,7 +553,7 @@ class AdvertHelper:
             if not advert_data or not advert_data.get("valid"):
                 logger.warning("Invalid advert packet received, dropping.")
                 packet.mark_do_not_retransmit()
-                packet.drop_reason = "Invalid advert packet"
+                packet.drop_reason = DropReason.INVALID_ADVERT
                 return
 
             # Extract data from parsed advert

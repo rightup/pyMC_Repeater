@@ -5,7 +5,6 @@ import time
 from openhop_core.node.handlers.ack import AckHandler
 from openhop_core.node.handlers.advert import AdvertHandler
 from openhop_core.node.handlers.control import ControlHandler
-from openhop_core.node.handlers.group_text import GroupTextHandler
 from openhop_core.node.handlers.login_response import LoginResponseHandler
 from openhop_core.node.handlers.login_server import LoginServerHandler
 from openhop_core.node.handlers.multipart import MultipartAckHandler
@@ -16,11 +15,13 @@ from openhop_core.node.handlers.text import TextMessageHandler
 from openhop_core.node.handlers.trace import TraceHandler
 from openhop_core.protocol.constants import (
     PAYLOAD_TYPE_GRP_DATA,
+    PAYLOAD_TYPE_GRP_TXT,
     PH_ROUTE_MASK,
     ROUTE_TYPE_DIRECT,
     ROUTE_TYPE_TRANSPORT_DIRECT,
 )
 
+from repeater.engine import DropReason
 from repeater.policy_engine import PolicyDecision, PolicyEngine
 
 logger = logging.getLogger("PacketRouter")
@@ -29,27 +30,11 @@ logger = logging.getLogger("PacketRouter")
 # so the client is not spammed with duplicate telemetry when the mesh delivers multiple copies.
 _COMPANION_DEDUPE_TTL_SEC = 60.0
 
-# Drop reasons that are normal policy outcomes and should not be warning-level.
-# TODO: create Enum in engine for drop reasons and use it here and in engine instead of string matching.
-_EXPECTED_DROP_REASON_PREFIXES = (
-    "Duplicate",
-    "Max flood hops limit reached",
-    "Path hop count at maximum",
-    "Path would exceed MAX_PATH_SIZE",
-    "Direct: no path",
-    "Direct: not for us",
-    "Unscoped flood policy disabled",
-    "Transport code not allowed to flood",
-    "FLOOD loop detected",
-    "Marked do not retransmit",
-    "Repeat disabled",
-    "No TX mode",
-    "Duty cycle limit",
-    "Empty payload",
-    "Path too long",
-    "Invalid advert packet",
-    "Multipart",
-)
+# Normal policy/forwarding drop outcomes (logged at debug, not warning). The engine
+# is the single source of truth via DropReason; string-form acceptance is retained
+# because records and the recent_packets fallback still carry detailed text variants
+# (e.g. "Max flood hops limit reached (5/5)").
+_EXPECTED_DROP_REASONS = frozenset(DropReason)
 
 
 def _companion_dedup_key(packet) -> str | None:
@@ -77,10 +62,14 @@ def _is_direct_intermediate_hop(packet) -> bool:
     )
 
 
-def _is_expected_drop_reason(reason: str | None) -> bool:
+def _is_expected_drop_reason(reason) -> bool:
+    # Membership is the fast path for a DropReason member or its exact text; the
+    # startswith scan covers detailed variants that embed a suffix.
+    if reason in _EXPECTED_DROP_REASONS:
+        return True
     if not isinstance(reason, str) or not reason:
         return False
-    return any(reason.startswith(prefix) for prefix in _EXPECTED_DROP_REASON_PREFIXES)
+    return any(reason.startswith(expected) for expected in _EXPECTED_DROP_REASONS)
 
 
 def _drop_reason_from_recent_packets(handler, packet) -> str | None:
@@ -181,11 +170,28 @@ class PacketRouter:
             if exc is not None:
                 logger.error("_route_packet raised: %s", exc, exc_info=exc)
 
-    def _should_deliver_path_to_companions(self, packet) -> bool:
-        """Return True if this PATH/protocol-response should be delivered to companions (first of duplicates)."""
+    def _was_delivered_to_companions(self, packet) -> bool:
+        """Pure check: True if this PATH/protocol-response was already delivered (unexpired).
+
+        Does not mutate delivery state, so callers can deliver first and only record
+        the packet as delivered once a bridge has actually received it.
+        """
         key = _companion_dedup_key(packet)
         if not key:
-            return True
+            return False
+        expiry = self._companion_delivered.get(key)
+        return expiry is not None and expiry > time.time()
+
+    def _mark_delivered_to_companions(self, packet) -> None:
+        """Record that this PATH/protocol-response reached companions.
+
+        Called only after a bridge has received the packet, so a delivery that
+        raised for every bridge is retried on the next copy instead of being
+        suppressed for the full dedupe TTL.
+        """
+        key = _companion_dedup_key(packet)
+        if not key:
+            return
         now = time.time()
         # Prune expired entries only when the dict grows large, avoiding a full
         # dict comprehension on every packet.  200 entries × 60 s TTL means a
@@ -196,9 +202,13 @@ class PacketRouter:
             self._companion_delivered = {
                 k: v for k, v in self._companion_delivered.items() if v > now
             }
-        if key in self._companion_delivered:
-            return False
         self._companion_delivered[key] = now + _COMPANION_DEDUPE_TTL_SEC
+
+    def _should_deliver_path_to_companions(self, packet) -> bool:
+        """Atomic check-and-mark: True on the first of duplicate PATH/protocol-responses."""
+        if self._was_delivered_to_companions(packet):
+            return False
+        self._mark_delivered_to_companions(packet)
         return True
 
     def _policy_companion_decision(self, packet, metadata: dict) -> PolicyDecision | None:
@@ -262,6 +272,25 @@ class PacketRouter:
         if self._policy_blocks_companion(packet, metadata):
             return {}
         return companion_bridges
+
+    async def _fan_out_to_bridges(self, packet, bridges, *, context: str) -> bool:
+        """Offer packet to each bridge; True if any bridge authenticated it.
+
+        Accepts a dict of bridges — pass a single-entry dict for targeted delivery
+        to the bridge that owns ``dest_hash``. A bridge that raises is logged and
+        skipped; ``result.authenticated`` is read directly (every bridge returns a
+        HandlerResult) so a broken contract surfaces instead of being hidden.
+        """
+        authenticated = False
+        for bridge in bridges.values():
+            try:
+                result = await bridge.process_received_packet(packet)
+            except Exception as e:
+                logger.debug("Companion bridge %s error: %s", context, e)
+                continue
+            if result.authenticated is True:
+                authenticated = True
+        return authenticated
 
     async def _consume_via_local_candidates(
         self, packet, metadata: dict, dest_hash, helper, process_method_name: str
@@ -537,11 +566,7 @@ class PacketRouter:
             # Also feed adverts to companion bridges (for contact/path updates),
             # but keep policy drop final just like the other companion paths.
             companion_bridges = self._companion_bridges_for_packet(packet, metadata)
-            for bridge in companion_bridges.values():
-                try:
-                    await bridge.process_received_packet(packet)
-                except Exception as e:
-                    logger.debug(f"Companion bridge advert error: {e}")
+            await self._fan_out_to_bridges(packet, companion_bridges, context="advert")
 
         elif payload_type == LoginServerHandler.payload_type():
             # Route ANON_REQ/login to the local identity that owns it. The on-air
@@ -566,11 +591,7 @@ class PacketRouter:
             # ACK has no dest in payload (4-byte CRC only); deliver to all bridges so sender sees send_confirmed.
             # Do not set processed_by_injection so packet also reaches engine for DIRECT forwarding when we're a middle hop.
             companion_bridges = self._companion_bridges_for_packet(packet, metadata)
-            for bridge in companion_bridges.values():
-                try:
-                    await bridge.process_received_packet(packet)
-                except Exception as e:
-                    logger.debug(f"Companion bridge ACK error: {e}")
+            await self._fan_out_to_bridges(packet, companion_bridges, context="ACK")
 
         elif payload_type == MultipartAckHandler.payload_type():
             # MULTIPART ACK wrapper: low nibble of first byte is embedded payload type.
@@ -610,18 +631,22 @@ class PacketRouter:
             dest_hash = packet.payload[0] if packet.payload else None
             companion_bridges = self._companion_bridges_for_packet(packet, metadata)
             if dest_hash is not None and dest_hash in companion_bridges:
-                if self._should_deliver_path_to_companions(packet):
-                    result = await companion_bridges[dest_hash].process_received_packet(packet)
-                    consumed = consumed or getattr(result, "authenticated", False) is True
-            elif companion_bridges and self._should_deliver_path_to_companions(packet):
+                if not self._was_delivered_to_companions(packet):
+                    consumed = (
+                        await self._fan_out_to_bridges(
+                            packet, {dest_hash: companion_bridges[dest_hash]}, context="PATH"
+                        )
+                        or consumed
+                    )
+                    self._mark_delivered_to_companions(packet)
+            elif companion_bridges and not self._was_delivered_to_companions(packet):
                 # Dest not in bridges: path-return with ephemeral dest (e.g. multi-hop login).
                 # Deliver to all bridges; each will try to decrypt and ignore if not relevant.
-                for bridge in companion_bridges.values():
-                    try:
-                        result = await bridge.process_received_packet(packet)
-                        consumed = consumed or getattr(result, "authenticated", False) is True
-                    except Exception as e:
-                        logger.debug(f"Companion bridge PATH error: {e}")
+                consumed = (
+                    await self._fan_out_to_bridges(packet, companion_bridges, context="PATH")
+                    or consumed
+                )
+                self._mark_delivered_to_companions(packet)
                 logger.debug(
                     "PATH dest=0x%02x (anon) delivered to %d bridge(s) for matching",
                     dest_hash or 0,
@@ -643,23 +668,15 @@ class PacketRouter:
             companion_bridges = self._companion_bridges_for_packet(packet, metadata)
             local_hash = getattr(self.daemon, "local_hash", None)
             if dest_hash is not None and dest_hash in companion_bridges:
-                try:
-                    result = await companion_bridges[dest_hash].process_received_packet(packet)
-                    consumed = consumed or getattr(result, "authenticated", False) is True
-                    logger.info(
-                        "RESPONSE dest=0x%02x delivered to companion bridge",
-                        dest_hash,
-                    )
-                except Exception as e:
-                    logger.debug(f"Companion bridge RESPONSE error: {e}")
+                consumed = await self._fan_out_to_bridges(
+                    packet, {dest_hash: companion_bridges[dest_hash]}, context="RESPONSE"
+                )
+                logger.info("RESPONSE dest=0x%02x delivered to companion bridge", dest_hash)
             elif dest_hash == local_hash and companion_bridges:
                 # Response addressed to this repeater (e.g. path-based reply to first hop)
-                for bridge in companion_bridges.values():
-                    try:
-                        result = await bridge.process_received_packet(packet)
-                        consumed = consumed or getattr(result, "authenticated", False) is True
-                    except Exception as e:
-                        logger.debug(f"Companion bridge RESPONSE error: {e}")
+                consumed = await self._fan_out_to_bridges(
+                    packet, companion_bridges, context="RESPONSE"
+                )
                 logger.info(
                     "RESPONSE dest=0x%02x (local) delivered to %d companion bridge(s)",
                     dest_hash,
@@ -669,12 +686,9 @@ class PacketRouter:
                 # Dest not in bridges and not local: likely ANON_REQ response (dest = ephemeral
                 # sender hash). Deliver to all bridges; each will try to decrypt and ignore if
                 # not relevant (firmware-like behavior, works with multiple companion bridges).
-                for bridge in companion_bridges.values():
-                    try:
-                        result = await bridge.process_received_packet(packet)
-                        consumed = consumed or getattr(result, "authenticated", False) is True
-                    except Exception as e:
-                        logger.debug(f"Companion bridge RESPONSE error: {e}")
+                consumed = await self._fan_out_to_bridges(
+                    packet, companion_bridges, context="RESPONSE"
+                )
                 logger.debug(
                     "RESPONSE dest=0x%02x (anon) delivered to %d bridge(s) for matching",
                     dest_hash or 0,
@@ -691,23 +705,16 @@ class PacketRouter:
 
         elif payload_type == ProtocolResponseHandler.payload_type():
             # PAYLOAD_TYPE_PATH (0x08): protocol responses (telemetry, binary, etc.).
-            # Deliver at most once per logical packet so the client is not spammed with duplicates.
-            # Do not set processed_by_injection so packet also reaches engine for DIRECT forwarding when we're a middle hop.
+            # Deliver at most once per logical packet so the client is not spammed with duplicates,
+            # but always deliver at a final hop (we are the destination). Do not set
+            # processed_by_injection for a middle hop so the packet still reaches engine forwarding.
             companion_bridges = self._companion_bridges_for_packet(packet, metadata)
-            if companion_bridges and self._should_deliver_path_to_companions(packet):
-                for bridge in companion_bridges.values():
-                    try:
-                        await bridge.process_received_packet(packet)
-                    except Exception as e:
-                        logger.debug(f"Companion bridge RESPONSE error: {e}")
-            if companion_bridges and _is_direct_final_hop(packet):
-                # DIRECT with empty path: we're the final hop; ensure delivery to all bridges (anon)
-                if not self._should_deliver_path_to_companions(packet):
-                    for bridge in companion_bridges.values():
-                        try:
-                            await bridge.process_received_packet(packet)
-                        except Exception as e:
-                            logger.debug(f"Companion bridge RESPONSE (final hop) error: {e}")
+            final_hop = _is_direct_final_hop(packet)
+            if companion_bridges and (final_hop or not self._was_delivered_to_companions(packet)):
+                await self._fan_out_to_bridges(packet, companion_bridges, context="RESPONSE")
+                self._mark_delivered_to_companions(packet)
+            if companion_bridges and final_hop:
+                # DIRECT with empty path: we're the final hop, so consume after delivery.
                 processed_by_injection = True
                 self._record_for_ui(packet, metadata)
 
@@ -732,36 +739,22 @@ class PacketRouter:
                 if companion_bridges and _is_direct_final_hop(packet):
                     # OpenHop release hygiene: an empty-path DIRECT has no next hop,
                     # so consume after offering it to bridges even without MAC ownership.
-                    for bridge in companion_bridges.values():
-                        try:
-                            await bridge.process_received_packet(packet)
-                        except Exception as e:
-                            logger.debug(f"Companion bridge REQ (final hop) error: {e}")
+                    await self._fan_out_to_bridges(packet, companion_bridges, context="REQ")
                     processed_by_injection = True
                     self._record_for_ui(packet, metadata)
 
-        elif payload_type == GroupTextHandler.payload_type():
+        elif payload_type == PAYLOAD_TYPE_GRP_TXT:
             # GRP_TXT: pass to all companions (they filter by channel); still forward.
             # Policy drop is final and blocks companion delivery.
             companion_bridges = self._companion_bridges_for_packet(packet, metadata)
-            if companion_bridges:
-                for bridge in companion_bridges.values():
-                    try:
-                        await bridge.process_received_packet(packet)
-                    except Exception as e:
-                        logger.debug(f"Companion bridge GRP_TXT error: {e}")
+            await self._fan_out_to_bridges(packet, companion_bridges, context="GRP_TXT")
 
         elif payload_type == PAYLOAD_TYPE_GRP_DATA:
             # MeshCore forwards direct packets with remaining hops before payload
             # handling. Otherwise, companions authenticate and filter channels.
             if not _is_direct_intermediate_hop(packet):
                 companion_bridges = self._companion_bridges_for_packet(packet, metadata)
-                if companion_bridges:
-                    for bridge in companion_bridges.values():
-                        try:
-                            await bridge.process_received_packet(packet)
-                        except Exception as e:
-                            logger.debug(f"Companion bridge GRP_DATA error: {e}")
+                await self._fan_out_to_bridges(packet, companion_bridges, context="GRP_DATA")
 
         # Only pass to repeater engine if not already processed by injection
         # Skip engine for packets we injected for TX (already sent; avoid double-send/double-count)

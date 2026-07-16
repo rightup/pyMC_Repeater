@@ -4,6 +4,7 @@ import logging
 import secrets
 import time
 from collections import OrderedDict, deque
+from enum import Enum
 from typing import Optional, Tuple
 
 from openhop_core.node.handlers.base import BaseHandler
@@ -45,6 +46,41 @@ LOOP_DETECT_MAX_COUNTERS = {
     LOOP_DETECT_MODERATE: {1: 2, 2: 1, 3: 1},
     LOOP_DETECT_STRICT: {1: 1, 2: 1, 3: 1},
 }
+
+
+class DropReason(str, Enum):
+    """Canonical, non-alarming reasons a packet was intentionally not retransmitted.
+
+    Single source of truth shared with the packet router, replacing the string
+    prefixes that used to be duplicated there. Members subclass ``str`` so they
+    compare equal to their text, JSON-serialize, and persist to SQLite as plain
+    strings unchanged. Where the engine still needs a detail suffix (hop counts,
+    loop mode, multipart sub-case) it formats the member into a larger string;
+    the router accepts both the bare member and any string that begins with one.
+    """
+
+    DUPLICATE = "Duplicate"
+    MAX_FLOOD_HOPS = "Max flood hops limit reached"
+    PATH_HOP_COUNT_MAX = "Path hop count at maximum"
+    PATH_EXCEEDS_MAX_SIZE = "Path would exceed MAX_PATH_SIZE"
+    DIRECT_NO_PATH = "Direct: no path"
+    DIRECT_NOT_FOR_US = "Direct: not for us"
+    UNSCOPED_FLOOD_DISABLED = "Unscoped flood policy disabled"
+    TRANSPORT_CODE_NOT_ALLOWED = "Transport code not allowed to flood"
+    FLOOD_LOOP_DETECTED = "FLOOD loop detected"
+    MARKED_DO_NOT_RETRANSMIT = "Marked do not retransmit"
+    REPEAT_DISABLED = "Repeat disabled"
+    NO_TX_MODE = "No TX mode"
+    DUTY_CYCLE_LIMIT = "Duty cycle limit"
+    EMPTY_PAYLOAD = "Empty payload"
+    PATH_TOO_LONG = "Path too long"
+    INVALID_ADVERT = "Invalid advert packet"
+    MULTIPART = "Multipart"
+
+    # Python 3.11+ formats a (str, Enum) member as "DropReason.X" under str()/%s;
+    # return the value so log lines and stored records keep the plain reason text.
+    def __str__(self) -> str:
+        return self.value
 
 
 class RepeaterHandler(BaseHandler):
@@ -359,7 +395,7 @@ class RepeaterHandler(BaseHandler):
                         f"wait={wait_time:.1f}s before retry"
                     )
                     self.dropped_count += 1
-                    drop_reason = "Duty cycle limit"
+                    drop_reason = DropReason.DUTY_CYCLE_LIMIT
             else:
                 tx_task = await self.schedule_retransmit(
                     fwd_pkt, delay, airtime_ms, local_transmission=local_transmission
@@ -394,9 +430,9 @@ class RepeaterHandler(BaseHandler):
             self.dropped_count += 1
             # Determine drop reason
             if local_transmission and not allow_local_tx:
-                drop_reason = policy_reason or "No TX mode"
+                drop_reason = policy_reason or DropReason.NO_TX_MODE
             elif not allow_forward:
-                drop_reason = policy_reason or "Repeat disabled"
+                drop_reason = policy_reason or DropReason.REPEAT_DISABLED
             else:
                 # Check if packet has a specific drop reason set by handlers
                 drop_reason = processed_packet.drop_reason or self._get_drop_reason(
@@ -424,7 +460,7 @@ class RepeaterHandler(BaseHandler):
 
         # Set drop reason for duplicates and count flood vs direct dups
         if is_dupe and drop_reason is None:
-            drop_reason = "Duplicate"
+            drop_reason = DropReason.DUPLICATE
         if is_dupe:
             if route_type in (ROUTE_TYPE_FLOOD, ROUTE_TYPE_TRANSPORT_FLOOD):
                 self.flood_dup_count += 1
@@ -473,7 +509,11 @@ class RepeaterHandler(BaseHandler):
         if self.storage:
             try:
                 # Only skip mqtt for actual invalid/bad packets
-                invalid_reasons = ["Invalid advert packet", "Empty payload", "Path too long"]
+                invalid_reasons = (
+                    DropReason.INVALID_ADVERT,
+                    DropReason.EMPTY_PAYLOAD,
+                    DropReason.PATH_TOO_LONG,
+                )
                 skip_mqtt = drop_reason in invalid_reasons if drop_reason else False
                 self.storage.record_packet(packet_record, skip_mqtt_if_invalid=skip_mqtt)
             except Exception as e:
@@ -618,7 +658,7 @@ class RepeaterHandler(BaseHandler):
             src_hash,
             dst_hash,
             transmitted=False,
-            drop_reason="Duplicate",
+            drop_reason=DropReason.DUPLICATE,
             is_duplicate=True,
             packet_hash=pkt_hash_full,
         )
@@ -777,13 +817,13 @@ class RepeaterHandler(BaseHandler):
     def _get_drop_reason(self, packet: Packet, packet_hash: Optional[str] = None) -> str:
 
         if self.is_duplicate(packet, packet_hash=packet_hash):
-            return "Duplicate"
+            return DropReason.DUPLICATE
 
         if not packet or not packet.payload:
-            return "Empty payload"
+            return DropReason.EMPTY_PAYLOAD
 
         if len(packet.path or []) > MAX_PATH_SIZE:
-            return "Path too long"
+            return DropReason.PATH_TOO_LONG
 
         route_type = packet.header & PH_ROUTE_MASK
 
@@ -793,15 +833,15 @@ class RepeaterHandler(BaseHandler):
                 "unscoped_flood_allow", self.config.get("mesh", {}).get("global_flood_allow", True)
             )
             if not unscoped_flood_allow:
-                return "Unscoped flood policy disabled"
+                return DropReason.UNSCOPED_FLOOD_DISABLED
 
         if route_type == ROUTE_TYPE_DIRECT:
             hash_size = packet.get_path_hash_size()
             if not packet.path or len(packet.path) < hash_size:
-                return "Direct: no path"
+                return DropReason.DIRECT_NO_PATH
             next_hop = bytes(packet.path[:hash_size])
             if next_hop != self.local_hash_bytes[:hash_size]:
-                return "Direct: not for us"
+                return DropReason.DIRECT_NOT_FOR_US
 
         # Default reason
         return "Unknown"
@@ -832,7 +872,7 @@ class RepeaterHandler(BaseHandler):
     def validate_packet(self, packet: Packet) -> Tuple[bool, str]:
 
         if not packet or not packet.payload:
-            return False, "Empty payload"
+            return False, DropReason.EMPTY_PAYLOAD
 
         if packet.get_path_hash_size() > 3:
             return False, "Reserved path hash size is invalid"
@@ -988,7 +1028,7 @@ class RepeaterHandler(BaseHandler):
         if packet.is_marked_do_not_retransmit():
             # Check if packet has custom drop reason
             if not packet.drop_reason:
-                packet.drop_reason = "Marked do not retransmit"
+                packet.drop_reason = DropReason.MARKED_DO_NOT_RETRANSMIT
             return None
 
         # Check unscoped flood policy
@@ -998,24 +1038,24 @@ class RepeaterHandler(BaseHandler):
         route_type = packet.header & PH_ROUTE_MASK
         if route_type == ROUTE_TYPE_FLOOD:
             if not unscoped_flood_allow:
-                packet.drop_reason = "Unscoped flood policy disabled"
+                packet.drop_reason = DropReason.UNSCOPED_FLOOD_DISABLED
                 return None
 
         # Check transport scopes flood policy
         if route_type == ROUTE_TYPE_TRANSPORT_FLOOD:
             allowed, check_reason = self._check_transport_codes(packet)
             if not allowed:
-                packet.drop_reason = "Transport code not allowed to flood"
+                packet.drop_reason = DropReason.TRANSPORT_CODE_NOT_ALLOWED
                 return None
 
         mode = self._get_loop_detect_mode()
         if self._is_flood_looped(packet, mode):
-            packet.drop_reason = f"FLOOD loop detected ({mode})"
+            packet.drop_reason = f"{DropReason.FLOOD_LOOP_DETECTED} ({mode})"
             return None
 
         # Suppress duplicates — pass pre-computed hash to avoid a second SHA-256.
         if self.is_duplicate(packet, packet_hash=packet_hash):
-            packet.drop_reason = "Duplicate"
+            packet.drop_reason = DropReason.DUPLICATE
             return None
 
         if packet.path is None:
@@ -1027,17 +1067,17 @@ class RepeaterHandler(BaseHandler):
         hop_count = packet.get_path_hash_count()
 
         if self.max_flood_hops > 0 and hop_count >= self.max_flood_hops:
-            packet.drop_reason = f"Max flood hops limit reached ({hop_count}/{self.max_flood_hops})"
+            packet.drop_reason = f"{DropReason.MAX_FLOOD_HOPS} ({hop_count}/{self.max_flood_hops})"
             return None
 
         # path_len encodes hop count in 6 bits (0-63); adding ourselves must not exceed 63
         if hop_count >= 63:
-            packet.drop_reason = "Path hop count at maximum (63), cannot append"
+            packet.drop_reason = f"{DropReason.PATH_HOP_COUNT_MAX} (63), cannot append"
             return None
 
         # Check path won't exceed MAX_PATH_SIZE after append
         if (hop_count + 1) * hash_size > MAX_PATH_SIZE:
-            packet.drop_reason = "Path would exceed MAX_PATH_SIZE"
+            packet.drop_reason = DropReason.PATH_EXCEEDS_MAX_SIZE
             return None
 
         self.mark_seen(packet, packet_hash=packet_hash)
@@ -1064,7 +1104,7 @@ class RepeaterHandler(BaseHandler):
         # Check if packet is marked do-not-retransmit
         if packet.is_marked_do_not_retransmit():
             if not packet.drop_reason:
-                packet.drop_reason = "Marked do not retransmit"
+                packet.drop_reason = DropReason.MARKED_DO_NOT_RETRANSMIT
             return None
 
         hash_size = packet.get_path_hash_size()
@@ -1072,17 +1112,17 @@ class RepeaterHandler(BaseHandler):
 
         # Check if we're the next hop
         if not packet.path or len(packet.path) < hash_size:
-            packet.drop_reason = "Direct: no path"
+            packet.drop_reason = DropReason.DIRECT_NO_PATH
             return None
 
         next_hop = bytes(packet.path[:hash_size])
         if next_hop != self.local_hash_bytes[:hash_size]:
-            packet.drop_reason = "Direct: not for us"
+            packet.drop_reason = DropReason.DIRECT_NOT_FOR_US
             return None
 
         # Suppress duplicates — pass pre-computed hash to avoid a second SHA-256.
         if self.is_duplicate(packet, packet_hash=packet_hash):
-            packet.drop_reason = "Duplicate"
+            packet.drop_reason = DropReason.DUPLICATE
             return None
 
         self.mark_seen(packet, packet_hash=packet_hash)
@@ -1116,7 +1156,7 @@ class RepeaterHandler(BaseHandler):
         # MeshCore only forwards multipart on the direct-route branch; the flood
         # switch case updates ACK state locally but never re-routes it.
         if not packet.is_route_direct():
-            packet.drop_reason = "Multipart: not direct-routed"
+            packet.drop_reason = f"{DropReason.MULTIPART}: not direct-routed"
             return None
 
         valid, reason = self.validate_packet(packet)
@@ -1125,7 +1165,7 @@ class RepeaterHandler(BaseHandler):
             return None
 
         if packet.is_marked_do_not_retransmit():
-            packet.drop_reason = packet.drop_reason or "Marked do not retransmit"
+            packet.drop_reason = packet.drop_reason or DropReason.MARKED_DO_NOT_RETRANSMIT
             return None
 
         payload = packet.payload or b""
@@ -1134,7 +1174,7 @@ class RepeaterHandler(BaseHandler):
         # Only multipart-ACKs are relayed; MeshCore leaves other types for future
         # use and does not forward them.
         if embedded_type != PAYLOAD_TYPE_ACK or len(payload) < 5:
-            packet.drop_reason = "Multipart: unsupported embedded type"
+            packet.drop_reason = f"{DropReason.MULTIPART}: unsupported embedded type"
             return None
 
         hash_size = packet.get_path_hash_size()
@@ -1143,10 +1183,10 @@ class RepeaterHandler(BaseHandler):
         # We must be the next hop (a final-hop multipart has no remaining path and
         # is handled locally, not forwarded).
         if not packet.path or len(packet.path) < hash_size:
-            packet.drop_reason = "Direct: no path"
+            packet.drop_reason = DropReason.DIRECT_NO_PATH
             return None
         if bytes(packet.path[:hash_size]) != self.local_hash_bytes[:hash_size]:
-            packet.drop_reason = "Direct: not for us"
+            packet.drop_reason = DropReason.DIRECT_NOT_FOR_US
             return None
 
         # Rebuild the received wrapper as the plain DIRECT ACK MeshCore would emit:
@@ -1161,7 +1201,7 @@ class RepeaterHandler(BaseHandler):
         # so a repeated multipart ACK — or an equivalent plain ACK — is not relayed
         # twice.  The pre-computed hash belongs to the original wrapper, so recompute.
         if self.is_duplicate(packet):
-            packet.drop_reason = "Duplicate"
+            packet.drop_reason = DropReason.DUPLICATE
             return None
         self.mark_seen(packet)
 
