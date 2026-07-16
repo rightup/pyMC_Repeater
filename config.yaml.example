@@ -628,7 +628,7 @@ glass:
   cert_store_dir: "/etc/openhop_repeater/glass"
 
 logging:
-  # Log level: DEBUG, INFO, WARNING, ERROR
+  # Log level: TRACE, DEBUG, INFO, WARNING, ERROR
   level: INFO
 
   # Log format

@@ -36,6 +36,7 @@ from repeater.packet_router import PacketRouter
 from repeater.sensors import SensorManager
 from repeater.utils_packet import create_scoped_advert_packet
 from repeater.web.http_server import HTTPStatsServer, _log_buffer
+from repeater.logging_utils import normalize_log_level
 
 from openhop_core.companion.radio_capabilities import resolve_max_tx_power_dbm
 from openhop_core.protocol.constants import PAYLOAD_TYPE_RAW_CUSTOM
@@ -115,14 +116,14 @@ class RepeaterDaemon:
         self.radio_status = "unknown"
         self.radio_error = None
 
-        log_level = config.get("logging", {}).get("level", "INFO")
+        log_level = normalize_log_level(config.get("logging", {}).get("level", "INFO"))
         logging.basicConfig(
-            level=getattr(logging, log_level),
+            level=log_level,
             format=config.get("logging", {}).get("format"),
         )
 
         root_logger = logging.getLogger()
-        _log_buffer.setLevel(getattr(logging, log_level))
+        _log_buffer.setLevel(log_level)
         root_logger.addHandler(_log_buffer)
 
     def _configured_identity_specs(self, identity_type: str) -> list[IdentitySpec]:

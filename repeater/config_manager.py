@@ -4,6 +4,8 @@ from typing import Any, Dict, List, Optional
 
 import yaml
 
+from repeater.logging_utils import normalize_log_level
+
 logger = logging.getLogger("ConfigManager")
 
 
@@ -192,6 +194,36 @@ class ConfigManager:
             logger.warning("Failed live HTTP config apply: %s", message)
         return success
 
+    def _apply_live_logging_config(self) -> bool:
+        if not self.daemon:
+            logger.warning("Daemon not available for logging live update")
+            return False
+
+        logging_cfg = self.config.get("logging", {}) if isinstance(self.config, dict) else {}
+        level = normalize_log_level(logging_cfg.get("level", "INFO"))
+
+        root_logger = logging.getLogger()
+        root_logger.setLevel(level)
+
+        repeater_logger = logging.getLogger("RepeaterDaemon")
+        repeater_logger.setLevel(level)
+
+        sx1262_logger = logging.getLogger("SX1262_wrapper")
+        sx1262_logger.setLevel(level)
+
+        mqtt_logger = logging.getLogger("MQTTHandler")
+        mqtt_logger.setLevel(level)
+
+        buffer = getattr(self.daemon, "_log_buffer", None)
+        if buffer is not None:
+            buffer.setLevel(level)
+
+        logger.info(
+            "Applied live logging config: level=%s",
+            logging.getLevelName(level) if isinstance(level, int) else level,
+        )
+        return True
+
     def save_to_file(self) -> bool:
         """
         Save current config to YAML file.
@@ -240,7 +272,16 @@ class ConfigManager:
 
             # Default sections to update if not specified
             if sections is None:
-                sections = ["repeater", "delays", "radio", "acl", "identities", "glass", "http"]
+                sections = [
+                    "repeater",
+                    "delays",
+                    "radio",
+                    "acl",
+                    "identities",
+                    "glass",
+                    "http",
+                    "logging",
+                ]
 
             # Update each section
             for section in sections:
@@ -305,6 +346,9 @@ class ConfigManager:
 
             if "http" in sections:
                 live_update_ok = self._apply_live_http_config() and live_update_ok
+
+            if "logging" in sections:
+                live_update_ok = self._apply_live_logging_config() and live_update_ok
 
             return live_update_ok
 
