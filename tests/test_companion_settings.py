@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import logging
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+
+from openhop_core.companion import CompanionBridge
+from openhop_core.protocol import LocalIdentity
 
 from repeater.companion.utils import (
     COMPANION_SETTINGS_ALLOWLIST,
@@ -65,12 +68,16 @@ class TestParseCompanionBridgeKwargs:
 
 class TestCompanionRadioCapabilities:
     def test_reads_active_radio_state_and_known_sx1262_limit(self):
+        # The SX1262 driver declares its 22 dBm limit as a backend attribute
+        # (SX1262Radio.max_tx_power_dbm); the daemon no longer string-matches
+        # radio_type to recover it.
         radio = SimpleNamespace(
             frequency=868_000_000,
             bandwidth=125_000,
             spreading_factor=7,
             coding_rate=8,
             tx_power=14,
+            max_tx_power_dbm=22,
         )
         daemon = RepeaterDaemon.__new__(RepeaterDaemon)
         daemon.config = {"radio_type": "sx1262", "radio": {"frequency": 915_000_000}}
@@ -101,6 +108,28 @@ class TestCompanionRadioCapabilities:
         daemon.radio = SimpleNamespace()
 
         assert RepeaterDaemon._get_companion_max_tx_power_dbm(daemon) == 15
+
+    def test_backend_class_attribute_reaches_self_info_max_tx_power(self):
+        # A driver declares its limit as a class attribute (as SX1262Radio
+        # does); no radio_type string match is involved.
+        class _FakeRadio:
+            max_tx_power_dbm = 20
+
+        daemon = RepeaterDaemon.__new__(RepeaterDaemon)
+        daemon.config = {"radio_type": "sx1262_ch341"}
+        daemon.repeater_handler = SimpleNamespace(radio_config={})
+        daemon.radio = _FakeRadio()
+
+        assert RepeaterDaemon._get_companion_max_tx_power_dbm(daemon) == 20
+
+        # The daemon getter is what a bridge is wired with at load time; the
+        # value must surface through the companion SELF_INFO max-tx-power path.
+        bridge = CompanionBridge(
+            LocalIdentity(),
+            AsyncMock(return_value=True),
+            max_tx_power_getter=daemon._get_companion_max_tx_power_dbm,
+        )
+        assert bridge.get_max_tx_power_dbm() == 20
 
 
 class TestEffectiveMaxContacts:
