@@ -4,6 +4,7 @@ import logging
 import secrets
 import time
 from collections import OrderedDict, deque
+from enum import Enum
 from typing import Optional, Tuple
 
 from openhop_core.node.handlers.base import BaseHandler
@@ -23,6 +24,7 @@ from openhop_core.protocol.constants import (
     ROUTE_TYPE_TRANSPORT_FLOOD,
 )
 from openhop_core.protocol.packet_utils import (
+    PacketHashingUtils,
     PacketHeaderUtils,
     PathUtils,
     flood_rx_metrics,
@@ -50,6 +52,57 @@ LOOP_DETECT_MAX_COUNTERS = {
     LOOP_DETECT_MODERATE: {1: 2, 2: 1, 3: 1},
     LOOP_DETECT_STRICT: {1: 1, 2: 1, 3: 1},
 }
+
+
+class DropReason(str, Enum):
+    """Canonical, non-alarming reasons a packet was intentionally not retransmitted.
+
+    Single source of truth shared with the packet router, replacing the string
+    prefixes that used to be duplicated there. Members subclass ``str`` so they
+    compare equal to their text, JSON-serialize, and persist to SQLite as plain
+    strings unchanged. Where the engine still needs a detail suffix (hop counts,
+    loop mode, multipart sub-case) it formats the member into a larger string;
+    the router accepts both the bare member and any string that begins with one.
+    """
+
+    DUPLICATE = "Duplicate"
+    MAX_FLOOD_HOPS = "Max flood hops limit reached"
+    PATH_HOP_COUNT_MAX = "Path hop count at maximum"
+    PATH_EXCEEDS_MAX_SIZE = "Path would exceed MAX_PATH_SIZE"
+    DIRECT_NO_PATH = "Direct: no path"
+    DIRECT_NOT_FOR_US = "Direct: not for us"
+    UNSCOPED_FLOOD_DISABLED = "Unscoped flood policy disabled"
+    TRANSPORT_CODE_NOT_ALLOWED = "Transport code not allowed to flood"
+    FLOOD_LOOP_DETECTED = "FLOOD loop detected"
+    MARKED_DO_NOT_RETRANSMIT = "Marked do not retransmit"
+    REPEAT_DISABLED = "Repeat disabled"
+    NO_TX_MODE = "No TX mode"
+    DUTY_CYCLE_LIMIT = "Duty cycle limit"
+    EMPTY_PAYLOAD = "Empty payload"
+    PATH_TOO_LONG = "Path too long"
+    INVALID_ADVERT = "Invalid advert packet"
+    MULTIPART = "Multipart"
+
+    # Python 3.11+ formats a (str, Enum) member as "DropReason.X" under str()/%s;
+    # return the value so log lines and stored records keep the plain reason text.
+    def __str__(self) -> str:
+        return self.value
+
+
+class ForwardResult(tuple):
+    """A forwarding decision that unpacks as a plain ``(packet, delay_seconds)`` pair.
+
+    ``extras`` carries additional ``(packet, delay_seconds)`` transmissions that
+    accompany the primary packet: MeshCore's routeDirectRecvAcks queues its
+    optional multi-ack redundancy copies ahead of the plain ACK at the same
+    scheduled time, so the caller must create the extra TX tasks before the
+    primary one.
+    """
+
+    def __new__(cls, packet: Packet, delay_s: float, extras=()):
+        result = super().__new__(cls, (packet, delay_s))
+        result.extras = tuple(extras)
+        return result
 
 
 class RepeaterHandler(BaseHandler):
@@ -93,6 +146,7 @@ class RepeaterHandler(BaseHandler):
         )
         self.use_score_for_tx = config.get("repeater", {}).get("use_score_for_tx", False)
         self.score_threshold = config.get("repeater", {}).get("score_threshold", 0.3)
+        self.multi_acks = self._normalize_multi_acks(config)
         self.max_flood_hops = config.get("repeater", {}).get("max_flood_hops", 64)
         self.send_advert_interval_hours = config.get("repeater", {}).get(
             "send_advert_interval_hours", 10
@@ -314,6 +368,16 @@ class RepeaterHandler(BaseHandler):
             # Capture the forwarded path (after modification)
             forwarded_path_hashes = fwd_pkt.get_path_hashes_hex()
 
+            # MeshCore queues multi-ack redundancy copies ahead of the primary
+            # ACK at the same scheduled time, so create their TX tasks first.
+            # Each task re-checks the duty-cycle gate before transmitting.
+            extra_tx_tasks = []
+            for extra_pkt, extra_delay in getattr(result, "extras", ()):
+                extra_airtime_ms = self.airtime_mgr.calculate_airtime(extra_pkt.get_raw_length())
+                extra_tx_tasks.append(
+                    await self.schedule_retransmit(extra_pkt, extra_delay, extra_airtime_ms)
+                )
+
             # Check duty-cycle before scheduling TX
             airtime_ms = self.airtime_mgr.calculate_airtime(fwd_pkt.get_raw_length())
 
@@ -368,7 +432,7 @@ class RepeaterHandler(BaseHandler):
                         f"wait={wait_time:.1f}s before retry"
                     )
                     self.dropped_count += 1
-                    drop_reason = "Duty cycle limit"
+                    drop_reason = DropReason.DUTY_CYCLE_LIMIT
             else:
                 tx_task = await self.schedule_retransmit(
                     fwd_pkt, delay, airtime_ms, local_transmission=local_transmission
@@ -399,13 +463,22 @@ class RepeaterHandler(BaseHandler):
                             f"LBT: {lbt_attempts} attempts, {total_lbt_delay:.0f}ms delay, "
                             f"backoffs={lbt_backoff_delays_ms}"
                         )
+
+            # Redundancy copies ride alongside the primary result: collect them
+            # without letting a failed extra change the primary outcome.
+            for extra_task in extra_tx_tasks:
+                try:
+                    if await extra_task:
+                        self.forwarded_count += 1
+                except Exception as e:
+                    logger.warning(f"Multi-ack redundancy TX failed: {e}")
         else:
             self.dropped_count += 1
             # Determine drop reason
             if local_transmission and not allow_local_tx:
-                drop_reason = policy_reason or "No TX mode"
+                drop_reason = policy_reason or DropReason.NO_TX_MODE
             elif not allow_forward:
-                drop_reason = policy_reason or "Repeat disabled"
+                drop_reason = policy_reason or DropReason.REPEAT_DISABLED
             else:
                 # Check if packet has a specific drop reason set by handlers
                 drop_reason = processed_packet.drop_reason or self._get_drop_reason(
@@ -433,7 +506,7 @@ class RepeaterHandler(BaseHandler):
 
         # Set drop reason for duplicates and count flood vs direct dups
         if is_dupe and drop_reason is None:
-            drop_reason = "Duplicate"
+            drop_reason = DropReason.DUPLICATE
         if is_dupe:
             if route_type in (ROUTE_TYPE_FLOOD, ROUTE_TYPE_TRANSPORT_FLOOD):
                 self.flood_dup_count += 1
@@ -482,7 +555,11 @@ class RepeaterHandler(BaseHandler):
         if self.storage:
             try:
                 # Only skip mqtt for actual invalid/bad packets
-                invalid_reasons = ["Invalid advert packet", "Empty payload", "Path too long"]
+                invalid_reasons = (
+                    DropReason.INVALID_ADVERT,
+                    DropReason.EMPTY_PAYLOAD,
+                    DropReason.PATH_TOO_LONG,
+                )
                 skip_mqtt = drop_reason in invalid_reasons if drop_reason else False
                 self.storage.record_packet(packet_record, skip_mqtt_if_invalid=skip_mqtt)
             except Exception as e:
@@ -631,7 +708,7 @@ class RepeaterHandler(BaseHandler):
             src_hash,
             dst_hash,
             transmitted=False,
-            drop_reason="Duplicate",
+            drop_reason=DropReason.DUPLICATE,
             is_duplicate=True,
             packet_hash=pkt_hash_full,
         )
@@ -795,13 +872,13 @@ class RepeaterHandler(BaseHandler):
     def _get_drop_reason(self, packet: Packet, packet_hash: Optional[str] = None) -> str:
 
         if self.is_duplicate(packet, packet_hash=packet_hash):
-            return "Duplicate"
+            return DropReason.DUPLICATE
 
         if not packet or not packet.payload:
-            return "Empty payload"
+            return DropReason.EMPTY_PAYLOAD
 
         if len(packet.path or []) > MAX_PATH_SIZE:
-            return "Path too long"
+            return DropReason.PATH_TOO_LONG
 
         route_type = packet.header & PH_ROUTE_MASK
 
@@ -811,15 +888,15 @@ class RepeaterHandler(BaseHandler):
                 "unscoped_flood_allow", self.config.get("mesh", {}).get("global_flood_allow", True)
             )
             if not unscoped_flood_allow:
-                return "Unscoped flood policy disabled"
+                return DropReason.UNSCOPED_FLOOD_DISABLED
 
         if route_type == ROUTE_TYPE_DIRECT:
             hash_size = packet.get_path_hash_size()
             if not packet.path or len(packet.path) < hash_size:
-                return "Direct: no path"
+                return DropReason.DIRECT_NO_PATH
             next_hop = bytes(packet.path[:hash_size])
             if next_hop != self.local_hash_bytes[:hash_size]:
-                return "Direct: not for us"
+                return DropReason.DIRECT_NOT_FOR_US
 
         # Default reason
         return "Unknown"
@@ -850,7 +927,7 @@ class RepeaterHandler(BaseHandler):
     def validate_packet(self, packet: Packet) -> Tuple[bool, str]:
 
         if not packet or not packet.payload:
-            return False, "Empty payload"
+            return False, DropReason.EMPTY_PAYLOAD
 
         if packet.get_path_hash_size() > 3:
             return False, "Reserved path hash size is invalid"
@@ -862,6 +939,16 @@ class RepeaterHandler(BaseHandler):
             )
 
         return True, ""
+
+    @staticmethod
+    def _normalize_multi_acks(config: dict) -> int:
+        """Read ``repeater.multi_acks``, constrained to 0..1 like MeshCore's
+        CommonCLI prefs load."""
+        try:
+            value = int(config.get("repeater", {}).get("multi_acks", 0))
+        except (TypeError, ValueError):
+            return 0
+        return max(0, min(1, value))
 
     def _normalize_loop_detect_mode(self, mode) -> str:
         if isinstance(mode, str):
@@ -1006,7 +1093,7 @@ class RepeaterHandler(BaseHandler):
         if packet.is_marked_do_not_retransmit():
             # Check if packet has custom drop reason
             if not packet.drop_reason:
-                packet.drop_reason = "Marked do not retransmit"
+                packet.drop_reason = DropReason.MARKED_DO_NOT_RETRANSMIT
             return None
 
         # Check unscoped flood policy
@@ -1016,24 +1103,24 @@ class RepeaterHandler(BaseHandler):
         route_type = packet.header & PH_ROUTE_MASK
         if route_type == ROUTE_TYPE_FLOOD:
             if not unscoped_flood_allow:
-                packet.drop_reason = "Unscoped flood policy disabled"
+                packet.drop_reason = DropReason.UNSCOPED_FLOOD_DISABLED
                 return None
 
         # Check transport scopes flood policy
         if route_type == ROUTE_TYPE_TRANSPORT_FLOOD:
             allowed, check_reason = self._check_transport_codes(packet)
             if not allowed:
-                packet.drop_reason = "Transport code not allowed to flood"
+                packet.drop_reason = DropReason.TRANSPORT_CODE_NOT_ALLOWED
                 return None
 
         mode = self._get_loop_detect_mode()
         if self._is_flood_looped(packet, mode):
-            packet.drop_reason = f"FLOOD loop detected ({mode})"
+            packet.drop_reason = f"{DropReason.FLOOD_LOOP_DETECTED} ({mode})"
             return None
 
         # Suppress duplicates — pass pre-computed hash to avoid a second SHA-256.
         if self.is_duplicate(packet, packet_hash=packet_hash):
-            packet.drop_reason = "Duplicate"
+            packet.drop_reason = DropReason.DUPLICATE
             return None
 
         if packet.path is None:
@@ -1045,17 +1132,17 @@ class RepeaterHandler(BaseHandler):
         hop_count = packet.get_path_hash_count()
 
         if self.max_flood_hops > 0 and hop_count >= self.max_flood_hops:
-            packet.drop_reason = f"Max flood hops limit reached ({hop_count}/{self.max_flood_hops})"
+            packet.drop_reason = f"{DropReason.MAX_FLOOD_HOPS} ({hop_count}/{self.max_flood_hops})"
             return None
 
         # path_len encodes hop count in 6 bits (0-63); adding ourselves must not exceed 63
         if hop_count >= 63:
-            packet.drop_reason = "Path hop count at maximum (63), cannot append"
+            packet.drop_reason = f"{DropReason.PATH_HOP_COUNT_MAX} (63), cannot append"
             return None
 
         # Check path won't exceed MAX_PATH_SIZE after append
         if (hop_count + 1) * hash_size > MAX_PATH_SIZE:
-            packet.drop_reason = "Path would exceed MAX_PATH_SIZE"
+            packet.drop_reason = DropReason.PATH_EXCEEDS_MAX_SIZE
             return None
 
         self.mark_seen(packet, packet_hash=packet_hash)
@@ -1082,7 +1169,7 @@ class RepeaterHandler(BaseHandler):
         # Check if packet is marked do-not-retransmit
         if packet.is_marked_do_not_retransmit():
             if not packet.drop_reason:
-                packet.drop_reason = "Marked do not retransmit"
+                packet.drop_reason = DropReason.MARKED_DO_NOT_RETRANSMIT
             return None
 
         hash_size = packet.get_path_hash_size()
@@ -1090,17 +1177,17 @@ class RepeaterHandler(BaseHandler):
 
         # Check if we're the next hop
         if not packet.path or len(packet.path) < hash_size:
-            packet.drop_reason = "Direct: no path"
+            packet.drop_reason = DropReason.DIRECT_NO_PATH
             return None
 
         next_hop = bytes(packet.path[:hash_size])
         if next_hop != self.local_hash_bytes[:hash_size]:
-            packet.drop_reason = "Direct: not for us"
+            packet.drop_reason = DropReason.DIRECT_NOT_FOR_US
             return None
 
         # Suppress duplicates — pass pre-computed hash to avoid a second SHA-256.
         if self.is_duplicate(packet, packet_hash=packet_hash):
-            packet.drop_reason = "Duplicate"
+            packet.drop_reason = DropReason.DUPLICATE
             return None
 
         self.mark_seen(packet, packet_hash=packet_hash)
@@ -1116,8 +1203,8 @@ class RepeaterHandler(BaseHandler):
     MULTIPART_ACK_SPACING_MS = 300
 
     def forward_multipart_direct(
-        self, packet: Packet, packet_hash: Optional[str] = None
-    ) -> Optional[Tuple[Packet, float]]:
+        self, packet: Packet, snr: float = 0.0, packet_hash: Optional[str] = None
+    ) -> Optional["ForwardResult"]:
         """Forward a MULTIPART packet the way MeshCore's forwardMultipartDirect does.
 
         MeshCore never relays the multipart wrapper as an ordinary directed
@@ -1125,7 +1212,8 @@ class RepeaterHandler(BaseHandler):
         and it is relayed by regenerating the embedded ACK as a plain DIRECT ACK
         (the wrapper byte stripped) rather than repeating the wrapper.  Every
         other multipart case — flood routing, a final hop, or a non-ACK embedded
-        type — is dropped.  Returns ``(ack_packet, delay_seconds)`` when a
+        type — is dropped.  Returns a ``ForwardResult`` — ``(ack_packet,
+        delay_seconds)`` plus any multi-ack redundancy ``extras`` — when a
         regenerated ACK should be sent, otherwise ``None``.
 
         INVARIANT: purely synchronous, mirroring flood_forward / direct_forward —
@@ -1134,7 +1222,7 @@ class RepeaterHandler(BaseHandler):
         # MeshCore only forwards multipart on the direct-route branch; the flood
         # switch case updates ACK state locally but never re-routes it.
         if not packet.is_route_direct():
-            packet.drop_reason = "Multipart: not direct-routed"
+            packet.drop_reason = f"{DropReason.MULTIPART}: not direct-routed"
             return None
 
         valid, reason = self.validate_packet(packet)
@@ -1143,7 +1231,7 @@ class RepeaterHandler(BaseHandler):
             return None
 
         if packet.is_marked_do_not_retransmit():
-            packet.drop_reason = packet.drop_reason or "Marked do not retransmit"
+            packet.drop_reason = packet.drop_reason or DropReason.MARKED_DO_NOT_RETRANSMIT
             return None
 
         payload = packet.payload or b""
@@ -1152,7 +1240,7 @@ class RepeaterHandler(BaseHandler):
         # Only multipart-ACKs are relayed; MeshCore leaves other types for future
         # use and does not forward them.
         if embedded_type != PAYLOAD_TYPE_ACK or len(payload) < 5:
-            packet.drop_reason = "Multipart: unsupported embedded type"
+            packet.drop_reason = f"{DropReason.MULTIPART}: unsupported embedded type"
             return None
 
         hash_size = packet.get_path_hash_size()
@@ -1161,33 +1249,127 @@ class RepeaterHandler(BaseHandler):
         # We must be the next hop (a final-hop multipart has no remaining path and
         # is handled locally, not forwarded).
         if not packet.path or len(packet.path) < hash_size:
-            packet.drop_reason = "Direct: no path"
+            packet.drop_reason = DropReason.DIRECT_NO_PATH
             return None
         if bytes(packet.path[:hash_size]) != self.local_hash_bytes[:hash_size]:
-            packet.drop_reason = "Direct: not for us"
+            packet.drop_reason = DropReason.DIRECT_NOT_FOR_US
             return None
 
+        # Dedupe before regenerating, on MeshCore's exact seen key: hasSeen()
+        # runs on a copy that keeps the MULTIPART payload type but carries the
+        # unwrapped ACK payload (the `remaining` count is stripped).  Keeping
+        # that key distinct from the plain ACK's is what lets a multi-ack
+        # redundancy pair — MULTIPART copy plus plain ACK — survive every hop
+        # instead of the second half being swallowed as a duplicate.  The
+        # pre-computed hash belongs to the wrapper as received, so recompute.
+        seen_key = (
+            PacketHashingUtils.calculate_packet_hash(
+                PAYLOAD_TYPE_MULTIPART, packet.path_len, bytes(payload[1:])
+            )
+            .hex()
+            .upper()
+        )
+        if self.is_duplicate(packet, packet_hash=seen_key):
+            packet.drop_reason = DropReason.DUPLICATE
+            return None
+        self.mark_seen(packet, packet_hash=seen_key)
+
         # Rebuild the received wrapper as the plain DIRECT ACK MeshCore would emit:
-        # drop the multipart header byte and force the ACK payload/route type. The
-        # path is left intact for the seen-check, then this node is removed from it,
-        # matching forwardMultipartDirect's hasSeen()/removeSelfFromPath() order.
+        # drop the multipart header byte and force the ACK payload/route type, then
+        # remove this node from the path (hasSeen()/removeSelfFromPath() order).
         packet.payload = bytearray(payload[1:])
         packet.payload_len = len(packet.payload)
         packet.header = (PAYLOAD_TYPE_ACK << PH_TYPE_SHIFT) | ROUTE_TYPE_DIRECT
-
-        # Dedupe on the regenerated ACK form (full path) before removing ourselves,
-        # so a repeated multipart ACK — or an equivalent plain ACK — is not relayed
-        # twice.  The pre-computed hash belongs to the original wrapper, so recompute.
-        if self.is_duplicate(packet):
-            packet.drop_reason = "Duplicate"
-            return None
-        self.mark_seen(packet)
-
+        packet.transport_codes = [0, 0]
         packet.path = bytearray(packet.path[hash_size:])
         packet.path_len = PathUtils.encode_path_len(hash_size, hop_count - 1)
 
-        delay_s = ((remaining + 1) * self.MULTIPART_ACK_SPACING_MS) / 1000.0
-        return packet, delay_s
+        extras, delay_ms = self._multi_ack_extras(
+            packet, float((remaining + 1) * self.MULTIPART_ACK_SPACING_MS), snr
+        )
+        return ForwardResult(packet, delay_ms / 1000.0, extras)
+
+    def _multi_ack_extras(
+        self, ack_packet: Packet, base_delay_ms: float, snr: float
+    ) -> Tuple[list, float]:
+        """Build MeshCore's optional multi-ack redundancy copies for a relayed ACK.
+
+        With ``multi_acks`` enabled, routeDirectRecvAcks precedes the plain ACK
+        with a MULTIPART-wrapped copy (``remaining<<4 | ACK`` prefix byte) on the
+        already self-removed path, pushing the accumulated delay out by a direct
+        retransmit delay + 300 ms per copy; the plain ACK itself slides to the
+        final accumulated delay.  Returns ``(extras, plain_ack_delay_ms)``.
+        """
+        extra = self.multi_acks
+        extras = []
+        delay_ms = base_delay_ms
+        while extra > 0:
+            delay_ms += (
+                self._calculate_tx_delay(ack_packet, snr) * 1000.0 + self.MULTIPART_ACK_SPACING_MS
+            )
+            wrapped = Packet()
+            wrapped.header = (PAYLOAD_TYPE_MULTIPART << PH_TYPE_SHIFT) | ROUTE_TYPE_DIRECT
+            wrapped.payload = bytearray(
+                bytes([(extra << 4) | PAYLOAD_TYPE_ACK]) + bytes(ack_packet.payload)
+            )
+            wrapped.payload_len = len(wrapped.payload)
+            wrapped.path = bytearray(ack_packet.path)
+            wrapped.path_len = ack_packet.path_len
+            extras.append((wrapped, delay_ms / 1000.0))
+            extra -= 1
+        return extras, delay_ms
+
+    def forward_routed_ack(
+        self, packet: Packet, snr: float = 0.0, packet_hash: Optional[str] = None
+    ) -> Optional["ForwardResult"]:
+        """Relay a routed ACK the way MeshCore's routeDirectRecvAcks does.
+
+        An ACK at an intermediate direct hop is not repeated verbatim: MeshCore
+        regenerates it (createAck) as a plain DIRECT ACK — transport codes
+        dropped, every other header bit cleared — removes this node from the
+        path, and transmits it with zero retransmit delay rather than the
+        generic direct forwarding delay.  With ``multi_acks`` enabled, the plain
+        ACK is preceded by a MULTIPART-wrapped redundancy copy and both slide
+        out by a direct retransmit delay + 300 ms.
+
+        INVARIANT: purely synchronous, mirroring direct_forward — the
+        is_duplicate + mark_seen pair must stay atomic within the event loop.
+        """
+        valid, reason = self.validate_packet(packet)
+        if not valid:
+            packet.drop_reason = reason
+            return None
+
+        if packet.is_marked_do_not_retransmit():
+            packet.drop_reason = packet.drop_reason or DropReason.MARKED_DO_NOT_RETRANSMIT
+            return None
+
+        hash_size = packet.get_path_hash_size()
+        hop_count = packet.get_path_hash_count()
+
+        # A final-hop ACK (no remaining path) is consumed locally, never relayed.
+        if not packet.path or len(packet.path) < hash_size:
+            packet.drop_reason = DropReason.DIRECT_NO_PATH
+            return None
+        if bytes(packet.path[:hash_size]) != self.local_hash_bytes[:hash_size]:
+            packet.drop_reason = DropReason.DIRECT_NOT_FOR_US
+            return None
+
+        # The packet hash covers only the payload type and payload, so the
+        # received form and the regenerated plain ACK share one key — matching
+        # MeshCore's hasSeen() on the incoming ACK before removeSelfFromPath().
+        if self.is_duplicate(packet, packet_hash=packet_hash):
+            packet.drop_reason = DropReason.DUPLICATE
+            return None
+        self.mark_seen(packet, packet_hash=packet_hash)
+
+        packet.header = (PAYLOAD_TYPE_ACK << PH_TYPE_SHIFT) | ROUTE_TYPE_DIRECT
+        packet.transport_codes = [0, 0]
+        packet.path = bytearray(packet.path[hash_size:])
+        packet.path_len = PathUtils.encode_path_len(hash_size, hop_count - 1)
+
+        extras, delay_ms = self._multi_ack_extras(packet, 0.0, snr)
+        return ForwardResult(packet, delay_ms / 1000.0, extras)
 
     @staticmethod
     def calculate_packet_score(snr: float, packet_len: int, spreading_factor: int = 8) -> float:
@@ -1257,8 +1439,18 @@ class RepeaterHandler(BaseHandler):
         # generic flood/direct path — it regenerates embedded ACKs and drops
         # everything else.  Its delay is fixed by the fragment count, so return
         # the (packet, delay) pair directly instead of _calculate_tx_delay.
-        if packet.get_payload_type() == PAYLOAD_TYPE_MULTIPART:
-            return self.forward_multipart_direct(packet, packet_hash=packet_hash)
+        payload_type = packet.get_payload_type()
+        if payload_type == PAYLOAD_TYPE_MULTIPART:
+            return self.forward_multipart_direct(packet, snr, packet_hash=packet_hash)
+
+        # Routed ACKs also get their own MeshCore branch: an intermediate direct
+        # hop re-emits the ACK immediately (routeDirectRecvAcks) instead of the
+        # delayed generic direct forward.  Flood ACKs stay on the generic path.
+        if payload_type == PAYLOAD_TYPE_ACK and route_type in (
+            ROUTE_TYPE_DIRECT,
+            ROUTE_TYPE_TRANSPORT_DIRECT,
+        ):
+            return self.forward_routed_ack(packet, snr, packet_hash=packet_hash)
 
         if route_type == ROUTE_TYPE_FLOOD or route_type == ROUTE_TYPE_TRANSPORT_FLOOD:
             fwd_pkt = self.flood_forward(packet, packet_hash=packet_hash)
@@ -1600,6 +1792,7 @@ class RepeaterHandler(BaseHandler):
             repeater_config = self.config.get("repeater", {})
             self.use_score_for_tx = repeater_config.get("use_score_for_tx", False)
             self.score_threshold = repeater_config.get("score_threshold", 0.3)
+            self.multi_acks = self._normalize_multi_acks(self.config)
             self.send_advert_interval_hours = repeater_config.get("send_advert_interval_hours", 10)
             self.cache_ttl = repeater_config.get("cache_ttl", 60)
             self.max_flood_hops = repeater_config.get("max_flood_hops", 64)

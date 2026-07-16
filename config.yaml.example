@@ -35,6 +35,11 @@ repeater:
   # Enable quality-based packet filtering and adaptive delays
   use_score_for_tx: false
 
+  # Multi-ack redundancy (0 = off, 1 = on; matches MeshCore's multi.acks pref).
+  # When on, a relayed routed ACK is preceded by a MULTIPART-wrapped copy so
+  # ACKs survive lossy links. Also settable via the mesh CLI: set multi.acks
+  multi_acks: 0
+
   # Score threshold for quality monitoring (future use)
   # Currently reserved for potential future features like dashboard alerts,
   # proactive statistics collection, or advanced filtering strategies.
