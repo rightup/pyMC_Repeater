@@ -656,9 +656,7 @@ async def test_protocol_request_real_crypto_consume_vs_collision_forward():
     genuine, _ = PacketBuilder.create_protocol_request(
         _SendDest(local.get_public_key()), sender, REQ_TYPE_GET_STATUS
     )
-    with patch(
-        "repeater.handler_helpers.protocol_request.asyncio.sleep", new_callable=AsyncMock
-    ):
+    with patch("repeater.handler_helpers.protocol_request.asyncio.sleep", new_callable=AsyncMock):
         assert await helper.process_request_packet(genuine) is True
     assert genuine.is_marked_do_not_retransmit()
     injector.assert_awaited()  # a response was transmitted

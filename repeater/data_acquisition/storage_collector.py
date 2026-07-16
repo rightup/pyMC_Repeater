@@ -441,6 +441,21 @@ class StorageCollector:
     def get_packet_by_id(self, packet_id: int) -> Optional[dict]:
         return self.sqlite_handler.get_packet_by_id(packet_id)
 
+    def get_neighbor_link_history(
+        self,
+        *,
+        peer_hash: str,
+        path_hash_size: int,
+        hours: int = 24,
+        limit: int = 1000,
+    ) -> list:
+        return self.sqlite_handler.get_neighbor_link_history(
+            peer_hash=peer_hash,
+            path_hash_size=path_hash_size,
+            hours=hours,
+            limit=limit,
+        )
+
     def get_rrd_data(
         self,
         start_time: Optional[int] = None,

@@ -26,6 +26,7 @@ from openhop_core.protocol.packet_utils import PacketHeaderUtils, PathUtils, pac
 
 from repeater.airtime import AirtimeManager
 from repeater.data_acquisition import StorageCollector
+from repeater.neighbour_links import NeighbourLinkTracker
 from repeater.policy_engine import PolicyDecision, PolicyEngine
 
 logger = logging.getLogger("RepeaterHandler")
@@ -95,6 +96,7 @@ class RepeaterHandler(BaseHandler):
         self.loop_detect_mode = self._normalize_loop_detect_mode(
             config.get("mesh", {}).get("loop_detect", LOOP_DETECT_OFF)
         )
+        self.neighbour_link_tracker = NeighbourLinkTracker(config)
 
         radio = dispatcher.radio if dispatcher else None
         if radio:
@@ -195,6 +197,8 @@ class RepeaterHandler(BaseHandler):
 
         route_type = packet.header & PH_ROUTE_MASK
         pkt_hash_full = packet.calculate_packet_hash().hex().upper()
+        snr = metadata.get("snr", 0.0)
+        rssi = metadata.get("rssi", 0)
 
         # TX mode: forward (repeat on), monitor (no repeat, tenants can TX), no_tx (all TX off)
         mode = self.config.get("repeater", {}).get("mode", "forward")
@@ -245,8 +249,6 @@ class RepeaterHandler(BaseHandler):
         # clone the packet to avoid modifying the original
         processed_packet = copy.deepcopy(packet)
 
-        snr = metadata.get("snr", 0.0)
-        rssi = metadata.get("rssi", 0)
         transmitted = False
         tx_delay_ms = 0.0
         drop_reason = None
@@ -256,6 +258,25 @@ class RepeaterHandler(BaseHandler):
 
         original_path_hashes = packet.get_path_hashes_hex()
         path_hash_size = packet.get_path_hash_size()
+
+        if not local_transmission:
+            payload_type = (
+                packet.get_payload_type() if hasattr(packet, "get_payload_type") else None
+            )
+            score = self.calculate_packet_score(
+                snr,
+                len(packet.payload or b""),
+                self.radio_config["spreading_factor"],
+            )
+            self.neighbour_link_tracker.observe(
+                packet,
+                route_type=route_type,
+                payload_type=payload_type,
+                rssi=rssi,
+                snr=snr,
+                score=score,
+                is_duplicate=(pkt_hash_full in self.seen_packets),
+            )
 
         # Process for forwarding (skip if repeat disabled or if this is a local transmission).
         # Pass pkt_hash_full so flood_forward / direct_forward don't recompute SHA-256.
@@ -568,6 +589,22 @@ class RepeaterHandler(BaseHandler):
         path_hash_size = packet.get_path_hash_size()
         path_hash = self._path_hash_display(original_path_hashes)
         src_hash, dst_hash = self._packet_record_src_dst(packet, payload_type)
+        pkt_hash_full = packet.calculate_packet_hash().hex().upper()
+
+        score = self.calculate_packet_score(
+            snr,
+            len(packet.payload or b""),
+            self.radio_config["spreading_factor"],
+        )
+        self.neighbour_link_tracker.observe(
+            packet,
+            route_type=route_type,
+            payload_type=payload_type,
+            rssi=float(rssi),
+            snr=float(snr),
+            score=score,
+            is_duplicate=True,
+        )
 
         packet_record = self._build_packet_record(
             packet,
@@ -583,7 +620,7 @@ class RepeaterHandler(BaseHandler):
             transmitted=False,
             drop_reason="Duplicate",
             is_duplicate=True,
-            packet_hash=packet.calculate_packet_hash().hex().upper(),
+            packet_hash=pkt_hash_full,
         )
 
         if self.storage:
@@ -666,6 +703,13 @@ class RepeaterHandler(BaseHandler):
         pkt_hash = packet_hash or packet.calculate_packet_hash().hex().upper()
         payload = getattr(packet, "payload", None)
         payload_len = len(payload or b"")
+        upstream_hash, upstream_hash_size = self.neighbour_link_tracker.get_upstream_peer_identity(
+            packet,
+            route_type,
+            payload_type,
+            path_hashes=original_path_hashes,
+            path_hash_size=path_hash_size,
+        )
 
         # LoRa time-on-air for this packet (Semtech reference formula).
         # Computed once here so every downstream consumer (MQTT, SQLite, Glass,
@@ -709,6 +753,8 @@ class RepeaterHandler(BaseHandler):
             "original_path": original_path_hashes or None,
             "forwarded_path": forwarded_path,
             "path_hash_size": path_hash_size,
+            "upstream_hash": upstream_hash,
+            "upstream_hash_size": upstream_hash_size,
             "raw_packet": packet.write_to().hex() if hasattr(packet, "write_to") else None,
             "lbt_attempts": lbt_attempts,
             "lbt_backoff_delays_ms": lbt_backoff_delays_ms,
@@ -1539,9 +1585,18 @@ class RepeaterHandler(BaseHandler):
             self.send_advert_interval_hours = repeater_config.get("send_advert_interval_hours", 10)
             self.cache_ttl = repeater_config.get("cache_ttl", 60)
             self.max_flood_hops = repeater_config.get("max_flood_hops", 64)
+            self.neighbour_link_tracker.refresh_config(self.config)
             self.loop_detect_mode = self._normalize_loop_detect_mode(
                 self.config.get("mesh", {}).get("loop_detect", LOOP_DETECT_OFF)
             )
+
+            with self.neighbour_link_tracker.lock:
+                now_monotonic = time.monotonic()
+                self.neighbour_link_tracker.purge_expired_locked(now_monotonic)
+                while (
+                    len(self.neighbour_link_tracker.links) > self.neighbour_link_tracker.max_entries
+                ):
+                    self.neighbour_link_tracker.evict_stalest_locked()
 
             # Note: Radio config changes require restart as they affect hardware
             # Note: Airtime manager has its own config reference that gets updated

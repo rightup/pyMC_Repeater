@@ -100,6 +100,8 @@ class SQLiteHandler:
                         src_hash TEXT,
                         dst_hash TEXT,
                         path_hash TEXT,
+                        upstream_hash TEXT,
+                        upstream_hash_size INTEGER,
                         header TEXT,
                         transport_codes TEXT,
                         payload TEXT,
@@ -189,6 +191,10 @@ class SQLiteHandler:
                 )
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_packets_type ON packets(type)")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_packets_hash ON packets(packet_hash)")
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_packets_upstream_time "
+                    "ON packets(upstream_hash, upstream_hash_size, timestamp)"
+                )
                 conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_packets_transmitted ON packets(transmitted)"
                 )
@@ -676,6 +682,35 @@ class SQLiteHandler:
                     )
                     logger.info(f"Migration '{migration_name}' applied successfully")
 
+                # Migration 13: Add upstream hash fields to packets for
+                # neighbour-link history lookups and indexing.
+                migration_name = "add_upstream_hash_to_packets"
+                existing = conn.execute(
+                    "SELECT migration_name FROM migrations WHERE migration_name = ?",
+                    (migration_name,),
+                ).fetchone()
+                if not existing:
+                    cursor = conn.execute("PRAGMA table_info(packets)")
+                    columns = [column[1] for column in cursor.fetchall()]
+
+                    if "upstream_hash" not in columns:
+                        conn.execute("ALTER TABLE packets ADD COLUMN upstream_hash TEXT")
+                        logger.info("Added upstream_hash column to packets table")
+
+                    if "upstream_hash_size" not in columns:
+                        conn.execute("ALTER TABLE packets ADD COLUMN upstream_hash_size INTEGER")
+                        logger.info("Added upstream_hash_size column to packets table")
+
+                    conn.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_packets_upstream_time "
+                        "ON packets(upstream_hash, upstream_hash_size, timestamp)"
+                    )
+                    conn.execute(
+                        "INSERT INTO migrations (migration_name, applied_at) VALUES (?, ?)",
+                        (migration_name, time.time()),
+                    )
+                    logger.info(f"Migration '{migration_name}' applied successfully")
+
                 conn.commit()
 
         except Exception as e:
@@ -771,10 +806,11 @@ class SQLiteHandler:
                     INSERT INTO packets (
                         timestamp, type, route, length, rssi, snr, score,
                         transmitted, is_duplicate, drop_reason, src_hash, dst_hash, path_hash,
+                        upstream_hash, upstream_hash_size,
                         header, transport_codes, payload, payload_length,
                         tx_delay_ms, packet_hash, original_path, forwarded_path, raw_packet,
                         lbt_attempts, lbt_backoff_delays_ms, lbt_channel_busy
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                     (
                         record.get("timestamp", time.time()),
@@ -790,6 +826,8 @@ class SQLiteHandler:
                         record.get("src_hash"),
                         record.get("dst_hash"),
                         record.get("path_hash"),
+                        record.get("upstream_hash"),
+                        record.get("upstream_hash_size"),
                         record.get("header"),
                         record.get("transport_codes"),
                         record.get("payload"),
@@ -1615,6 +1653,7 @@ class SQLiteHandler:
                         id,
                         timestamp, type, route, length, rssi, snr, score,
                         transmitted, is_duplicate, drop_reason, src_hash, dst_hash, path_hash,
+                        upstream_hash, upstream_hash_size,
                         transport_codes, payload, payload_length,
                         tx_delay_ms, packet_hash, original_path, forwarded_path,
                         lbt_attempts, lbt_channel_busy
@@ -1668,6 +1707,7 @@ class SQLiteHandler:
                         id,
                         timestamp, type, route, length, rssi, snr, score,
                         transmitted, is_duplicate, drop_reason, src_hash, dst_hash, path_hash,
+                        upstream_hash, upstream_hash_size,
                         transport_codes, payload, payload_length,
                         tx_delay_ms, packet_hash, original_path, forwarded_path,
                         lbt_attempts, lbt_channel_busy
@@ -1801,6 +1841,7 @@ class SQLiteHandler:
                         id,
                         timestamp, type, route, length, rssi, snr, score,
                         transmitted, is_duplicate, drop_reason, src_hash, dst_hash, path_hash,
+                        upstream_hash, upstream_hash_size,
                         header, transport_codes, payload, payload_length,
                         tx_delay_ms, packet_hash, original_path, forwarded_path, raw_packet,
                         lbt_attempts, lbt_backoff_delays_ms, lbt_channel_busy
@@ -1827,6 +1868,7 @@ class SQLiteHandler:
                         id,
                         timestamp, type, route, length, rssi, snr, score,
                         transmitted, is_duplicate, drop_reason, src_hash, dst_hash, path_hash,
+                        upstream_hash, upstream_hash_size,
                         header, transport_codes, payload, payload_length,
                         tx_delay_ms, packet_hash, original_path, forwarded_path, raw_packet,
                         lbt_attempts, lbt_backoff_delays_ms, lbt_channel_busy
@@ -1841,6 +1883,80 @@ class SQLiteHandler:
         except Exception as e:
             logger.error(f"Failed to get packet by id: {e}")
             return None
+
+    def get_neighbor_link_history(
+        self,
+        *,
+        peer_hash: str,
+        path_hash_size: int,
+        hours: int = 24,
+        limit: int = 1000,
+    ) -> list:
+        try:
+            normalized_hash = str(peer_hash or "").strip().upper()
+            if not normalized_hash:
+                return []
+
+            path_hash_size = int(path_hash_size)
+            hours = max(1, int(hours))
+            limit = max(1, min(int(limit), 5000))
+            cutoff = time.time() - (hours * 3600)
+
+            with self._connect() as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute(
+                    """
+                    SELECT
+                        timestamp,
+                        rssi,
+                        snr,
+                        score,
+                        is_duplicate,
+                        packet_hash,
+                        type,
+                        route,
+                        original_path
+                    FROM packets INDEXED BY idx_packets_upstream_time
+                    WHERE upstream_hash = ?
+                      AND upstream_hash_size = ?
+                      AND timestamp >= ?
+                    ORDER BY timestamp DESC
+                    LIMIT ?
+                    """,
+                    (normalized_hash, path_hash_size, cutoff, limit),
+                ).fetchall()
+
+                history = []
+                for row in rows:
+                    hop_count = None
+                    original_path = row["original_path"]
+                    if original_path:
+                        try:
+                            parsed = json.loads(original_path)
+                            if isinstance(parsed, list):
+                                hop_count = len(parsed)
+                        except Exception:
+                            hop_count = None
+
+                    history.append(
+                        {
+                            "timestamp": row["timestamp"],
+                            "rssi": row["rssi"],
+                            "snr": row["snr"],
+                            "score": row["score"],
+                            "is_duplicate": bool(row["is_duplicate"]),
+                            "packet_hash": row["packet_hash"],
+                            "packet_type": row["type"],
+                            "route_type": row["route"],
+                            "path_hop_count": hop_count,
+                        }
+                    )
+
+                history.reverse()
+                return history
+        except Exception as e:
+            logger.error(f"Failed to get neighbor link history: {e}")
+            return []
 
     def get_packet_type_stats(self, hours: int = 24) -> dict:
         try:
