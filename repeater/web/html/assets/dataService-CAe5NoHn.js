@@ -1,0 +1,1 @@
+import{t as e}from"./dataService-DFpUsoNv.js";export{e as useDataService};
