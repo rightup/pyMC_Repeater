@@ -1,1 +1,0 @@
-import{t as e}from"./dataService-auvhoQZt.js";export{e as useDataService};

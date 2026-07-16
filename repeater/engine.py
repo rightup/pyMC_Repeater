@@ -27,6 +27,7 @@ from openhop_core.protocol.packet_utils import (
     PacketHashingUtils,
     PacketHeaderUtils,
     PathUtils,
+    flood_rx_metrics,
     packet_score,
 )
 
@@ -321,11 +322,15 @@ class RepeaterHandler(BaseHandler):
             payload_type = (
                 packet.get_payload_type() if hasattr(packet, "get_payload_type") else None
             )
-            score = self.calculate_packet_score(
+            frame_len = packet.get_raw_length() if hasattr(packet, "get_raw_length") else 0
+            score = flood_rx_metrics(
+                frame_len,
                 snr,
-                len(packet.payload or b""),
                 self.radio_config["spreading_factor"],
-            )
+                self.radio_config["bandwidth"],
+                self.radio_config["coding_rate"],
+                self.radio_config["preamble_length"],
+            ).score
             self.neighbour_link_tracker.observe(
                 packet,
                 route_type=route_type,
@@ -672,11 +677,15 @@ class RepeaterHandler(BaseHandler):
         src_hash, dst_hash = self._packet_record_src_dst(packet, payload_type)
         pkt_hash_full = packet.calculate_packet_hash().hex().upper()
 
-        score = self.calculate_packet_score(
+        frame_len = packet.get_raw_length() if hasattr(packet, "get_raw_length") else 0
+        score = flood_rx_metrics(
+            frame_len,
             snr,
-            len(packet.payload or b""),
             self.radio_config["spreading_factor"],
-        )
+            self.radio_config["bandwidth"],
+            self.radio_config["coding_rate"],
+            self.radio_config["preamble_length"],
+        ).score
         self.neighbour_link_tracker.observe(
             packet,
             route_type=route_type,
@@ -819,9 +828,14 @@ class RepeaterHandler(BaseHandler):
             "length": payload_len,
             "rssi": rssi,
             "snr": snr,
-            "score": self.calculate_packet_score(
-                snr, payload_len, self.radio_config["spreading_factor"]
-            ),
+            "score": flood_rx_metrics(
+                packet.get_raw_length() if hasattr(packet, "get_raw_length") else 0,
+                snr,
+                self.radio_config["spreading_factor"],
+                self.radio_config["bandwidth"],
+                self.radio_config["coding_rate"],
+                self.radio_config["preamble_length"],
+            ).score,
             "tx_delay_ms": tx_delay_ms,
             "airtime_ms": airtime_ms,
             "transmitted": transmitted,
