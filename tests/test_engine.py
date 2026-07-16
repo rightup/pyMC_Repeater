@@ -8,6 +8,7 @@ airtime duty-cycle, TX mode (forward/monitor/no_tx), and config reloading.
 
 import asyncio
 import base64
+import logging
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -848,6 +849,14 @@ class TestTxDelay:
         pkt = _make_flood_packet()
         delay = handler._calculate_tx_delay(pkt, snr=0.0)
         assert delay == 0.0
+
+    def test_startup_log_states_delay_factor_semantics(self, caplog):
+        with caplog.at_level(logging.INFO, logger="RepeaterHandler"):
+            _make_handler_with_hash(bytes([LOCAL_HASH]))
+        assert any(
+            "TX delay factors" in record.message and "airtime multipliers" in record.message
+            for record in caplog.records
+        )
 
     def test_transport_direct_uses_random_window(self, handler):
         handler.direct_tx_delay_factor = 0.77

@@ -77,6 +77,14 @@ class RepeaterHandler(BaseHandler):
         self.max_duplicates_per_packet = 20
         self.tx_delay_factor = config.get("delays", {}).get("tx_delay_factor", 1.0)
         self.direct_tx_delay_factor = config.get("delays", {}).get("direct_tx_delay_factor", 0.5)
+        # These are airtime multipliers, not seconds: TX delay is a random value in
+        # [0, 5 * airtime * factor] (matching MeshCore getRetransmitDelay). Flood and
+        # direct share the formula and differ only in the factor.
+        logger.info(
+            "TX delay factors (airtime multipliers, not seconds): "
+            f"flood random 0-5*airtime*F (F={self.tx_delay_factor}), "
+            f"direct random 0-5*airtime*F (F={self.direct_tx_delay_factor})"
+        )
         self.use_score_for_tx = config.get("repeater", {}).get("use_score_for_tx", False)
         self.score_threshold = config.get("repeater", {}).get("score_threshold", 0.3)
         self.max_flood_hops = config.get("repeater", {}).get("max_flood_hops", 64)
