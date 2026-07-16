@@ -17,7 +17,8 @@ def _semtech_airtime_ms(payload_len: int, sf: int, bw_hz: int, cr: int, preamble
     """Independent Semtech reference formula used as oracle in tests."""
     crc = 1
     h = 0  # explicit header
-    de = 1 if (sf >= 11 and bw_hz <= 125000) else 0
+    # LDRO follows the radio driver's auto rule: on when symbol time >= 16 ms
+    de = 1 if (2**sf) / (bw_hz / 1000) >= 16.0 else 0
     t_sym = (2**sf) / (bw_hz / 1000)
     t_preamble = (preamble + 4.25) * t_sym
     numerator = max(8 * payload_len - 4 * sf + 28 + 16 * crc - 20 * h, 0)
@@ -95,6 +96,17 @@ def test_long_range_preset_has_higher_airtime_than_fast_preset_for_same_payload(
     fast_mgr = _make_mgr(sf=7, bw_hz=62500, cr=5, preamble=8)
     payload_len = 64
     assert long_mgr.calculate_airtime(payload_len) > fast_mgr.calculate_airtime(payload_len)
+
+
+def test_ldro_follows_symbol_time_rule_like_radiolib():
+    """Settings with 16.384 ms symbols use LDRO on real hardware (RadioLib's
+    auto rule) even though they fall outside the old "SF >= 11 and
+    BW <= 125 kHz" shorthand. Expected values generated with RadioLib 7.6.0's
+    SX126x::calculateTimeOnAir integer arithmetic (microseconds / 1000)."""
+    sf12_wide = _make_mgr(sf=12, bw_hz=250000, cr=5, preamble=8)
+    assert math.isclose(sf12_wide.calculate_airtime(50), 1150.976, rel_tol=1e-9)
+    sf10_narrow = _make_mgr(sf=10, bw_hz=62500, cr=6, preamble=8)
+    assert math.isclose(sf10_narrow.calculate_airtime(32), 1216.512, rel_tol=1e-9)
 
 
 def test_legacy_coding_rate_index_matches_denominator_form():
