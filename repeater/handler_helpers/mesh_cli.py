@@ -576,11 +576,15 @@ class MeshCLI:
             return f"> {delay}"
 
         elif param == "txdelay":
-            delay = self.repeater_config.get("tx_delay_factor", 1.0)
+            # The TX delay factor lives in the delays section (the value the
+            # engine consumes), not the repeater section.
+            delay = self.config.get("delays", {}).get("tx_delay_factor", 1.0)
             return f"> {delay}"
 
         elif param == "direct.txdelay":
-            delay = self.repeater_config.get("direct_tx_delay_factor", 0.5)
+            # The direct TX delay factor lives in the delays section (the
+            # value the engine consumes), not the repeater section.
+            delay = self.config.get("delays", {}).get("direct_tx_delay_factor", 0.5)
             return f"> {delay}"
 
         elif param == "multi.acks":
@@ -752,7 +756,7 @@ class MeshCLI:
                 delay = float(value)
                 if delay < 0:
                     return "Error: cannot be negative"
-                self.repeater_config["tx_delay_factor"] = delay
+                self.config.setdefault("delays", {})["tx_delay_factor"] = delay
                 saved, _ = self.config_manager.save_to_file()
                 self.config_manager.live_update_daemon(["repeater", "delays"])
                 return "OK"
@@ -761,7 +765,7 @@ class MeshCLI:
                 delay = float(value)
                 if delay < 0:
                     return "Error: cannot be negative"
-                self.repeater_config["direct_tx_delay_factor"] = delay
+                self.config.setdefault("delays", {})["direct_tx_delay_factor"] = delay
                 saved, _ = self.config_manager.save_to_file()
                 self.config_manager.live_update_daemon(["repeater", "delays"])
                 return "OK"
