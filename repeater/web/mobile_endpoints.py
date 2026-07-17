@@ -1,14 +1,15 @@
 """
-Mobile Companion API v1 endpoints (phase 1: journal-backed sync core).
+Mobile Companion API v1 endpoints (phase 1 sync core + phase 2 SSE stream).
 
 Mounted as ``APIEndpoints.v1`` so CherryPy serves it at ``/api/v1/``.
-Implements the read-only synchronization surface from
+Implements the synchronization surface from
 docs/architecture/mobile-companion-api.md §7:
 
 - ``GET /api/v1/companions`` — list companion identities
 - ``GET /api/v1/companions/{name}/snapshot`` — bootstrap document (§7.4)
 - ``GET /api/v1/companions/{name}/sync?cursor=&limit=`` — journal delta (§7.5)
 - ``GET /api/v1/companions/{name}/messages?before_id=&limit=`` — history page
+- ``GET /api/v1/companions/{name}/events`` — resumable SSE live stream (§8)
 
 Cursor semantics (§5.3): clients hold an opaque cursor string (the journal
 seq); the server keeps no per-client read state. ``journal_epoch`` detects
@@ -16,11 +17,13 @@ DB resets; ``prune_floor`` turns aged-out cursors into ``snapshot_required``
 instead of silently incomplete deltas. All reads are bounded, index-served
 SQLite queries executed directly on the request thread (§13).
 
-Action endpoints (send/login/telemetry), SSE, and pairing arrive in later
-phases; the existing ``/api/companion/*`` surface remains for the web UI.
+Action endpoints (send/login/telemetry) and pairing arrive in a later phase;
+the existing ``/api/companion/*`` surface remains for the web UI.
 """
 
+import json
 import logging
+import queue
 import time
 from typing import Optional, Tuple
 
@@ -48,7 +51,7 @@ class MobileAPIEndpoints:
 class CompanionsV1:
     """``/api/v1/companions`` collection and per-companion sync resources."""
 
-    _ACTIONS = ("snapshot", "sync", "messages")
+    _ACTIONS = ("snapshot", "sync", "messages", "events")
 
     def __init__(self, daemon_instance=None, config=None):
         self.daemon_instance = daemon_instance
@@ -123,6 +126,30 @@ class CompanionsV1:
         if not sqlite_handler:
             raise cherrypy.HTTPError(503, "SQLite storage not available")
         return sqlite_handler
+
+    def _get_journal(self, companion_hash: str):
+        """Return the CompanionEventJournal for ``companion_hash``, or None.
+
+        The journal lives on the per-companion frame server (main.py wires
+        one ``CompanionEventJournal`` per companion into its
+        ``CompanionFrameServer``), not on the bridge — ``daemon_instance.
+        companion_frame_servers`` is a flat list, matched here by the same
+        ``'0x%02x'`` hash string ``_resolve`` returns.
+        """
+        servers = getattr(self.daemon_instance, "companion_frame_servers", None) or []
+        for server in servers:
+            if getattr(server, "companion_hash", None) == companion_hash:
+                return getattr(server, "journal", None)
+        return None
+
+    def _sse_settings(self) -> Tuple[int, int]:
+        """Return ``(queue_maxsize, keepalive_sec)`` from ``config.http``,
+        same keys and defaults as the legacy SSE stream in
+        companion_endpoints.py."""
+        http_cfg = self.config.get("http", {}) if isinstance(self.config, dict) else {}
+        queue_maxsize = max(32, int(http_cfg.get("sse_queue_maxsize", 64)))
+        keepalive_sec = max(5, int(http_cfg.get("sse_keepalive_sec", 15)))
+        return queue_maxsize, keepalive_sec
 
     @staticmethod
     def _etag_not_modified(etag: str) -> bool:
@@ -343,3 +370,154 @@ class CompanionsV1:
         rows = handler.companion_get_messages(companion_hash, before_id=before, limit=limit_n)
         next_before_id = rows[-1]["id"] if rows else None
         return self._success({"messages": rows, "next_before_id": next_before_id})
+
+    # ------------------------------------------------------------------
+    # GET /api/v1/companions/{name}/events  (SSE, design doc §8)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _sse_frame(row: dict) -> str:
+        """Format one journal row (or listener event — same shape) as an SSE
+        frame: ``id:`` = seq, ``event:`` = event type, ``data:`` = the same
+        JSON object ``sync`` returns for this row (§8, one schema/two
+        transports)."""
+        seq = row["seq"]
+        event_type = row["event_type"]
+        data = json.dumps(
+            {
+                "seq": seq,
+                "type": event_type,
+                "ts": row["created_at"],
+                "packet_hash": row.get("packet_hash"),
+                "data": row.get("payload", {}),
+            },
+            separators=(",", ":"),
+        )
+        return f"id: {seq}\nevent: {event_type}\ndata: {data}\n\n"
+
+    @cherrypy.expose
+    def events(self, companion_name=None, cursor=None, **kwargs):
+        """GET /api/v1/companions/{name}/events — resumable SSE live stream.
+
+        Connect with ``EventSource('.../events?token=JWT')``. Auth is the
+        CherryPy tool-level require_auth that covers the whole /api tree
+        (http_server.py) — it accepts the query-param JWT that browser
+        EventSource needs and CONSUMES it before the handler runs, which is
+        why this handler must not stack the @require_auth decorator on top
+        (the decorator would re-check and 401 a query-token request whose
+        token the tool already stripped; the legacy /api/companion/events
+        stream omits the decorator for the same reason). Resume point is
+        the standard ``Last-Event-ID`` header if present, else
+        ``?cursor=``, else the current journal head (a bare connection
+        with neither gets a live tail only, no replay).
+
+        No-gap ordering (§8, §6 at-least-once): the journal listener is
+        registered BEFORE the backlog is drained, so anything appended
+        during the drain lands in this client's queue instead of being
+        missed; events the drain already yielded are then skipped once the
+        queue is consumed (``seq <= last_sent_seq``). Net effect: at most a
+        few duplicate events around the handoff, never a gap — the same
+        contract sync gives clients that re-poll from an old cursor.
+        """
+        self._require_get()
+        _bridge, companion_hash = self._resolve(companion_name)
+        handler = self._get_sqlite_handler()
+        journal = self._get_journal(companion_hash)
+        if journal is None:
+            raise cherrypy.HTTPError(503, "Companion event journal not available")
+
+        last_event_id = cherrypy.request.headers.get("Last-Event-ID")
+        cursor_param = last_event_id if last_event_id is not None else cursor
+        if cursor_param is None:
+            cursor_seq = handler.companion_journal_head(companion_hash)
+        else:
+            try:
+                cursor_seq = int(str(cursor_param))
+            except (TypeError, ValueError):
+                raise cherrypy.HTTPError(400, "Invalid cursor")
+            if cursor_seq < 0:
+                raise cherrypy.HTTPError(400, "Invalid cursor")
+
+        epoch = handler.companion_journal_epoch()
+        prune_floor = int(handler.companion_journal_meta_get("prune_floor") or 0)
+        queue_maxsize, keepalive_sec = self._sse_settings()
+
+        cherrypy.response.headers["Content-Type"] = "text/event-stream"
+        cherrypy.response.headers["Cache-Control"] = "no-cache"
+        cherrypy.response.headers["X-Accel-Buffering"] = "no"
+
+        if cursor_seq < prune_floor:
+            # Cursor is older than the journal's retention floor: a replay
+            # from here would be silently incomplete. One control event,
+            # then close — client must snapshot and reconnect with a fresh
+            # cursor, same rule sync applies via snapshot_required.
+            def _snapshot_required_stream():
+                payload = json.dumps(
+                    {"journal_epoch": epoch, "snapshot_required": True},
+                    separators=(",", ":"),
+                )
+                yield f"event: snapshot_required\ndata: {payload}\n\n"
+
+            return _snapshot_required_stream()
+
+        client_queue: queue.Queue = queue.Queue(maxsize=queue_maxsize)
+        # Plain dict, not a lock: a single bool set/read is atomic under the
+        # GIL, and the callback (worker thread) only ever writes True while
+        # the generator (request thread) only ever reads it.
+        overflow = {"dead": False}
+
+        def _on_event(event: dict) -> None:
+            # Fires from an asyncio.to_thread worker thread (journal
+            # _notify's caller). queue.Queue.put_nowait is thread-safe.
+            try:
+                client_queue.put_nowait(event)
+            except queue.Full:
+                # Slow client: drop it rather than buffer unboundedly or
+                # block the journal writer. It reconnects with
+                # Last-Event-ID and replays the backlog it missed.
+                overflow["dead"] = True
+
+        journal.register_listener(_on_event)
+
+        def generate():
+            last_sent_seq = cursor_seq
+            try:
+                # Drain the backlog from the cursor in pages, so a
+                # long-offline client doesn't hold one huge query open.
+                while True:
+                    rows = handler.companion_get_events(companion_hash, last_sent_seq, 500)
+                    if not rows:
+                        break
+                    for row in rows:
+                        last_sent_seq = row["seq"]
+                        yield self._sse_frame(row)
+                    if len(rows) < 500:
+                        break
+
+                # Live tail: consume the queue, skipping anything already
+                # sent by the drain above (the registration-before-drain
+                # overlap window).
+                while True:
+                    if overflow["dead"]:
+                        break
+                    try:
+                        event = client_queue.get(timeout=keepalive_sec)
+                    except queue.Empty:
+                        # Keep-alive comment frame; EventSource ignores
+                        # lines starting with ':'.
+                        yield ": ka\n\n"
+                        continue
+                    if event["seq"] <= last_sent_seq:
+                        continue
+                    last_sent_seq = event["seq"]
+                    yield self._sse_frame(event)
+            except GeneratorExit:
+                pass
+            except Exception as exc:
+                logger.debug("Mobile SSE stream ended for %s: %s", companion_hash, exc)
+            finally:
+                journal.unregister_listener(_on_event)
+
+        return generate()
+
+    events._cp_config = {"response.stream": True}

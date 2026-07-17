@@ -54,7 +54,25 @@ class CompanionEventJournal:
         with self._listeners_lock:
             self._listeners.append(fn)
 
-    def _notify(self, seq: int, event_type: str, payload: dict) -> None:
+    def unregister_listener(self, fn: Callable[[dict], None]) -> None:
+        """Remove a previously registered listener (SSE phase: generator
+        cleanup on disconnect). A no-op if ``fn`` isn't registered — callers
+        don't need to guard against double-unregister (e.g. in a ``finally``
+        that can run after an earlier error already cleaned up)."""
+        with self._listeners_lock:
+            try:
+                self._listeners.remove(fn)
+            except ValueError:
+                pass
+
+    def _notify(
+        self,
+        seq: int,
+        event_type: str,
+        payload: dict,
+        created_at: float,
+        packet_hash: Optional[str],
+    ) -> None:
         with self._listeners_lock:
             listeners = list(self._listeners)
         if not listeners:
@@ -62,7 +80,8 @@ class CompanionEventJournal:
         event = {
             "seq": seq,
             "event_type": event_type,
-            "created_at": time.time(),
+            "created_at": created_at,
+            "packet_hash": packet_hash,
             "payload": payload,
         }
         for fn in listeners:
@@ -85,12 +104,18 @@ class CompanionEventJournal:
         payload: dict,
         packet_hash: Optional[str] = None,
     ) -> Optional[int]:
+        # Captured once and passed through to the DB write so the row's
+        # created_at and the notified event's created_at agree exactly (SSE
+        # phase: a listener may fire before the caller ever reads the row
+        # back, and the two must not drift).
+        created_at = time.time()
         try:
             seq = self.sqlite_handler.companion_append_event(
                 self.companion_hash,
                 event_type,
                 payload,
                 packet_hash=packet_hash,
+                created_at=created_at,
             )
         except Exception:
             logger.exception(
@@ -100,7 +125,7 @@ class CompanionEventJournal:
             )
             return None
         if seq is not None:
-            self._notify(seq, event_type, payload)
+            self._notify(seq, event_type, payload, created_at, packet_hash)
         return seq
 
     def record_message(self, msg_dict: dict) -> Optional[int]:

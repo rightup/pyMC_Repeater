@@ -112,13 +112,47 @@ class TestListeners:
         received = []
         journal.register_listener(received.append)
 
-        seq = journal.record_message({"text": "hi"})
+        seq = journal.record_message({"text": "hi", "packet_hash": "ph-listen"})
 
         assert len(received) == 1
         assert received[0]["seq"] == seq
         assert received[0]["event_type"] == "message"
         assert "created_at" in received[0]
         assert "payload" in received[0]
+        # SSE phase (§8): the notified event carries packet_hash and the
+        # exact created_at written to the DB row, so a listener-fed stream
+        # can emit the same wire object sync/snapshot would for this seq.
+        assert received[0]["packet_hash"] == "ph-listen"
+        stored = journal.sqlite_handler.companion_get_events(_HASH, 0)
+        assert stored[0]["created_at"] == received[0]["created_at"]
+
+    def test_listener_packet_hash_none_when_absent(self, tmp_path):
+        journal = _journal(tmp_path)
+        received = []
+        journal.register_listener(received.append)
+
+        journal.record_prefs({"node_name": "x"})
+
+        assert received[0]["packet_hash"] is None
+
+    def test_unregister_listener_stops_future_notifications(self, tmp_path):
+        journal = _journal(tmp_path)
+        received = []
+        journal.register_listener(received.append)
+
+        journal.record_message({"text": "one"})
+        journal.unregister_listener(received.append)
+        journal.record_message({"text": "two"})
+
+        assert len(received) == 1
+
+    def test_unregister_unknown_listener_is_a_noop(self, tmp_path):
+        journal = _journal(tmp_path)
+
+        def _never_registered(event):
+            pass
+
+        journal.unregister_listener(_never_registered)  # must not raise
 
     def test_raising_listener_does_not_break_append_or_other_listeners(self, tmp_path):
         journal = _journal(tmp_path)
