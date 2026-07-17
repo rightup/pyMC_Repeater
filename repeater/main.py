@@ -7,6 +7,9 @@ import socket
 import sys
 import time
 
+from openhop_core.companion.radio_capabilities import resolve_max_tx_power_dbm
+from openhop_core.protocol.constants import PAYLOAD_TYPE_RAW_CUSTOM
+
 from repeater.companion.utils import (
     CompanionContactCapacityError,
     CompanionStateLoadError,
@@ -32,14 +35,11 @@ from repeater.handler_helpers import (
     TraceHelper,
 )
 from repeater.identity_manager import IdentityConfigurationError, IdentityManager, IdentitySpec
+from repeater.logging_utils import normalize_log_level
 from repeater.packet_router import PacketRouter
 from repeater.sensors import SensorManager
 from repeater.utils_packet import create_scoped_advert_packet
 from repeater.web.http_server import HTTPStatsServer, _log_buffer
-from repeater.logging_utils import normalize_log_level
-
-from openhop_core.companion.radio_capabilities import resolve_max_tx_power_dbm
-from openhop_core.protocol.constants import PAYLOAD_TYPE_RAW_CUSTOM
 
 logger = logging.getLogger("RepeaterDaemon")
 
