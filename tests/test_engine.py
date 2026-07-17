@@ -692,8 +692,10 @@ class TestForwardRoutedAck:
 
 # Literal MeshCore-format routed-ACK frames (Packet::writeTo layout).  MeshCore's
 # routeDirectRecvAcks re-emits through createAck: the header is rebuilt from
-# scratch (payload type ACK, route DIRECT, version bits cleared, transport codes
-# dropped) and this node is removed from the path.  Independent wire fixtures —
+# scratch (payload type ACK, route DIRECT, transport codes dropped) and this
+# node is removed from the path.  Non-zero-version inputs are not represented
+# here: firmware's Dispatcher::tryParsePacket (and our Packet.read_from) drops
+# them at parse, so they can never reach the relay.  Independent wire fixtures —
 # do NOT rebuild them through Packet.write_to()/PathUtils.
 FIRMWARE_ROUTED_ACK_VECTORS = (
     # header 0x0E = ACK<<2 | ROUTE_DIRECT; path_len 0x02 = 1-byte/2-hop;
@@ -718,13 +720,6 @@ FIRMWARE_ROUTED_ACK_VECTORS = (
         bytes.fromhex("0F3412785602ABCC4DABAF95"),
         bytes.fromhex("0E01CC4DABAF95"),
         id="transport-direct-1-byte-2-hop",
-    ),
-    # header 0x4E = version bit set on a direct ACK; createAck clears it.
-    pytest.param(
-        bytes([0xAB]),
-        bytes.fromhex("4E02ABCC4DABAF95"),
-        bytes.fromhex("0E01CC4DABAF95"),
-        id="direct-version-bits-cleared",
     ),
 )
 
