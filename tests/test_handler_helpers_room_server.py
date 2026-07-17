@@ -86,6 +86,28 @@ async def test_room_server_add_post_stores_message_and_updates_sync_state():
 
 
 @pytest.mark.asyncio
+async def test_room_server_add_post_does_not_advance_author_sync_watermark():
+    """Posting must not move the author's sync_since watermark: it advances only
+    when a push is ACKed. Self-echo is prevented by the author exclusion in the
+    unsynced-message query, so an on-post advance would only skip OTHER authors'
+    older, still-unsynced messages for this client. Activity is still refreshed."""
+    db = _FakeDB()
+    rs = _make_room_server(db=db, acl=_FakeACL([_FakeClient(b"C" * 32)]))
+
+    ok = await rs.add_post(
+        client_pubkey=b"A" * 32,
+        message_text="newer post",
+        sender_timestamp=222,
+        txt_type=TXT_TYPE_PLAIN,
+    )
+
+    assert ok is True
+    kwargs = db.upsert_client_sync.call_args.kwargs
+    assert "sync_since" not in kwargs
+    assert kwargs["last_activity"] > 0
+
+
+@pytest.mark.asyncio
 async def test_room_server_add_post_truncates_and_rate_limits_client():
     db = _FakeDB()
     rs = _make_room_server(db=db)
