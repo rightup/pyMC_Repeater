@@ -34,6 +34,7 @@ from .auth.middleware import require_auth
 from .auth_endpoints import AuthAPIEndpoints
 from .cad_calibration_engine import CADCalibrationEngine
 from .companion_endpoints import CompanionAPIEndpoints
+from .mobile_endpoints import MobileAPIEndpoints
 from .update_endpoints import UpdateAPIEndpoints
 
 logger = logging.getLogger("HTTPServer")
@@ -222,6 +223,9 @@ class APIEndpoints:
         self.companion = CompanionAPIEndpoints(
             daemon_instance, event_loop, self.config, self.config_manager
         )
+
+        # Create nested v1 object for /api/v1/* routes (Mobile Companion API)
+        self.v1 = MobileAPIEndpoints(daemon_instance=daemon_instance, config=self.config)
 
         # Create nested update object for /api/update/* routes
         self.update = UpdateAPIEndpoints()
