@@ -142,6 +142,29 @@ def test_acl_admin_login_sets_client_state_and_replay_protection():
     assert replay_perms == 0
 
 
+def test_acl_touch_client_session_watermark_is_monotonic():
+    """The replay watermark never moves backwards: if another accepted request
+    advanced it between the replay check and the session touch, an older (but
+    already-validated) timestamp must not regress it."""
+    identity = _FakeIdentity(b"B" * 32)
+    acl = ACL(max_clients=5, admin_password="top-secret", guest_password="guest")
+
+    ok, _ = acl.authenticate_client(
+        client_identity=identity,
+        shared_secret=b"k" * 32,
+        password="top-secret",
+        timestamp=2000,
+    )
+    assert ok is True
+    client = acl.get_client(b"B" * 40)
+
+    acl._touch_client_session(client, b"k" * 32, timestamp=1500)
+    assert client.last_timestamp == 2000
+
+    acl._touch_client_session(client, b"k" * 32, timestamp=2500)
+    assert client.last_timestamp == 2500
+
+
 def test_acl_max_clients_invalid_password_and_remove_client_paths():
     acl = ACL(max_clients=1, admin_password="a", guest_password="g")
     id_a = _FakeIdentity(b"C" * 32)
