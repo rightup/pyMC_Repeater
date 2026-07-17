@@ -669,3 +669,150 @@ async def test_protocol_request_real_crypto_consume_vs_collision_forward():
     assert await helper.process_request_packet(collision) is False
     assert not collision.is_marked_do_not_retransmit()
     injector.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# REQ_TYPE_GET_TELEMETRY_DATA (matches simple_repeater / simple_room_server
+# handleRequest). Response payload is CayenneLPP: a base voltage entry on
+# TELEM_CHANNEL_SELF, then configured sensors gated by the (inverse) perm mask.
+# ---------------------------------------------------------------------------
+
+from openhop_core.node.handlers.protocol_request import (  # noqa: E402
+    REQ_TYPE_GET_TELEMETRY_DATA,
+)
+from openhop_core.protocol.cayenne_lpp import (  # noqa: E402
+    TELEM_CHANNEL_SELF,
+    encode_relative_humidity,
+    encode_temperature,
+    encode_voltage,
+)
+
+
+class _FakeSensorManager:
+    """Minimal sensor manager exposing cached readings via get_summary()."""
+
+    def __init__(self, readings):
+        self._readings = readings
+
+    def get_summary(self):
+        return {"readings": self._readings}
+
+
+def _reading(ok=True, **data):
+    return {"name": "s", "type": "t", "ok": ok, "data": data}
+
+
+def test_telemetry_base_voltage_floor_when_no_sensors():
+    """No configured sensors -> base voltage-only floor of 0.0 V."""
+    helper = ProtocolRequestHelper(identity_manager=MagicMock(), packet_injector=AsyncMock())
+    admin = SimpleNamespace(is_guest=lambda: False)
+
+    lpp = helper._handle_get_telemetry(admin, 0, b"\x00")
+
+    assert lpp == encode_voltage(TELEM_CHANNEL_SELF, 0.0)
+
+
+def test_telemetry_base_voltage_from_ups_sensor():
+    """The configured UPS bus voltage seeds the base entry."""
+    sm = _FakeSensorManager([_reading(bus_voltage_v=12.6)])
+    helper = ProtocolRequestHelper(
+        identity_manager=MagicMock(), packet_injector=AsyncMock(), sensor_manager=sm
+    )
+    admin = SimpleNamespace(is_guest=lambda: False)
+
+    lpp = helper._handle_get_telemetry(admin, 0, b"\x00")
+
+    # No environment values on the UPS reading -> voltage entry only.
+    assert lpp == encode_voltage(TELEM_CHANNEL_SELF, 12.6)
+
+
+def test_telemetry_admin_full_mask_includes_environment_sensors():
+    """Admin with full mask gets configured env sensors after the base entry.
+
+    The UPS reading has no temperature/humidity, so channel 2 is assigned to the
+    first environment sensor (firmware querySensors channel assignment).
+    """
+    sm = _FakeSensorManager(
+        [
+            _reading(bus_voltage_v=12.6),
+            _reading(temperature_c=21.5, humidity_pct=55.0),
+        ]
+    )
+    helper = ProtocolRequestHelper(
+        identity_manager=MagicMock(), packet_injector=AsyncMock(), sensor_manager=sm
+    )
+    admin = SimpleNamespace(is_guest=lambda: False)
+
+    # req_data[0] = 0x00 inverse mask -> perm_mask 0xFF (environment allowed).
+    lpp = helper._handle_get_telemetry(admin, 0, b"\x00")
+
+    expected = (
+        encode_voltage(TELEM_CHANNEL_SELF, 12.6)
+        + encode_temperature(TELEM_CHANNEL_SELF + 1, 21.5)
+        + encode_relative_humidity(TELEM_CHANNEL_SELF + 1, 55.0)
+    )
+    assert lpp == expected
+
+
+def test_telemetry_guest_forced_to_base_only():
+    """A guest is restricted to base telemetry even when requesting the full mask."""
+    sm = _FakeSensorManager([_reading(temperature_c=21.5, humidity_pct=55.0)])
+    helper = ProtocolRequestHelper(
+        identity_manager=MagicMock(), packet_injector=AsyncMock(), sensor_manager=sm
+    )
+    guest = SimpleNamespace(is_guest=lambda: True)
+
+    lpp = helper._handle_get_telemetry(guest, 0, b"\x00")
+
+    assert lpp == encode_voltage(TELEM_CHANNEL_SELF, 0.0)
+
+
+def test_telemetry_inverse_mask_gates_environment():
+    """An inverse mask that clears the environment bit strips env sensors.
+
+    perm_mask = ~inverse_mask; inverse byte 0x04 clears TELEM_PERM_ENVIRONMENT.
+    """
+    sm = _FakeSensorManager([_reading(temperature_c=21.5)])
+    helper = ProtocolRequestHelper(
+        identity_manager=MagicMock(), packet_injector=AsyncMock(), sensor_manager=sm
+    )
+    admin = SimpleNamespace(is_guest=lambda: False)
+
+    lpp = helper._handle_get_telemetry(admin, 0, b"\x04")
+
+    assert lpp == encode_voltage(TELEM_CHANNEL_SELF, 0.0)
+
+
+@pytest.mark.asyncio
+async def test_telemetry_req_end_to_end_produces_response_and_advances_watermark():
+    """A real, correctly-encrypted telemetry REQ is consumed, answered through
+    the normal _build_response path, and advances the client replay watermark."""
+    local, sender, _remote = _distinct_identities()
+    local_hash = local.get_public_key()[0]
+
+    acl = _acl_with_client(sender, local_identity=local)
+    client = acl.clients[sender.get_public_key()]
+    assert client.last_timestamp == 0
+
+    sm = _FakeSensorManager([_reading(bus_voltage_v=12.6)])
+    injector = AsyncMock(return_value=True)
+    helper = ProtocolRequestHelper(
+        identity_manager=MagicMock(),
+        packet_injector=injector,
+        acl_dict={local_hash: acl},
+        sensor_manager=sm,
+    )
+    helper.register_identity("rep", local, identity_type="repeater")
+
+    genuine, ts = PacketBuilder.create_protocol_request(
+        _SendDest(local.get_public_key()),
+        sender,
+        REQ_TYPE_GET_TELEMETRY_DATA,
+        b"\x00",
+    )
+    with patch("repeater.handler_helpers.protocol_request.asyncio.sleep", new_callable=AsyncMock):
+        assert await helper.process_request_packet(genuine) is True
+
+    assert genuine.is_marked_do_not_retransmit()
+    injector.assert_awaited()  # a RESPONSE frame was transmitted
+    assert client.last_timestamp == ts  # replay watermark advanced
