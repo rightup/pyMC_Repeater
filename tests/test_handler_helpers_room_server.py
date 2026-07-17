@@ -1,3 +1,4 @@
+import asyncio
 import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -9,6 +10,7 @@ from repeater.handler_helpers.room_server import (
     MAX_UNSYNCED_POSTS,
     TXT_TYPE_PLAIN,
     TXT_TYPE_SIGNED_PLAIN,
+    GlobalRateLimiter,
     RoomServer,
     _truncate_utf8,
 )
@@ -509,3 +511,104 @@ async def test_room_server_start_and_stop_are_idempotent():
     # Ensure task is cleaned up.
     if first_task:
         assert first_task.cancelled() or first_task.done()
+
+
+def _push_post(author=b"F" * 32):
+    return {
+        "author_pubkey": author.hex(),
+        "message_text": "payload",
+        "post_timestamp": 1234.5,
+    }
+
+
+@pytest.mark.asyncio
+async def test_global_rate_limiter_serializes_concurrent_room_pushes():
+    """Two room loops sharing the limiter must not transmit concurrently, and
+    the inter-message gap must be enforced between their sends.
+
+    Regression: acquire() used to release the lock before returning, so
+    both pushes ran their radio send with no lock held.
+    """
+    limiter = GlobalRateLimiter(min_gap_seconds=0.05)
+
+    active = 0
+    max_active = 0
+    starts = []
+
+    async def injector(packet, wait_for_ack=True, expected_crc=0, ack_timeout_s=0.0):
+        nonlocal active, max_active
+        starts.append(time.monotonic())
+        active += 1
+        max_active = max(max_active, active)
+        try:
+            await asyncio.sleep(0.02)  # simulate airtime
+        finally:
+            active -= 1
+        return True
+
+    rooms = []
+    for i in range(2):
+        db = _FakeDB()
+        db.get_client_sync.return_value = {"push_failures": 0}
+        rs = _make_room_server(db=db, injector=injector)
+        rs.global_limiter = limiter  # share one real limiter across both rooms
+        rs._handle_ack_received = AsyncMock()
+        rooms.append(rs)
+
+    client = _FakeClient(pubkey=b"E" * 32)
+    packet = SimpleNamespace(path=bytearray(), path_len=0)
+    with (
+        patch(
+            "repeater.handler_helpers.room_server.CryptoUtils.sha256",
+            return_value=b"\x01\x02\x03\x04abcd",
+        ),
+        patch(
+            "repeater.handler_helpers.room_server.PacketBuilder.create_datagram",
+            return_value=packet,
+        ),
+    ):
+        results = await asyncio.gather(
+            *(rs.push_post_to_client(client, _push_post()) for rs in rooms)
+        )
+
+    assert results == [True, True]
+    assert max_active == 1  # never two transmissions in flight at once
+    assert len(starts) == 2
+    # The second send started at least min_gap after the first began.
+    assert starts[1] - starts[0] >= 0.05
+    assert not limiter.lock.locked()  # fully released at the end
+
+
+@pytest.mark.asyncio
+async def test_global_rate_limiter_releases_lock_on_send_exception():
+    """If the radio send raises, the limiter lock must still be released so the
+    next push is not deadlocked."""
+    limiter = GlobalRateLimiter(min_gap_seconds=0.0)
+
+    async def failing_injector(packet, **kwargs):
+        raise RuntimeError("radio boom")
+
+    db = _FakeDB()
+    db.get_client_sync.return_value = {"push_failures": 0}
+    rs = _make_room_server(db=db, injector=failing_injector)
+    rs.global_limiter = limiter
+
+    client = _FakeClient(pubkey=b"E" * 32)
+    packet = SimpleNamespace(path=bytearray(), path_len=0)
+    with (
+        patch(
+            "repeater.handler_helpers.room_server.CryptoUtils.sha256",
+            return_value=b"\x01\x02\x03\x04abcd",
+        ),
+        patch(
+            "repeater.handler_helpers.room_server.PacketBuilder.create_datagram",
+            return_value=packet,
+        ),
+    ):
+        ok = await rs.push_post_to_client(client, _push_post())
+
+    assert ok is False
+    assert not limiter.lock.locked()
+    # The lock is reusable immediately afterwards.
+    await limiter.acquire()
+    limiter.release()

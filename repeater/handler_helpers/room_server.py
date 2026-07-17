@@ -67,23 +67,35 @@ class GlobalRateLimiter:
     def __init__(self, min_gap_seconds: float = 0.1):
         self.min_gap = min_gap_seconds  # Minimum gap between consecutive messages
         self.lock = asyncio.Lock()  # Only one transmission at a time
-        self.last_release_time = 0
+        self.last_release_time = 0.0
 
     async def acquire(self):
+        """Acquire the global transmit lock and enforce the inter-message gap.
 
-        async with self.lock:
-            # Enforce minimum gap between consecutive transmissions
-            now = time.time()
-            time_since_last = now - self.last_release_time
+        The lock is **held on return** and must be released with ``release()``
+        (call it in a ``finally``). The previous implementation released the
+        lock inside an ``async with`` before returning, so the caller's radio
+        transmission ran with no lock held and multiple room loops could push
+        concurrently. A monotonic clock is used so a wall-clock jump cannot
+        skip or extend the gap.
+        """
+        await self.lock.acquire()
+        try:
+            time_since_last = time.monotonic() - self.last_release_time
             if time_since_last < self.min_gap:
                 wait_time = self.min_gap - time_since_last
                 logger.debug(f"Global rate limiter: waiting {wait_time * 1000:.0f}ms")
                 await asyncio.sleep(wait_time)
-            # Lock is now held - caller can transmit
-            # Will be released when context exits
+        except BaseException:
+            # Never leak the lock if the gap wait is cancelled.
+            self.lock.release()
+            raise
 
     def release(self):
-        self.last_release_time = time.time()
+        """Record the transmission time and release the transmit lock."""
+        self.last_release_time = time.monotonic()
+        if self.lock.locked():
+            self.lock.release()
 
 
 class RoomServer:
@@ -338,10 +350,6 @@ class RoomServer:
     async def push_post_to_client(self, client_info, post: Dict) -> bool:
 
         try:
-            # SAFETY: Global transmission lock - only ONE message on radio at a time
-            # This is critical because LoRa is serial (0.5-9s airtime per message)
-            await self.global_limiter.acquire()
-
             # SAFETY: Check client failure backoff
             sync_state = self.db.get_client_sync(
                 room_hash=f"0x{self.room_hash:02X}",
@@ -436,34 +444,47 @@ class RoomServer:
                     PUSH_TIMEOUT_BASE_MS + PUSH_ACK_TIMEOUT_FACTOR_MS * (path_len + 1)
                 ) / 1000.0
 
-            # Update client sync state with pending ACK
             current_sync_since = (
                 sync_state.get("sync_since", 0)
                 if sync_state
                 else getattr(client_info, "sync_since", 0)
             )
-            self.db.upsert_client_sync(
-                room_hash=f"0x{self.room_hash:02X}",
-                client_pubkey=client_info.id.get_public_key().hex(),
-                sync_since=current_sync_since,
-                pending_ack_crc=expected_ack_crc,
-                push_post_timestamp=post["post_timestamp"],
-                ack_timeout_time=time.time() + ack_timeout,
-                last_activity=time.time(),
-            )
-            # Send and wait for the client's delivery ACK. The injector must be
-            # told the crypto ACK CRC we computed above — its default
-            # (packet.get_crc()) is a packet-hash CRC no client ever sends.
-            # This blocks for the entire transmission duration (0.5-9 seconds)
-            success = await self.packet_injector(
-                packet,
-                wait_for_ack=True,
-                expected_crc=expected_ack_crc,
-                ack_timeout_s=ack_timeout,
-            )
 
-            # SAFETY: Release transmission lock AFTER send completes
-            self.global_limiter.release()
+            # SAFETY: Global transmission lock - only ONE message on the radio at
+            # a time, enforced across the entire send. LoRa is serial (0.5-9s
+            # airtime per message), and every room has its own sync loop sharing
+            # this limiter, so the lock must be held from before we start the ACK
+            # timeout clock through the blocking send. Released in `finally` so
+            # backoff/exception paths above (which returned before acquiring) do
+            # not, and the send path always does, free it exactly once.
+            await self.global_limiter.acquire()
+            try:
+                # Update client sync state with pending ACK. Done under the lock
+                # so the ACK-timeout clock starts when the send actually begins,
+                # not before the inter-message gap has elapsed.
+                self.db.upsert_client_sync(
+                    room_hash=f"0x{self.room_hash:02X}",
+                    client_pubkey=client_info.id.get_public_key().hex(),
+                    sync_since=current_sync_since,
+                    pending_ack_crc=expected_ack_crc,
+                    push_post_timestamp=post["post_timestamp"],
+                    ack_timeout_time=time.time() + ack_timeout,
+                    last_activity=time.time(),
+                )
+                # Send and wait for the client's delivery ACK. The injector must
+                # be told the crypto ACK CRC we computed above — its default
+                # (packet.get_crc()) is a packet-hash CRC no client ever sends.
+                # This blocks for the entire transmission duration (0.5-9 seconds)
+                success = await self.packet_injector(
+                    packet,
+                    wait_for_ack=True,
+                    expected_crc=expected_ack_crc,
+                    ack_timeout_s=ack_timeout,
+                )
+            finally:
+                # SAFETY: Release the transmission lock on every path (ACK,
+                # timeout, or exception during the send).
+                self.global_limiter.release()
 
             if success:
                 # ACK received! Update sync state
