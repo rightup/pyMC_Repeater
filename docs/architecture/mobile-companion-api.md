@@ -752,11 +752,17 @@ Budget rules for every endpoint in this document:
 
 ## 14. Migration and compatibility
 
-- **TCP frame protocol: unchanged.** Standard MeshCore clients keep working.
-  Frame-protocol delivery state (destructive pop) is already independent of
-  `companion_messages` retention for other readers; journal appends hook the
-  same persistence path (`_persist_companion_message`) *before* pop semantics
-  apply, so both consumers see every message.
+- **TCP frame protocol: preserved via soft-consume.** Standard MeshCore
+  clients keep working, but this required one storage-semantics change:
+  `companion_pop_message` historically **deleted** the row (the frame
+  protocol destructively drained history), which would have erased message
+  history out from under the API. Pop now *soft-consumes* — it sets a
+  `consumed_at` timestamp instead of deleting. Frame-protocol reads filter
+  `consumed_at IS NULL`, and offline-queue capacity/eviction counts only
+  unconsumed rows, so MeshCore clients observe identical queue behavior;
+  API history reads see all rows. Consumed rows age out on the normal
+  retention schedule. Journal appends hook the same persistence path
+  (`_persist_companion_message`), so both consumers see every message.
 - **Existing `/api/companion/*`: kept, frozen.** The web UI migrates to
   `/api/v1/companions/*` opportunistically (the SSE upgrade in §8 is the main
   win — reconnect without missing events). Once migrated, the old endpoints
