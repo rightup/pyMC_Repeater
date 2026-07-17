@@ -782,19 +782,94 @@ class SQLiteHandler:
                     )
                     logger.info(f"Migration '{migration_name}' applied successfully")
 
+                # Migration 15: Mobile Companion API phase 2 — device pairing
+                # and send idempotency (design doc §5.4, §11.1).
+                # companion_devices links a device API token 1:1 to a paired
+                # phone; companion_idempotency lets POST …/messages replay the
+                # original response for a retried Idempotency-Key instead of
+                # re-sending the RF packet (design doc §6). api_tokens gains a
+                # nullable 'scope' column: NULL means a pre-migration token,
+                # treated as 'admin' for backward compatibility (§11.1) — that
+                # defaulting happens in verify_api_token's returned dict, not
+                # by backfilling existing rows.
+                migration_name = "add_companion_devices_and_idempotency"
+                existing = conn.execute(
+                    "SELECT migration_name FROM migrations WHERE migration_name = ?",
+                    (migration_name,),
+                ).fetchone()
+                if not existing:
+                    cursor = conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table' AND name='companion_devices'"
+                    )
+                    if not cursor.fetchone():
+                        conn.execute(
+                            """
+                            CREATE TABLE companion_devices (
+                                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                companion_hash TEXT NOT NULL,
+                                device_id TEXT NOT NULL UNIQUE,
+                                name TEXT NOT NULL,
+                                token_id INTEGER NOT NULL,
+                                platform TEXT,
+                                push_token TEXT,
+                                push_relay_url TEXT,
+                                created_at REAL NOT NULL,
+                                last_seen REAL,
+                                last_synced_seq INTEGER
+                            )
+                            """
+                        )
+                        logger.info("Created companion_devices table")
+
+                    cursor = conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table' AND name='companion_idempotency'"
+                    )
+                    if not cursor.fetchone():
+                        conn.execute(
+                            """
+                            CREATE TABLE companion_idempotency (
+                                device_id TEXT NOT NULL,
+                                idempotency_key TEXT NOT NULL,
+                                request_hash TEXT NOT NULL,
+                                response_json TEXT NOT NULL,
+                                created_at REAL NOT NULL,
+                                PRIMARY KEY (device_id, idempotency_key)
+                            )
+                            """
+                        )
+                        logger.info("Created companion_idempotency table")
+
+                    cursor = conn.execute("PRAGMA table_info(api_tokens)")
+                    columns = [column[1] for column in cursor.fetchall()]
+                    if "scope" not in columns:
+                        conn.execute("ALTER TABLE api_tokens ADD COLUMN scope TEXT")
+                        logger.info("Added scope column to api_tokens table")
+
+                    conn.execute(
+                        "INSERT INTO migrations (migration_name, applied_at) VALUES (?, ?)",
+                        (migration_name, time.time()),
+                    )
+                    logger.info(f"Migration '{migration_name}' applied successfully")
+
                 conn.commit()
 
         except Exception as e:
             logger.error(f"Failed to run migrations: {e}")
 
     # API Token methods
-    def create_api_token(self, name: str, token_hash: str) -> int:
-        """Create a new API token entry"""
+    def create_api_token(self, name: str, token_hash: str, scope: Optional[str] = None) -> int:
+        """Create a new API token entry.
+
+        ``scope`` follows the mobile companion API's scope model (design doc
+        §11.1): ``companion:{name}``, ``companion:*``, or ``admin``. Leaving
+        it None is the existing (pre-companion-API) behavior and is treated
+        as 'admin' by verify_api_token for backward compatibility.
+        """
         try:
             with self._connect() as conn:
                 cursor = conn.execute(
-                    "INSERT INTO api_tokens (name, token_hash, created_at) VALUES (?, ?, ?)",
-                    (name, token_hash, time.time()),
+                    "INSERT INTO api_tokens (name, token_hash, created_at, scope) VALUES (?, ?, ?, ?)",
+                    (name, token_hash, time.time(), scope),
                 )
                 return cursor.lastrowid
         except Exception as e:
@@ -806,13 +881,13 @@ class SQLiteHandler:
         try:
             with self._connect() as conn:
                 cursor = conn.execute(
-                    "SELECT id, name, created_at, last_used FROM api_tokens WHERE token_hash = ?",
+                    "SELECT id, name, created_at, last_used, scope FROM api_tokens WHERE token_hash = ?",
                     (token_hash,),
                 )
                 row = cursor.fetchone()
 
                 if row:
-                    token_id, name, created_at, _last_used = row
+                    token_id, name, created_at, _last_used, scope = row
                     now = time.time()
 
                     # Throttle last_used updates to reduce write-lock contention.
@@ -824,7 +899,15 @@ class SQLiteHandler:
                         conn.commit()
                         self._api_token_last_used_updates[token_id] = now
 
-                    return {"id": token_id, "name": name, "created_at": created_at}
+                    # NULL scope means a pre-migration token; treat as 'admin'
+                    # for backward compatibility (design doc §11.1) rather
+                    # than backfilling existing rows.
+                    return {
+                        "id": token_id,
+                        "name": name,
+                        "created_at": created_at,
+                        "scope": scope if scope is not None else "admin",
+                    }
                 return None
         except Exception as e:
             logger.error(f"Failed to verify API token: {e}")
@@ -845,13 +928,19 @@ class SQLiteHandler:
         try:
             with self._connect() as conn:
                 cursor = conn.execute(
-                    "SELECT id, name, created_at, last_used FROM api_tokens ORDER BY created_at DESC"
+                    "SELECT id, name, created_at, last_used, scope FROM api_tokens ORDER BY created_at DESC"
                 )
 
                 tokens = []
                 for row in cursor.fetchall():
                     tokens.append(
-                        {"id": row[0], "name": row[1], "created_at": row[2], "last_used": row[3]}
+                        {
+                            "id": row[0],
+                            "name": row[1],
+                            "created_at": row[2],
+                            "last_used": row[3],
+                            "scope": row[4] if row[4] is not None else "admin",
+                        }
                     )
                 return tokens
         except Exception as e:
@@ -2467,10 +2556,12 @@ class SQLiteHandler:
             )
             events_deleted = self.companion_prune_events(companion_retention)
             consumed_deleted = self.companion_prune_consumed_messages(companion_retention)
-            if events_deleted > 0 or consumed_deleted > 0:
+            idempotency_deleted = self.companion_idempotency_prune()
+            if events_deleted > 0 or consumed_deleted > 0 or idempotency_deleted > 0:
                 logger.info(
                     f"Cleaned up {events_deleted} old companion journal events, "
-                    f"{consumed_deleted} old consumed companion messages"
+                    f"{consumed_deleted} old consumed companion messages, "
+                    f"{idempotency_deleted} old companion idempotency records"
                 )
 
         except Exception as e:
@@ -3841,14 +3932,22 @@ class SQLiteHandler:
         ref_table: Optional[str] = None,
         ref_id: Optional[int] = None,
         packet_hash: Optional[str] = None,
+        created_at: Optional[float] = None,
     ) -> Optional[int]:
         """Append one row to the companion event journal.
 
         Returns the new row's ``seq`` (the AUTOINCREMENT rowid), or None on
         failure. Callers should append in the same transaction scope as the
         state write the event describes where possible (design doc §5.4).
+
+        ``created_at`` defaults to ``time.time()`` when omitted. Callers that
+        also notify in-process listeners (``CompanionEventJournal._append``,
+        for the SSE phase) pass an explicit value so the timestamp on the
+        live-pushed event matches the one persisted here exactly.
         """
         try:
+            if created_at is None:
+                created_at = time.time()
             payload_json = json.dumps(payload, separators=(",", ":"))
             with self._connect() as conn:
                 cursor = conn.execute(
@@ -3860,7 +3959,7 @@ class SQLiteHandler:
                     (
                         companion_hash,
                         event_type,
-                        time.time(),
+                        created_at,
                         ref_table,
                         ref_id,
                         packet_hash,
@@ -4072,3 +4171,244 @@ class SQLiteHandler:
         except Exception as e:
             logger.error(f"Failed to prune consumed companion messages: {e}")
             return 0
+
+    # --- Companion idempotency (design doc §5.4, §6) -----------------------
+    #
+    # POST …/messages requires an Idempotency-Key header; a retried request
+    # with the same (device_id, idempotency_key) replays the stored response
+    # instead of re-sending the RF packet. Rows are pruned after 48h (§5.4),
+    # long past any plausible mobile retry horizon.
+
+    def companion_idempotency_get(
+        self, device_id: str, idempotency_key: str
+    ) -> Optional[Dict[str, Any]]:
+        """Return the stored {request_hash, response_json, created_at} for
+        this (device_id, idempotency_key), or None if no such row exists."""
+        try:
+            with self._connect() as conn:
+                conn.row_factory = sqlite3.Row
+                row = conn.execute(
+                    """
+                    SELECT request_hash, response_json, created_at
+                    FROM companion_idempotency
+                    WHERE device_id = ? AND idempotency_key = ?
+                    """,
+                    (device_id, idempotency_key),
+                ).fetchone()
+                if not row:
+                    return None
+                return {
+                    "request_hash": row["request_hash"],
+                    "response_json": row["response_json"],
+                    "created_at": row["created_at"],
+                }
+        except Exception as e:
+            logger.error(
+                f"Failed to get companion idempotency record for device {device_id}: {e}"
+            )
+            return None
+
+    def companion_idempotency_put(
+        self, device_id: str, idempotency_key: str, request_hash: str, response_json: str
+    ) -> bool:
+        """Record a (device_id, idempotency_key) -> response mapping.
+
+        Uses INSERT OR IGNORE so a concurrent duplicate write (two retries
+        racing each other) can't raise an IntegrityError; returns False if a
+        row for this key already existed (whether from the race or an
+        earlier call), True if this call created it.
+        """
+        try:
+            with self._connect() as conn:
+                cursor = conn.execute(
+                    """
+                    INSERT OR IGNORE INTO companion_idempotency
+                    (device_id, idempotency_key, request_hash, response_json, created_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (device_id, idempotency_key, request_hash, response_json, time.time()),
+                )
+                conn.commit()
+                return cursor.rowcount > 0
+        except Exception as e:
+            logger.error(
+                f"Failed to put companion idempotency record for device {device_id}: {e}"
+            )
+            return False
+
+    def companion_idempotency_prune(self, max_age_seconds: float = 48 * 3600) -> int:
+        """Delete companion_idempotency rows older than max_age_seconds.
+
+        Default 48h per design doc §5.4 — long past any plausible mobile
+        retry horizon. Returns the number of rows deleted.
+        """
+        try:
+            cutoff = time.time() - float(max_age_seconds)
+            with self._connect() as conn:
+                result = conn.execute(
+                    "DELETE FROM companion_idempotency WHERE created_at < ?", (cutoff,)
+                )
+                deleted = result.rowcount
+                conn.commit()
+                if deleted:
+                    logger.info(f"Pruned {deleted} old companion idempotency record(s)")
+                return deleted
+        except Exception as e:
+            logger.error(f"Failed to prune companion idempotency records: {e}")
+            return 0
+
+    # --- Companion devices (design doc §5.4, §11.2 pairing) -----------------
+
+    def companion_device_create(
+        self,
+        companion_hash: str,
+        device_id: str,
+        name: str,
+        token_id: int,
+        platform: Optional[str] = None,
+        push_relay_url: Optional[str] = None,
+    ) -> Optional[int]:
+        """Create a companion_devices row for a newly paired device.
+
+        Returns the new row's id, or None on failure (e.g. device_id already
+        registered — the column is UNIQUE).
+        """
+        try:
+            with self._connect() as conn:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO companion_devices
+                    (companion_hash, device_id, name, token_id, platform, push_relay_url, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        companion_hash,
+                        device_id,
+                        name,
+                        token_id,
+                        platform,
+                        push_relay_url,
+                        time.time(),
+                    ),
+                )
+                conn.commit()
+                return cursor.lastrowid
+        except Exception as e:
+            logger.error(f"Failed to create companion device {device_id}: {e}")
+            return None
+
+    @staticmethod
+    def _companion_device_row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
+        return {
+            "id": row["id"],
+            "companion_hash": row["companion_hash"],
+            "device_id": row["device_id"],
+            "name": row["name"],
+            "token_id": row["token_id"],
+            "platform": row["platform"],
+            "push_token": row["push_token"],
+            "push_relay_url": row["push_relay_url"],
+            "created_at": row["created_at"],
+            "last_seen": row["last_seen"],
+            "last_synced_seq": row["last_synced_seq"],
+        }
+
+    def companion_device_get(self, device_id: str) -> Optional[Dict[str, Any]]:
+        """Return the companion_devices row for device_id, or None."""
+        try:
+            with self._connect() as conn:
+                conn.row_factory = sqlite3.Row
+                row = conn.execute(
+                    "SELECT * FROM companion_devices WHERE device_id = ?", (device_id,)
+                ).fetchone()
+                return self._companion_device_row_to_dict(row) if row else None
+        except Exception as e:
+            logger.error(f"Failed to get companion device {device_id}: {e}")
+            return None
+
+    def companion_device_get_by_token(self, token_id: int) -> Optional[Dict[str, Any]]:
+        """Return the companion_devices row linked to token_id, or None."""
+        try:
+            with self._connect() as conn:
+                conn.row_factory = sqlite3.Row
+                row = conn.execute(
+                    "SELECT * FROM companion_devices WHERE token_id = ?", (token_id,)
+                ).fetchone()
+                return self._companion_device_row_to_dict(row) if row else None
+        except Exception as e:
+            logger.error(f"Failed to get companion device for token {token_id}: {e}")
+            return None
+
+    def companion_device_list(
+        self, companion_hash: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """List companion_devices rows, optionally filtered to one companion_hash."""
+        try:
+            with self._connect() as conn:
+                conn.row_factory = sqlite3.Row
+                if companion_hash is not None:
+                    rows = conn.execute(
+                        "SELECT * FROM companion_devices WHERE companion_hash = ? "
+                        "ORDER BY created_at DESC",
+                        (companion_hash,),
+                    ).fetchall()
+                else:
+                    rows = conn.execute(
+                        "SELECT * FROM companion_devices ORDER BY created_at DESC"
+                    ).fetchall()
+                return [self._companion_device_row_to_dict(row) for row in rows]
+        except Exception as e:
+            logger.error(f"Failed to list companion devices: {e}")
+            return []
+
+    def companion_device_touch(
+        self,
+        device_id: str,
+        last_seen: Optional[float] = None,
+        last_synced_seq: Optional[int] = None,
+    ) -> bool:
+        """Update last_seen and/or last_synced_seq for a device.
+
+        Only the provided fields are updated; omitted ones are left as-is.
+        last_seen defaults to now when neither argument is given a value by
+        the caller AND last_synced_seq is also omitted -- i.e. a bare call
+        with no arguments still records a "seen now" heartbeat.
+        """
+        try:
+            updates = []
+            params: List[Any] = []
+            if last_seen is not None:
+                updates.append("last_seen = ?")
+                params.append(last_seen)
+            if last_synced_seq is not None:
+                updates.append("last_synced_seq = ?")
+                params.append(last_synced_seq)
+            if not updates:
+                # Bare call: at least bump last_seen to now.
+                updates.append("last_seen = ?")
+                params.append(time.time())
+
+            params.append(device_id)
+            with self._connect() as conn:
+                cursor = conn.execute(
+                    f"UPDATE companion_devices SET {', '.join(updates)} WHERE device_id = ?",
+                    params,
+                )
+                conn.commit()
+                return cursor.rowcount > 0
+        except Exception as e:
+            logger.error(f"Failed to touch companion device {device_id}: {e}")
+            return False
+
+    def companion_device_delete(self, device_id: str) -> bool:
+        """Delete a companion_devices row (e.g. on token revocation)."""
+        try:
+            with self._connect() as conn:
+                cursor = conn.execute(
+                    "DELETE FROM companion_devices WHERE device_id = ?", (device_id,)
+                )
+                conn.commit()
+                return cursor.rowcount > 0
+        except Exception as e:
+            logger.error(f"Failed to delete companion device {device_id}: {e}")
+            return False

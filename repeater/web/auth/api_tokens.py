@@ -19,11 +19,11 @@ class APITokenManager:
     def hash_token(self, token: str) -> str:
         return hmac.new(self.secret_key, token.encode("utf-8"), hashlib.sha256).hexdigest()
 
-    def create_token(self, name: str) -> tuple[int, str]:
+    def create_token(self, name: str, scope: Optional[str] = None) -> tuple[int, str]:
         plaintext_token = self.generate_api_token()
         token_hash = self.hash_token(plaintext_token)
 
-        token_id = self.db.create_api_token(name, token_hash)
+        token_id = self.db.create_api_token(name, token_hash, scope=scope)
 
         logger.info(f"Created API token '{name}' with ID {token_id}")
         return token_id, plaintext_token
