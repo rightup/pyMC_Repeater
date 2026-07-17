@@ -377,8 +377,6 @@ class RepeaterDaemon:
             # Load additional identities from config (e.g., room servers)
             await self._load_additional_identities()
 
-            self.dispatcher._is_own_packet = lambda pkt: False
-
             self.repeater_handler = RepeaterHandler(
                 self.config,
                 self.dispatcher,
