@@ -502,6 +502,20 @@ class HTTPStatsServer:
                 "/api/config_import": {
                     "tools.require_auth.on": False,
                 },
+                # Mobile Companion API v1 public entry points (design doc
+                # §7.1, §11.2): server_info is the unauthenticated discovery
+                # endpoint an app validates a scanned URL against before it
+                # has any credential. This config path also covers
+                # "/api/v1/pair/start" (CherryPy config cascades to
+                # descendants) even though that endpoint is admin-only —
+                # it carries its own @require_auth decorator for that
+                # reason (see PairV1.start's docstring in mobile_endpoints.py).
+                "/api/v1/server_info": {
+                    "tools.require_auth.on": False,
+                },
+                "/api/v1/pair": {
+                    "tools.require_auth.on": False,
+                },
             }
 
             # Add WebSocket configuration to main config if available

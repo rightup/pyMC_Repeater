@@ -37,10 +37,13 @@ def check_auth():
         payload = jwt_handler.verify_jwt(token)
 
         if payload:
+            # Web UI operators are always 'admin' scope (design doc §11.1);
+            # scopes are a mobile-device-token concept, not a JWT one.
             cherrypy.request.user = {
                 "username": payload.get("sub"),
                 "client_id": payload.get("client_id"),
                 "auth_type": "jwt",
+                "scope": "admin",
             }
             return
 
@@ -55,6 +58,7 @@ def check_auth():
                 "username": payload.get("sub"),
                 "client_id": payload.get("client_id"),
                 "auth_type": "jwt_query",
+                "scope": "admin",
             }
             # Remove token from params to avoid exposing it in logs
             del cherrypy.request.params["token"]
@@ -66,10 +70,13 @@ def check_auth():
         token_info = token_manager.verify_token(api_key)
 
         if token_info:
+            # verify_token already NULL-defaults scope to 'admin' for
+            # pre-migration tokens (design doc §11.1 backward compat).
             cherrypy.request.user = {
                 "token_id": token_info["id"],
                 "token_name": token_info["name"],
                 "auth_type": "api_token",
+                "scope": token_info.get("scope", "admin"),
             }
             return
 

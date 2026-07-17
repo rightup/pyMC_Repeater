@@ -29,11 +29,14 @@ def require_auth(func):
             payload = jwt_handler.verify_jwt(token)
 
             if payload:
-                # JWT is valid
+                # JWT is valid. Web UI operators are always 'admin' scope
+                # (design doc §11.1) -- scopes are a mobile-device-token
+                # concept, not a JWT one.
                 cherrypy.request.user = {
                     "username": payload["sub"],
                     "client_id": payload["client_id"],
                     "auth_type": "jwt",
+                    "scope": "admin",
                 }
                 return func(*args, **kwargs)
             else:
@@ -52,6 +55,7 @@ def require_auth(func):
                     "username": payload["sub"],
                     "client_id": payload["client_id"],
                     "auth_type": "jwt_query",
+                    "scope": "admin",
                 }
                 if hasattr(cherrypy.request, "params") and "token" in cherrypy.request.params:
                     del cherrypy.request.params["token"]
@@ -65,12 +69,15 @@ def require_auth(func):
             token_info = token_manager.verify_token(api_key)
 
             if token_info:
-                # API token is valid
+                # API token is valid. verify_token already NULL-defaults
+                # scope to 'admin' for pre-migration tokens (design doc
+                # §11.1 backward compatibility).
                 cherrypy.request.user = {
                     "username": "api_token",
                     "token_name": token_info["name"],
                     "token_id": token_info["id"],
                     "auth_type": "api_token",
+                    "scope": token_info.get("scope", "admin"),
                 }
                 return func(*args, **kwargs)
             else:

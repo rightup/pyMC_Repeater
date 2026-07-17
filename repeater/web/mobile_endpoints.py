@@ -1,11 +1,16 @@
 """
 Mobile Companion API v1 endpoints (phase 1 sync core + phase 2 SSE stream +
-actions).
+actions + auth).
 
 Mounted as ``APIEndpoints.v1`` so CherryPy serves it at ``/api/v1/``.
-Implements the synchronization and action surface from
+Implements the synchronization, action, and auth surface from
 docs/architecture/mobile-companion-api.md §7:
 
+- ``GET /api/v1/server_info`` — unauthenticated discovery (§7.1, §11.3)
+- ``POST /api/v1/pair/start`` — admin-only pairing code generation (§11.2)
+- ``POST /api/v1/pair`` — exchange a pairing code for a device token (§11.2)
+- ``GET /api/v1/devices`` / ``DELETE /api/v1/devices/{device_id}`` — device
+  registry (§11.2 step 4)
 - ``GET /api/v1/companions`` — list companion identities
 - ``GET /api/v1/companions/{name}/snapshot`` — bootstrap document (§7.4)
 - ``GET /api/v1/companions/{name}/sync?cursor=&limit=`` — journal delta (§7.5)
@@ -28,7 +33,12 @@ Action endpoints mirror the bridge calls of the existing
 web UI. The one behavioral addition is the mandatory ``Idempotency-Key``
 contract on sends (§6): every ``POST …/messages`` transmits RF, so retries
 after a timeout must replay the original response instead of double-sending.
-Pairing (§11.2) arrives in a later phase.
+
+Scope enforcement (§11.1) lives at ``CompanionsV1._resolve`` — the one
+choke point every companion handler (including the undecorated ``events``
+SSE stream) passes through — checked against ``cherrypy.request.user``'s
+``scope``, which ``auth/middleware.py`` and ``auth/cherrypy_tool.py`` both
+set alongside the existing JWT/API-token verification.
 """
 
 import asyncio
@@ -36,6 +46,8 @@ import hashlib
 import json
 import logging
 import queue
+import secrets
+import threading
 import time
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from typing import Optional, Tuple
@@ -61,6 +73,37 @@ class MobileAPIEndpoints:
         self.config = config or {}
         self.event_loop = event_loop
         self.companions = CompanionsV1(daemon_instance, self.config, event_loop=event_loop)
+        self.pair = PairV1(daemon_instance, self.config, event_loop=event_loop)
+        self.devices = DevicesV1(daemon_instance, self.config, event_loop=event_loop)
+
+    # ------------------------------------------------------------------
+    # GET /api/v1/server_info  (unauthenticated, design doc §7.1 / §11.3)
+    # ------------------------------------------------------------------
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    def server_info(self, **kwargs):
+        """Unauthenticated-safe minimum so an app can validate a scanned
+        pairing URL before it has any credential (§7.1): server/site name,
+        supported API versions, supported auth modes, and repeater
+        version/time. Deliberately excludes companion names — the
+        ``/api/v1/companions`` listing requires auth, matching the design
+        doc's explicit "companion names list requires auth" note.
+        """
+        if cherrypy.request.method not in ("GET", "OPTIONS"):
+            cherrypy.response.headers["Allow"] = "GET"
+            raise cherrypy.HTTPError(405, "Method not allowed. Use GET.")
+        # Same source as the legacy /api/site_info (api_endpoints.py).
+        site_name = self.config.get("web", {}).get("site_name", "") or ""
+        return {
+            "success": True,
+            "data": {
+                "site_name": str(site_name),
+                "api_versions": ["v1"],
+                "auth_modes": ["jwt", "api_token"],
+                "server": {"version": _REPEATER_VERSION, "time": time.time()},
+            },
+        }
 
 
 class CompanionsV1:
@@ -197,6 +240,12 @@ class CompanionsV1:
         The hash string is lowercase ``'0x%02x'`` — the exact key format
         main.py uses for the companion_* SQLite namespaces (NOT the
         uppercase display form used by the legacy /api/companion listing).
+
+        This is the single choke point for scope enforcement (design doc
+        §11.1): every companion handler above, including the SSE ``events``
+        stream (which has no ``@require_auth`` decorator of its own — see
+        its docstring), resolves the companion name through here, so the
+        scope check below covers all of them uniformly.
         """
         if not name:
             raise cherrypy.HTTPError(400, "companion_name required")
@@ -212,8 +261,33 @@ class CompanionsV1:
                     hash_byte = identity.get_public_key()[0]
                     bridge = bridges.get(hash_byte)
                     if bridge:
+                        self._check_scope(name)
                         return bridge, f"0x{hash_byte:02x}"  # noqa: E231
         raise cherrypy.HTTPError(404, f"Companion '{name}' not found")
+
+    @staticmethod
+    def _check_scope(name: str) -> None:
+        """Enforce the caller's token scope against companion ``name``
+        (design doc §11.1): ``admin``, ``companion:*`` (all companions), or
+        ``companion:{name}`` (exact resolved name) are allowed; anything
+        else is a 403.
+
+        A ``request.user`` dict with no ``scope`` key at all is a
+        pre-scope-migration / legacy caller (e.g. a JWT payload predating
+        this change, or a test harness) and is treated as ``admin`` for
+        backward compatibility — ``verify_token``/``verify_jwt`` callers
+        already apply this same NULL-defaults-to-admin rule (design doc
+        §11.1). A genuinely missing ``request.user`` (require_auth didn't
+        run, or somehow didn't set it) has no scope to fall back to, so it
+        is rejected rather than silently treated as admin.
+        """
+        user = getattr(cherrypy.request, "user", None)
+        if user is None:
+            raise cherrypy.HTTPError(403, "No auth scope for this companion")
+        scope = user.get("scope", "admin")
+        if scope in ("admin", "companion:*", f"companion:{name}"):
+            return
+        raise cherrypy.HTTPError(403, "Insufficient scope for this companion")
 
     def _get_sqlite_handler(self):
         """Return the repeater's sqlite_handler, or raise 503 (same path as
@@ -281,10 +355,20 @@ class CompanionsV1:
     @cherrypy.tools.json_out()
     @require_auth
     def index(self, **kwargs):
-        """List configured companion identities."""
+        """List configured companion identities.
+
+        Filtered by the caller's scope (design doc §11.1): a
+        ``companion:{name}`` device token sees only its own companion —
+        the scope grants "the full companion API for ONE companion
+        identity", and that includes not enumerating the others' names
+        and public keys. ``admin``/``companion:*`` (and legacy scope-less
+        callers) see everything.
+        """
         self._require_get()
         if not self.daemon_instance:
             raise cherrypy.HTTPError(503, "Daemon not initialized")
+        user = getattr(cherrypy.request, "user", None) or {}
+        scope = user.get("scope", "admin")
         bridges = getattr(self.daemon_instance, "companion_bridges", {})
         identity_manager = getattr(self.daemon_instance, "identity_manager", None)
 
@@ -297,9 +381,12 @@ class CompanionsV1:
 
         items = []
         for hash_byte, bridge in bridges.items():
+            name = name_by_hash.get(hash_byte, "")
+            if scope not in ("admin", "companion:*", f"companion:{name}"):
+                continue
             items.append(
                 {
-                    "name": name_by_hash.get(hash_byte, ""),
+                    "name": name,
                     "companion_hash": f"0x{hash_byte:02x}",  # noqa: E231
                     "node_name": bridge.prefs.node_name,
                     "public_key": bridge.get_public_key().hex(),
@@ -786,3 +873,336 @@ class CompanionsV1:
         pub_key = self._pub_key_from_hex(contact_pubkey)
         ok = bridge.reset_path(pub_key)
         return self._success({"reset": ok})
+
+
+class PairV1:
+    """``/api/v1/pair`` and ``/api/v1/pair/start`` — QR pairing (design doc
+    §11.2).
+
+    Pairing codes live in an in-memory dict on this instance, guarded by a
+    lock (a single process serves the whole daemon, and codes are 5-minute
+    TTL by design — nothing here needs to survive a restart). Not reused
+    from ``CompanionsV1._resolve``: pairing has its own auth shape (``start``
+    requires admin scope explicitly; the exchange endpoint has no auth at
+    all — the code *is* the credential), so it deliberately does not route
+    through ``_resolve``'s per-companion scope gate.
+    """
+
+    _TTL_SEC = 300.0
+    _RATE_LIMIT_MAX = 10
+    _RATE_LIMIT_WINDOW_SEC = 60.0
+
+    def __init__(self, daemon_instance=None, config=None, event_loop=None):
+        self.daemon_instance = daemon_instance
+        self.config = config or {}
+        self.event_loop = event_loop
+        self._lock = threading.Lock()
+        self._codes: dict = {}  # code -> {companion_name, companion_hash, created_at}
+        self._attempts: list = []  # POST /pair attempt timestamps, for rate limiting
+
+    # ------------------------------------------------------------------
+    # Small helpers (deliberately not shared with CompanionsV1 — pairing's
+    # auth/resolve shape differs enough that reuse would be more confusing
+    # than a few duplicated lines; see class docstring).
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _success(data, **kwargs):
+        result = {"success": True, "data": data}
+        result.update(kwargs)
+        return result
+
+    @staticmethod
+    def _require_post():
+        if cherrypy.request.method != "POST":
+            cherrypy.response.headers["Allow"] = "POST"
+            raise cherrypy.HTTPError(405, "Method not allowed. Use POST.")
+
+    def _get_json_body(self) -> dict:
+        try:
+            raw = cherrypy.request.body.read()
+            return json.loads(raw) if raw else {}
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise cherrypy.HTTPError(400, f"Invalid JSON body: {exc}")
+
+    @staticmethod
+    def _check_admin_scope() -> None:
+        """pair/start is admin-only (design doc §11.2 step 1). Same
+        legacy-scope-less-dict-is-admin rule as
+        ``CompanionsV1._check_scope``."""
+        user = getattr(cherrypy.request, "user", None)
+        if user is None or user.get("scope", "admin") != "admin":
+            raise cherrypy.HTTPError(403, "Admin scope required")
+
+    def _resolve_companion(self, name: Optional[str]) -> Tuple[str, bytes]:
+        """Return ``(companion_hash_str, public_key_bytes)`` for a companion
+        name, 404 if unknown (mirrors the identity_manager lookup in
+        ``CompanionsV1._resolve``, without the bridge/scope-gate parts that
+        don't apply here)."""
+        if not name:
+            raise cherrypy.HTTPError(400, "companion_name required")
+        if not self.daemon_instance:
+            raise cherrypy.HTTPError(503, "Daemon not initialized")
+        identity_manager = getattr(self.daemon_instance, "identity_manager", None)
+        if identity_manager:
+            for reg_name, identity, _cfg in identity_manager.get_identities_by_type(
+                "companion"
+            ):
+                if reg_name == name:
+                    pub_key = identity.get_public_key()
+                    return f"0x{pub_key[0]:02x}", pub_key  # noqa: E231
+        raise cherrypy.HTTPError(404, f"Companion '{name}' not found")
+
+    def _get_sqlite_handler(self):
+        if not self.daemon_instance:
+            raise cherrypy.HTTPError(503, "Daemon not initialized")
+        repeater_handler = getattr(self.daemon_instance, "repeater_handler", None)
+        if not repeater_handler:
+            raise cherrypy.HTTPError(503, "Repeater handler not initialized")
+        storage = getattr(repeater_handler, "storage", None)
+        if not storage:
+            raise cherrypy.HTTPError(503, "Storage not initialized")
+        sqlite_handler = getattr(storage, "sqlite_handler", None)
+        if not sqlite_handler:
+            raise cherrypy.HTTPError(503, "SQLite storage not available")
+        return sqlite_handler
+
+    def _sweep_expired_locked(self) -> None:
+        """Drop expired codes. Caller must hold ``self._lock``."""
+        now = time.time()
+        expired = [
+            code
+            for code, entry in self._codes.items()
+            if now - entry["created_at"] > self._TTL_SEC
+        ]
+        for code in expired:
+            del self._codes[code]
+
+    def _check_rate_limit(self) -> None:
+        """Small in-memory fixed-window counter (design doc §11.3): max
+        ``_RATE_LIMIT_MAX`` POST /pair attempts per ``_RATE_LIMIT_WINDOW_SEC``
+        across all callers. A single global counter is fine for a Pi-class
+        single-tenant deployment; applied before code lookup so it blunts
+        guessing regardless of whether the guessed code exists."""
+        with self._lock:
+            now = time.time()
+            self._attempts = [
+                t for t in self._attempts if now - t < self._RATE_LIMIT_WINDOW_SEC
+            ]
+            if len(self._attempts) >= self._RATE_LIMIT_MAX:
+                raise cherrypy.HTTPError(429, "Too many pairing attempts, try again later")
+            self._attempts.append(now)
+
+    # ------------------------------------------------------------------
+    # POST /api/v1/pair/start  (admin scope, design doc §11.2 step 1)
+    # ------------------------------------------------------------------
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    @require_auth
+    def start(self, **kwargs):
+        """Generate a single-use, 5-minute pairing code for a companion.
+
+        Body: ``{companion_name, device_name?}`` (``device_name`` is
+        accepted for a future audit-log/QR-label use but not otherwise
+        used in v1). Response data: ``{code, expires_in, companion_name,
+        fingerprint}`` — ``fingerprint`` is the sha256 hexdigest of the
+        companion identity's public key; this is what the app pins on
+        first pair (TOFU, §11.3) to detect later server substitution even
+        without TLS. Assembling the QR code / pairing URL from these
+        ingredients is the web UI's job, not this endpoint's.
+        """
+        self._require_post()
+        self._check_admin_scope()
+        body = self._get_json_body()
+        companion_name = body.get("companion_name")
+        companion_hash, pub_key = self._resolve_companion(companion_name)
+
+        code = secrets.token_hex(16)  # 128-bit pairing code (§11.3)
+        fingerprint = hashlib.sha256(pub_key).hexdigest()
+        with self._lock:
+            self._sweep_expired_locked()
+            self._codes[code] = {
+                "companion_name": companion_name,
+                "companion_hash": companion_hash,
+                "created_at": time.time(),
+            }
+
+        return self._success(
+            {
+                "code": code,
+                "expires_in": int(self._TTL_SEC),
+                "companion_name": companion_name,
+                "fingerprint": fingerprint,
+            }
+        )
+
+    # ------------------------------------------------------------------
+    # POST /api/v1/pair  (no auth — the pairing code is the credential)
+    # ------------------------------------------------------------------
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    def index(self, **kwargs):
+        """Exchange a pairing code for a device API token (design doc
+        §11.2 steps 2-3).
+
+        Deliberately NOT decorated with ``@require_auth`` — the pairing
+        code itself is the credential. http_server.py exempts
+        ``"/api/v1/pair"`` from the tool-level ``require_auth`` config;
+        because CherryPy config paths cascade to descendants, that same
+        exemption also covers ``"/api/v1/pair/start"``, which is why
+        ``start()`` above carries its own ``@require_auth`` decorator
+        instead of relying on the tool-level gate.
+
+        Body: ``{code, device_id, name, platform?}``. The code is consumed
+        atomically (popped under the lock) so a code can only ever produce
+        one token; unknown or expired codes both 404 with the same message
+        so a caller can't distinguish "wrong code" from "code expired".
+        """
+        self._require_post()
+        self._check_rate_limit()
+
+        body = self._get_json_body()
+        code = body.get("code")
+        device_id = body.get("device_id")
+        name = body.get("name")
+        platform = body.get("platform")
+        if not code or not device_id or not name:
+            raise cherrypy.HTTPError(400, "code, device_id, and name are required")
+
+        with self._lock:
+            self._sweep_expired_locked()
+            entry = self._codes.pop(code, None)
+        if entry is None:
+            raise cherrypy.HTTPError(404, "Invalid or expired pairing code")
+
+        companion_name = entry["companion_name"]
+        companion_hash = entry["companion_hash"]
+
+        token_manager = cherrypy.config.get("token_manager")
+        if not token_manager:
+            raise cherrypy.HTTPError(500, "Authentication not configured")
+
+        scope = f"companion:{companion_name}"  # noqa: E231
+        token_id, plaintext = token_manager.create_token(name=f"device:{name}", scope=scope)
+
+        handler = self._get_sqlite_handler()
+        created = handler.companion_device_create(
+            companion_hash, device_id, name, token_id, platform
+        )
+        if created is None:
+            # device_id already registered (UNIQUE constraint) -- the token
+            # we just minted is an orphan; clean it up rather than leaving
+            # an unreachable credential behind.
+            handler.revoke_api_token(token_id)
+            raise cherrypy.HTTPError(409, "device_id already registered")
+
+        return self._success(
+            {
+                "token": plaintext,
+                "device_id": device_id,
+                "companion_name": companion_name,
+                "scope": scope,
+            }
+        )
+
+
+class DevicesV1:
+    """``/api/v1/devices`` — admin-only paired-device registry (design doc
+    §11.2 step 4)."""
+
+    def __init__(self, daemon_instance=None, config=None, event_loop=None):
+        self.daemon_instance = daemon_instance
+        self.config = config or {}
+        self.event_loop = event_loop
+
+    def _cp_dispatch(self, vpath):
+        """Route ``DELETE /devices/{device_id}``. ``GET /devices`` (empty
+        vpath) resolves to ``index`` through CherryPy's normal dispatch."""
+        if len(vpath) == 1:
+            device_id = vpath.pop(0)
+            cherrypy.request.params["device_id"] = device_id
+            return self.delete
+        return None
+
+    @staticmethod
+    def _success(data, **kwargs):
+        result = {"success": True, "data": data}
+        result.update(kwargs)
+        return result
+
+    @staticmethod
+    def _check_admin_scope() -> None:
+        user = getattr(cherrypy.request, "user", None)
+        if user is None or user.get("scope", "admin") != "admin":
+            raise cherrypy.HTTPError(403, "Admin scope required")
+
+    def _get_sqlite_handler(self):
+        if not self.daemon_instance:
+            raise cherrypy.HTTPError(503, "Daemon not initialized")
+        repeater_handler = getattr(self.daemon_instance, "repeater_handler", None)
+        if not repeater_handler:
+            raise cherrypy.HTTPError(503, "Repeater handler not initialized")
+        storage = getattr(repeater_handler, "storage", None)
+        if not storage:
+            raise cherrypy.HTTPError(503, "Storage not initialized")
+        sqlite_handler = getattr(storage, "sqlite_handler", None)
+        if not sqlite_handler:
+            raise cherrypy.HTTPError(503, "SQLite storage not available")
+        return sqlite_handler
+
+    # ------------------------------------------------------------------
+    # GET /api/v1/devices
+    # ------------------------------------------------------------------
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    @require_auth
+    def index(self, **kwargs):
+        """List paired devices across all companions. ``last_seen`` is
+        filled in from the linked api_token's ``last_used`` when that is
+        newer than the device row's own ``last_seen`` — presence is derived
+        from token use rather than a per-request DB write here (no write
+        amplification for something that's purely informational)."""
+        if cherrypy.request.method not in ("GET", "OPTIONS"):
+            cherrypy.response.headers["Allow"] = "GET"
+            raise cherrypy.HTTPError(405, "Method not allowed. Use GET.")
+        self._check_admin_scope()
+        handler = self._get_sqlite_handler()
+
+        last_used_by_token = {t["id"]: t.get("last_used") for t in handler.list_api_tokens()}
+
+        items = []
+        for device in handler.companion_device_list():
+            item = dict(device)
+            token_last_used = last_used_by_token.get(device["token_id"])
+            if token_last_used is not None and (
+                item["last_seen"] is None or token_last_used > item["last_seen"]
+            ):
+                item["last_seen"] = token_last_used
+            items.append(item)
+        return self._success(items)
+
+    # ------------------------------------------------------------------
+    # DELETE /api/v1/devices/{device_id}  (revoke, routed via _cp_dispatch)
+    # ------------------------------------------------------------------
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    @require_auth
+    def delete(self, device_id=None, **kwargs):
+        """Revoke a paired device: deletes its api_token row (the next
+        request with that token 401s naturally) and its companion_devices
+        row."""
+        if cherrypy.request.method != "DELETE":
+            cherrypy.response.headers["Allow"] = "DELETE"
+            raise cherrypy.HTTPError(405, "Method not allowed. Use DELETE.")
+        self._check_admin_scope()
+        handler = self._get_sqlite_handler()
+        device = handler.companion_device_get(device_id)
+        if device is None:
+            raise cherrypy.HTTPError(404, f"Device '{device_id}' not found")
+        handler.revoke_api_token(device["token_id"])
+        handler.companion_device_delete(device_id)
+        return self._success({"revoked": True, "device_id": device_id})

@@ -77,10 +77,17 @@ def endpoints(handler, journal):
 
 @pytest.fixture(autouse=True)
 def request_context():
-    """Minimal CherryPy request/response state for direct handler calls."""
+    """Minimal CherryPy request/response state for direct handler calls.
+
+    ``request.user`` defaults to an admin-scope caller: _resolve (called
+    from events()) now runs a scope check (design doc §11.1) that would
+    otherwise 403 every stream here, none of which are about scope
+    enforcement itself (see tests/test_mobile_pairing.py for that).
+    """
     cherrypy.serving.request.method = "GET"
     cherrypy.serving.request.headers = {}
     cherrypy.serving.request.params = {}
+    cherrypy.serving.request.user = {"username": "test", "auth_type": "jwt", "scope": "admin"}
     cherrypy.serving.response.headers = {}
     cherrypy.serving.response.status = None
     yield
