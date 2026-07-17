@@ -38,6 +38,8 @@ class CompanionFrameServer(_BaseFrameServer):
         local_hash: Optional[int] = None,
         stats_getter=None,
         control_handler=None,
+        *,
+        journal=None,
     ):
         super().__init__(
             bridge=bridge,
@@ -53,6 +55,7 @@ class CompanionFrameServer(_BaseFrameServer):
             control_handler=control_handler,
         )
         self.sqlite_handler = sqlite_handler
+        self.journal = journal
 
     async def start(self) -> None:
         """Start persistence before accepting companion client connections."""
@@ -92,6 +95,8 @@ class CompanionFrameServer(_BaseFrameServer):
         )
         if persisted:
             self.bridge.message_queue.pop_last()
+            if self.journal is not None:
+                await asyncio.to_thread(self.journal.record_message, msg_dict)
         else:
             logger.debug(
                 "Companion %s: retaining message in memory after SQLite queue rejection",
@@ -180,9 +185,16 @@ class CompanionFrameServer(_BaseFrameServer):
             self.companion_hash,
             contact_dict,
         )
+        if self.journal is not None:
+            await asyncio.to_thread(self.journal.record_contact, contact_dict, "update")
 
     async def _save_contacts(self) -> None:
-        """Persist all contacts to SQLite (non-blocking)."""
+        """Persist all contacts to SQLite (non-blocking).
+
+        Bulk stop-time save: not journaled (would spam the journal with the
+        entire contact set on every restart). Channel/bulk journal events are
+        deferred to phase 2.
+        """
         if not self.sqlite_handler:
             return
         contacts = self.bridge.get_contacts()
@@ -194,7 +206,12 @@ class CompanionFrameServer(_BaseFrameServer):
         )
 
     async def _save_channels(self) -> None:
-        """Persist channels to SQLite (non-blocking)."""
+        """Persist channels to SQLite (non-blocking).
+
+        Bulk stop-time save: not journaled (would spam the journal with the
+        entire channel set on every restart). Channel/bulk journal events are
+        deferred to phase 2.
+        """
         if not self.sqlite_handler:
             return
         channels = []

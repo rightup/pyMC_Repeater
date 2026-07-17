@@ -685,7 +685,11 @@ class RepeaterDaemon:
 
     async def _load_companion_identities(self) -> None:
         """Load companion identities from config and create CompanionBridge + frame server for each."""
-        from repeater.companion import CompanionFrameServer, RepeaterCompanionBridge
+        from repeater.companion import (
+            CompanionEventJournal,
+            CompanionFrameServer,
+            RepeaterCompanionBridge,
+        )
 
         companion_specs = self._companion_specs
         if companion_specs is None:
@@ -765,6 +769,24 @@ class RepeaterDaemon:
                             max_contacts,
                         )
 
+                journal = (
+                    CompanionEventJournal(sqlite_handler, companion_hash_str)
+                    if sqlite_handler
+                    else None
+                )
+
+                _sync_node_name_to_config = _make_sync_node_name_to_config(name)
+
+                def _on_companion_prefs_saved(
+                    new_node_name: str,
+                    _journal=journal,
+                    _sync=_sync_node_name_to_config,
+                ) -> None:
+                    """Journal the prefs change, then run the existing config-sync hook."""
+                    if _journal is not None:
+                        _journal.record_prefs({"node_name": new_node_name})
+                    _sync(new_node_name)
+
                 bridge = RepeaterCompanionBridge(
                     identity=identity,
                     # Tag the injector with this companion's hash so inject_packet can
@@ -779,7 +801,7 @@ class RepeaterDaemon:
                     max_tx_power_getter=self._get_companion_max_tx_power_dbm,
                     sqlite_handler=sqlite_handler,
                     companion_hash=companion_hash_str,
-                    on_prefs_saved=_make_sync_node_name_to_config(name),
+                    on_prefs_saved=_on_companion_prefs_saved,
                     **bridge_kwargs,
                 )
 
@@ -811,6 +833,7 @@ class RepeaterDaemon:
                     control_handler=(
                         self.discovery_helper.control_handler if self.discovery_helper else None
                     ),
+                    journal=journal,
                 )
                 await frame_server.start()
                 self.companion_frame_servers.append(frame_server)
@@ -925,7 +948,11 @@ class RepeaterDaemon:
         """
         from openhop_core import LocalIdentity
 
-        from repeater.companion import CompanionFrameServer, RepeaterCompanionBridge
+        from repeater.companion import (
+            CompanionEventJournal,
+            CompanionFrameServer,
+            RepeaterCompanionBridge,
+        )
         from repeater.companion.constants import DEFAULT_PUBLIC_CHANNEL_SECRET
 
         name = comp_config.get("name")
@@ -1003,6 +1030,15 @@ class RepeaterDaemon:
                     max_contacts,
                 )
 
+        journal = (
+            CompanionEventJournal(sqlite_handler, companion_hash_str) if sqlite_handler else None
+        )
+
+        def _on_companion_prefs_saved(new_node_name: str, _journal=journal) -> None:
+            """Journal the prefs change (no config-name sync in hot-reload path)."""
+            if _journal is not None:
+                _journal.record_prefs({"node_name": new_node_name})
+
         bridge = RepeaterCompanionBridge(
             identity=identity,
             packet_injector=functools.partial(
@@ -1014,6 +1050,7 @@ class RepeaterDaemon:
             max_tx_power_getter=self._get_companion_max_tx_power_dbm,
             sqlite_handler=sqlite_handler,
             companion_hash=companion_hash_str,
+            on_prefs_saved=_on_companion_prefs_saved,
             **bridge_kwargs,
         )
 
@@ -1039,6 +1076,7 @@ class RepeaterDaemon:
             control_handler=(
                 self.discovery_helper.control_handler if self.discovery_helper else None
             ),
+            journal=journal,
         )
         await frame_server.start()
         self.companion_frame_servers.append(frame_server)

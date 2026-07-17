@@ -15,8 +15,10 @@ from .constants import (
     RESP_CODE_OK,
 )
 from .frame_server import CompanionFrameServer
+from .journal import CompanionEventJournal
 
 __all__ = [
+    "CompanionEventJournal",
     "CompanionFrameServer",
     "RepeaterCompanionBridge",
     "CMD_APP_START",
