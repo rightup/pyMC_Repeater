@@ -384,6 +384,123 @@ async def test_room_server_push_expected_ack_matches_firmware_signed_ack():
 
 
 @pytest.mark.asyncio
+async def test_push_serializes_stored_post_timestamp_not_walltime():
+    """The pushed frame's timestamp must be the post's own stored timestamp,
+    not the delivery wall-clock time (MyMesh.cpp:56 serializes the stored
+    post's timestamp, not `now`)."""
+    db = _FakeDB()
+    db.get_client_sync.return_value = {"push_failures": 0}
+    injector = AsyncMock(return_value=True)
+    rs = _make_room_server(db=db, injector=injector)
+    rs.global_limiter = SimpleNamespace(acquire=AsyncMock(), release=MagicMock())
+    rs._handle_ack_received = AsyncMock()
+
+    client = _FakeClient(pubkey=b"E" * 32)
+    post = {
+        "author_pubkey": (b"F" * 32).hex(),
+        "message_text": "payload",
+        "post_timestamp": 1000.0,
+    }
+
+    packet = SimpleNamespace(path=bytearray(), path_len=0)
+    with (
+        patch(
+            "repeater.handler_helpers.room_server.CryptoUtils.sha256",
+            return_value=b"\x01\x02\x03\x04abcd",
+        ),
+        patch(
+            "repeater.handler_helpers.room_server.PacketBuilder.create_datagram",
+            return_value=packet,
+        ) as create_datagram,
+    ):
+        ok = await rs.push_post_to_client(client, post)
+
+    assert ok is True
+    plaintext = create_datagram.call_args.kwargs["plaintext"]
+    assert int.from_bytes(plaintext[0:4], "little") == 1000
+
+
+@pytest.mark.asyncio
+async def test_push_attempt_bits_randomized_across_retries():
+    """Each push must OR a fresh random byte's low 2 bits into flags so a
+    retried post gets a different packet hash (and ACK), per MyMesh.cpp:59-60
+    ("so packet hash (and ACK) will be different")."""
+    db = _FakeDB()
+    db.get_client_sync.return_value = {"push_failures": 0}
+    injector = AsyncMock(return_value=True)
+    rs = _make_room_server(db=db, injector=injector)
+    rs.global_limiter = SimpleNamespace(acquire=AsyncMock(), release=MagicMock())
+    rs._handle_ack_received = AsyncMock()
+
+    client = _FakeClient(pubkey=b"E" * 32)
+    post = {
+        "author_pubkey": (b"F" * 32).hex(),
+        "message_text": "payload",
+        "post_timestamp": 1234.5,
+    }
+
+    plaintexts = []
+    acks = []
+    with patch("repeater.handler_helpers.room_server.secrets.randbits", side_effect=[1, 2]):
+        for _ in range(2):
+            packet = SimpleNamespace(path=bytearray(), path_len=0)
+            with patch(
+                "repeater.handler_helpers.room_server.PacketBuilder.create_datagram",
+                return_value=packet,
+            ) as create_datagram:
+                ok = await rs.push_post_to_client(client, post)
+            assert ok is True
+            plaintexts.append(create_datagram.call_args.kwargs["plaintext"])
+            acks.append(db.upsert_client_sync.call_args.kwargs["pending_ack_crc"])
+
+    flags = [pt[4] for pt in plaintexts]
+    assert (flags[0] >> 2) & 0x3F == TXT_TYPE_SIGNED_PLAIN
+    assert (flags[1] >> 2) & 0x3F == TXT_TYPE_SIGNED_PLAIN
+    assert flags[0] & 0x03 != flags[1] & 0x03
+    assert plaintexts[0][0:4] == plaintexts[1][0:4]  # timestamp unchanged
+    assert plaintexts[0][5:] == plaintexts[1][5:]  # author prefix + text unchanged
+    assert acks[0] != acks[1]
+
+
+@pytest.mark.asyncio
+async def test_push_watermark_equals_serialized_timestamp():
+    """The db sync watermark update must use the same timestamp value that
+    was serialized into the pushed plaintext."""
+    db = _FakeDB()
+    db.get_client_sync.return_value = {"push_failures": 0}
+    injector = AsyncMock(return_value=True)
+    rs = _make_room_server(db=db, injector=injector)
+    rs.global_limiter = SimpleNamespace(acquire=AsyncMock(), release=MagicMock())
+    rs._handle_ack_received = AsyncMock()
+
+    client = _FakeClient(pubkey=b"E" * 32)
+    post = {
+        "author_pubkey": (b"F" * 32).hex(),
+        "message_text": "payload",
+        "post_timestamp": 555.0,
+    }
+
+    packet = SimpleNamespace(path=bytearray(), path_len=0)
+    with (
+        patch(
+            "repeater.handler_helpers.room_server.CryptoUtils.sha256",
+            return_value=b"\x01\x02\x03\x04abcd",
+        ),
+        patch(
+            "repeater.handler_helpers.room_server.PacketBuilder.create_datagram",
+            return_value=packet,
+        ) as create_datagram,
+    ):
+        ok = await rs.push_post_to_client(client, post)
+
+    assert ok is True
+    plaintext = create_datagram.call_args.kwargs["plaintext"]
+    serialized_ts = int.from_bytes(plaintext[0:4], "little")
+    watermark = db.upsert_client_sync.call_args.kwargs["push_post_timestamp"]
+    assert int(watermark) == serialized_ts
+
+
+@pytest.mark.asyncio
 async def test_room_server_push_post_to_client_backoff_skip_and_timeout_path():
     db = _FakeDB()
     injector = AsyncMock(return_value=False)

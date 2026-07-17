@@ -379,9 +379,13 @@ class RoomServer:
                         )
                         return False  # Skip this client for now
 
-            # Build message payload
-            timestamp = int(time.time())
-            flags = TXT_TYPE_SIGNED_PLAIN << 2  # Include author prefix
+            # Build message payload.
+            # Timestamp is the post's own stored timestamp, not the delivery
+            # time (MyMesh.cpp:56 serializes the stored post's timestamp).
+            timestamp = int(post["post_timestamp"])
+            # Low 2 bits carry a random attempt nonce so retries of the same
+            # post get a different packet hash/ACK (MyMesh.cpp:59-60).
+            flags = (TXT_TYPE_SIGNED_PLAIN << 2) | (secrets.randbits(8) & 0x03)
 
             # Author prefix (first 4 bytes of pubkey)
             author_pubkey = bytes.fromhex(post["author_pubkey"])
