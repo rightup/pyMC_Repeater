@@ -225,7 +225,9 @@ class APIEndpoints:
         )
 
         # Create nested v1 object for /api/v1/* routes (Mobile Companion API)
-        self.v1 = MobileAPIEndpoints(daemon_instance=daemon_instance, config=self.config)
+        self.v1 = MobileAPIEndpoints(
+            daemon_instance=daemon_instance, config=self.config, event_loop=self.event_loop
+        )
 
         # Create nested update object for /api/update/* routes
         self.update = UpdateAPIEndpoints()
