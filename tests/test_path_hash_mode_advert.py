@@ -34,8 +34,8 @@ class MockRadio:
 def _make_advert_packet():
     """Build a 0-hop flood ADVERT packet (same shape as PacketBuilder.create_advert)."""
     pkt = Packet()
-    # Version 1, ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_ADVERT
-    pkt.header = (1 << 6) | (PAYLOAD_TYPE_ADVERT << PH_TYPE_SHIFT) | ROUTE_TYPE_FLOOD
+    # Version 0 (the only version firmware accepts), ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_ADVERT
+    pkt.header = (PAYLOAD_TYPE_ADVERT << PH_TYPE_SHIFT) | ROUTE_TYPE_FLOOD
     pkt.path_len = 0
     pkt.path = bytearray()
     pkt.payload = bytearray(b"minimal_advert_payload")
