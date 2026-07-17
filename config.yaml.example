@@ -523,6 +523,10 @@ storage:
     # Clean up SQLite records older than this many days
     sqlite_cleanup_days: 31
 
+    # Companion API event journal and consumed message history retention.
+    # A mobile client offline longer than this must take a fresh snapshot.
+    companion_events_days: 31
+
     # RRD archives are managed automatically:
     # - 1 minute resolution for 1 week
     # - 5 minute resolution for 1 month

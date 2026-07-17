@@ -711,6 +711,77 @@ class SQLiteHandler:
                     )
                     logger.info(f"Migration '{migration_name}' applied successfully")
 
+                # Migration 14: Mobile Companion API phase 1 — event journal.
+                # companion_events is the canonical sync mechanism (design doc
+                # §5): every companion-scoped state change appends one row,
+                # and a client's sync state is a single seq integer.
+                # AUTOINCREMENT is required so pruned/deleted rowids are never
+                # reused — that guarantee is what makes client cursors safe
+                # across retention pruning. companion_journal_meta carries the
+                # journal epoch (bumped on DB reset) and the prune floor.
+                # companion_messages gains consumed_at so the frame-protocol
+                # queue becomes soft-consume: popped rows are marked consumed
+                # instead of deleted, turning the destructive queue into a
+                # durable history that still behaves like a queue for the
+                # frame protocol (see companion_pop_message/companion_push_message).
+                migration_name = "add_companion_event_journal"
+                existing = conn.execute(
+                    "SELECT migration_name FROM migrations WHERE migration_name = ?",
+                    (migration_name,),
+                ).fetchone()
+                if not existing:
+                    cursor = conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table' AND name='companion_events'"
+                    )
+                    if not cursor.fetchone():
+                        conn.execute(
+                            """
+                            CREATE TABLE companion_events (
+                                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                                companion_hash TEXT NOT NULL,
+                                event_type TEXT NOT NULL,
+                                created_at REAL NOT NULL,
+                                ref_table TEXT,
+                                ref_id INTEGER,
+                                packet_hash TEXT,
+                                payload TEXT NOT NULL
+                            )
+                            """
+                        )
+                        conn.execute(
+                            "CREATE INDEX IF NOT EXISTS idx_companion_events_sync "
+                            "ON companion_events(companion_hash, seq)"
+                        )
+                        logger.info("Created companion_events table")
+
+                    cursor = conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table' AND name='companion_journal_meta'"
+                    )
+                    if not cursor.fetchone():
+                        conn.execute(
+                            """
+                            CREATE TABLE companion_journal_meta (
+                                key TEXT PRIMARY KEY,
+                                value TEXT
+                            )
+                            """
+                        )
+                        logger.info("Created companion_journal_meta table")
+
+                    cursor = conn.execute("PRAGMA table_info(companion_messages)")
+                    columns = [column[1] for column in cursor.fetchall()]
+                    if "consumed_at" not in columns:
+                        conn.execute(
+                            "ALTER TABLE companion_messages ADD COLUMN consumed_at REAL"
+                        )
+                        logger.info("Added consumed_at column to companion_messages table")
+
+                    conn.execute(
+                        "INSERT INTO migrations (migration_name, applied_at) VALUES (?, ?)",
+                        (migration_name, time.time()),
+                    )
+                    logger.info(f"Migration '{migration_name}' applied successfully")
+
                 conn.commit()
 
         except Exception as e:
@@ -2351,7 +2422,18 @@ class SQLiteHandler:
             logger.error(f"Failed to vacuum database: {e}")
             raise
 
-    def cleanup_old_data(self, days: int = 7):
+    def cleanup_old_data(self, days: int = 7, companion_events_days: Optional[int] = None):
+        """Prune retention-bounded tables, including the companion journal.
+
+        ``companion_events_days`` mirrors how the caller reads
+        ``storage.retention.sqlite_cleanup_days`` for ``days`` (see
+        engine.py's periodic cleanup call): it should be read from
+        ``storage.retention.companion_events_days`` (default 31) and passed
+        in. When omitted (e.g. an existing call site that only knows about
+        ``days``), it defaults to the same 31-day default as the config key,
+        so companion journal/history pruning still runs on the existing
+        cleanup schedule without requiring every caller to be updated.
+        """
         try:
             cutoff = time.time() - (days * 24 * 3600)
 
@@ -2379,6 +2461,17 @@ class SQLiteHandler:
                     logger.info(
                         f"Cleaned up {packets_deleted} old packets, {adverts_deleted} old adverts, {noise_deleted} old noise measurements, {crc_deleted} old CRC error records"
                     )
+
+            companion_retention = (
+                companion_events_days if companion_events_days is not None else 31
+            )
+            events_deleted = self.companion_prune_events(companion_retention)
+            consumed_deleted = self.companion_prune_consumed_messages(companion_retention)
+            if events_deleted > 0 or consumed_deleted > 0:
+                logger.info(
+                    f"Cleaned up {events_deleted} old companion journal events, "
+                    f"{consumed_deleted} old consumed companion messages"
+                )
 
         except Exception as e:
             logger.error(f"Failed to cleanup old data: {e}")
@@ -3462,11 +3555,21 @@ class SQLiteHandler:
             return False
 
     def companion_count_messages(self, companion_hash: str) -> int:
-        """Return the number of persisted queued messages for a companion."""
+        """Return the number of live (unconsumed) queued messages for a companion.
+
+        Soft-consumed rows are retained history, not part of the pending
+        queue, so they're excluded here to stay consistent with
+        companion_load_messages (callers that compare a load's row count
+        against this count to detect a silently-failed load require both to
+        reflect the same query).
+        """
         try:
             with self._connect() as conn:
                 cursor = conn.execute(
-                    "SELECT COUNT(*) FROM companion_messages WHERE companion_hash = ?",
+                    """
+                    SELECT COUNT(*) FROM companion_messages
+                    WHERE companion_hash = ? AND consumed_at IS NULL
+                    """,
                     (companion_hash,),
                 )
                 row = cursor.fetchone()
@@ -3478,10 +3581,14 @@ class SQLiteHandler:
     def companion_load_messages(
         self, companion_hash: str, limit: int = 100
     ) -> Optional[List[Dict]]:
-        """Load queued messages for a companion (oldest first for queue order).
+        """Load live (unconsumed) queued messages, oldest first for queue order.
 
-        Returns [] when the companion has no persisted messages, or None when
-        the load failed — callers must not treat a failed load as "no data".
+        Soft-consumed rows (already popped, or evicted to make room) are
+        durable history now, not part of the pending queue, so they're
+        excluded here — this is the boot-restore read path and must reflect
+        only what's still waiting for delivery. Returns [] when the companion
+        has no pending messages, or None when the load failed — callers must
+        not treat a failed load as "no data".
         """
         try:
             with self._connect() as conn:
@@ -3491,7 +3598,7 @@ class SQLiteHandler:
                     SELECT sender_key, txt_type, timestamp, text, is_channel, channel_idx,
                            path_len, sender_prefix, snr, rssi, channel_data_type,
                            channel_data_payload
-                    FROM companion_messages WHERE companion_hash = ?
+                    FROM companion_messages WHERE companion_hash = ? AND consumed_at IS NULL
                     ORDER BY id ASC LIMIT ?
                 """,
                     (companion_hash, limit),
@@ -3571,8 +3678,15 @@ class SQLiteHandler:
                     return False
                 if max_messages is not None:
                     last_id = cursor.lastrowid
+                    # Capacity accounting counts only unconsumed rows: consumed
+                    # rows are retained history (companion_get_messages), not
+                    # part of the live offline queue, and must not count
+                    # against the MeshCore queue-depth limit.
                     count = conn.execute(
-                        "SELECT COUNT(*) FROM companion_messages WHERE companion_hash = ?",
+                        """
+                        SELECT COUNT(*) FROM companion_messages
+                        WHERE companion_hash = ? AND consumed_at IS NULL
+                        """,
                         (companion_hash,),
                     ).fetchone()[0]
                     excess = count - max_messages
@@ -3585,7 +3699,8 @@ class SQLiteHandler:
                         evictable = conn.execute(
                             """
                             SELECT COUNT(*) FROM companion_messages
-                            WHERE companion_hash = ? AND is_channel = 1 AND id != ?
+                            WHERE companion_hash = ? AND is_channel = 1
+                              AND consumed_at IS NULL AND id != ?
                             """,
                             (companion_hash, last_id),
                         ).fetchone()[0]
@@ -3598,16 +3713,21 @@ class SQLiteHandler:
                             conn.execute("RELEASE SAVEPOINT companion_message_push")
                             conn.commit()
                             return False
+                        # Eviction marks rows consumed instead of deleting them:
+                        # queue semantics are preserved (the row no longer
+                        # counts toward capacity or is delivered again) while
+                        # the row survives as history, same as a normal pop.
                         conn.execute(
                             """
-                            DELETE FROM companion_messages
+                            UPDATE companion_messages SET consumed_at = ?
                             WHERE id IN (
                                 SELECT id FROM companion_messages
-                                WHERE companion_hash = ? AND is_channel = 1 AND id != ?
+                                WHERE companion_hash = ? AND is_channel = 1
+                                  AND consumed_at IS NULL AND id != ?
                                 ORDER BY id ASC LIMIT ?
                             )
                             """,
-                            (companion_hash, last_id, excess),
+                            (time.time(), companion_hash, last_id, excess),
                         )
                 conn.execute("RELEASE SAVEPOINT companion_message_push")
                 conn.commit()
@@ -3617,7 +3737,15 @@ class SQLiteHandler:
             return False
 
     def companion_pop_message(self, companion_hash: str) -> Optional[Dict]:
-        """Remove and return the oldest message from the companion's queue."""
+        """Soft-consume and return the oldest unconsumed message in the queue.
+
+        companion_messages is durable history (Mobile Companion API journal
+        phase 1): popping no longer deletes the row, it sets ``consumed_at``
+        so the frame protocol still sees a draining queue (subsequent pops
+        return the next unconsumed row) while the row itself — and its
+        history for companion_get_messages / future sync — survives until
+        retention pruning (companion_prune_consumed_messages) removes it.
+        """
         try:
             with self._connect() as conn:
                 conn.row_factory = sqlite3.Row
@@ -3626,7 +3754,7 @@ class SQLiteHandler:
                     SELECT id, sender_key, txt_type, timestamp, text, is_channel, channel_idx,
                            path_len, sender_prefix, snr, rssi, channel_data_type,
                            channel_data_payload
-                    FROM companion_messages WHERE companion_hash = ?
+                    FROM companion_messages WHERE companion_hash = ? AND consumed_at IS NULL
                     ORDER BY id ASC LIMIT 1
                 """,
                     (companion_hash,),
@@ -3640,9 +3768,307 @@ class SQLiteHandler:
                 msg["rssi"] = int(msg.get("rssi") or 0)
                 msg["channel_data_type"] = int(msg.get("channel_data_type") or 0)
                 msg["channel_data_payload"] = bytes(msg.get("channel_data_payload") or b"")
-                conn.execute("DELETE FROM companion_messages WHERE id = ?", (msg["id"],))
+                conn.execute(
+                    "UPDATE companion_messages SET consumed_at = ? WHERE id = ?",
+                    (time.time(), msg["id"]),
+                )
                 conn.commit()
                 return {k: v for k, v in msg.items() if k != "id"}
         except Exception as e:
             logger.error(f"Failed to pop companion message: {e}")
             return None
+
+    def companion_get_messages(
+        self, companion_hash: str, before_id: Optional[int] = None, limit: int = 100
+    ) -> List[Dict]:
+        """Return a newest-first page of a companion's message history.
+
+        Unlike companion_load_messages (queue-order, for boot restore),
+        this serves the Mobile Companion API's message-history endpoint:
+        newest-first, optionally paged backward with ``before_id`` (an
+        exclusive upper bound on the rowid), and includes ``id`` and
+        ``consumed_at`` so callers can tell delivered/history apart. Bytes
+        columns are hex-encoded for JSON transport, matching the ``.hex()``
+        convention used elsewhere in this file (e.g. companion_push_message).
+        """
+        try:
+            limit = max(1, min(int(limit), 200))
+            with self._connect() as conn:
+                conn.row_factory = sqlite3.Row
+                query = """
+                    SELECT id, companion_hash, sender_key, txt_type, timestamp, text,
+                           is_channel, channel_idx, path_len, sender_prefix, snr, rssi,
+                           channel_data_type, channel_data_payload, packet_hash,
+                           created_at, consumed_at
+                    FROM companion_messages WHERE companion_hash = ?
+                """
+                params: List[Any] = [companion_hash]
+                if before_id is not None:
+                    query += " AND id < ?"
+                    params.append(before_id)
+                query += " ORDER BY id DESC LIMIT ?"
+                params.append(limit)
+
+                rows = conn.execute(query, params).fetchall()
+                messages = []
+                for row in rows:
+                    msg = dict(row)
+                    msg["sender_key"] = bytes(msg.get("sender_key") or b"").hex()
+                    msg["channel_data_payload"] = bytes(
+                        msg.get("channel_data_payload") or b""
+                    ).hex()
+                    msg["snr"] = float(msg.get("snr") or 0.0)
+                    msg["rssi"] = int(msg.get("rssi") or 0)
+                    msg["channel_data_type"] = int(msg.get("channel_data_type") or 0)
+                    messages.append(msg)
+                return messages
+        except Exception as e:
+            logger.error(f"Failed to get companion messages for {companion_hash}: {e}")
+            return []
+
+    # --- Mobile Companion API event journal (design doc §5) ---
+    #
+    # companion_events is the canonical sync mechanism: every companion-scoped
+    # state change appends one row, and a client's sync state collapses to a
+    # single seq integer. companion_journal_meta carries small journal-wide
+    # facts (the epoch, the prune floor) that aren't per-event.
+
+    def companion_append_event(
+        self,
+        companion_hash: str,
+        event_type: str,
+        payload: dict,
+        ref_table: Optional[str] = None,
+        ref_id: Optional[int] = None,
+        packet_hash: Optional[str] = None,
+    ) -> Optional[int]:
+        """Append one row to the companion event journal.
+
+        Returns the new row's ``seq`` (the AUTOINCREMENT rowid), or None on
+        failure. Callers should append in the same transaction scope as the
+        state write the event describes where possible (design doc §5.4).
+        """
+        try:
+            payload_json = json.dumps(payload, separators=(",", ":"))
+            with self._connect() as conn:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO companion_events
+                    (companion_hash, event_type, created_at, ref_table, ref_id, packet_hash, payload)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        companion_hash,
+                        event_type,
+                        time.time(),
+                        ref_table,
+                        ref_id,
+                        packet_hash,
+                        payload_json,
+                    ),
+                )
+                conn.commit()
+                return cursor.lastrowid
+        except Exception as e:
+            logger.error(f"Failed to append companion event for {companion_hash}: {e}")
+            return None
+
+    def companion_get_events(
+        self, companion_hash: str, after_seq: int, limit: int = 100
+    ) -> List[Dict]:
+        """Return journal rows for ``companion_hash`` with seq > after_seq.
+
+        Ordered oldest-first, served entirely by idx_companion_events_sync
+        (companion_hash, seq) — no other predicate is added, keeping this an
+        index range scan per the performance rules (design doc §13).
+        """
+        try:
+            limit = max(1, min(int(limit), 500))
+            with self._connect() as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute(
+                    """
+                    SELECT seq, event_type, created_at, packet_hash, payload
+                    FROM companion_events
+                    WHERE companion_hash = ? AND seq > ?
+                    ORDER BY seq ASC LIMIT ?
+                    """,
+                    (companion_hash, int(after_seq), limit),
+                ).fetchall()
+
+                events = []
+                for row in rows:
+                    event = {
+                        "seq": row["seq"],
+                        "event_type": row["event_type"],
+                        "created_at": row["created_at"],
+                        "packet_hash": row["packet_hash"],
+                    }
+                    try:
+                        event["payload"] = json.loads(row["payload"])
+                    except (TypeError, ValueError) as parse_err:
+                        logger.error(
+                            f"Failed to parse companion event payload "
+                            f"seq={row['seq']}: {parse_err}"
+                        )
+                        event["payload"] = {}
+                        event["payload_raw"] = row["payload"]
+                    events.append(event)
+                return events
+        except Exception as e:
+            logger.error(f"Failed to get companion events for {companion_hash}: {e}")
+            return []
+
+    def companion_journal_head(self, companion_hash: str) -> int:
+        """Return the highest journaled seq for this companion, 0 if none."""
+        try:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT MAX(seq) FROM companion_events WHERE companion_hash = ?",
+                    (companion_hash,),
+                ).fetchone()
+                return int(row[0]) if row and row[0] is not None else 0
+        except Exception as e:
+            logger.error(f"Failed to get companion journal head for {companion_hash}: {e}")
+            return 0
+
+    def companion_journal_meta_get(self, key: str) -> Optional[str]:
+        """Return a companion_journal_meta value, or None if unset/on failure."""
+        try:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT value FROM companion_journal_meta WHERE key = ?", (key,)
+                ).fetchone()
+                return row[0] if row else None
+        except Exception as e:
+            logger.error(f"Failed to get companion journal meta '{key}': {e}")
+            return None
+
+    def companion_journal_meta_set(self, key: str, value: str) -> bool:
+        """Upsert a companion_journal_meta key/value pair."""
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO companion_journal_meta (key, value) VALUES (?, ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                    """,
+                    (key, value),
+                )
+                conn.commit()
+                return True
+        except Exception as e:
+            logger.error(f"Failed to set companion journal meta '{key}': {e}")
+            return False
+
+    def companion_journal_epoch(self) -> str:
+        """Return the journal epoch, generating and persisting one if unset.
+
+        The epoch is a random ID a client compares against its stored value
+        (design doc §5.3): a mismatch means the database was wiped or restored
+        from backup, and the client must discard its cursor and re-snapshot
+        rather than risk a smaller-but-valid-looking seq silently replaying or
+        skipping history. Stable across calls and across handler instances
+        (persisted in companion_journal_meta, not process state).
+        """
+        try:
+            existing = self.companion_journal_meta_get("journal_epoch")
+            if existing:
+                return existing
+            epoch = secrets.token_hex(8)
+            with self._connect() as conn:
+                # INSERT OR IGNORE so a concurrent first-caller race can't
+                # clobber whichever epoch value actually won.
+                conn.execute(
+                    "INSERT OR IGNORE INTO companion_journal_meta (key, value) "
+                    "VALUES ('journal_epoch', ?)",
+                    (epoch,),
+                )
+                conn.commit()
+                row = conn.execute(
+                    "SELECT value FROM companion_journal_meta WHERE key = 'journal_epoch'"
+                ).fetchone()
+                return row[0] if row and row[0] is not None else epoch
+        except Exception as e:
+            logger.error(f"Failed to get/generate companion journal epoch: {e}")
+            return secrets.token_hex(8)
+
+    def companion_prune_events(self, max_age_days: float) -> int:
+        """Delete companion_events rows older than max_age_days.
+
+        Before deleting, records the highest seq about to be removed and, if
+        it exceeds the current 'prune_floor' meta value, advances the floor.
+        prune_floor semantics: a client cursor ``c`` is only valid if
+        ``c >= prune_floor``; sync requests below the floor must be answered
+        with snapshot_required rather than a silently incomplete delta.
+        Returns the number of rows deleted.
+        """
+        try:
+            cutoff = time.time() - (float(max_age_days) * 86400)
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT MAX(seq) FROM companion_events WHERE created_at < ?",
+                    (cutoff,),
+                ).fetchone()
+                max_deleted_seq = int(row[0]) if row and row[0] is not None else None
+
+                result = conn.execute(
+                    "DELETE FROM companion_events WHERE created_at < ?", (cutoff,)
+                )
+                deleted = result.rowcount
+
+                if max_deleted_seq is not None:
+                    floor_row = conn.execute(
+                        "SELECT value FROM companion_journal_meta WHERE key = 'prune_floor'"
+                    ).fetchone()
+                    current_floor = (
+                        int(floor_row[0]) if floor_row and floor_row[0] is not None else 0
+                    )
+                    if max_deleted_seq > current_floor:
+                        conn.execute(
+                            """
+                            INSERT INTO companion_journal_meta (key, value) VALUES ('prune_floor', ?)
+                            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                            """,
+                            (str(max_deleted_seq),),
+                        )
+
+                conn.commit()
+                if deleted:
+                    logger.info(
+                        f"Pruned {deleted} companion journal event(s) older than "
+                        f"{max_age_days}d"
+                    )
+                return deleted
+        except Exception as e:
+            logger.error(f"Failed to prune companion events: {e}")
+            return 0
+
+    def companion_prune_consumed_messages(self, max_age_days: float) -> int:
+        """Delete soft-consumed companion_messages rows older than max_age_days.
+
+        Only rows with consumed_at set are eligible — unconsumed rows are the
+        live offline queue and must never be pruned by age alone. Returns the
+        number of rows deleted.
+        """
+        try:
+            cutoff = time.time() - (float(max_age_days) * 86400)
+            with self._connect() as conn:
+                result = conn.execute(
+                    """
+                    DELETE FROM companion_messages
+                    WHERE consumed_at IS NOT NULL AND consumed_at < ?
+                    """,
+                    (cutoff,),
+                )
+                deleted = result.rowcount
+                conn.commit()
+                if deleted:
+                    logger.info(
+                        f"Pruned {deleted} consumed companion message(s) older than "
+                        f"{max_age_days}d"
+                    )
+                return deleted
+        except Exception as e:
+            logger.error(f"Failed to prune consumed companion messages: {e}")
+            return 0

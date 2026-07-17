@@ -413,7 +413,8 @@ class TestSenderPrefixPersistence:
             "DELETE FROM migrations "
             "WHERE migration_name IN ("
             "'add_sender_prefix_to_companion_messages', "
-            "'add_signal_and_channel_data_to_companion_messages')"
+            "'add_signal_and_channel_data_to_companion_messages', "
+            "'add_companion_event_journal')"
         )
         conn.execute("ALTER TABLE companion_messages RENAME TO companion_messages_old")
         conn.execute(
@@ -523,6 +524,7 @@ class TestPersistSkipWhenOff:
         fs = CompanionFrameServer.__new__(CompanionFrameServer)
         fs.sqlite_handler = MagicMock()
         fs.companion_hash = "0x01"
+        fs.journal = None
         bridge = MagicMock()
         bridge.message_queue.max_size = max_size
         fs.bridge = bridge
