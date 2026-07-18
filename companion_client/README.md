@@ -40,6 +40,28 @@ reading "You were mentioned", never the message text).
 Live mode connects to a real repeater. Sending is real; receiving depends on
 actual RF traffic, and pushes go wherever that device's registered relay points.
 
+## Channels
+
+Channels are enumerated per index rather than with the server's whole-table
+form. `CMD_GET_CHANNEL` with an *empty* body replies with one `CHANNEL_INFO`
+frame **per channel slot**, which this client cannot match to a command — the
+protocol has no request IDs, so ordering is the only thing tying a response to
+its request. Per-index costs a few more round trips and stays in lockstep.
+
+Unconfigured slots come back zero-filled; an empty name means unused, and
+`list_channels()` drops them.
+
+```python
+for channel in await client.list_channels():
+    print(channel.idx, channel.name)
+await client.send_channel_message(channel.idx, "hi")
+```
+
+Verified against a live dev repeater: one companion reported 23 configured
+channels (`Public`, `#seattle`, `#weather`, …), another reported 2. The
+simulator ships a small representative table rather than a single hardcoded
+channel, so indexing is exercised the same way.
+
 ## Library use
 
 ```python
@@ -90,3 +112,11 @@ first-message push latency is ~0, not up to 30 seconds.
 - DM (`send_direct_message`) is implemented against the wire format but is not
   covered end-to-end, because the double has no contact store.
 - `aiohttp` is needed only for the web UI, not for the library or the tests.
+
+## Live mode and RF
+
+`--live` talks to a real repeater. Reading is harmless, but **sending
+transmits over the air** — on the dev radio that is 22 dBm at 910.525 MHz into
+a public mesh with real people on channels like `#seattle` and `#emergency`.
+The UI shows a banner in live mode and labels every message with its channel.
+Pick the channel deliberately; `#howltest` is the safe one on this deployment.

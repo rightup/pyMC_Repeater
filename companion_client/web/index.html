@@ -81,6 +81,15 @@
   button:disabled { opacity: .5; cursor: not-allowed; }
   .hint { font-size: 12px; color: var(--muted); margin-top: 8px; }
   .empty { color: var(--muted); font-size: 13px; padding: 12px 0; }
+  select {
+    padding: 4px 8px; border-radius: 8px; background: var(--panel-2);
+    border: 1px solid var(--line); color: var(--text); font-size: 13px;
+    text-transform: none; letter-spacing: normal; font-weight: 600; max-width: 220px;
+  }
+  .warn {
+    background: var(--mention); border: 1px solid var(--mention-line);
+    color: var(--text); font-size: 13px; padding: 8px 18px;
+  }
   #err { color: #e5534b; font-size: 13px; padding: 0 18px 8px; display: none; }
   @media (max-width: 820px) {
     main { flex-direction: column; }
@@ -96,9 +105,16 @@
   <span class="badge" id="node"></span>
 </header>
 <div id="err"></div>
+<div class="warn" id="livewarn" style="display:none">
+  <strong>Live mode.</strong> Messages you send are transmitted over the air to a
+  real mesh. Check the selected channel before sending.
+</div>
 <main>
   <section class="col chat">
-    <h2>Channel 0</h2>
+    <h2 style="display:flex;align-items:center;gap:10px">
+      <span>Channel</span>
+      <select id="channel" aria-label="Channel"></select>
+    </h2>
     <div class="scroll" id="messages"><div class="empty">No messages yet.</div></div>
     <footer>
       <div class="row">
@@ -131,7 +147,30 @@ function clearEmpty(el) {
 }
 function atBottom(el) { return el.scrollHeight - el.scrollTop - el.clientHeight < 40; }
 
+let currentChannel = 0;
+const allMessages = [];
+
+function renderAll() {
+  messagesEl.innerHTML = "";
+  const visible = allMessages.filter((m) => Number(m.channel) === Number(currentChannel));
+  if (!visible.length) {
+    const empty = document.createElement("div");
+    empty.className = "empty";
+    empty.textContent = "No messages on this channel yet.";
+    messagesEl.appendChild(empty);
+    return;
+  }
+  visible.forEach(renderMessage);
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+}
+
 function addMessage(m) {
+  allMessages.push(m);
+  if (Number(m.channel) !== Number(currentChannel)) return;
+  renderMessage(m);
+}
+
+function renderMessage(m) {
   clearEmpty(messagesEl);
   const stick = atBottom(messagesEl);
   const wrap = document.createElement("div");
@@ -143,6 +182,7 @@ function addMessage(m) {
   meta.className = "meta";
   const when = m.timestamp ? new Date(m.timestamp * 1000).toLocaleTimeString() : "";
   meta.textContent = (m.direction === "out" ? "sent" : "received") +
+    (m.channel_name ? " · " + m.channel_name : "") +
     (when ? " · " + when : "") +
     (m.snr != null ? " · SNR " + m.snr : "");
   bubble.appendChild(meta);
@@ -198,7 +238,23 @@ async function init() {
   mode.textContent = state.mode === "sim" ? "simulator" : "live";
   mode.className = "badge mode-" + state.mode;
   $("node").textContent = state.node_name ? state.node_name + " · 0x" + state.companion_hash : "";
-  (state.messages || []).forEach(addMessage);
+  const sel = $("channel");
+  (state.channels || []).forEach((c) => {
+    const opt = document.createElement("option");
+    opt.value = c.idx;
+    opt.textContent = c.name + "  (" + c.idx + ")";
+    sel.appendChild(opt);
+  });
+  if (!(state.channels || []).length) {
+    const opt = document.createElement("option");
+    opt.value = 0; opt.textContent = "Public (0)";
+    sel.appendChild(opt);
+  }
+  currentChannel = Number(sel.value || 0);
+  sel.onchange = () => { currentChannel = Number(sel.value); renderAll(); };
+  if (state.mode === "live") $("livewarn").style.display = "block";
+  (state.messages || []).forEach((m) => allMessages.push(m));
+  renderAll();
   if (!state.can_inject) {
     $("inject").disabled = true;
     $("injectBtn").disabled = true;
@@ -219,7 +275,7 @@ async function doSend() {
   if (!text) return;
   input.value = "";
   showError("");
-  try { await post("/api/send", {text}); }
+  try { await post("/api/send", {text, channel: currentChannel}); }
   catch (err) { showError("Send failed: " + err.message); }
 }
 
@@ -228,7 +284,7 @@ async function doInject() {
   if (!text) return;
   input.value = "";
   showError("");
-  try { await post("/api/inject", {text}); }
+  try { await post("/api/inject", {text, channel: currentChannel}); }
   catch (err) { showError("Receive failed: " + err.message); }
 }
 

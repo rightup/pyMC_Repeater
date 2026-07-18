@@ -74,18 +74,33 @@ class FakeChannel:
     secret: bytes = b"\x00" * 16
 
 
+# Mirrors the shape of a real deployment: slot 0 is the default Public channel
+# and the rest are hash-prefixed group channels. Taken from the channel table a
+# live dev repeater actually reports, so the simulator exercises the same
+# indexing (sparse, name-keyed) rather than a single hardcoded channel.
+DEFAULT_CHANNELS: tuple[tuple[int, str], ...] = (
+    (0, "Public"),
+    (1, "#howltest"),
+    (2, "#seattle"),
+    (3, "#weather"),
+)
+
+
 class FakeBridge:
     """Minimal bridge satisfying the frame server's command handlers.
 
     Outbound sends are recorded rather than transmitted -- there is no radio.
     """
 
-    def __init__(self, public_key: Optional[bytes] = None) -> None:
+    def __init__(self, public_key: Optional[bytes] = None, channels=None) -> None:
         # First byte is the companion hash the repeater keys everything by.
         self.public_key = public_key or (bytes([0xF5]) + bytes(range(31)))
         self.prefs = FakePrefs()
         self.message_queue = FakeMessageQueue()
-        self.channels_by_idx = {0: FakeChannel(0)}
+        self.channels_by_idx = {
+            idx: FakeChannel(idx, name, bytes([idx]) * 16)
+            for idx, name in (channels if channels is not None else DEFAULT_CHANNELS)
+        }
         self.sent_channel_messages: list[tuple[int, str, int]] = []
         self.sent_direct_messages: list[tuple[bytes, str, int]] = []
         self._pending_sync: list = []
@@ -167,7 +182,9 @@ class Harness:
     port: int = 0
     _notifier: object = field(default=None, repr=False)
 
-    async def inject_inbound_message(self, text: str, packet_hash: str, timestamp: int = 0) -> dict:
+    async def inject_inbound_message(
+        self, text: str, packet_hash: str, timestamp: int = 0, channel_idx: int = 0
+    ) -> dict:
         """Simulate a message arriving from the mesh.
 
         This is the only step that has to reach inside the server: journal
@@ -175,7 +192,13 @@ class Harness:
         inbound RF, and there is no radio here. Everything downstream (SQLite
         persistence, journal append, notifier debounce, relay POST) is real.
         """
-        msg = {"text": text, "packet_hash": packet_hash, "timestamp": timestamp}
+        msg = {
+            "text": text,
+            "packet_hash": packet_hash,
+            "timestamp": timestamp,
+            "channel_idx": channel_idx,
+            "is_channel": True,
+        }
         await self.server._persist_companion_message(msg)
         return msg
 
@@ -183,11 +206,15 @@ class Harness:
         await self.server.stop()
 
 
-async def start_harness(tmp_path, *, companion_hash: str = "f5", port: int = 0) -> Harness:
+async def start_harness(
+    tmp_path, *, companion_hash: str = "f5", port: int = 0, channels=None
+) -> Harness:
     """Start a real frame server on ``port`` (0 = pick a free one)."""
     handler = SQLiteHandler(tmp_path)
     journal = CompanionEventJournal(handler, companion_hash)
-    bridge = FakeBridge(public_key=bytes([int(companion_hash, 16)]) + bytes(range(31)))
+    bridge = FakeBridge(
+        public_key=bytes([int(companion_hash, 16)]) + bytes(range(31)), channels=channels
+    )
 
     server = CompanionFrameServer(
         bridge=bridge,

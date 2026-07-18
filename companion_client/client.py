@@ -31,7 +31,7 @@ from openhop_core.companion.constants import (
 )
 
 from . import protocol
-from .protocol import ProtocolError, ReceivedMessage, SelfInfo
+from .protocol import Channel, ProtocolError, ReceivedMessage, SelfInfo
 
 logger = logging.getLogger("companion_client")
 
@@ -70,6 +70,7 @@ class CompanionClient:
         self.auto_sync = auto_sync
 
         self.self_info: Optional[SelfInfo] = None
+        self.channels: list[Channel] = []
         self.messages: list[ReceivedMessage] = []
 
         self._reader: Optional[asyncio.StreamReader] = None
@@ -162,6 +163,32 @@ class CompanionClient:
         )
         # A DM returns RESP_CODE_SENT (with tag/timeout), not plain OK.
         await self._command(payload)
+
+    async def get_channel(self, channel_idx: int) -> Channel:
+        """Fetch one channel slot."""
+        payload = await self._command(protocol.cmd_get_channel(channel_idx))
+        return protocol.parse_channel_info(payload)
+
+    async def list_channels(self, max_channels: int = 40) -> list[Channel]:
+        """Enumerate configured channels, one request per slot.
+
+        Deliberately not the server's whole-table form (CMD_GET_CHANNEL with an
+        empty body): that replies with one frame per index, which this client
+        cannot match to a command because the protocol has no request IDs.
+        Per-index is a few more round trips and stays in lockstep.
+
+        Unconfigured slots are zero-filled by the server and dropped here.
+        """
+        channels: list[Channel] = []
+        for idx in range(max_channels):
+            try:
+                channel = await self.get_channel(idx)
+            except CommandError:
+                break  # NOT_FOUND: past the end of the table
+            if channel.is_configured:
+                channels.append(channel)
+        self.channels = channels
+        return channels
 
     async def sync_next_message(self) -> Optional[ReceivedMessage]:
         """Pull one queued message, or None when the queue is empty."""

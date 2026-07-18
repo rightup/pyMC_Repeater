@@ -401,3 +401,84 @@ def test_relay_410_clears_the_push_token(tmp_path):
             await harness.stop()
 
     run(scenario())
+
+
+# --- channels -------------------------------------------------------------
+
+
+def test_list_channels_returns_configured_slots(tmp_path):
+    """Enumerated per-index. The server's whole-table form replies with one
+    frame per channel, which this client cannot match to a command."""
+
+    async def scenario():
+        harness = await start_harness(tmp_path)
+        try:
+            client = await connected_client(harness)
+            try:
+                channels = await client.list_channels()
+                assert [(c.idx, c.name) for c in channels] == [
+                    (0, "Public"),
+                    (1, "#howltest"),
+                    (2, "#seattle"),
+                    (3, "#weather"),
+                ]
+            finally:
+                await client.close()
+        finally:
+            await harness.stop()
+
+    run(scenario())
+
+
+def test_unconfigured_slots_are_dropped(tmp_path):
+    """The server zero-fills empty slots; an empty name means unused."""
+
+    async def scenario():
+        harness = await start_harness(tmp_path, channels=[(0, "Public"), (5, "#sparse")])
+        try:
+            client = await connected_client(harness)
+            try:
+                channels = await client.list_channels()
+                assert [(c.idx, c.name) for c in channels] == [(0, "Public"), (5, "#sparse")]
+                # Slot 1 exists in the table but is unconfigured.
+                assert (await client.get_channel(1)).is_configured is False
+            finally:
+                await client.close()
+        finally:
+            await harness.stop()
+
+    run(scenario())
+
+
+def test_send_targets_the_selected_channel(tmp_path):
+    async def scenario():
+        harness = await start_harness(tmp_path)
+        try:
+            client = await connected_client(harness)
+            try:
+                await client.send_channel_message(2, "to seattle", timestamp=7)
+                assert harness.bridge.sent_channel_messages == [(2, "to seattle", 7)]
+            finally:
+                await client.close()
+        finally:
+            await harness.stop()
+
+    run(scenario())
+
+
+def test_inbound_message_carries_its_channel(tmp_path):
+    async def scenario():
+        harness = await start_harness(tmp_path)
+        try:
+            client = await connected_client(harness)
+            try:
+                await harness.inject_inbound_message("hi", "ph-ch", channel_idx=3)
+                messages = await client.drain_messages()
+                assert messages[0].channel_idx == 3
+                assert messages[0].is_channel is True
+            finally:
+                await client.close()
+        finally:
+            await harness.stop()
+
+    run(scenario())

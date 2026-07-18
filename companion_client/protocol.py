@@ -19,8 +19,10 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from openhop_core.companion.constants import (
+    CHANNEL_NAME_SIZE,
     CMD_APP_START,
     CMD_DEVICE_QUERY,
+    CMD_GET_CHANNEL,
     CMD_GET_CONTACTS,
     CMD_SEND_CHANNEL_TXT_MSG,
     CMD_SEND_TXT_MSG,
@@ -28,6 +30,7 @@ from openhop_core.companion.constants import (
     FRAME_INBOUND_PREFIX,
     FRAME_OUTBOUND_PREFIX,
     MAX_FRAME_SIZE,
+    RESP_CODE_CHANNEL_INFO,
     RESP_CODE_CHANNEL_MSG_RECV,
     RESP_CODE_CHANNEL_MSG_RECV_V3,
     RESP_CODE_CONTACT_MSG_RECV,
@@ -135,6 +138,17 @@ def cmd_send_text(pubkey_prefix: bytes, text: str, timestamp: int, attempt: int 
     )
 
 
+def cmd_get_channel(channel_idx: int) -> bytes:
+    """CMD_GET_CHANNEL for ONE channel: [idx u8].
+
+    Sending this with an empty body instead asks for the whole table, which the
+    server answers with one CHANNEL_INFO frame *per* channel index. That breaks
+    the one-command-one-response invariant this client relies on (the protocol
+    has no request IDs), so callers enumerate by index instead.
+    """
+    return bytes([CMD_GET_CHANNEL, channel_idx])
+
+
 def cmd_sync_next_message() -> bytes:
     return bytes([CMD_SYNC_NEXT_MESSAGE])
 
@@ -168,6 +182,20 @@ class SelfInfo:
     def companion_hash(self) -> str:
         """First pubkey byte as lowercase hex -- how the repeater keys a companion."""
         return f"{self.public_key[0]:02x}"
+
+
+@dataclass
+class Channel:
+    """A group channel slot. Unconfigured slots come back with an empty name."""
+
+    idx: int
+    name: str
+    secret: bytes = b""
+
+    @property
+    def is_configured(self) -> bool:
+        """An empty name means the slot is unused -- the server zero-fills it."""
+        return bool(self.name)
 
 
 @dataclass
@@ -222,6 +250,21 @@ def _decode_snr(snr_byte: int) -> float:
     # Firmware packs SNR as a signed byte scaled by 4.
     signed = snr_byte - 256 if snr_byte > 127 else snr_byte
     return signed / 4.0
+
+
+def parse_channel_info(payload: bytes) -> Channel:
+    """Decode RESP_CODE_CHANNEL_INFO: [code][idx][name 32][secret 16]."""
+    if not payload or payload[0] != RESP_CODE_CHANNEL_INFO:
+        raise ProtocolError("not a CHANNEL_INFO frame")
+    if len(payload) < 2 + CHANNEL_NAME_SIZE:
+        raise ProtocolError("CHANNEL_INFO too short")
+    name_raw = payload[2 : 2 + CHANNEL_NAME_SIZE]
+    secret = payload[2 + CHANNEL_NAME_SIZE : 2 + CHANNEL_NAME_SIZE + 16]
+    return Channel(
+        idx=payload[1],
+        name=name_raw.split(b"\x00")[0].decode("utf-8", errors="replace").strip(),
+        secret=secret,
+    )
 
 
 def parse_message(payload: bytes) -> Optional[ReceivedMessage]:

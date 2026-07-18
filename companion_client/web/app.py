@@ -65,6 +65,7 @@ class ChatSession:
             await self._start_sim(tmp_dir)
 
         self.client.on_message(self._handle_message)
+        await self.client.list_channels()
 
     async def _start_sim(self, tmp_dir: Path) -> None:
         # Imported here so live mode never needs the repeater package.
@@ -127,11 +128,18 @@ class ChatSession:
         for queue in self._subscribers:
             queue.put_nowait(event)
 
+    def channel_name(self, idx) -> str:
+        for channel in self.client.channels or []:
+            if channel.idx == idx:
+                return channel.name
+        return f"channel {idx}"
+
     def _handle_message(self, message) -> None:
         entry = {
             "text": message.text,
             "direction": "in",
             "channel": message.channel_idx,
+            "channel_name": self.channel_name(message.channel_idx),
             "timestamp": message.timestamp,
             "snr": message.snr,
         }
@@ -164,17 +172,20 @@ class ChatSession:
             "text": text,
             "direction": "out",
             "channel": channel,
+            "channel_name": self.channel_name(channel),
             "timestamp": int(time.time()),
         }
         self.messages.append(entry)
         self.emit("message", entry)
         return entry
 
-    async def inject(self, text: str) -> None:
+    async def inject(self, text: str, channel: int = 0) -> None:
         """Simulate a message arriving from the mesh (sim mode only)."""
         if self.harness is None:
             raise web.HTTPBadRequest(reason="inject is only available in sim mode")
-        await self.harness.inject_inbound_message(text, f"web-{time.time_ns()}", int(time.time()))
+        await self.harness.inject_inbound_message(
+            text, f"web-{time.time_ns()}", int(time.time()), channel_idx=channel
+        )
         await self.client.drain_messages()
 
 
@@ -196,6 +207,7 @@ async def state(request: web.Request) -> web.Response:
             "node_name": info.node_name if info else None,
             "companion_hash": info.companion_hash if info else None,
             "messages": session.messages,
+            "channels": [{"idx": c.idx, "name": c.name} for c in (session.client.channels or [])],
             "can_inject": session.harness is not None,
         }
     )
@@ -245,7 +257,7 @@ async def inject(request: web.Request) -> web.Response:
     text = (body.get("text") or "").strip()
     if not text:
         raise web.HTTPBadRequest(reason="text is required")
-    await session.inject(text)
+    await session.inject(text, int(body.get("channel", 0)))
     return web.json_response({"ok": True})
 
 
