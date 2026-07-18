@@ -8,6 +8,7 @@ import sys
 import time
 
 from repeater.companion.correlation import CompanionCorrelationTracker
+from repeater.companion.push_notifier import CompanionPushNotifier
 from repeater.companion.utils import (
     CompanionContactCapacityError,
     CompanionStateLoadError,
@@ -113,6 +114,10 @@ class RepeaterDaemon:
         # duplicate_observer hook can route a correlation hit to the right
         # companion's journal without scanning companion_frame_servers.
         self.correlation_tracker = None
+        # Mobile Companion API push notifier (design doc §12.2): one
+        # process-wide notifier, built lazily once companion storage is known,
+        # registered as a listener on every companion journal.
+        self.push_notifier = None
         self.companion_journals: dict[str, object] = {}
         # Opt-in RF-reception firehose (design doc §9 "Correlated vs.
         # uncorrelated receptions"): only companions with
@@ -703,6 +708,24 @@ class RepeaterDaemon:
         """
         return resolve_max_tx_power_dbm(self.radio, self._get_companion_radio_settings())
 
+    def _build_push_notifier(self, sqlite_handler) -> CompanionPushNotifier:
+        """Construct and start the process-wide push notifier from config
+        (design doc §12.2). Config lives under ``companion.push``:
+        ``enabled`` (default true), ``min_interval_sec`` (default 30, the
+        per-device collapse window), ``request_timeout_sec`` (default 10)."""
+        push_cfg = {}
+        companion_cfg = self.config.get("companion", {})
+        if isinstance(companion_cfg, dict):
+            push_cfg = companion_cfg.get("push", {}) or {}
+        notifier = CompanionPushNotifier(
+            sqlite_handler,
+            enabled=bool(push_cfg.get("enabled", True)),
+            min_interval=float(push_cfg.get("min_interval_sec", 30.0)),
+            request_timeout=float(push_cfg.get("request_timeout_sec", 10.0)),
+        )
+        notifier.start()
+        return notifier
+
     async def _load_companion_identities(self) -> None:
         """Load companion identities from config and create CompanionBridge + frame server for each."""
         from repeater.companion import (
@@ -728,6 +751,11 @@ class RepeaterDaemon:
             logger.warning(
                 "Companion persistence disabled: no storage (contacts/channels will not survive restart or disconnect)"
             )
+
+        # Build the process-wide push notifier once storage is known (design
+        # doc §12.2). Journals register a listener on it below.
+        if self.push_notifier is None and sqlite_handler is not None:
+            self.push_notifier = self._build_push_notifier(sqlite_handler)
 
         radio_config = (
             self.repeater_handler.radio_config
@@ -798,6 +826,10 @@ class RepeaterDaemon:
                     self.companion_journals[companion_hash_str] = journal
                     if bool(settings.get("rf_reception_events")):
                         self._rf_reception_journals[companion_hash_str] = journal
+                    if self.push_notifier is not None:
+                        journal.register_listener(
+                            self.push_notifier.make_listener(companion_hash_str)
+                        )
 
                 _sync_node_name_to_config = _make_sync_node_name_to_config(name)
 
@@ -1063,6 +1095,10 @@ class RepeaterDaemon:
             self.companion_journals[companion_hash_str] = journal
             if bool(settings.get("rf_reception_events")):
                 self._rf_reception_journals[companion_hash_str] = journal
+            if self.push_notifier is not None:
+                journal.register_listener(
+                    self.push_notifier.make_listener(companion_hash_str)
+                )
 
         def _on_companion_prefs_saved(new_node_name: str, _journal=journal) -> None:
             """Journal the prefs change (no config-name sync in hot-reload path)."""
@@ -1601,6 +1637,13 @@ class RepeaterDaemon:
         if self._shutdown_started:
             return
         self._shutdown_started = True
+
+        # Stop the push notifier's worker thread before tearing down journals.
+        if self.push_notifier is not None:
+            try:
+                self.push_notifier.stop()
+            except Exception as e:
+                logger.warning(f"Push notifier stop error: {e}")
 
         # Stop companion frame servers first to close client sockets and child workers.
         for frame_server in getattr(self, "companion_frame_servers", []):
