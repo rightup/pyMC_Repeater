@@ -7,6 +7,7 @@ import socket
 import sys
 import time
 
+from repeater.companion.correlation import CompanionCorrelationTracker
 from repeater.companion.utils import (
     CompanionContactCapacityError,
     CompanionStateLoadError,
@@ -106,6 +107,13 @@ class RepeaterDaemon:
         self.router = None
         self.companion_bridges: dict[int, object] = {}
         self.companion_frame_servers: list = []
+        # Mobile Companion API live RF correlation (design doc §10.4): one
+        # process-wide tracker (built once RepeaterHandler's cache_ttl is
+        # known) and a companion_hash-string -> journal registry so the
+        # duplicate_observer hook can route a correlation hit to the right
+        # companion's journal without scanning companion_frame_servers.
+        self.correlation_tracker = None
+        self.companion_journals: dict[str, object] = {}
         # Parsed once during the startup preflight; the identity loaders reuse
         # them so config parsing (and its warnings) does not run twice.
         self._room_server_specs: list[IdentitySpec] | None = None
@@ -377,12 +385,19 @@ class RepeaterDaemon:
             # Load additional identities from config (e.g., room servers)
             await self._load_additional_identities()
 
+            # Same cache_ttl computation as RepeaterHandler.__init__ (min 5
+            # minutes, default 1 hour): the correlation window must never
+            # outlive the dedup window it rides on (design doc §10.4).
+            correlation_ttl = max(300, self.config.get("repeater", {}).get("cache_ttl", 3600))
+            self.correlation_tracker = CompanionCorrelationTracker(ttl_seconds=correlation_ttl)
+
             self.repeater_handler = RepeaterHandler(
                 self.config,
                 self.dispatcher,
                 self.local_hash,
                 local_hash_bytes=self.local_hash_bytes,
                 send_advert_func=self.send_advert,
+                duplicate_observer=self._companion_duplicate_observer,
             )
 
             # Create router
@@ -774,6 +789,8 @@ class RepeaterDaemon:
                     if sqlite_handler
                     else None
                 )
+                if journal is not None:
+                    self.companion_journals[companion_hash_str] = journal
 
                 _sync_node_name_to_config = _make_sync_node_name_to_config(name)
 
@@ -802,6 +819,7 @@ class RepeaterDaemon:
                     sqlite_handler=sqlite_handler,
                     companion_hash=companion_hash_str,
                     on_prefs_saved=_on_companion_prefs_saved,
+                    tracker=self.correlation_tracker,
                     **bridge_kwargs,
                 )
 
@@ -834,6 +852,7 @@ class RepeaterDaemon:
                         self.discovery_helper.control_handler if self.discovery_helper else None
                     ),
                     journal=journal,
+                    tracker=self.correlation_tracker,
                 )
                 await frame_server.start()
                 self.companion_frame_servers.append(frame_server)
@@ -1033,6 +1052,8 @@ class RepeaterDaemon:
         journal = (
             CompanionEventJournal(sqlite_handler, companion_hash_str) if sqlite_handler else None
         )
+        if journal is not None:
+            self.companion_journals[companion_hash_str] = journal
 
         def _on_companion_prefs_saved(new_node_name: str, _journal=journal) -> None:
             """Journal the prefs change (no config-name sync in hot-reload path)."""
@@ -1051,6 +1072,7 @@ class RepeaterDaemon:
             sqlite_handler=sqlite_handler,
             companion_hash=companion_hash_str,
             on_prefs_saved=_on_companion_prefs_saved,
+            tracker=self.correlation_tracker,
             **bridge_kwargs,
         )
 
@@ -1077,6 +1099,7 @@ class RepeaterDaemon:
                 self.discovery_helper.control_handler if self.discovery_helper else None
             ),
             journal=journal,
+            tracker=self.correlation_tracker,
         )
         await frame_server.start()
         self.companion_frame_servers.append(frame_server)
@@ -1143,6 +1166,49 @@ class RepeaterDaemon:
                 await bridge.process_received_packet(packet)
             except Exception as e:
                 logger.debug("Companion bridge RAW_CUSTOM error: %s", e)
+
+    def _companion_duplicate_observer(self, packet_record: dict) -> None:
+        """RepeaterHandler's ``duplicate_observer`` hook (design doc §10.4).
+
+        Consults the process-wide correlation tracker for every genuine OTA
+        duplicate; on a hit, journals a ``message_reception`` (inbound) or
+        ``message_send_state`` (outbound heard-repeat) event via the
+        matching companion's journal, and — for inbound hits — write-throughs
+        the running counters onto the message row (§10.6) so they survive
+        ``packets`` retention pruning. RepeaterHandler already wraps this
+        call in try/except, but errors are caught here too so one bad hit
+        (e.g. a journal write failure) never drops the others in the list.
+        """
+        if self.correlation_tracker is None:
+            return
+        hits = self.correlation_tracker.observe_duplicate(packet_record)
+        if not hits:
+            return
+        sqlite_handler = None
+        if self.repeater_handler and self.repeater_handler.storage:
+            sqlite_handler = self.repeater_handler.storage.sqlite_handler
+        for hit in hits:
+            journal = self.companion_journals.get(hit["companion_hash"])
+            if journal is None:
+                continue
+            try:
+                if hit["direction"] == "in":
+                    journal.record_message_reception(hit)
+                    message_id = hit.get("message_id")
+                    if sqlite_handler is not None and message_id is not None:
+                        sqlite_handler.companion_update_message_observations(
+                            message_id,
+                            hit["observation_count"],
+                            hit["unique_path_count"],
+                        )
+                else:
+                    journal.record_send_state(hit)
+            except Exception:
+                logger.exception(
+                    "Companion correlation hit failed for companion=%s packet_hash=%s",
+                    hit.get("companion_hash"),
+                    hit.get("packet_hash"),
+                )
 
     def _register_duplicate_logging_hook(self, dedupe_enabled: bool) -> None:
         """Register pre-dedup duplicate logging only when dispatcher dedupe is active."""

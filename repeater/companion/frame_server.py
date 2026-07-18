@@ -40,6 +40,7 @@ class CompanionFrameServer(_BaseFrameServer):
         control_handler=None,
         *,
         journal=None,
+        tracker=None,
     ):
         super().__init__(
             bridge=bridge,
@@ -56,6 +57,11 @@ class CompanionFrameServer(_BaseFrameServer):
         )
         self.sqlite_handler = sqlite_handler
         self.journal = journal
+        # RF correlation tracker (design doc §10.4): registers each freshly
+        # persisted inbound message so a later duplicate reception can be
+        # journaled as message_reception. Optional/None when correlation
+        # isn't wired up (e.g. some tests construct a frame server directly).
+        self.tracker = tracker
 
     async def start(self) -> None:
         """Start persistence before accepting companion client connections."""
@@ -97,6 +103,13 @@ class CompanionFrameServer(_BaseFrameServer):
             self.bridge.message_queue.pop_last()
             if self.journal is not None:
                 await asyncio.to_thread(self.journal.record_message, msg_dict)
+            tracker = getattr(self, "tracker", None)
+            packet_hash = msg_dict.get("packet_hash")
+            if tracker is not None and packet_hash:
+                message_id = await asyncio.to_thread(
+                    self.sqlite_handler.companion_get_message_id, self.companion_hash, packet_hash
+                )
+                tracker.register_inbound(packet_hash, self.companion_hash, message_id)
         else:
             logger.debug(
                 "Companion %s: retaining message in memory after SQLite queue rejection",

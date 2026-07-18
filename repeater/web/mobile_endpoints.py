@@ -54,6 +54,8 @@ from typing import Optional, Tuple
 
 import cherrypy
 
+from repeater.companion.correlation import outbound_send_capture
+
 from .auth.middleware import require_auth
 from .companion_endpoints import _to_json_safe
 
@@ -63,6 +65,28 @@ try:
     from repeater._version import __version__ as _REPEATER_VERSION
 except Exception:  # pragma: no cover - version metadata is best-effort
     _REPEATER_VERSION = None
+
+
+async def _send_and_capture(coro):
+    """Await ``coro`` with a fresh ``outbound_send_capture`` holder in scope.
+
+    ``RepeaterCompanionBridge._send_packet`` (awaited somewhere inside
+    ``coro``, transitively) publishes the packet_hash it computed into
+    whatever holder is set in the *current* context (design doc §10.4).
+    Setting the ContextVar here — inside the coroutine actually scheduled
+    onto the event loop — rather than in the request thread that builds
+    ``coro``, is what scopes the holder to this one send: contextvars
+    propagate down an await chain within the same task, so two concurrent
+    sends (two separate calls to this function, two separate tasks) never
+    see each other's holder.
+    """
+    holder: dict = {}
+    token = outbound_send_capture.set(holder)
+    try:
+        result = await coro
+    finally:
+        outbound_send_capture.reset(token)
+    return result, holder.get("hash")
 
 
 class MobileAPIEndpoints:
@@ -586,6 +610,14 @@ class CompanionsV1:
         is a 409. Only a *successful* send claims the key; a failed send
         (radio/queue rejection) leaves it unclaimed so a retry reaches the
         radio again instead of replaying a cached failure forever.
+
+        A successful response also carries ``packet_hash``: the 16-char
+        correlation key (§10.2) for the packet that was just transmitted,
+        captured off ``RepeaterCompanionBridge._send_packet`` via the
+        ``outbound_send_capture`` contextvar (§10.4). Clients can use it to
+        match a send against later ``message_send_state`` heard-repeat
+        events without waiting on a round trip through the journal. Absent
+        on failure — a send that never reached the radio has no packet_hash.
         """
         bridge, _companion_hash = self._resolve(companion_name)
 
@@ -623,19 +655,27 @@ class CompanionsV1:
         if has_to:
             pub_key = self._pub_key_from_hex(to_hex)
             txt_type = int(body.get("txt_type", 0))
-            result = self._run_async(bridge.send_text_message(pub_key, text, txt_type=txt_type))
-            sent_ok = result.success
-            response = self._success(
-                {
-                    "sent": result.success,
-                    "is_flood": result.is_flood,
-                    "expected_ack": result.expected_ack,
-                }
+            result, packet_hash = self._run_async(
+                _send_and_capture(bridge.send_text_message(pub_key, text, txt_type=txt_type))
             )
+            sent_ok = result.success
+            data = {
+                "sent": result.success,
+                "is_flood": result.is_flood,
+                "expected_ack": result.expected_ack,
+            }
+            if sent_ok and packet_hash:
+                data["packet_hash"] = packet_hash[:16]
+            response = self._success(data)
         else:
             idx = int(channel_idx)
-            sent_ok = self._run_async(bridge.send_channel_message(idx, text))
-            response = self._success({"sent": sent_ok})
+            sent_ok, packet_hash = self._run_async(
+                _send_and_capture(bridge.send_channel_message(idx, text))
+            )
+            data = {"sent": sent_ok}
+            if sent_ok and packet_hash:
+                data["packet_hash"] = packet_hash[:16]
+            response = self._success(data)
 
         if not sent_ok:
             return response

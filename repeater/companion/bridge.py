@@ -16,6 +16,8 @@ from typing import Any, Callable, Optional
 
 from openhop_core.companion import CompanionBridge
 
+from repeater.companion.correlation import outbound_send_capture
+
 logger = logging.getLogger("RepeaterCompanionBridge")
 
 
@@ -75,10 +77,15 @@ class RepeaterCompanionBridge(CompanionBridge):
         sqlite_handler=None,
         companion_hash: str = "",
         on_prefs_saved: Optional[Callable[[str], None]] = None,
+        tracker=None,
     ) -> None:
         self._sqlite_handler = sqlite_handler
         self._companion_hash = companion_hash
         self._on_prefs_saved = on_prefs_saved
+        # RF correlation tracker (design doc §10.4): registers each
+        # outbound send so a later heard-repeat can be journaled as
+        # message_send_state. Optional/None when correlation isn't wired up.
+        self._tracker = tracker
         super().__init__(
             identity=identity,
             packet_injector=packet_injector,
@@ -93,6 +100,37 @@ class RepeaterCompanionBridge(CompanionBridge):
             radio_settings_getter=radio_settings_getter,
             max_tx_power_getter=max_tx_power_getter,
         )
+
+    async def _send_packet(self, pkt, wait_for_ack: bool = False, expected_crc=None) -> bool:
+        """Send via the packet_injector, then register/publish the outbound
+        packet_hash for RF correlation (design doc §10.4).
+
+        Registration and hash publication happen unconditionally (even for
+        actions this bridge sends besides text/channel messages — logins,
+        status/telemetry requests) since a hash-only registration that never
+        gets a duplicate is just an inert, TTL-expiring tracker entry; the
+        cost is one cheap dict write. The hash is computed once here and
+        reused for both, so it matches exactly what ``packets.packet_hash``
+        and ``companion_messages.packet_hash`` use as their correlation key.
+        """
+        if expected_crc is None:
+            sent = await self._packet_injector(pkt, wait_for_ack=wait_for_ack)
+        else:
+            sent = await self._packet_injector(
+                pkt, wait_for_ack=wait_for_ack, expected_crc=expected_crc
+            )
+        if sent:
+            try:
+                packet_hash = pkt.calculate_packet_hash().hex().upper()
+            except Exception as e:
+                logger.debug("Could not compute packet hash for correlation: %s", e)
+                return sent
+            if self._tracker is not None and self._companion_hash:
+                self._tracker.register_outbound(packet_hash, self._companion_hash)
+            holder = outbound_send_capture.get()
+            if holder is not None:
+                holder["hash"] = packet_hash
+        return sent
 
     def _save_prefs(self) -> None:
         """Persist full NodePrefs as JSON to SQLite."""

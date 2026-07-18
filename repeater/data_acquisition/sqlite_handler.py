@@ -851,6 +851,43 @@ class SQLiteHandler:
                     )
                     logger.info(f"Migration '{migration_name}' applied successfully")
 
+                # Migration 16: Mobile Companion API phase 3 — live RF
+                # correlation derived counters (design doc §10.6).
+                # ``observation_count`` / ``unique_path_count`` track total OTA
+                # copies observed (including the original reception) and
+                # distinct incoming paths, so headline counts survive
+                # ``packets`` retention pruning even after raw rows age out.
+                # DEFAULT 1 makes existing rows an honest lower bound (one
+                # observation, one path) — no backfill needed.
+                migration_name = "add_companion_message_observation_counters"
+                existing = conn.execute(
+                    "SELECT migration_name FROM migrations WHERE migration_name = ?",
+                    (migration_name,),
+                ).fetchone()
+                if not existing:
+                    cursor = conn.execute("PRAGMA table_info(companion_messages)")
+                    columns = [column[1] for column in cursor.fetchall()]
+
+                    if "observation_count" not in columns:
+                        conn.execute(
+                            "ALTER TABLE companion_messages "
+                            "ADD COLUMN observation_count INTEGER NOT NULL DEFAULT 1"
+                        )
+                        logger.info("Added observation_count column to companion_messages table")
+
+                    if "unique_path_count" not in columns:
+                        conn.execute(
+                            "ALTER TABLE companion_messages "
+                            "ADD COLUMN unique_path_count INTEGER NOT NULL DEFAULT 1"
+                        )
+                        logger.info("Added unique_path_count column to companion_messages table")
+
+                    conn.execute(
+                        "INSERT INTO migrations (migration_name, applied_at) VALUES (?, ?)",
+                        (migration_name, time.time()),
+                    )
+                    logger.info(f"Migration '{migration_name}' applied successfully")
+
                 conn.commit()
 
         except Exception as e:
@@ -3827,6 +3864,55 @@ class SQLiteHandler:
             logger.error(f"Failed to push companion message: {e}")
             return False
 
+    def companion_get_message_id(self, companion_hash: str, packet_hash) -> Optional[int]:
+        """Return the row id of a companion message by its ``packet_hash``, or None.
+
+        Used to register a freshly persisted inbound message with the RF
+        correlation tracker (design doc §10.4). ``companion_push_message``
+        intentionally keeps its plain-bool return contract (existing tests
+        assert on it directly), so the id is fetched separately via the same
+        ``UNIQUE(companion_hash, packet_hash)`` index migration 8 added.
+        """
+        if isinstance(packet_hash, bytes):
+            packet_hash = packet_hash.decode("utf-8", errors="replace") if packet_hash else None
+        if not packet_hash:
+            return None
+        try:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT id FROM companion_messages WHERE companion_hash = ? AND packet_hash = ?",
+                    (companion_hash, packet_hash),
+                ).fetchone()
+                return int(row[0]) if row else None
+        except Exception as e:
+            logger.error(f"Failed to get companion message id for {companion_hash}: {e}")
+            return None
+
+    def companion_update_message_observations(
+        self, message_id: int, observation_count: int, unique_path_count: int
+    ) -> bool:
+        """Write-through the running reception counters onto a message row
+        (design doc §10.6): keeps headline counts alive in ``companion_messages``
+        after the raw ``packets`` rows they were derived from age out of
+        retention. Bounded ``UPDATE`` by primary key; volume is bounded by the
+        companion's own message rate, not the mesh's packet rate.
+        """
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    UPDATE companion_messages
+                    SET observation_count = ?, unique_path_count = ?
+                    WHERE id = ?
+                    """,
+                    (int(observation_count), int(unique_path_count), int(message_id)),
+                )
+                conn.commit()
+                return True
+        except Exception as e:
+            logger.error(f"Failed to update companion message observations for {message_id}: {e}")
+            return False
+
     def companion_pop_message(self, companion_hash: str) -> Optional[Dict]:
         """Soft-consume and return the oldest unconsumed message in the queue.
 
@@ -3890,7 +3976,7 @@ class SQLiteHandler:
                     SELECT id, companion_hash, sender_key, txt_type, timestamp, text,
                            is_channel, channel_idx, path_len, sender_prefix, snr, rssi,
                            channel_data_type, channel_data_payload, packet_hash,
-                           created_at, consumed_at
+                           created_at, consumed_at, observation_count, unique_path_count
                     FROM companion_messages WHERE companion_hash = ?
                 """
                 params: List[Any] = [companion_hash]

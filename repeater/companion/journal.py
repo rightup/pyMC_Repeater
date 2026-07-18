@@ -147,6 +147,55 @@ class CompanionEventJournal:
         payload = _to_json_safe(dict(fields))
         return self._append("prefs", payload)
 
+    def record_message_reception(self, correlation: dict) -> Optional[int]:
+        """Journal another RF copy of a known inbound message (design doc §9:
+        ``type: message_reception``, §10.4 live correlation).
+
+        ``correlation`` is one of the dicts returned by
+        ``CompanionCorrelationTracker.observe_duplicate`` for an "in"
+        direction hit. Path entries are raw hashes only for now — resolving
+        them against contacts (§10.5) is a later phase, so ``data["path"]``
+        stays the plain hash list here.
+        """
+        payload = {
+            "message_id": correlation.get("message_id"),
+            "packet_hash": correlation.get("packet_hash"),
+            "path": correlation.get("path") or [],
+            "rssi": correlation.get("rssi"),
+            "snr": correlation.get("snr"),
+            "observed_at": correlation.get("observed_at"),
+            "observation_count": correlation.get("observation_count"),
+            "unique_path_count": correlation.get("unique_path_count"),
+        }
+        return self._append(
+            "message_reception", payload, packet_hash=correlation.get("packet_hash")
+        )
+
+    def record_send_state(self, correlation: dict) -> Optional[int]:
+        """Journal a heard-repeat of one of our own sends (design doc §9:
+        ``type: message_send_state``, §10.3 heard-repeat semantics).
+
+        ``correlation`` is one of the dicts returned by
+        ``CompanionCorrelationTracker.observe_duplicate`` for an "out"
+        direction hit. ``message_id`` is always ``None`` for now — outbound
+        sends aren't persisted to ``companion_messages`` yet.
+        """
+        payload = {
+            "message_id": correlation.get("message_id"),
+            "state": "heard_repeated",
+            "packet_hash": correlation.get("packet_hash"),
+            "path": correlation.get("path") or [],
+            "terminal_repeater_hash": correlation.get("terminal_hash"),
+            "rssi": correlation.get("rssi"),
+            "snr": correlation.get("snr"),
+            "observed_at": correlation.get("observed_at"),
+            "heard_repeat_count": correlation.get("heard_repeat_count"),
+            "unique_repeater_count": correlation.get("unique_repeater_count"),
+        }
+        return self._append(
+            "message_send_state", payload, packet_hash=correlation.get("packet_hash")
+        )
+
     @property
     def epoch(self) -> str:
         """Current journal epoch (design doc §5.3), delegated to storage."""
