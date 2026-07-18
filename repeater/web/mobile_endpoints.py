@@ -51,6 +51,7 @@ import threading
 import time
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from typing import Optional, Tuple
+from urllib.parse import urlparse
 
 import cherrypy
 
@@ -1551,12 +1552,18 @@ class DevicesV1:
         self.event_loop = event_loop
 
     def _cp_dispatch(self, vpath):
-        """Route ``DELETE /devices/{device_id}``. ``GET /devices`` (empty
+        """Route ``DELETE /devices/{device_id}`` and
+        ``POST|DELETE /devices/{device_id}/push``. ``GET /devices`` (empty
         vpath) resolves to ``index`` through CherryPy's normal dispatch."""
         if len(vpath) == 1:
             device_id = vpath.pop(0)
             cherrypy.request.params["device_id"] = device_id
             return self.delete
+        if len(vpath) == 2 and vpath[1] == "push":
+            device_id = vpath.pop(0)
+            vpath.pop(0)  # literal 'push' segment
+            cherrypy.request.params["device_id"] = device_id
+            return self.push
         return None
 
     @staticmethod
@@ -1639,3 +1646,96 @@ class DevicesV1:
         handler.revoke_api_token(device["token_id"])
         handler.companion_device_delete(device_id)
         return self._success({"revoked": True, "device_id": device_id})
+
+    # ------------------------------------------------------------------
+    # POST | DELETE /api/v1/devices/{device_id}/push  (routed via _cp_dispatch)
+    # ------------------------------------------------------------------
+
+    _VALID_PUSH_DETAIL = ("none", "count", "preview")
+
+    def _get_json_body(self) -> dict:
+        try:
+            raw = cherrypy.request.body.read()
+            return json.loads(raw) if raw else {}
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise cherrypy.HTTPError(400, f"Invalid JSON body: {exc}")
+
+    def _check_device_or_admin(self, handler, device_id: str) -> None:
+        """A device manages its own push registration; admins manage any.
+
+        Admin scope (web UI / admin token) passes unconditionally. Otherwise
+        the caller must be authenticating with the very device-token paired to
+        ``device_id`` — a scoped device token can register push only for
+        itself, never for another device (mirrors the 404-folding choke point
+        the rest of /api/v1 uses so a token can't probe other device ids).
+        """
+        user = getattr(cherrypy.request, "user", None) or {}
+        if user.get("scope", "admin") == "admin":
+            return
+        token_id = user.get("token_id")
+        if token_id is not None:
+            own = handler.companion_device_get_by_token(token_id)
+            if own is not None and own["device_id"] == device_id:
+                return
+        # Indistinguishable from "device not found" for a non-owning caller
+        # (no cross-device existence leak).
+        raise cherrypy.HTTPError(404, f"Device '{device_id}' not found")
+
+    @staticmethod
+    def _validate_relay_url(url):
+        """Relay URL is client-supplied (design doc §12.2): require an
+        absolute http(s) URL with a host. Private/LAN targets are allowed on
+        purpose — self-hosted relays are a supported deployment."""
+        parsed = urlparse(url or "")
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            raise cherrypy.HTTPError(400, "push_relay_url must be an absolute http(s) URL")
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    @require_auth
+    def push(self, device_id=None, **kwargs):
+        """Register (POST) or clear (DELETE) a device's push credentials
+        (design doc §12.2). POST body: ``{push_token, push_relay_url?,
+        push_detail?}`` — ``push_token`` required; ``push_detail`` defaults to
+        the stored value (``none`` for a fresh device). Auth: the device's own
+        token, or admin."""
+        method = cherrypy.request.method
+        if method not in ("POST", "DELETE", "OPTIONS"):
+            cherrypy.response.headers["Allow"] = "POST, DELETE"
+            raise cherrypy.HTTPError(405, "Method not allowed. Use POST or DELETE.")
+        handler = self._get_sqlite_handler()
+        self._check_device_or_admin(handler, device_id)
+
+        if method == "DELETE":
+            if not handler.companion_device_clear_push(device_id):
+                raise cherrypy.HTTPError(404, f"Device '{device_id}' not found")
+            return self._success({"unregistered": True, "device_id": device_id})
+
+        body = self._get_json_body()
+        push_token = body.get("push_token")
+        if not push_token or not isinstance(push_token, str):
+            raise cherrypy.HTTPError(400, "push_token is required")
+
+        push_relay_url = body.get("push_relay_url")
+        if push_relay_url is not None:
+            self._validate_relay_url(push_relay_url)
+
+        push_detail = body.get("push_detail")
+        if push_detail is not None and push_detail not in self._VALID_PUSH_DETAIL:
+            raise cherrypy.HTTPError(
+                400, f"push_detail must be one of {', '.join(self._VALID_PUSH_DETAIL)}"
+            )
+
+        if not handler.companion_device_set_push(
+            device_id, push_token, push_relay_url=push_relay_url, push_detail=push_detail
+        ):
+            raise cherrypy.HTTPError(404, f"Device '{device_id}' not found")
+
+        device = handler.companion_device_get(device_id)
+        return self._success(
+            {
+                "device_id": device_id,
+                "push_detail": device["push_detail"] if device else (push_detail or "none"),
+                "registered": True,
+            }
+        )

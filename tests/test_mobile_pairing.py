@@ -531,3 +531,102 @@ class TestDevicesDispatch:
     def test_dispatch_falls_through_for_other_lengths(self, devices):
         assert devices._cp_dispatch([]) is None
         assert devices._cp_dispatch(["a", "b"]) is None
+
+    def test_dispatch_routes_push_subresource(self, devices):
+        vpath = ["dev-x", "push"]
+        handler_fn = devices._cp_dispatch(vpath)
+        assert handler_fn == devices.push
+        assert cherrypy.request.params["device_id"] == "dev-x"
+
+
+class TestDevicesPush:
+    def _make_device(self, handler, device_id="dev-p", token_hash="hash-p"):
+        token_id = handler.create_api_token(
+            "phone", token_hash, scope=f"companion:{_NAME}"
+        )
+        handler.companion_device_create(_HASH, device_id, "Phone P", token_id)
+        return token_id
+
+    def test_device_registers_own_push(self, devices, handler):
+        token_id = self._make_device(handler)
+        _set_user(scope=f"companion:{_NAME}", token_id=token_id)
+        _post(devices, {
+            "push_token": "apns-xyz",
+            "push_relay_url": "https://relay.example/notify",
+            "push_detail": "count",
+        })
+        result = _call(devices.push, device_id="dev-p")
+        assert result["success"] is True
+        assert result["data"]["push_detail"] == "count"
+        device = handler.companion_device_get("dev-p")
+        assert device["push_token"] == "apns-xyz"
+        assert device["push_relay_url"] == "https://relay.example/notify"
+
+    def test_admin_registers_any_device(self, devices, handler):
+        self._make_device(handler)
+        _set_user(scope="admin")
+        _post(devices, {"push_token": "tok", "push_relay_url": "https://r.example"})
+        result = _call(devices.push, device_id="dev-p")
+        assert result["success"] is True
+        assert handler.companion_device_get("dev-p")["push_token"] == "tok"
+
+    def test_non_owning_device_token_404(self, devices, handler):
+        # dev-p is paired to token_a; the caller authenticates as a DIFFERENT
+        # device's token and must not be able to touch dev-p.
+        self._make_device(handler, "dev-p", "hash-a")
+        other_token = handler.create_api_token(
+            "other", "hash-b", scope=f"companion:{_NAME}"
+        )
+        handler.companion_device_create(_HASH, "dev-other", "Other", other_token)
+        _set_user(scope=f"companion:{_NAME}", token_id=other_token)
+        _post(devices, {"push_token": "tok"})
+        with pytest.raises(cherrypy.HTTPError) as exc:
+            _call(devices.push, device_id="dev-p")
+        assert exc.value.status == 404
+        assert handler.companion_device_get("dev-p")["push_token"] is None
+
+    def test_missing_push_token_400(self, devices, handler):
+        token_id = self._make_device(handler)
+        _set_user(scope=f"companion:{_NAME}", token_id=token_id)
+        _post(devices, {"push_relay_url": "https://r.example"})
+        with pytest.raises(cherrypy.HTTPError) as exc:
+            _call(devices.push, device_id="dev-p")
+        assert exc.value.status == 400
+
+    def test_invalid_push_detail_400(self, devices, handler):
+        token_id = self._make_device(handler)
+        _set_user(scope=f"companion:{_NAME}", token_id=token_id)
+        _post(devices, {"push_token": "tok", "push_detail": "everything"})
+        with pytest.raises(cherrypy.HTTPError) as exc:
+            _call(devices.push, device_id="dev-p")
+        assert exc.value.status == 400
+
+    def test_invalid_relay_url_400(self, devices, handler):
+        token_id = self._make_device(handler)
+        _set_user(scope=f"companion:{_NAME}", token_id=token_id)
+        _post(devices, {"push_token": "tok", "push_relay_url": "ftp://nope"})
+        with pytest.raises(cherrypy.HTTPError) as exc:
+            _call(devices.push, device_id="dev-p")
+        assert exc.value.status == 400
+
+    def test_delete_clears_push_token(self, devices, handler):
+        token_id = self._make_device(handler)
+        handler.companion_device_set_push(
+            "dev-p", "tok", push_relay_url="https://r.example", push_detail="count"
+        )
+        _set_user(scope=f"companion:{_NAME}", token_id=token_id)
+        cherrypy.serving.request.method = "DELETE"
+        result = _call(devices.push, device_id="dev-p")
+        assert result["data"]["unregistered"] is True
+        device = handler.companion_device_get("dev-p")
+        assert device["push_token"] is None
+        # relay/detail preserved for a later re-register
+        assert device["push_relay_url"] == "https://r.example"
+
+    def test_wrong_method_405(self, devices, handler):
+        token_id = self._make_device(handler)
+        _set_user(scope=f"companion:{_NAME}", token_id=token_id)
+        cherrypy.serving.request.method = "GET"
+        with pytest.raises(cherrypy.HTTPError) as exc:
+            _call(devices.push, device_id="dev-p")
+        assert exc.value.status == 405
