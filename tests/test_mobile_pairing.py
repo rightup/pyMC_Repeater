@@ -630,3 +630,34 @@ class TestDevicesPush:
         with pytest.raises(cherrypy.HTTPError) as exc:
             _call(devices.push, device_id="dev-p")
         assert exc.value.status == 405
+
+    def test_registers_mention_fields(self, devices, handler):
+        token_id = self._make_device(handler)
+        _set_user(scope=f"companion:{_NAME}", token_id=token_id)
+        _post(devices, {
+            "push_token": "tok",
+            "mention_push": True,
+            "mention_keywords": ["adam", "@adam"],
+        })
+        result = _call(devices.push, device_id="dev-p")
+        assert result["data"]["mention_push"] is True
+        device = handler.companion_device_get("dev-p")
+        assert device["mention_push"] is True
+        import json as _json
+        assert _json.loads(device["mention_keywords"]) == ["adam", "@adam"]
+
+    def test_invalid_mention_push_type_400(self, devices, handler):
+        token_id = self._make_device(handler)
+        _set_user(scope=f"companion:{_NAME}", token_id=token_id)
+        _post(devices, {"push_token": "tok", "mention_push": "yes"})
+        with pytest.raises(cherrypy.HTTPError) as exc:
+            _call(devices.push, device_id="dev-p")
+        assert exc.value.status == 400
+
+    def test_invalid_mention_keywords_400(self, devices, handler):
+        token_id = self._make_device(handler)
+        _set_user(scope=f"companion:{_NAME}", token_id=token_id)
+        _post(devices, {"push_token": "tok", "mention_keywords": [1, 2]})
+        with pytest.raises(cherrypy.HTTPError) as exc:
+            _call(devices.push, device_id="dev-p")
+        assert exc.value.status == 400

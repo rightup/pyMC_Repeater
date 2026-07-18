@@ -1726,8 +1726,24 @@ class DevicesV1:
                 400, f"push_detail must be one of {', '.join(self._VALID_PUSH_DETAIL)}"
             )
 
+        mention_push = body.get("mention_push")
+        if mention_push is not None and not isinstance(mention_push, bool):
+            raise cherrypy.HTTPError(400, "mention_push must be a boolean")
+
+        mention_keywords = body.get("mention_keywords")
+        if mention_keywords is not None:
+            if not isinstance(mention_keywords, list) or not all(
+                isinstance(k, str) for k in mention_keywords
+            ):
+                raise cherrypy.HTTPError(400, "mention_keywords must be an array of strings")
+
         if not handler.companion_device_set_push(
-            device_id, push_token, push_relay_url=push_relay_url, push_detail=push_detail
+            device_id,
+            push_token,
+            push_relay_url=push_relay_url,
+            push_detail=push_detail,
+            mention_push=mention_push,
+            mention_keywords=mention_keywords,
         ):
             raise cherrypy.HTTPError(404, f"Device '{device_id}' not found")
 
@@ -1736,6 +1752,7 @@ class DevicesV1:
             {
                 "device_id": device_id,
                 "push_detail": device["push_detail"] if device else (push_detail or "none"),
+                "mention_push": device["mention_push"] if device else bool(mention_push),
                 "registered": True,
             }
         )

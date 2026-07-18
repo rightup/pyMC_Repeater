@@ -4693,6 +4693,13 @@ paths:
                               type: string
                               enum: [none, count, preview]
                               description: Per-device push content level (design doc §12.2). Defaults to `none`.
+                            mention_push:
+                              type: boolean
+                              description: Whether the content-free mention alert class is enabled for this device (design doc §12.2).
+                            mention_keywords:
+                              type: string
+                              nullable: true
+                              description: JSON array of trigger strings, or null to fall back to the companion node_name.
                             created_at:
                               type: number
                             last_seen:
@@ -4776,6 +4783,15 @@ paths:
         opting `preview` in is the only way message text reaches the relay,
         which is why it defaults off (§11.4).
 
+        **Mentions.** `mention_push: true` enables a separate, content-free
+        mention alert: when a new message's text matches one of the device's
+        `mention_keywords` (or, if none set, the companion's node_name — as a
+        whole word, case-insensitive), the relay push is a user-visible alert
+        (`{mention: true, alert: "You were mentioned"}`, never the message
+        text) instead of a silent wake. It takes precedence over `push_detail`
+        for that push and is what makes a mention prompt without leaking
+        content (design doc §12.2).
+
         The **relay service itself is a separate deliverable** (phase 4): until
         one is deployed, registration succeeds and the notifier's POSTs simply
         have no recipient; the app falls back to background-refresh sync.
@@ -4812,6 +4828,14 @@ paths:
                   type: string
                   enum: [none, count, preview]
                   description: Content level. Omitted → stored value (default `none`).
+                mention_push:
+                  type: boolean
+                  description: Enable the content-free mention alert class. Omitted → stored value (default false).
+                mention_keywords:
+                  type: array
+                  items:
+                    type: string
+                  description: Trigger strings for mentions. Omitted → stored value; `[]` → fall back to the companion node_name.
       responses:
         '200':
           description: Push registered
@@ -4830,14 +4854,18 @@ paths:
                           push_detail:
                             type: string
                             enum: [none, count, preview]
+                          mention_push:
+                            type: boolean
                           registered:
                             type: boolean
                             example: true
         '400':
           description: |
-            `push_token is required`, an invalid `push_detail`, or a
-            `push_relay_url` that isn't an absolute http(s) URL. Rendered as
-            the v1 JSON error envelope (see tag description).
+            `push_token is required`, an invalid `push_detail`, a
+            `push_relay_url` that isn't an absolute http(s) URL, a non-boolean
+            `mention_push`, or a `mention_keywords` that isn't an array of
+            strings. Rendered as the v1 JSON error envelope (see tag
+            description).
           content:
             application/json:
               schema:
