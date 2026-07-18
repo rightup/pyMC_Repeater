@@ -58,6 +58,47 @@ tags:
     description: Access Control Lists
   - name: Room Server
     description: Room server messaging
+  - name: Mobile Companion API v1
+    description: |
+      `/api/v1/*` — sync/action surface for first-party mobile companion
+      clients (`repeater/web/mobile_endpoints.py`), per
+      `docs/architecture/mobile-companion-api.md`. Distinct from the legacy
+      `/api/companion/*` surface used by the web UI (`companion_endpoints.py`),
+      which remains unchanged and unversioned.
+
+      **Envelope:** every JSON response is either
+      `{"success": true, "data": {…}}` or (auth failures only —
+      see below) `{"success": false, "error": "…"}`.
+
+      **Error rendering:** only `401 Unauthorized` gets converted to the
+      `{"success": false, "error": "…"}` JSON shape — either by the
+      request-authentication step happening entirely inside `require_auth`
+      before the handler runs (`repeater/web/auth/middleware.py`), or by the
+      one globally-registered `error_page.401` handler
+      (`repeater/web/http_server.py:_json_error_handler`) that runs for the
+      tool-level auth gate applied to the whole `/api` tree. Every other
+      error status raised from inside a v1 handler — `400`, `403`, `404`,
+      `409`, `429`, `500`, `503`, `504`, all raised as plain
+      `cherrypy.HTTPError` — has **no** matching `error_page` entry, so
+      CherryPy renders its own default `text/html` error page (the reason
+      phrase appears in that page's body, not as JSON). `@cherrypy.tools.
+      json_out()` only encodes a handler's normal return value; it does not
+      intercept exceptions, so these errors bypass the success/error JSON
+      envelope entirely. The one exception inside this surface:
+      `CompanionsV1._run_async` (used by every action/send endpoint) catches
+      a bridge-coroutine timeout or exception itself and re-raises it as
+      `cherrypy.HTTPError(504` or `500)` — still HTML-rendered per the rule
+      above, just triggered from a caught exception rather than an explicit
+      `raise` in the handler body.
+
+      **Auth:** `Bearer` JWT (web UI / `admin` scope) or `X-API-Key` scoped
+      device token (`ApiKeyAuth`) — see the security scheme below for scope
+      semantics. `GET .../events` (SSE) additionally accepts the JWT as
+      `?token=` since `EventSource` cannot set custom headers; the token is
+      stripped from `request.params` once consumed. `GET /api/v1/server_info`
+      and `POST /api/v1/pair` (and, by config-path cascade, `POST
+      /api/v1/pair/start`) are exempt from the tree-wide auth gate;
+      `pair/start` re-imposes its own `admin`-scope check in-handler instead.
 
 paths:
   # ============================================================================
@@ -4363,6 +4404,1208 @@ paths:
               schema:
                 type: object
 
+  # ============================================================================
+  # Mobile Companion API v1 (repeater/web/mobile_endpoints.py)
+  # ============================================================================
+  /v1/server_info:
+    get:
+      tags: [Mobile Companion API v1]
+      summary: Unauthenticated discovery
+      description: |
+        Unauthenticated-safe minimum an app uses to validate a scanned
+        pairing URL before it has any credential: site name, supported API
+        version(s), supported auth modes, repeater version/time.
+        Deliberately excludes companion names (`GET /v1/companions` requires
+        auth).
+      responses:
+        '200':
+          description: Server info
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessResponse'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          site_name:
+                            type: string
+                          api_versions:
+                            type: array
+                            items:
+                              type: string
+                            example: ["v1"]
+                          auth_modes:
+                            type: array
+                            items:
+                              type: string
+                            example: ["jwt", "api_token"]
+                          server:
+                            type: object
+                            properties:
+                              version:
+                                type: string
+                                nullable: true
+                              time:
+                                type: number
+              examples:
+                success:
+                  value:
+                    success: true
+                    data:
+                      site_name: "Everett North Repeater"
+                      api_versions: ["v1"]
+                      auth_modes: ["jwt", "api_token"]
+                      server: { version: "1.4.0", time: 1789012345.6 }
+        '405':
+          description: |
+            Method not allowed (only `GET`/`OPTIONS`). `Allow: GET` header
+            set; rendered as CherryPy's default HTML error page (see tag
+            description).
+          content:
+            text/html:
+              schema:
+                type: string
+
+  /v1/pair/start:
+    post:
+      tags: [Mobile Companion API v1]
+      summary: Generate a pairing code (admin)
+      description: |
+        Admin-scope-only. Generates a single-use, 5-minute-TTL pairing code
+        for a companion identity (design doc §11.2 step 1). Exempt from the
+        tree-wide `/api` auth gate by config path (it shares the `/api/v1/
+        pair` exemption via CherryPy config-path cascade), so this handler
+        re-checks `admin` scope itself.
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [companion_name]
+              properties:
+                companion_name:
+                  type: string
+                device_name:
+                  type: string
+                  description: Accepted for a future audit-log/QR-label use; not otherwise used in v1.
+      responses:
+        '200':
+          description: Pairing code generated
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessResponse'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          code:
+                            type: string
+                            description: 128-bit hex pairing code (5-minute TTL).
+                          expires_in:
+                            type: integer
+                            example: 300
+                          companion_name:
+                            type: string
+                          fingerprint:
+                            type: string
+                            description: sha256 hexdigest of the companion identity's public key (TOFU pin, §11.3).
+        '400':
+          description: |
+            `companion_name required`. Rendered as CherryPy's default HTML
+            error page, not the JSON error envelope (see tag description).
+          content:
+            text/html:
+              schema:
+                type: string
+        '401':
+          description: Missing/invalid JWT or API token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: |
+            `Admin scope required`. HTML error page, not JSON (see tag
+            description).
+          content:
+            text/html:
+              schema:
+                type: string
+        '404':
+          description: |
+            `Companion '{companion_name}' not found`. HTML error page, not
+            JSON (see tag description).
+          content:
+            text/html:
+              schema:
+                type: string
+
+  /v1/pair:
+    post:
+      tags: [Mobile Companion API v1]
+      summary: Exchange a pairing code for a device token
+      description: |
+        No auth — the pairing code itself is the credential (design doc
+        §11.2 steps 2-3). Exempt from the tree-wide `/api` auth gate. The
+        code is consumed atomically (single use); unknown and expired codes
+        both 404 with the same message so a caller can't distinguish "wrong
+        code" from "code expired". Rate-limited to 10 attempts/60s globally
+        across all callers, checked before code lookup.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code, device_id, name]
+              properties:
+                code:
+                  type: string
+                device_id:
+                  type: string
+                  description: Client-generated stable device identifier. Unique per companion_devices row.
+                name:
+                  type: string
+                  description: Human-readable device name (e.g. "Adam's iPhone").
+                platform:
+                  type: string
+                  nullable: true
+                  example: ios
+      responses:
+        '200':
+          description: Device paired; token returned once.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessResponse'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          token:
+                            type: string
+                            description: Plaintext device API token — shown once, store in Keychain. Send as `X-API-Key` on all subsequent v1 requests.
+                          device_id:
+                            type: string
+                          companion_name:
+                            type: string
+                          scope:
+                            type: string
+                            example: "companion:field-radio-1"
+        '400':
+          description: |
+            `code, device_id, and name are required`. HTML error page, not
+            JSON (see tag description).
+          content:
+            text/html:
+              schema:
+                type: string
+        '404':
+          description: |
+            `Invalid or expired pairing code`. HTML error page, not JSON
+            (see tag description).
+          content:
+            text/html:
+              schema:
+                type: string
+        '409':
+          description: |
+            `device_id already registered` — the just-minted token is
+            revoked server-side before this response. HTML error page, not
+            JSON (see tag description).
+          content:
+            text/html:
+              schema:
+                type: string
+        '429':
+          description: |
+            `Too many pairing attempts, try again later` (fixed 60s window,
+            max 10 attempts, process-global). HTML error page, not JSON (see
+            tag description).
+          content:
+            text/html:
+              schema:
+                type: string
+        '500':
+          description: |
+            `Authentication not configured` (no token manager wired up).
+            HTML error page, not JSON (see tag description).
+          content:
+            text/html:
+              schema:
+                type: string
+
+  /v1/devices:
+    get:
+      tags: [Mobile Companion API v1]
+      summary: List paired devices (admin)
+      description: |
+        All companions' paired devices. `last_seen` is backfilled from the
+        linked api_token's `last_used` timestamp when that is newer than the
+        device row's own `last_seen` — presence is derived from token use,
+        not written per-request.
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      responses:
+        '200':
+          description: Paired devices
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessResponse'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            id:
+                              type: integer
+                            companion_hash:
+                              type: string
+                              pattern: '^0x[0-9a-f]{2}$'
+                            device_id:
+                              type: string
+                            name:
+                              type: string
+                            token_id:
+                              type: integer
+                            platform:
+                              type: string
+                              nullable: true
+                            push_token:
+                              type: string
+                              nullable: true
+                            push_relay_url:
+                              type: string
+                              nullable: true
+                            created_at:
+                              type: number
+                            last_seen:
+                              type: number
+                              nullable: true
+                            last_synced_seq:
+                              type: integer
+                              nullable: true
+        '403':
+          description: |
+            `Admin scope required`. HTML error page, not JSON (see tag
+            description).
+          content:
+            text/html:
+              schema:
+                type: string
+
+  /v1/devices/{device_id}:
+    delete:
+      tags: [Mobile Companion API v1]
+      summary: Revoke a paired device (admin)
+      description: |
+        Deletes the device's `api_tokens` row (its next request 401s
+        naturally) and its `companion_devices` row.
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      parameters:
+        - name: device_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Device revoked
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessResponse'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          revoked:
+                            type: boolean
+                            example: true
+                          device_id:
+                            type: string
+        '403':
+          description: |
+            `Admin scope required`. HTML error page, not JSON (see tag
+            description).
+          content:
+            text/html:
+              schema:
+                type: string
+        '404':
+          description: |
+            `Device '{device_id}' not found`. HTML error page, not JSON (see
+            tag description).
+          content:
+            text/html:
+              schema:
+                type: string
+
+  /v1/companions:
+    get:
+      tags: [Mobile Companion API v1]
+      summary: List companion identities
+      description: |
+        Scope-filtered (design doc §11.1): a `companion:{name}` device token
+        sees only its own companion (name + public key of the others are
+        withheld, not just their action endpoints); `admin`/`companion:*`
+        (and legacy scope-less callers) see all.
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      responses:
+        '200':
+          description: Companion identities visible to this caller's scope
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessResponse'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/MobileCompanionSummary'
+        '401':
+          description: Missing/invalid JWT or API token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /v1/companions/{name}/snapshot:
+    get:
+      tags: [Mobile Companion API v1]
+      summary: Bootstrap document (state + journal cursor)
+      description: |
+        Full state snapshot plus the journal cursor it corresponds to
+        (design doc §7.4): self info, contacts, channels (no PSK secrets),
+        and the most recent messages. Journal head is read *before* the
+        state queries, so any event with `seq >` the returned `cursor` may
+        duplicate snapshot content — clients dedupe by message id.
+
+        Supports conditional requests: `ETag` = `"{journal_epoch}:{head_seq}"`;
+        send it back as `If-None-Match` to get `304 Not Modified` with no
+        body when nothing has changed.
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Companion identity name.
+        - name: messages_limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 100
+            minimum: 1
+            maximum: 200
+        - name: If-None-Match
+          in: header
+          required: false
+          schema:
+            type: string
+          description: Previously-received `ETag` value; a match returns `304`.
+      responses:
+        '200':
+          description: Snapshot
+          headers:
+            ETag:
+              schema:
+                type: string
+              description: '`"{journal_epoch}:{head_seq}"`'
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessResponse'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/MobileSnapshot'
+        '304':
+          description: Not modified — `If-None-Match` matched the current `ETag`. No body.
+          headers:
+            ETag:
+              schema:
+                type: string
+        '401':
+          description: Missing/invalid JWT or API token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: |
+            `Insufficient scope for this companion` (or `No auth scope for
+            this companion`). HTML error page, not JSON (see tag
+            description).
+          content:
+            text/html:
+              schema:
+                type: string
+        '404':
+          description: |
+            `Companion '{name}' not found`. HTML error page, not JSON (see
+            tag description).
+          content:
+            text/html:
+              schema:
+                type: string
+
+  /v1/companions/{name}/sync:
+    get:
+      tags: [Mobile Companion API v1]
+      summary: Journal delta since a cursor
+      description: |
+        One indexed range scan (`idx_companion_events_sync`) bounded by
+        `limit` (design doc §7.5). A `cursor` older than the journal's prune
+        floor returns `200` with empty `events` and `"snapshot_required":
+        true` rather than a silently incomplete delta — the client must
+        re-fetch `snapshot` and resume from its `cursor`. `has_more: true`
+        means immediately re-request with `next_cursor`.
+
+        Supports `ETag`/`If-None-Match` the same way as `snapshot`
+        (`"{journal_epoch}:{head_seq}"`) for cheap poll-and-check.
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: cursor
+          in: query
+          required: true
+          schema:
+            type: string
+            description: Opaque journal seq, as returned by `snapshot.cursor` or a prior `sync.next_cursor`. Non-negative integer string.
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 100
+            minimum: 1
+            maximum: 500
+        - name: If-None-Match
+          in: header
+          required: false
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Delta (possibly empty)
+          headers:
+            ETag:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessResponse'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          journal_epoch:
+                            type: string
+                          events:
+                            type: array
+                            items:
+                              $ref: '#/components/schemas/MobileJournalEvent'
+                          next_cursor:
+                            type: string
+                          has_more:
+                            type: boolean
+                          snapshot_required:
+                            type: boolean
+              examples:
+                delta:
+                  value:
+                    success: true
+                    data:
+                      journal_epoch: "b3f1c2"
+                      events:
+                        - { seq: 184224, type: message, ts: 1789012345.0, packet_hash: null, data: {} }
+                      next_cursor: "184224"
+                      has_more: false
+                      snapshot_required: false
+        '304':
+          description: Not modified.
+          headers:
+            ETag:
+              schema:
+                type: string
+        '400':
+          description: |
+            `cursor required` or `Invalid cursor`. HTML error page, not JSON
+            (see tag description).
+          content:
+            text/html:
+              schema:
+                type: string
+        '401':
+          description: Missing/invalid JWT or API token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: |
+            Insufficient scope. HTML error page, not JSON (see tag
+            description).
+          content:
+            text/html:
+              schema:
+                type: string
+        '404':
+          description: |
+            Companion not found. HTML error page, not JSON (see tag
+            description).
+          content:
+            text/html:
+              schema:
+                type: string
+
+  /v1/companions/{name}/messages:
+    get:
+      tags: [Mobile Companion API v1]
+      summary: Paged message history (infinite scroll)
+      description: |
+        Newest-first page over `companion_messages`, independent of the
+        journal — serves history/infinite-scroll rather than sync.
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: before_id
+          in: query
+          required: false
+          schema:
+            type: integer
+          description: Exclusive upper bound on message `id` (rowid) — page backward in time.
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 100
+            minimum: 1
+            maximum: 200
+      responses:
+        '200':
+          description: Message page
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessResponse'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          messages:
+                            type: array
+                            items:
+                              $ref: '#/components/schemas/MobileMessage'
+                          next_before_id:
+                            type: integer
+                            nullable: true
+                            description: Pass as `before_id` to fetch the next (older) page; `null` when this page was empty.
+        '400':
+          description: |
+            `Invalid before_id`. HTML error page, not JSON (see tag
+            description).
+          content:
+            text/html:
+              schema:
+                type: string
+        '401':
+          description: Missing/invalid JWT or API token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: |
+            Companion not found. HTML error page, not JSON (see tag
+            description).
+          content:
+            text/html:
+              schema:
+                type: string
+
+    post:
+      tags: [Mobile Companion API v1]
+      summary: Send a DM or channel message
+      description: |
+        Sends RF, so retries must be idempotent (design doc §6): the
+        `Idempotency-Key` header is **required**. A retry with the same key
+        and the same request body (companion name + JSON body, hashed)
+        replays the stored response without touching the radio again; the
+        same key against a different body, or a different companion, is a
+        `409`. Only a *successful* send claims the key — a failed send
+        leaves it unclaimed so a retry reaches the radio.
+
+        Unlike the design doc's example response, the actual response has
+        **no** `message_id`/`packet_hash` fields (code wins over doc): a DM
+        send returns `{sent, is_flood, expected_ack}`; a channel send
+        returns `{sent}`. Delivery/heard-repeat progress arrives only via
+        `sync`/`events`, correlated by the client on `text`+timing, not by an
+        id returned here.
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+          description: Caller-generated opaque retry key, scoped per authenticated device (or `user:{username}` for JWT callers with no paired device row).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [text]
+              description: Exactly one of `to` or `channel_idx` is required (validated as a strict XOR).
+              properties:
+                to:
+                  type: string
+                  description: Recipient's 32-byte public key, hex-encoded. Required for a DM; omit for a channel send.
+                channel_idx:
+                  type: integer
+                  description: Channel index (0 is valid). Required for a channel send; omit for a DM.
+                text:
+                  type: string
+                  minLength: 1
+                txt_type:
+                  type: integer
+                  default: 0
+                  description: DM only; ignored for channel sends.
+      responses:
+        '200':
+          description: |
+            Send attempted (`sent: false` is still a `200` — the radio/queue
+            rejected it — not an error status), or a replayed response for a
+            reused `Idempotency-Key` with an identical body.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessResponse'
+                  - type: object
+                    properties:
+                      data:
+                        oneOf:
+                          - type: object
+                            description: DM send result.
+                            properties:
+                              sent:
+                                type: boolean
+                              is_flood:
+                                type: boolean
+                              expected_ack:
+                                type: boolean
+                          - type: object
+                            description: Channel send result.
+                            properties:
+                              sent:
+                                type: boolean
+              examples:
+                dm_sent:
+                  value:
+                    success: true
+                    data: { sent: true, is_flood: false, expected_ack: true }
+                channel_sent:
+                  value:
+                    success: true
+                    data: { sent: true }
+        '400':
+          description: |
+            Missing `Idempotency-Key` header, invalid JSON body, neither/both
+            of `to`/`channel_idx` set, missing `text`, or an invalid `to` hex
+            key. HTML error page, not JSON (see tag description).
+          content:
+            text/html:
+              schema:
+                type: string
+        '401':
+          description: Missing/invalid JWT or API token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: |
+            Companion not found. HTML error page, not JSON (see tag
+            description).
+          content:
+            text/html:
+              schema:
+                type: string
+        '409':
+          description: |
+            `Idempotency-Key reuse with different request` — same key,
+            different companion or body. HTML error page, not JSON (see tag
+            description).
+          content:
+            text/html:
+              schema:
+                type: string
+        '504':
+          description: |
+            `Timed out waiting for radio response` — the bridge coroutine
+            (default 30s) did not complete; the idempotency key is left
+            unclaimed so a retry reaches the radio. HTML error page, not
+            JSON (see tag description).
+          content:
+            text/html:
+              schema:
+                type: string
+
+  /v1/companions/{name}/events:
+    get:
+      tags: [Mobile Companion API v1]
+      summary: Resumable live event stream (SSE)
+      description: |
+        `text/event-stream`. Each frame: `id:` = `seq`, `event:` = event
+        `type`, `data:` = the same JSON object `sync` returns for that row
+        (design doc §8) — one schema, two transports.
+
+        **Resume point:** the standard `Last-Event-ID` header if present,
+        else `?cursor=`, else the current journal head (a bare connection
+        gets a live tail only, no replay). On connect the server drains the
+        backlog from that point (paged, reusing the sync query) before
+        switching to a live tail; a cursor older than the prune floor gets
+        one `event: snapshot_required` frame and the stream closes — the
+        client must `snapshot` and reconnect with a fresh cursor.
+
+        Keepalive: a `: ka` comment frame every `http.sse_keepalive_sec`
+        (default 15s) while idle. A slow client whose queue overflows is
+        disconnected outright (no unbounded buffering) — it reconnects with
+        `Last-Event-ID` and replays what it missed.
+
+        This endpoint does **not** carry the `@require_auth` decorator the
+        other companion handlers do — auth still applies (the tree-wide
+        CherryPy tool-level gate on `/api`, which also accepts `?token=` for
+        `EventSource` and consumes it from the query string before the
+        handler runs); stacking the decorator on top would re-check and
+        401 a request whose token was already stripped.
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: cursor
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Resume point if `Last-Event-ID` is absent. Defaults to current journal head.
+        - name: Last-Event-ID
+          in: header
+          required: false
+          schema:
+            type: string
+          description: Standard SSE resume header; takes priority over `?cursor=`.
+        - name: token
+          in: query
+          required: false
+          schema:
+            type: string
+          description: JWT, for `EventSource` clients that cannot set an `Authorization` header. Consumed (stripped from params) before the handler runs.
+      responses:
+        '200':
+          description: Event stream established
+          headers:
+            Content-Type:
+              schema:
+                type: string
+                example: text/event-stream
+            Cache-Control:
+              schema:
+                type: string
+                example: no-cache
+            X-Accel-Buffering:
+              schema:
+                type: string
+                example: "no"
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                description: |
+                  Stream of `id: {seq}\nevent: {type}\ndata: {json}\n\n` frames,
+                  `: ka\n\n` keepalive comments, and — only when `cursor`/
+                  `Last-Event-ID` is below the prune floor — a single
+                  `event: snapshot_required\ndata: {"journal_epoch":…,
+                  "snapshot_required":true}\n\n` frame before the stream ends.
+        '400':
+          description: |
+            `Invalid cursor`. HTML error page, not JSON (see tag
+            description).
+          content:
+            text/html:
+              schema:
+                type: string
+        '401':
+          description: Missing/invalid JWT or API token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: |
+            Insufficient scope. HTML error page, not JSON (see tag
+            description).
+          content:
+            text/html:
+              schema:
+                type: string
+        '404':
+          description: |
+            Companion not found. HTML error page, not JSON (see tag
+            description).
+          content:
+            text/html:
+              schema:
+                type: string
+        '503':
+          description: |
+            `Companion event journal not available`. HTML error page, not
+            JSON (see tag description).
+          content:
+            text/html:
+              schema:
+                type: string
+
+  /v1/companions/{name}/contacts/{pubkey}/login:
+    post:
+      tags: [Mobile Companion API v1]
+      summary: Room/repeater login for a contact
+      description: |
+        Mirrors the legacy `/api/companion/login` bridge call. No
+        idempotency requirement (only message sends transmit a duplicable
+        payload, design doc §6). 15s bridge timeout.
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: pubkey
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: '^[0-9a-fA-F]{64}$'
+          description: Contact's 32-byte public key, hex-encoded.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                password:
+                  type: string
+                  default: ""
+      responses:
+        '200':
+          description: Login attempted
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessResponse'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/MobileActionResult'
+        '400':
+          description: |
+            Invalid JSON body or invalid public key. HTML error page, not
+            JSON (see tag description).
+          content:
+            text/html:
+              schema:
+                type: string
+        '401':
+          description: Missing/invalid JWT or API token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: |
+            Companion not found. HTML error page, not JSON (see tag
+            description).
+          content:
+            text/html:
+              schema:
+                type: string
+        '405':
+          description: |
+            Method not allowed (POST only, no OPTIONS exception). HTML error
+            page, not JSON (see tag description).
+          content:
+            text/html:
+              schema:
+                type: string
+        '504':
+          description: |
+            Bridge coroutine timed out. HTML error page, not JSON (see tag
+            description).
+          content:
+            text/html:
+              schema:
+                type: string
+
+  /v1/companions/{name}/contacts/{pubkey}/status_request:
+    post:
+      tags: [Mobile Companion API v1]
+      summary: Request a contact's status
+      description: |
+        Mirrors the legacy `/api/companion/request_status` bridge call.
+        Empty body. Bridge timeout 15s (handler waits up to 20s total).
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: pubkey
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: '^[0-9a-fA-F]{64}$'
+      responses:
+        '200':
+          description: Status request completed (or timed out inside the bridge call and returned a failure result)
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessResponse'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/MobileActionResult'
+        '400':
+          description: |
+            Invalid public key. HTML error page, not JSON (see tag
+            description).
+          content:
+            text/html:
+              schema:
+                type: string
+        '401':
+          description: Missing/invalid JWT or API token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: |
+            Companion not found. HTML error page, not JSON (see tag
+            description).
+          content:
+            text/html:
+              schema:
+                type: string
+        '504':
+          description: |
+            Bridge coroutine timed out (outer 20s guard). HTML error page,
+            not JSON (see tag description).
+          content:
+            text/html:
+              schema:
+                type: string
+
+  /v1/companions/{name}/contacts/{pubkey}/telemetry_request:
+    post:
+      tags: [Mobile Companion API v1]
+      summary: Request a contact's telemetry
+      description: |
+        Mirrors the legacy `/api/companion/request_telemetry` bridge call,
+        always requesting base + location + environment. Empty body. Bridge
+        timeout 20s (handler waits up to 25s total).
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: pubkey
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: '^[0-9a-fA-F]{64}$'
+      responses:
+        '200':
+          description: Telemetry request completed
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessResponse'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/MobileActionResult'
+        '400':
+          description: |
+            Invalid public key. HTML error page, not JSON (see tag
+            description).
+          content:
+            text/html:
+              schema:
+                type: string
+        '401':
+          description: Missing/invalid JWT or API token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: |
+            Companion not found. HTML error page, not JSON (see tag
+            description).
+          content:
+            text/html:
+              schema:
+                type: string
+        '504':
+          description: |
+            Bridge coroutine timed out (outer 25s guard). HTML error page,
+            not JSON (see tag description).
+          content:
+            text/html:
+              schema:
+                type: string
+
+  /v1/companions/{name}/contacts/{pubkey}/reset_path:
+    post:
+      tags: [Mobile Companion API v1]
+      summary: Reset a contact's outbound routing path
+      description: |
+        Mirrors the legacy `/api/companion/reset_path` bridge call. Empty
+        body, synchronous (not routed through `_run_async` — no bridge
+        timeout applies).
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: pubkey
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: '^[0-9a-fA-F]{64}$'
+      responses:
+        '200':
+          description: Path reset
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessResponse'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          reset:
+                            type: boolean
+        '400':
+          description: |
+            Invalid public key. HTML error page, not JSON (see tag
+            description).
+          content:
+            text/html:
+              schema:
+                type: string
+        '401':
+          description: Missing/invalid JWT or API token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: |
+            Companion not found. HTML error page, not JSON (see tag
+            description).
+          content:
+            text/html:
+              schema:
+                type: string
+
 components:
   schemas:
     SuccessResponse:
@@ -5070,6 +6313,167 @@ components:
           description: Hash of the identity
           example: "0xC5"
 
+    MobileCompanionSummary:
+      type: object
+      description: One entry from `GET /api/v1/companions` (scope-filtered).
+      properties:
+        name:
+          type: string
+          example: "field-radio-1"
+        companion_hash:
+          type: string
+          pattern: '^0x[0-9a-f]{2}$'
+          example: "0xa4"
+        node_name:
+          type: string
+        public_key:
+          type: string
+          description: Full ed25519 public key, hex-encoded (64 chars).
+
+    MobileSnapshot:
+      type: object
+      description: Bootstrap document returned by `GET .../snapshot`.
+      properties:
+        journal_epoch:
+          type: string
+          description: Opaque epoch id; changes if the journal is ever reset (e.g. DB restore).
+        cursor:
+          type: string
+          description: Journal head `seq` at snapshot time, as a string. Feed this to `sync` as `cursor`.
+        self:
+          type: object
+          properties:
+            public_key:
+              type: string
+            node_name:
+              type: string
+            adv_type:
+              type: integer
+            latitude:
+              type: number
+            longitude:
+              type: number
+        contacts:
+          type: array
+          items:
+            type: object
+            properties:
+              public_key:
+                type: string
+              name:
+                type: string
+              adv_type:
+                type: integer
+              flags:
+                type: integer
+              out_path_len:
+                type: integer
+              last_advert_timestamp:
+                type: integer
+              lastmod:
+                type: integer
+              gps_lat:
+                type: number
+              gps_lon:
+                type: number
+        channels:
+          type: array
+          items:
+            type: object
+            properties:
+              index:
+                type: integer
+              name:
+                type: string
+          description: PSK secrets are never exposed on this surface.
+        messages:
+          type: array
+          description: Most recent messages (default/max 200 via `messages_limit`), oldest-first.
+          items:
+            $ref: '#/components/schemas/MobileMessage'
+        server:
+          type: object
+          properties:
+            time:
+              type: number
+            version:
+              type: string
+              nullable: true
+
+    MobileMessage:
+      type: object
+      description: |
+        A `companion_messages` row. `sender_key` and `channel_data_payload`
+        are hex-encoded byte strings; `is_channel` distinguishes a channel
+        post (`channel_idx` set) from a DM (`sender_key`/`sender_prefix` set).
+      properties:
+        id:
+          type: integer
+        companion_hash:
+          type: string
+        sender_key:
+          type: string
+        sender_prefix:
+          type: string
+        txt_type:
+          type: integer
+        timestamp:
+          type: integer
+        text:
+          type: string
+        is_channel:
+          type: boolean
+        channel_idx:
+          type: integer
+          nullable: true
+        path_len:
+          type: integer
+        snr:
+          type: number
+        rssi:
+          type: integer
+        channel_data_type:
+          type: integer
+        channel_data_payload:
+          type: string
+        packet_hash:
+          type: string
+          nullable: true
+        created_at:
+          type: number
+        consumed_at:
+          type: number
+          nullable: true
+
+    MobileJournalEvent:
+      type: object
+      description: |
+        One event, identical shape whether delivered via `sync`'s `events`
+        array or one SSE frame's `data:` line (design doc §9). `data` is
+        type-specific per `type` — clients must ignore unrecognized types.
+      properties:
+        seq:
+          type: integer
+        type:
+          type: string
+          example: message
+        ts:
+          type: number
+        packet_hash:
+          type: string
+          nullable: true
+        data:
+          type: object
+
+    MobileActionResult:
+      type: object
+      description: |
+        `data` for the contact-action endpoints (login/status_request/
+        telemetry_request). This is the underlying `CompanionBridge` call's
+        result object passed through `companion_endpoints._to_json_safe`
+        (dataclass/enum -> plain JSON), so its exact fields depend on the
+        companion bridge library version; treat it as an open object.
+
   securitySchemes:
     BearerAuth:
       type: http
@@ -5080,7 +6484,20 @@ components:
       type: apiKey
       in: header
       name: X-API-Key
-      description: API key authentication for machine-to-machine access
+      description: |
+        API key authentication for machine-to-machine access. Also the
+        transport for Mobile Companion API v1 (`/api/v1/*`) device tokens
+        minted by `POST /api/v1/pair` — despite
+        `docs/architecture/mobile-companion-api.md` describing these as
+        `Authorization: Bearer`, the actual auth code
+        (`repeater/web/auth/middleware.py`, `repeater/web/auth/
+        cherrypy_tool.py`) only ever reads device tokens from `X-API-Key`;
+        `Authorization: Bearer` is JWT-only. Each token carries a `scope`
+        recorded at mint time and enforced by `CompanionsV1._check_scope`:
+        `admin` (full access, implied for all pre-scope-migration tokens),
+        `companion:*` (all companion identities), or `companion:{name}`
+        (exactly the one companion identity the token was paired to). A
+        `scope`-less `request.user` (legacy caller) is treated as `admin`.
 
 # Future security - currently open
 # security:
