@@ -4905,6 +4905,20 @@ paths:
             default: 100
             minimum: 1
             maximum: 500
+        - name: include
+          in: query
+          required: false
+          schema:
+            type: string
+          description: |
+            Comma-separated opt-in list of otherwise-excluded event types.
+            The only recognized token is `rf_receptions` — without it, the
+            `rf_reception` firehose events (§9, off by default) are filtered
+            out of `events` even for a companion that has the
+            `rf_reception_events` setting enabled. Filtered rows still advance
+            `next_cursor`/`has_more` (the scan, not the returned list, drives
+            paging), so a client that opts in late never sees a gap. Unknown
+            tokens are ignored.
         - name: If-None-Match
           in: header
           required: false
@@ -5248,6 +5262,16 @@ paths:
           schema:
             type: string
           description: JWT, for `EventSource` clients that cannot set an `Authorization` header. Consumed (stripped from params) before the handler runs.
+        - name: include
+          in: query
+          required: false
+          schema:
+            type: string
+          description: |
+            Same semantics as on `sync`: a comma-separated opt-in list whose
+            only recognized token is `rf_receptions`. Applies to both the
+            backlog replay and the live tail — without it, `rf_reception`
+            firehose frames are suppressed. Unknown tokens are ignored.
       responses:
         '200':
           description: Event stream established
@@ -5582,6 +5606,304 @@ paths:
             caller's token scope (identical status and message, so a scoped
             device token cannot enumerate other companion names). Rendered as
             the v1 JSON error envelope (see tag description).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponseV1'
+
+  /v1/companions/{name}/messages/{id}/receptions:
+    get:
+      tags: [Mobile Companion API v1]
+      summary: Every RF reception of a message's packet_hash
+      description: |
+        RF observation surface (design doc §10). Returns every reception of
+        the message's `packet_hash` within the window — per-copy RSSI/SNR,
+        the incoming path (each element resolved against the companion's
+        contacts, §10.5), arrival time, and whether we retransmitted it.
+        Answers "how did this message reach me, and how well".
+
+        The window is measured back from *now*, not anchored on the message's
+        own timestamp — a message can be heard again well after it first
+        arrived — so a copy that predates the message but falls inside the
+        window is included. The query resolves through `idx_packets_hash`
+        with the bounded window (§10.1); `observation_count`/
+        `unique_path_count` are the exact counts from this query, not the
+        approximate running counters on the message row (§10.4). A message
+        with no `packet_hash` (predates correlation) returns an empty
+        `receptions` list rather than a 404.
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+          description: The `companion_messages` row id.
+        - name: window
+          in: query
+          required: false
+          schema:
+            type: string
+            default: 24h
+          description: |
+            Look-back window, back from now. Bare integer seconds or an
+            integer with an `s`/`m`/`h`/`d` suffix (e.g. `30m`, `24h`, `7d`).
+            Clamped to `[60s, 7d]` (default `24h`); a malformed string is a
+            `400` (§10.1).
+      responses:
+        '200':
+          description: Receptions (possibly empty)
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessResponse'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          message_id:
+                            type: integer
+                          packet_hash:
+                            type: string
+                            nullable: true
+                            description: 16-char (64-bit) correlation key, or null if the message has none.
+                          window:
+                            type: integer
+                            description: Effective (clamped) window in seconds.
+                          receptions:
+                            type: array
+                            items:
+                              $ref: '#/components/schemas/RfReception'
+                          observation_count:
+                            type: integer
+                          unique_path_count:
+                            type: integer
+                          observations_pruned:
+                            type: boolean
+                            description: True when the window reaches past the packets retention floor (§10.6).
+        '400':
+          description: |
+            `Invalid message id` or `Invalid window`. Rendered as the v1 JSON error envelope (see tag description).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponseV1'
+        '401':
+          description: Missing/invalid JWT or API token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponseV1'
+        '404':
+          description: |
+            Companion or message not found — also returned for companions
+            outside the caller's token scope (identical status and message).
+            Rendered as the v1 JSON error envelope (see tag description).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponseV1'
+
+  /v1/companions/{name}/contacts/{pubkey}/paths:
+    get:
+      tags: [Mobile Companion API v1]
+      summary: Incoming path aggregation for a contact
+      description: |
+        RF observation surface (design doc §10). Aggregates distinct incoming
+        paths seen on a contact's traffic within the window, each with a copy
+        count, first/last-seen timestamps, and RSSI/SNR min/max/avg — a
+        "route diversity" view. Paths are ordered most-observed first.
+
+        Resolution is by `companion_messages.sender_key`, so the contact does
+        not need to exist in `companion_contacts` to be queried. The contact's
+        recent `packet_hash`es are resolved first (bounded to
+        `message_limit` messages, reported as `messages_scanned`), then a
+        hash-keyed `idx_packets_hash` lookup per packet — never a scan of
+        `packets` on a non-indexed column (§10.1). Each path element is
+        resolved against the companion's contacts (§10.5).
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: pubkey
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: '^[0-9a-fA-F]{64}$'
+        - name: window
+          in: query
+          required: false
+          schema:
+            type: string
+            default: 24h
+          description: |
+            Look-back window, back from now. Same format/clamps as the
+            receptions endpoint (`[60s, 7d]`, default `24h`, §10.1).
+      responses:
+        '200':
+          description: Path aggregation (possibly empty)
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessResponse'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          contact_pubkey:
+                            type: string
+                            description: Lowercase hex, echoed from the path param.
+                          window:
+                            type: integer
+                          paths:
+                            type: array
+                            items:
+                              $ref: '#/components/schemas/RfPathAggregate'
+                          total_observations:
+                            type: integer
+                          messages_scanned:
+                            type: integer
+                            description: Number of the contact's messages resolved for hashes (bounded).
+                          message_limit:
+                            type: integer
+                            description: The cap on `messages_scanned` (200).
+                          observations_pruned:
+                            type: boolean
+        '400':
+          description: |
+            Invalid public key or `Invalid window`. Rendered as the v1 JSON error envelope (see tag description).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponseV1'
+        '401':
+          description: Missing/invalid JWT or API token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponseV1'
+        '404':
+          description: |
+            Companion not found — also returned for companions outside the
+            caller's token scope (identical status and message). Rendered as
+            the v1 JSON error envelope (see tag description).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponseV1'
+
+  /v1/companions/{name}/transmissions/{packet_hash}/repeats:
+    get:
+      tags: [Mobile Companion API v1]
+      summary: Heard repeats of our own transmission
+      description: |
+        RF observation surface (design doc §10). Given a `packet_hash` we
+        transmitted, returns the receptions of that same hash arriving
+        *after* our transmit — neighbors repeating us. The strongest
+        available signal that a send actually propagated.
+
+        Predicate is exactly §10.3: `is_duplicate=1 AND transmitted=0 AND
+        timestamp > tx.timestamp` (local echo and the transmit row itself are
+        excluded). Two counts are exposed and neither is collapsed into the
+        other: `heard_repeat_count` (every matching OTA copy — a repeater
+        heard twice counts twice) and `unique_repeater_count` (distinct
+        terminal path hashes, i.e. the last hop each copy took). Both are a
+        lower bound (hash-changing rebroadcast variants are out of scope,
+        §10.3). `packet_hash` accepts either the full or already-truncated
+        16-char form.
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: packet_hash
+          in: path
+          required: true
+          schema:
+            type: string
+          description: The transmission's correlation key (full or 16-char hex).
+        - name: window
+          in: query
+          required: false
+          schema:
+            type: string
+            default: 24h
+          description: |
+            Look-back window for locating the transmit row, back from now.
+            Same format/clamps as the receptions endpoint (`[60s, 7d]`,
+            default `24h`, §10.1). Repeats are then searched from the
+            transmit time forward.
+      responses:
+        '200':
+          description: Heard repeats (possibly empty)
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessResponse'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          packet_hash:
+                            type: string
+                            description: 16-char correlation key.
+                          transmitted_at:
+                            type: number
+                            description: Earliest matching transmit timestamp (epoch seconds).
+                          window:
+                            type: integer
+                          repeats:
+                            type: array
+                            items:
+                              $ref: '#/components/schemas/RfHeardRepeat'
+                          heard_repeat_count:
+                            type: integer
+                          unique_repeater_count:
+                            type: integer
+                          observations_pruned:
+                            type: boolean
+        '400':
+          description: |
+            `Invalid packet_hash` or `Invalid window`. Rendered as the v1 JSON error envelope (see tag description).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponseV1'
+        '401':
+          description: Missing/invalid JWT or API token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponseV1'
+        '404':
+          description: |
+            Companion not found, or no transmission of this `packet_hash` in
+            the window — also returned for companions outside the caller's
+            token scope (identical status and message). Rendered as the v1
+            JSON error envelope (see tag description).
           content:
             application/json:
               schema:
@@ -6450,11 +6772,32 @@ components:
         One event, identical shape whether delivered via `sync`'s `events`
         array or one SSE frame's `data:` line (design doc §9). `data` is
         type-specific per `type` — clients must ignore unrecognized types.
+
+        Known `type` values and their `data` shapes:
+        - `message` — a persisted inbound/outbound message (`data` mirrors a
+          `companion_messages` row).
+        - `contact` — a contact upsert.
+        - `channel` — a channel-list change.
+        - `prefs` — a bridge-preferences change.
+        - `message_reception` — another RF copy of a known inbound message
+          (§10.4): `{message_id, packet_hash, path[], rssi, snr, observed_at,
+          observation_count, unique_path_count}`.
+        - `message_send_state` — a heard-repeat of one of our sends (§10.3):
+          `{message_id (null — outbound sends aren't persisted), state:
+          "heard_repeated", packet_hash, path[], terminal_repeater_hash,
+          rssi, snr, observed_at, heard_repeat_count, unique_repeater_count}`.
+        - `rf_reception` — the opt-in firehose (§9): every OTA duplicate the
+          repeater hears, regardless of companion relevance. **Off by
+          default** — suppressed from `sync`/`events` output unless the caller
+          passes `?include=rf_receptions` *and* the companion has the
+          `rf_reception_events` setting enabled. `{packet_hash, rssi, snr,
+          path[], observed_at}`. `path` here is raw hashes (not resolved).
       properties:
         seq:
           type: integer
         type:
           type: string
+          enum: [message, contact, channel, prefs, message_reception, message_send_state, rf_reception]
           example: message
         ts:
           type: number
@@ -6472,6 +6815,131 @@ components:
         result object passed through `companion_endpoints._to_json_safe`
         (dataclass/enum -> plain JSON), so its exact fields depend on the
         companion bridge library version; treat it as an open object.
+
+    ResolvedPathElement:
+      type: object
+      description: |
+        One hop of an RF path (design doc §10.5). Path entries are abbreviated
+        hashes (commonly one byte) that genuinely collide, so every rendered
+        element carries both the raw value and its interpretation against the
+        companion's current contacts. Clients display `raw_hash` unless
+        `resolution` is `unique`. Resolution is computed at read time, so it
+        can improve as contacts are learned.
+      properties:
+        raw_hash:
+          description: The raw path element as stored (opaque; usually a short hex string).
+        resolution:
+          type: string
+          enum: [unique, ambiguous, unknown]
+          description: |
+            `unique` = exactly one contact prefix-matches; `ambiguous` = more
+            than one; `unknown` = none (or a blank element).
+        candidates:
+          type: array
+          description: Prefix-matching contacts, capped at 5.
+          items:
+            type: object
+            properties:
+              pubkey:
+                type: string
+                description: Full contact public key, lowercase hex.
+              name:
+                type: string
+        truncated:
+          type: boolean
+          description: Present and true only when more than 5 contacts matched and `candidates` was capped.
+
+    RfReception:
+      type: object
+      description: One RF copy of a message's `packet_hash` (design doc §10).
+      properties:
+        observed_at:
+          type: number
+          description: Arrival timestamp, epoch seconds.
+        rssi:
+          type: number
+          nullable: true
+        snr:
+          type: number
+          nullable: true
+        path:
+          type: array
+          description: Incoming path, each hop resolved (§10.5).
+          items:
+            $ref: '#/components/schemas/ResolvedPathElement'
+        is_duplicate:
+          type: boolean
+        transmitted:
+          type: boolean
+          description: True if this row is one we retransmitted.
+
+    RfPathAggregate:
+      type: object
+      description: One distinct incoming path for a contact, with signal stats (§10).
+      properties:
+        path:
+          type: array
+          items:
+            $ref: '#/components/schemas/ResolvedPathElement'
+        count:
+          type: integer
+          description: Copies observed over this exact path in the window.
+        first_seen:
+          type: number
+        last_seen:
+          type: number
+        rssi_min:
+          type: number
+          nullable: true
+        rssi_max:
+          type: number
+          nullable: true
+        rssi_avg:
+          type: number
+          nullable: true
+        snr_min:
+          type: number
+          nullable: true
+        snr_max:
+          type: number
+          nullable: true
+        snr_avg:
+          type: number
+          nullable: true
+        first_hop:
+          allOf:
+            - $ref: '#/components/schemas/ResolvedPathElement'
+          nullable: true
+          description: Convenience alias for `path[0]`, null for an empty path.
+        last_hop:
+          allOf:
+            - $ref: '#/components/schemas/ResolvedPathElement'
+          nullable: true
+          description: Convenience alias for `path[-1]`, null for an empty path.
+
+    RfHeardRepeat:
+      type: object
+      description: One heard repeat of our transmission (design doc §10.3).
+      properties:
+        observed_at:
+          type: number
+        rssi:
+          type: number
+          nullable: true
+        snr:
+          type: number
+          nullable: true
+        path:
+          type: array
+          items:
+            $ref: '#/components/schemas/ResolvedPathElement'
+        terminal_repeater:
+          allOf:
+            - $ref: '#/components/schemas/ResolvedPathElement'
+          nullable: true
+          description: |
+            The last path hop — the repeater that forwarded this copy to us
+            (§10.3). Null for an empty path.
 
   securitySchemes:
     BearerAuth:
