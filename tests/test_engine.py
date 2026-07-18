@@ -2774,7 +2774,9 @@ class TestEngineTransmissionAndBackgroundLifecycle:
         handler._record_crc_errors_async.assert_awaited_once()
         handler._send_periodic_advert_async.assert_awaited_once()
         handler.cleanup_cache.assert_called_once()
-        handler.storage.cleanup_old_data.assert_called_once()
+        handler.storage.cleanup_old_data.assert_called_once_with(
+            days=31, companion_events_days=31
+        )
 
     @pytest.mark.asyncio
     async def test_background_timer_loop_continues_when_db_cleanup_fails(self, handler):

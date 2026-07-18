@@ -1,6 +1,6 @@
 import logging
 import time
-from typing import Tuple
+from typing import Optional, Tuple
 
 from openhop_core.protocol.packet_utils import calculate_lora_airtime_ms
 
@@ -16,16 +16,27 @@ class AirtimeManager:
         )
 
         # Store radio settings for airtime calculations
-        self.spreading_factor = self.radio_config.get("spreading_factor", 7)
-        self.bandwidth = self.radio_config.get("bandwidth", 125000)
-        self.coding_rate = self.radio_config.get("coding_rate", 5)
-        self.preamble_length = self.radio_config.get("preamble_length", 8)
+        self.refresh_radio_params(self.radio_config)
 
         # Track airtime in rolling window
         self.tx_history = []  # [(timestamp, airtime_ms), ...]
         self.window_size = 60  # seconds
         self.total_airtime_ms = 0
         self.total_rx_airtime_ms = 0
+
+    def refresh_radio_params(self, radio_config: Optional[dict] = None) -> None:
+        """Reload cached modulation params used by airtime estimation.
+
+        Call after a successful live radio reconfiguration. Does not reset
+        TX/RX history or duty-cycle totals.
+        """
+        if radio_config is None:
+            radio_config = self.config.get("radio", {}) or {}
+        self.radio_config = radio_config
+        self.spreading_factor = self.radio_config.get("spreading_factor", 7)
+        self.bandwidth = self.radio_config.get("bandwidth", 125000)
+        self.coding_rate = self.radio_config.get("coding_rate", 5)
+        self.preamble_length = self.radio_config.get("preamble_length", 8)
 
     def calculate_airtime(
         self,

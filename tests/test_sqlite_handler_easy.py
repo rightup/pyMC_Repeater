@@ -676,3 +676,29 @@ def test_get_lbt_diagnostics_empty_range_preserves_no_data_distinction(tmp_path)
         assert bucket["avg_attempts"] is None
     assert out["packet_types"] == []
     assert out["packet_type_buckets"] == []
+
+
+def test_cleanup_old_data_accepts_companion_events_days(tmp_path):
+    """engine.py forwards companion_events_days; accepting it must not break
+    packet retention cleanup (the pre-fix TypeError was swallowed upstream).
+    """
+    import time
+
+    h = _make_handler(tmp_path)
+    old_ts = time.time() - (40 * 86400)
+    h.store_packet(
+        {
+            "timestamp": old_ts,
+            "type": 1,
+            "route": 2,
+            "length": 3,
+            "transmitted": False,
+            "packet_hash": "pkt-old",
+        }
+    )
+
+    h.cleanup_old_data(days=31, companion_events_days=14)
+
+    with h._connect() as conn:
+        count = conn.execute("SELECT COUNT(*) FROM packets").fetchone()[0]
+    assert count == 0
