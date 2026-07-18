@@ -332,6 +332,15 @@ class CompanionRestClient:
             body=fields,
         )
 
+    def set_favorite(self, companion_name: str, pubkey: str, favorite: bool = True) -> dict:
+        """Mark or unmark a contact as a favourite.
+
+        Favourites are protected from forced-trim eviction when the contact
+        store fills. This writes flags bit 0 server-side so the other bits
+        (which are in active use) are preserved.
+        """
+        return self.upsert_contact(companion_name, pubkey, favorite=favorite)
+
     def delete_contact(self, companion_name: str, pubkey: str) -> dict:
         return self._data(
             "DELETE",

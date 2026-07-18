@@ -56,6 +56,7 @@ from urllib.parse import urlparse
 import cherrypy
 
 from repeater.companion.correlation import outbound_send_capture
+from repeater.companion.utils import CONTACT_FLAG_FAVOURITE
 from repeater.companion.path_resolution import resolve_path
 from repeater.companion.rf_window import observations_pruned, parse_window_seconds
 
@@ -573,6 +574,10 @@ class CompanionsV1:
                     "name": c.name,
                     "adv_type": c.adv_type,
                     "flags": c.flags,
+                    # Derived from flags bit 0 rather than stored separately, so
+                    # the two can never disagree. Favourites are protected from
+                    # forced-trim eviction (companion/utils.trim_contacts).
+                    "favorite": bool(int(c.flags or 0) & CONTACT_FLAG_FAVOURITE),
                     "out_path_len": c.out_path_len,
                     "last_advert_timestamp": c.last_advert_timestamp,
                     "lastmod": c.lastmod,
@@ -1097,13 +1102,25 @@ class CompanionsV1:
         body = self._get_json_body()
 
         existing = bridge.contacts.get_by_key(pub_key)
+        flags = int(body.get("flags", getattr(existing, "flags", 0)))
+        # `favorite` is a convenience over flags bit 0. The server does the
+        # read-modify-write so other bits survive: real deployments use bits
+        # beyond bit 0 (flags 129 and 145 are both live), and a client setting
+        # a favourite by writing raw flags would clobber them. If both are
+        # supplied, `favorite` wins as the more specific instruction.
+        if "favorite" in body:
+            if body.get("favorite"):
+                flags |= CONTACT_FLAG_FAVOURITE
+            else:
+                flags &= ~CONTACT_FLAG_FAVOURITE
+
         # Preserve routing state on update: out_path/out_path_len are learned
         # from the mesh, and a client PATCHing a name must not erase them.
         contact = Contact(
             public_key=pub_key,
             name=body.get("name", getattr(existing, "name", "")),
             adv_type=int(body.get("adv_type", getattr(existing, "adv_type", 0))),
-            flags=int(body.get("flags", getattr(existing, "flags", 0))),
+            flags=flags,
             out_path_len=int(body.get("out_path_len", getattr(existing, "out_path_len", -1))),
             out_path=getattr(existing, "out_path", b""),
             last_advert_timestamp=getattr(existing, "last_advert_timestamp", 0),
@@ -1212,7 +1229,11 @@ class CompanionsV1:
         index = self._channel_index(channel_index)
         if bridge.get_channel(index) is None:
             raise cherrypy.HTTPError(404, "Channel not configured")
-        if not bridge.set_channel(index, "", b"\x00" * 16):
+        # remove_channel, not set_channel(idx, ""): an empty name creates an
+        # empty-named channel that still occupies the slot and still appears in
+        # the snapshot. Caught on a live repeater, where the "cleared" slot
+        # came back in the channel list with a blank name.
+        if not bridge.remove_channel(index):
             raise cherrypy.HTTPError(400, "Channel could not be cleared")
         self._journal_channel(companion_hash, index, None, "remove")
         return self._success({"removed": True})
@@ -1262,6 +1283,7 @@ class CompanionsV1:
             "name": contact.name,
             "adv_type": contact.adv_type,
             "flags": contact.flags,
+            "favorite": bool(int(contact.flags or 0) & CONTACT_FLAG_FAVOURITE),
             "out_path_len": contact.out_path_len,
             "last_advert_timestamp": contact.last_advert_timestamp,
             "lastmod": contact.lastmod,

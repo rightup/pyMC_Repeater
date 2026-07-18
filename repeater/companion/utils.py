@@ -18,7 +18,10 @@ COMPANION_BRIDGE_SETTING_KEYS = frozenset({"max_contacts", "offline_queue_size"}
 _COMPANION_IGNORED_BRIDGE_KEYS = frozenset({"max_channels", "adv_type"})
 
 # Contact flag bit 0 marks a favourite (protected from forced-trim eviction).
-_CONTACT_FLAG_FAVOURITE = 0x01
+CONTACT_FLAG_FAVOURITE = 0x01
+# Back-compat alias: this module used the private name before the flag became
+# part of the v1 API surface (`favorite` on contacts).
+_CONTACT_FLAG_FAVOURITE = CONTACT_FLAG_FAVOURITE
 
 
 class CompanionContactCapacityError(Exception):

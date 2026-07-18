@@ -428,17 +428,23 @@ def test_full_contact_store_is_507(paired, harness):
     Restores the store afterwards: the harness is module-scoped, so leaving it
     full would fail whichever contact test happened to run next.
     """
-    added = []
-    with pytest.raises(RestError) as excinfo:
-        for i in range(12):
-            pubkey = f"{0xD0 + i:02x}" * 32
-            paired.upsert_contact(harness.companion_name, pubkey, name=f"n{i}")
-            added.append(pubkey)
-    assert excinfo.value.status == 507
-    assert added, "should have added some before filling"
+    store = harness.bridge.contacts
+    original_limit = store.max_contacts
+    store.max_contacts = len(store.values()) + 2  # room for exactly two more
 
-    for pubkey in added:
-        paired.delete_contact(harness.companion_name, pubkey)
+    added = []
+    try:
+        with pytest.raises(RestError) as excinfo:
+            for i in range(6):
+                pubkey = f"{0xD0 + i:02x}" * 32
+                paired.upsert_contact(harness.companion_name, pubkey, name=f"n{i}")
+                added.append(pubkey)
+        assert excinfo.value.status == 507
+        assert added, "should have added some before filling"
+    finally:
+        store.max_contacts = original_limit
+        for pubkey in added:
+            paired.delete_contact(harness.companion_name, pubkey)
 
 
 def test_contact_endpoint_rejects_get(paired, harness):
@@ -548,3 +554,80 @@ def test_clear_unconfigured_channel_is_404(paired, harness):
     with pytest.raises(RestError) as excinfo:
         paired.clear_channel(harness.companion_name, 2)
     assert excinfo.value.status == 404
+
+
+# --- favourites ------------------------------------------------------------
+# Favourites are flags bit 0. They are protected from forced-trim eviction
+# (companion/utils.trim_contacts), so getting this wrong loses contacts a user
+# deliberately kept. Live data uses other bits too (flags 129 and 145 both
+# occur), which is why `favorite` is a server-side read-modify-write rather
+# than something the client computes.
+
+
+def test_contacts_expose_a_favorite_field(paired, harness):
+    pubkey = "f1" * 32
+    result = paired.upsert_contact(harness.companion_name, pubkey, name="Fav", favorite=True)
+    assert result["contact"]["favorite"] is True
+    assert result["contact"]["flags"] & 0x01
+
+    data, _etag = paired.snapshot(harness.companion_name)
+    entry = next(c for c in data["contacts"] if c["public_key"] == pubkey)
+    assert entry["favorite"] is True
+
+
+def test_favorite_defaults_false(paired, harness):
+    result = paired.upsert_contact(harness.companion_name, "f2" * 32, name="Plain")
+    assert result["contact"]["favorite"] is False
+
+
+def test_setting_favorite_preserves_other_flag_bits(paired, harness):
+    """Live contacts carry flags like 129 (0x81) and 145 (0x91). Favouriting
+    must not clobber the high bits."""
+    pubkey = "f3" * 32
+    paired.upsert_contact(harness.companion_name, pubkey, name="Flagged", flags=0x90)
+    result = paired.set_favorite(harness.companion_name, pubkey, True)
+
+    assert result["contact"]["flags"] == 0x91
+    assert result["contact"]["favorite"] is True
+
+
+def test_unfavoriting_preserves_other_flag_bits(paired, harness):
+    pubkey = "f4" * 32
+    paired.upsert_contact(harness.companion_name, pubkey, name="Flagged2", flags=0x91)
+    result = paired.set_favorite(harness.companion_name, pubkey, False)
+
+    assert result["contact"]["flags"] == 0x90
+    assert result["contact"]["favorite"] is False
+
+
+def test_favorite_survives_an_unrelated_update(paired, harness):
+    """Renaming a favourite must not silently unfavourite it."""
+    pubkey = "f5" * 32
+    paired.set_favorite(harness.companion_name, pubkey, True)
+    result = paired.upsert_contact(harness.companion_name, pubkey, name="Renamed")
+
+    assert result["contact"]["name"] == "Renamed"
+    assert result["contact"]["favorite"] is True
+
+
+def test_favorite_beats_raw_flags_when_both_sent(paired, harness):
+    """`favorite` is the more specific instruction, so it wins."""
+    pubkey = "f6" * 32
+    result = paired.upsert_contact(
+        harness.companion_name, pubkey, name="Both", flags=0x00, favorite=True
+    )
+    assert result["contact"]["favorite"] is True
+
+
+def test_clear_does_not_leave_an_empty_named_channel(paired, harness):
+    """Regression: DELETE used to call set_channel(idx, "") which creates an
+    empty-named channel still occupying the slot. Found on a live repeater,
+    where the "cleared" channel reappeared in the snapshot with a blank name.
+    """
+    paired.set_channel(harness.companion_name, 5, "#willclear", bytes(16))
+    paired.clear_channel(harness.companion_name, 5)
+
+    data, _etag = paired.snapshot(harness.companion_name)
+    assert 5 not in [c["index"] for c in data["channels"]]
+    assert "" not in [c["name"] for c in data["channels"]]
+    assert harness.bridge.get_channel(5) is None

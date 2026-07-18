@@ -5576,6 +5576,20 @@ paths:
                   type: integer
                 flags:
                   type: integer
+                  description: |
+                    Raw contact flag bitfield. **Bit 0 (`0x01`) marks a
+                    favourite**, which protects the contact from forced-trim
+                    eviction when the store fills. Other bits are in active use
+                    on real deployments (values like `129` and `145` occur), so
+                    prefer the `favorite` boolean below over writing this
+                    directly — the server does a read-modify-write that
+                    preserves the bits you did not mean to touch.
+                favorite:
+                  type: boolean
+                  description: |
+                    Convenience over `flags` bit 0. Derived on read, and on
+                    write sets/clears just that bit. If both `flags` and
+                    `favorite` are supplied, `favorite` wins.
                 out_path_len:
                   type: integer
                 gps_lat:
@@ -7158,6 +7172,12 @@ components:
                 type: integer
               flags:
                 type: integer
+                description: |
+                  Raw flag bitfield; **bit 0 (`0x01`) marks a favourite**
+                  (protected from forced-trim eviction). Other bits are in use.
+              favorite:
+                type: boolean
+                description: Derived from `flags` bit 0.
               out_path_len:
                 type: integer
               last_advert_timestamp:

@@ -56,12 +56,15 @@ class _FakeChannels:
 
 
 class _FakeContactStore:
-    """In-memory contact store, keyed by public key."""
+    """In-memory contact store, keyed by public key.
 
-    max_contacts = 4
+    ``max_contacts`` is an instance attribute so a test can shrink it to
+    exercise the full-store path without every other test tripping over it.
+    """
 
-    def __init__(self, contacts: list) -> None:
+    def __init__(self, contacts: list, max_contacts: int = 64) -> None:
         self._by_key = {bytes(c.public_key): c for c in contacts}
+        self.max_contacts = max_contacts
 
     def get_by_key(self, pub_key):
         return self._by_key.get(bytes(pub_key))
@@ -137,10 +140,20 @@ class RestFakeBridge:
         return True
 
     def set_channel(self, idx: int, name: str, secret: bytes) -> bool:
+        """Mirrors the real bridge: an empty name creates an EMPTY-NAMED
+        channel, it does not remove the slot. Removing is remove_channel().
+
+        This faithfulness matters -- an earlier version of this double treated
+        an empty name as a delete, which masked a real bug where the clear
+        endpoint left an empty channel behind on a live repeater.
+        """
         if idx >= _FakeChannels.max_channels:
             return False
-        self.set_channel_entry(idx, name or None)
+        self._channel_map[idx] = SimpleNamespace(name=name[:32], secret=secret)
         return True
+
+    def remove_channel(self, idx: int) -> bool:
+        return self._channel_map.pop(idx, None) is not None
 
     async def send_channel_message(self, channel_idx: int, text: str, **kwargs):
         """Record an outbound channel send. No radio, so nothing transmits.
