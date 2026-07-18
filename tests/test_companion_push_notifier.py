@@ -53,12 +53,14 @@ def _handler(tmp_path):
 
 
 def _device(handler, device_id="dev-1", token_hash="h1", push_token="apns-1",
-            relay="https://relay.example/notify", detail="none"):
+            relay="https://relay.example/notify", detail="none",
+            mention_push=None, mention_keywords=None):
     token_id = handler.create_api_token("t", token_hash, scope=f"companion:x")
     handler.companion_device_create(_HASH, device_id, "Phone", token_id, platform="ios")
     if push_token is not None:
         handler.companion_device_set_push(
-            device_id, push_token, push_relay_url=relay, push_detail=detail
+            device_id, push_token, push_relay_url=relay, push_detail=detail,
+            mention_push=mention_push, mention_keywords=mention_keywords,
         )
     return device_id
 
@@ -334,3 +336,103 @@ def test_journal_non_message_does_not_reach_notifier(tmp_path):
 
     journal.record_prefs({"node_name": "new-name"})
     assert n._dirty == {}
+
+
+# --- mentions ------------------------------------------------------------
+
+
+def test_mention_off_gives_plain_wake_even_on_match(tmp_path):
+    h = _handler(tmp_path)
+    _device(h, mention_push=False, mention_keywords=["adam"])
+    poster = _FakePoster(200)
+    n = _notifier(h, poster, _Clock())
+    n._on_event(_HASH, _message_event(text="hey adam!"))
+    _drive_once(n)
+    payload = poster.calls[0]["payload"]
+    assert "mention" not in payload and "alert" not in payload
+
+
+def test_keyword_match_sends_content_free_mention_alert(tmp_path):
+    h = _handler(tmp_path)
+    _device(h, detail="preview", mention_push=True, mention_keywords=["adam"])
+    poster = _FakePoster(200)
+    n = _notifier(h, poster, _Clock())
+    n._on_event(_HASH, _message_event(text="ping @adam are you there"))
+    _drive_once(n)
+    payload = poster.calls[0]["payload"]
+    assert payload["mention"] is True
+    assert payload["alert"] == "You were mentioned"
+    # content-free: the actual message text must never appear
+    assert "adam are you there" not in payload["alert"]
+
+
+def test_mention_takes_precedence_over_count_detail(tmp_path):
+    h = _handler(tmp_path)
+    _device(h, detail="count", mention_push=True, mention_keywords=["adam"])
+    poster = _FakePoster(200)
+    n = _notifier(h, poster, _Clock())
+    n._on_event(_HASH, _message_event(text="adam!"))
+    _drive_once(n)
+    payload = poster.calls[0]["payload"]
+    assert payload.get("mention") is True
+    assert "badge_hint" not in payload
+
+
+def test_no_match_is_plain_wake(tmp_path):
+    h = _handler(tmp_path)
+    _device(h, mention_push=True, mention_keywords=["adam"])
+    poster = _FakePoster(200)
+    n = _notifier(h, poster, _Clock())
+    n._on_event(_HASH, _message_event(text="hello everyone"))
+    _drive_once(n)
+    assert "mention" not in poster.calls[0]["payload"]
+
+
+def test_word_boundary_avoids_false_positive(tmp_path):
+    h = _handler(tmp_path)
+    _device(h, mention_push=True, mention_keywords=["adam"])
+    poster = _FakePoster(200)
+    n = _notifier(h, poster, _Clock())
+    n._on_event(_HASH, _message_event(text="that was adamant"))
+    _drive_once(n)
+    assert "mention" not in poster.calls[0]["payload"]
+
+
+def test_default_trigger_is_companion_node_name(tmp_path):
+    h = _handler(tmp_path)
+    h.companion_save_prefs(_HASH, {"node_name": "Howl"})
+    _device(h, mention_push=True)  # no explicit keywords -> node_name default
+    poster = _FakePoster(200)
+    n = _notifier(h, poster, _Clock())
+    n._on_event(_HASH, _message_event(text="hey Howl come in"))
+    _drive_once(n)
+    assert poster.calls[0]["payload"]["mention"] is True
+
+
+def test_no_trigger_when_no_keywords_and_no_node_name(tmp_path):
+    h = _handler(tmp_path)
+    _device(h, mention_push=True)  # no keywords, no prefs row -> no trigger
+    poster = _FakePoster(200)
+    n = _notifier(h, poster, _Clock())
+    n._on_event(_HASH, _message_event(text="anybody there"))
+    _drive_once(n)
+    assert "mention" not in poster.calls[0]["payload"]
+
+
+def test_mention_match_across_debounced_burst(tmp_path):
+    h = _handler(tmp_path)
+    _device(h, mention_push=True, mention_keywords=["adam"])
+    poster = _FakePoster(200)
+    clock = _Clock()
+    n = _notifier(h, poster, clock)
+    # First message (no mention) sends a wake.
+    n._on_event(_HASH, _message_event(1, text="hello"))
+    _drive_once(n)
+    assert "mention" not in poster.calls[0]["payload"]
+    # A mention arrives during the debounce window; the trailing send is a mention.
+    clock.advance(5)
+    n._on_event(_HASH, _message_event(2, text="adam ping"))
+    _drive_once(n)
+    clock.advance(30)
+    _drive_once(n)
+    assert poster.calls[1]["payload"]["mention"] is True

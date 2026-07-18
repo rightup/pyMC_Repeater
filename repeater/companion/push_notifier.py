@@ -35,9 +35,10 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import threading
 import time
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, List, Optional
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 
@@ -50,26 +51,42 @@ _PUSH_EVENT_TYPES = frozenset({"message"})
 #: whole message.
 _PREVIEW_MAX_CHARS = 140
 
+#: per-pass cap on message texts kept for mention matching (design doc §12.2);
+#: a burst larger than this still wakes/counts, it just stops scanning more
+#: texts for a mention hit.
+_MAX_MATCH_TEXTS = 64
+
+#: how long a resolved companion node_name (the default mention trigger) is
+#: cached before a re-read picks up a rename.
+_NODE_NAME_TTL = 300.0
+
+#: content-free mention alert body (design doc §11.4 / §12.2): the fact of a
+#: mention, never the message text.
+_MENTION_ALERT = "You were mentioned"
+
 
 class _CompanionAccum:
     """Accumulated new-event info for one companion since the last worker pass."""
 
-    __slots__ = ("count", "preview")
+    __slots__ = ("count", "preview", "texts")
 
     def __init__(self) -> None:
         self.count = 0
         self.preview: Optional[str] = None
+        # Raw message texts, for per-device mention matching in the worker.
+        self.texts: List[str] = []
 
 
 class _DevicePending:
     """A device awaiting a (trailing-edge) push, with backoff bookkeeping."""
 
-    __slots__ = ("companion_hash", "count", "preview", "attempts", "not_before")
+    __slots__ = ("companion_hash", "count", "preview", "mention", "attempts", "not_before")
 
     def __init__(self, companion_hash: str) -> None:
         self.companion_hash = companion_hash
         self.count = 0
         self.preview: Optional[str] = None
+        self.mention = False
         self.attempts = 0
         self.not_before = 0.0
 
@@ -125,6 +142,8 @@ class CompanionPushNotifier:
         self._dirty: Dict[str, _CompanionAccum] = {}
         self._device_pending: Dict[str, _DevicePending] = {}
         self._device_cooldown: Dict[str, float] = {}
+        # companion_hash -> (node_name, fetched_at); the default mention trigger.
+        self._node_name_cache: Dict[str, tuple] = {}
         self._stop = False
         self._worker: Optional[threading.Thread] = None
 
@@ -174,6 +193,7 @@ class CompanionPushNotifier:
         if event.get("event_type") not in _PUSH_EVENT_TYPES:
             return
         preview = self._extract_preview(event)
+        text = (event.get("payload") or {}).get("text")
         with self._cv:
             accum = self._dirty.get(companion_hash)
             if accum is None:
@@ -182,6 +202,8 @@ class CompanionPushNotifier:
             accum.count += 1
             if preview is not None:
                 accum.preview = preview
+            if isinstance(text, str) and text.strip() and len(accum.texts) < _MAX_MATCH_TEXTS:
+                accum.texts.append(text)
             self._cv.notify()
 
     @staticmethod
@@ -194,6 +216,61 @@ class CompanionPushNotifier:
         if len(text) > _PREVIEW_MAX_CHARS:
             text = text[:_PREVIEW_MAX_CHARS].rstrip() + "…"
         return text
+
+    # -----------------------------------------------------------------
+    # Mention detection (design doc §12.2)
+    # -----------------------------------------------------------------
+
+    def _device_triggers(self, device: dict, companion_hash: str) -> List[str]:
+        """The mention trigger strings for a device: its explicit
+        ``mention_keywords`` if any, else the companion's node_name."""
+        raw = device.get("mention_keywords")
+        if raw:
+            try:
+                parsed = json.loads(raw)
+            except (TypeError, ValueError):
+                parsed = []
+            triggers = [t for t in parsed if isinstance(t, str) and t.strip()]
+            if triggers:
+                return triggers
+        node_name = self._node_name(companion_hash)
+        return [node_name] if node_name else []
+
+    def _node_name(self, companion_hash: str) -> str:
+        now = self._clock()
+        cached = self._node_name_cache.get(companion_hash)
+        if cached is not None and now - cached[1] < _NODE_NAME_TTL:
+            return cached[0]
+        try:
+            prefs = self.sqlite_handler.companion_load_prefs(companion_hash) or {}
+        except Exception:
+            logger.exception("push notifier: node_name lookup failed for %s", companion_hash)
+            prefs = {}
+        node_name = (prefs.get("node_name") or "").strip()
+        self._node_name_cache[companion_hash] = (node_name, now)
+        return node_name
+
+    @staticmethod
+    def _any_mention(texts: List[str], triggers: List[str]) -> bool:
+        """True if any text contains any trigger as a whole token (bounded by
+        non-alphanumeric characters, case-insensitive) — so ``adam`` matches
+        "hey adam" and "@adam" but not "adamant"."""
+        patterns = []
+        for trig in triggers:
+            trig = trig.strip()
+            if not trig:
+                continue
+            patterns.append(
+                re.compile(
+                    r"(?<![0-9A-Za-z])" + re.escape(trig) + r"(?![0-9A-Za-z])",
+                    re.IGNORECASE,
+                )
+            )
+        for text in texts:
+            for pat in patterns:
+                if pat.search(text):
+                    return True
+        return False
 
     # -----------------------------------------------------------------
     # Worker
@@ -238,6 +315,16 @@ class CompanionPushNotifier:
                 continue
             if not devices:
                 continue
+            # Evaluate mentions outside the lock (node_name resolution reads
+            # the DB): device_id -> True if any accumulated text mentions it.
+            mention_hits: Dict[str, bool] = {}
+            if accum.texts:
+                for device in devices:
+                    if device.get("mention_push"):
+                        triggers = self._device_triggers(device, companion_hash)
+                        mention_hits[device["device_id"]] = bool(triggers) and self._any_mention(
+                            accum.texts, triggers
+                        )
             with self._cv:
                 for device in devices:
                     device_id = device["device_id"]
@@ -248,6 +335,8 @@ class CompanionPushNotifier:
                     pending.count += accum.count
                     if accum.preview is not None:
                         pending.preview = accum.preview
+                    if mention_hits.get(device_id):
+                        pending.mention = True
 
     def _collect_due(self):
         """Return ((device_id, pending), …) that are due to send now, and the
@@ -314,11 +403,21 @@ class CompanionPushNotifier:
 
     def _build_payload(self, device: dict, pending: _DevicePending) -> dict:
         """Build the relay ``/notify`` body. Payload-free by default; badge/
-        alert only when the device opted in (design doc §12.2)."""
+        alert only when the device opted in (design doc §12.2).
+
+        A mention takes precedence: it becomes a content-free ``mention`` alert
+        (``"You were mentioned"``, never the message text — §11.4) regardless
+        of ``push_detail``. The ``mention`` flag tells the relay to send a
+        user-visible APNs alert rather than a silent wake, which is what makes
+        a mention prompt."""
         payload = {
             "push_token": device["push_token"],
             "collapse_id": pending.companion_hash,
         }
+        if pending.mention:
+            payload["mention"] = True
+            payload["alert"] = _MENTION_ALERT
+            return payload
         detail = device.get("push_detail") or "none"
         if detail == "count":
             payload["badge_hint"] = pending.count
