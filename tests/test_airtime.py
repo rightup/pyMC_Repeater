@@ -157,3 +157,31 @@ def test_stats_report_tx_rx_airtime_totals():
     assert stats["total_airtime_ms"] == pytest.approx(tx_airtime)
     assert stats["total_rx_airtime_ms"] == pytest.approx(rx_airtime)
     assert stats["current_airtime_ms"] == pytest.approx(tx_airtime)
+
+
+def test_refresh_radio_params_updates_cached_modulation():
+    """Live SF/BW changes must refresh estimation scalars without clearing history."""
+    from openhop_core.protocol.packet_utils import calculate_lora_airtime_ms
+
+    mgr = _make_mgr(sf=7, bw_hz=125000, cr=5, preamble=8)
+    before = mgr.calculate_airtime(50)
+    assert math.isclose(before, 97.536, rel_tol=1e-9)
+
+    mgr.record_tx(before)
+    mgr.refresh_radio_params(
+        {
+            "spreading_factor": 12,
+            "bandwidth": 125000,
+            "coding_rate": 5,
+            "preamble_length": 8,
+        }
+    )
+
+    after = mgr.calculate_airtime(50)
+    expected = calculate_lora_airtime_ms(50, 12, 125000, 5, 8)
+    assert math.isclose(after, expected, rel_tol=1e-9)
+    assert math.isclose(after, 2301.952, rel_tol=1e-9)
+    assert after > before
+    assert mgr.spreading_factor == 12
+    assert mgr.total_airtime_ms == pytest.approx(before)
+    assert len(mgr.tx_history) == 1

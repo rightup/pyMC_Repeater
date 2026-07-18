@@ -2512,6 +2512,7 @@ class SQLiteHandler:
             raise
 
     def cleanup_old_data(self, days: int = 7, companion_events_days: Optional[int] = None):
+<<<<<<< HEAD
         """Prune retention-bounded tables, including the companion journal.
 
         ``companion_events_days`` mirrors how the caller reads
@@ -2522,6 +2523,15 @@ class SQLiteHandler:
         ``days``), it defaults to the same 31-day default as the config key,
         so companion journal/history pruning still runs on the existing
         cleanup schedule without requiring every caller to be updated.
+=======
+        """Prune retention-bounded tables.
+
+        ``companion_events_days`` is forwarded from engine.py
+        (``storage.retention.companion_events_days``, default 31). Accepted here
+        so the periodic cleanup call cannot TypeError and silently skip all
+        SQLite pruning. Companion journal/history pruning is layered on by the
+        companion-api storage work once those tables exist.
+>>>>>>> fix/all-the-things
         """
         try:
             cutoff = time.time() - (days * 24 * 3600)
