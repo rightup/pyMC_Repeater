@@ -4003,6 +4003,188 @@ class SQLiteHandler:
             logger.error(f"Failed to get companion messages for {companion_hash}: {e}")
             return []
 
+    # --- Mobile Companion API RF observation surface (design doc §10) ---
+    #
+    # Read-only queries over the existing packets/companion_messages tables;
+    # no new write path. Every query here resolves through idx_packets_hash
+    # (an equality lookup on packet_hash) or the companion_messages rowid,
+    # with the caller-supplied time window applied as an additional SQL
+    # predicate -- never a scan of packets filtered by a non-indexed column
+    # alone (design doc §13).
+
+    @staticmethod
+    def _parse_json_path(raw: Optional[str]) -> List[str]:
+        """Parse a packets.original_path/forwarded_path JSON array column.
+
+        Returns [] for NULL/empty/malformed input rather than raising --
+        callers treat "no path recorded" the same as "empty path".
+        """
+        if not raw:
+            return []
+        try:
+            parsed = json.loads(raw)
+        except (TypeError, ValueError):
+            return []
+        return parsed if isinstance(parsed, list) else []
+
+    def companion_message_get_by_id(
+        self, companion_hash: str, message_id: int
+    ) -> Optional[Dict]:
+        """Return one companion message row by id, scoped to companion_hash.
+
+        Scoping the WHERE clause to companion_hash (not just id) means a
+        device token paired to one companion can't probe another
+        companion's message ids and learn whether they exist (mirrors the
+        404-folding choke point mobile_endpoints._resolve already applies
+        to companion names).
+        """
+        try:
+            with self._connect() as conn:
+                conn.row_factory = sqlite3.Row
+                row = conn.execute(
+                    """
+                    SELECT id, companion_hash, packet_hash, timestamp,
+                           observation_count, unique_path_count
+                    FROM companion_messages
+                    WHERE id = ? AND companion_hash = ?
+                    """,
+                    (message_id, companion_hash),
+                ).fetchone()
+                return dict(row) if row else None
+        except Exception as e:
+            logger.error(
+                f"Failed to get companion message {message_id} for {companion_hash}: {e}"
+            )
+            return None
+
+    def companion_messages_by_sender(
+        self,
+        companion_hash: str,
+        sender_key: bytes,
+        since_ts: float,
+        until_ts: float,
+        limit: int = 200,
+    ) -> List[Dict]:
+        """Recent message rows from one sender pubkey within a time window.
+
+        Backs the contact-paths endpoint (design doc §10, contact pubkey
+        resolution): bounded LIMIT (newest first) rather than an unbounded
+        scan, since a single busy contact could otherwise dominate the
+        query.
+        """
+        try:
+            limit = max(1, min(int(limit), 200))
+            with self._connect() as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute(
+                    """
+                    SELECT id, packet_hash, timestamp
+                    FROM companion_messages
+                    WHERE companion_hash = ? AND sender_key = ?
+                      AND timestamp >= ? AND timestamp <= ?
+                    ORDER BY id DESC LIMIT ?
+                    """,
+                    (companion_hash, sender_key, since_ts, until_ts, limit),
+                ).fetchall()
+                return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error(
+                f"Failed to get companion messages by sender for {companion_hash}: {e}"
+            )
+            return []
+
+    def packets_receptions(
+        self, packet_hash_16: str, since_ts: float, until_ts: float, limit: int = 500
+    ) -> List[Dict]:
+        """Every OTA copy of ``packet_hash_16`` within [since_ts, until_ts].
+
+        Ordered oldest-first. ``idx_packets_hash`` narrows to this one
+        packet's copies first (small fanout even with no composite index --
+        see design doc §10.1/§13); the time bound is then applied as a
+        second SQL predicate rather than a separate scan.
+        """
+        try:
+            limit = max(1, min(int(limit), 500))
+            with self._connect() as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute(
+                    """
+                    SELECT timestamp, rssi, snr, original_path, is_duplicate, transmitted
+                    FROM packets
+                    WHERE packet_hash = ? AND timestamp >= ? AND timestamp <= ?
+                    ORDER BY timestamp ASC LIMIT ?
+                    """,
+                    (packet_hash_16, since_ts, until_ts, limit),
+                ).fetchall()
+                results = []
+                for row in rows:
+                    d = dict(row)
+                    d["original_path"] = self._parse_json_path(d.get("original_path"))
+                    d["is_duplicate"] = bool(d.get("is_duplicate"))
+                    d["transmitted"] = bool(d.get("transmitted"))
+                    results.append(d)
+                return results
+        except Exception as e:
+            logger.error(f"Failed to get packet receptions for {packet_hash_16}: {e}")
+            return []
+
+    def packets_transmissions(
+        self, packet_hash_16: str, since_ts: float, until_ts: float
+    ) -> List[Dict]:
+        """This repeater's own transmitted rows for ``packet_hash_16`` within
+        the window (design doc §10.3's anchor for heard-repeat correlation).
+        """
+        try:
+            with self._connect() as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute(
+                    """
+                    SELECT timestamp FROM packets
+                    WHERE packet_hash = ? AND transmitted = 1
+                      AND timestamp >= ? AND timestamp <= ?
+                    ORDER BY timestamp ASC
+                    """,
+                    (packet_hash_16, since_ts, until_ts),
+                ).fetchall()
+                return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error(f"Failed to get packet transmissions for {packet_hash_16}: {e}")
+            return []
+
+    def packets_heard_repeats(
+        self, packet_hash_16: str, after_ts: float, until_ts: float, limit: int = 500
+    ) -> List[Dict]:
+        """Heard repeats of our own transmission of ``packet_hash_16``.
+
+        Applies the design doc §10.3 local-echo-exclusion predicate exactly:
+        ``is_duplicate=1 AND transmitted=0 AND timestamp > after_ts`` (the
+        earliest matching transmit row's timestamp) -- a locally injected
+        outbound frame or the transmission row itself never qualifies, only
+        a genuine OTA reception heard strictly afterward.
+        """
+        try:
+            limit = max(1, min(int(limit), 500))
+            with self._connect() as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute(
+                    """
+                    SELECT timestamp, rssi, snr, original_path FROM packets
+                    WHERE packet_hash = ? AND is_duplicate = 1 AND transmitted = 0
+                      AND timestamp > ? AND timestamp <= ?
+                    ORDER BY timestamp ASC LIMIT ?
+                    """,
+                    (packet_hash_16, after_ts, until_ts, limit),
+                ).fetchall()
+                results = []
+                for row in rows:
+                    d = dict(row)
+                    d["original_path"] = self._parse_json_path(d.get("original_path"))
+                    results.append(d)
+                return results
+        except Exception as e:
+            logger.error(f"Failed to get heard repeats for {packet_hash_16}: {e}")
+            return []
+
     # --- Mobile Companion API event journal (design doc §5) ---
     #
     # companion_events is the canonical sync mechanism: every companion-scoped

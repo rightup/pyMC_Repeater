@@ -55,6 +55,8 @@ from typing import Optional, Tuple
 import cherrypy
 
 from repeater.companion.correlation import outbound_send_capture
+from repeater.companion.path_resolution import resolve_path
+from repeater.companion.rf_window import observations_pruned, parse_window_seconds
 
 from .auth.middleware import require_auth
 from .companion_endpoints import _to_json_safe
@@ -65,6 +67,31 @@ try:
     from repeater._version import __version__ as _REPEATER_VERSION
 except Exception:  # pragma: no cover - version metadata is best-effort
     _REPEATER_VERSION = None
+
+
+def _normalize_hash16(value) -> Optional[str]:
+    """Normalize any hash representation (bytes or str, any length, either
+    case, optionally ``0x``-prefixed) to the canonical 16-char uppercase
+    truncated form used by ``packets.packet_hash`` (design doc §10.2)."""
+    if not value:
+        return None
+    if isinstance(value, (bytes, bytearray)):
+        value = value.hex()
+    text = str(value).strip()
+    if text.lower().startswith("0x"):
+        text = text[2:]
+    text = text.upper()
+    if not text:
+        return None
+    return text[:16]
+
+
+def _is_hex(value: str) -> bool:
+    try:
+        int(value, 16)
+        return True
+    except (TypeError, ValueError):
+        return False
 
 
 async def _send_and_capture(coro):
@@ -139,6 +166,15 @@ class CompanionsV1:
     # requirement (only message sends transmit RF that a duplicate retry
     # would repeat).
     _CONTACT_ACTIONS = ("login", "status_request", "telemetry_request", "reset_path")
+    # GET-only sub-resource actions on the same /contacts/{pubkey}/{action}
+    # URL shape (§10): route identically to _CONTACT_ACTIONS, just a
+    # different HTTP method and handler set.
+    _CONTACT_GET_ACTIONS = ("paths",)
+    # Sub-resource actions under /companions/{name}/messages/{id}/{action}
+    # and /companions/{name}/transmissions/{packet_hash}/{action} (§10): the
+    # RF observation surface's other two URL shapes.
+    _MESSAGE_SUB_ACTIONS = ("receptions",)
+    _TRANSMISSION_SUB_ACTIONS = ("repeats",)
 
     def __init__(self, daemon_instance=None, config=None, event_loop=None):
         self.daemon_instance = daemon_instance
@@ -150,12 +186,16 @@ class CompanionsV1:
     # ------------------------------------------------------------------
 
     def _cp_dispatch(self, vpath):
-        """Route ``/companions/{name}/{action}`` and
-        ``/companions/{name}/contacts/{pubkey}/{action}`` to their handlers.
+        """Route ``/companions/{name}/{action}``,
+        ``/companions/{name}/contacts/{pubkey}/{action}``,
+        ``/companions/{name}/messages/{id}/{action}``, and
+        ``/companions/{name}/transmissions/{packet_hash}/{action}`` to their
+        handlers.
 
         The companion name segment becomes the ``companion_name`` request
-        param; for the contacts form, the pubkey segment becomes
-        ``contact_pubkey``. Unknown actions fall through to CherryPy's 404.
+        param; the second/third segments become ``contact_pubkey``,
+        ``message_id``, or ``packet_hash`` depending on the URL shape.
+        Unknown actions fall through to CherryPy's 404.
         """
         if len(vpath) == 2:
             name = vpath.pop(0)
@@ -163,14 +203,35 @@ class CompanionsV1:
             if action in self._ACTIONS:
                 cherrypy.request.params["companion_name"] = name
                 return getattr(self, action)
-        elif len(vpath) == 4 and vpath[1] == "contacts" and vpath[3] in self._CONTACT_ACTIONS:
-            name = vpath.pop(0)
-            vpath.pop(0)  # literal 'contacts' segment
-            pubkey = vpath.pop(0)
-            action = vpath.pop(0)
-            cherrypy.request.params["companion_name"] = name
-            cherrypy.request.params["contact_pubkey"] = pubkey
-            return getattr(self, action)
+        elif len(vpath) == 4:
+            collection = vpath[1]
+            action = vpath[3]
+            if collection == "contacts" and action in (
+                self._CONTACT_ACTIONS + self._CONTACT_GET_ACTIONS
+            ):
+                name = vpath.pop(0)
+                vpath.pop(0)  # literal 'contacts' segment
+                pubkey = vpath.pop(0)
+                vpath.pop(0)
+                cherrypy.request.params["companion_name"] = name
+                cherrypy.request.params["contact_pubkey"] = pubkey
+                return getattr(self, action)
+            if collection == "messages" and action in self._MESSAGE_SUB_ACTIONS:
+                name = vpath.pop(0)
+                vpath.pop(0)  # literal 'messages' segment
+                message_id = vpath.pop(0)
+                vpath.pop(0)
+                cherrypy.request.params["companion_name"] = name
+                cherrypy.request.params["message_id"] = message_id
+                return getattr(self, action)
+            if collection == "transmissions" and action in self._TRANSMISSION_SUB_ACTIONS:
+                name = vpath.pop(0)
+                vpath.pop(0)  # literal 'transmissions' segment
+                packet_hash = vpath.pop(0)
+                vpath.pop(0)
+                cherrypy.request.params["companion_name"] = name
+                cherrypy.request.params["packet_hash"] = packet_hash
+                return getattr(self, action)
         return None
 
     @staticmethod
@@ -375,6 +436,15 @@ class CompanionsV1:
         except (TypeError, ValueError):
             raise cherrypy.HTTPError(400, "Invalid integer parameter")
         return max(low, min(parsed, high))
+
+    @staticmethod
+    def _parse_window(value) -> int:
+        """Parse+clamp a ``?window=`` param (design doc §10.1), raising the
+        API's standard 400 on a malformed (not clamped) value."""
+        try:
+            return parse_window_seconds(value)
+        except ValueError as exc:
+            raise cherrypy.HTTPError(400, str(exc))
 
     # ------------------------------------------------------------------
     # GET /api/v1/companions
@@ -918,6 +988,272 @@ class CompanionsV1:
         pub_key = self._pub_key_from_hex(contact_pubkey)
         ok = bridge.reset_path(pub_key)
         return self._success({"reset": ok})
+
+    # ------------------------------------------------------------------
+    # RF observation surface (design doc §10) -- read-only queries over
+    # `packets`/`companion_messages`, no new write path. All three below
+    # share the mandatory bounded-window rule (§10.1) and the path-hash
+    # resolution helper (§10.5).
+    # ------------------------------------------------------------------
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    @require_auth
+    def receptions(self, companion_name=None, message_id=None, window=None, **kwargs):
+        """GET .../messages/{id}/receptions?window=24h -- every reception of
+        that message's packet_hash: per-copy RSSI/SNR, incoming path,
+        arrival time, whether we retransmitted it (design doc §10, first
+        row of the table in §10).
+
+        The window is measured back from now, not anchored on the
+        message's own timestamp (per the design doc: a message can be
+        heard again well after it first arrived), so a copy that predates
+        the message but falls inside the window is included too.
+        """
+        self._require_get()
+        _bridge, companion_hash = self._resolve(companion_name)
+        handler = self._get_sqlite_handler()
+
+        try:
+            msg_id = int(str(message_id))
+        except (TypeError, ValueError):
+            raise cherrypy.HTTPError(400, "Invalid message id")
+
+        msg = handler.companion_message_get_by_id(companion_hash, msg_id)
+        if msg is None:
+            raise cherrypy.HTTPError(404, f"Message '{message_id}' not found")
+
+        window_seconds = self._parse_window(window)
+        now = time.time()
+        since = now - window_seconds
+
+        packet_hash = msg.get("packet_hash")
+        if not packet_hash:
+            # This message row has no RF correlation key (e.g. it predates
+            # packet_hash persistence). That's an empty result, not an
+            # error -- the message is real, it just has nothing to
+            # correlate against `packets`.
+            return self._success(
+                {
+                    "message_id": msg_id,
+                    "packet_hash": None,
+                    "window": window_seconds,
+                    "receptions": [],
+                    "observation_count": 0,
+                    "unique_path_count": 0,
+                    "observations_pruned": False,
+                }
+            )
+
+        packet_hash_16 = _normalize_hash16(packet_hash)
+        rows = handler.packets_receptions(packet_hash_16, since, now)
+        contacts = handler.companion_load_contacts(companion_hash) or []
+
+        unique_paths = set()
+        receptions_out = []
+        for row in rows:
+            path = row.get("original_path") or []
+            unique_paths.add(tuple(path))
+            receptions_out.append(
+                {
+                    "observed_at": row["timestamp"],
+                    "rssi": row.get("rssi"),
+                    "snr": row.get("snr"),
+                    "path": resolve_path(path, contacts),
+                    "is_duplicate": bool(row.get("is_duplicate")),
+                    "transmitted": bool(row.get("transmitted")),
+                }
+            )
+
+        return self._success(
+            {
+                "message_id": msg_id,
+                "packet_hash": packet_hash_16,
+                "window": window_seconds,
+                "receptions": receptions_out,
+                # Exact counts from this query, not the running (and
+                # approximate -- design doc §10.4) journal counters on the
+                # message row.
+                "observation_count": len(receptions_out),
+                "unique_path_count": len(unique_paths),
+                "observations_pruned": observations_pruned(since, self.config),
+            }
+        )
+
+    # Message limit for contact-paths sender resolution (design doc §10 /
+    # §10.1): bounded so one prolific contact can't turn the endpoint into
+    # an unbounded scan.
+    _CONTACT_PATHS_MESSAGE_LIMIT = 200
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    @require_auth
+    def paths(self, companion_name=None, contact_pubkey=None, window=None, **kwargs):
+        """GET .../contacts/{pubkey}/paths?window=24h -- incoming path
+        aggregation for a contact within the window: distinct paths seen on
+        their traffic, with counts and RSSI/SNR stats (design doc §10,
+        second row of the table).
+
+        The contact does not need to exist in companion_contacts to be
+        queried -- resolution is via companion_messages.sender_key, which
+        exists independent of whether the sender was ever saved as a
+        contact.
+        """
+        self._require_get()
+        _bridge, companion_hash = self._resolve(companion_name)
+        handler = self._get_sqlite_handler()
+
+        sender_key = self._pub_key_from_hex(contact_pubkey)
+        window_seconds = self._parse_window(window)
+        now = time.time()
+        since = now - window_seconds
+
+        msg_rows = handler.companion_messages_by_sender(
+            companion_hash, sender_key, since, now, limit=self._CONTACT_PATHS_MESSAGE_LIMIT
+        )
+        packet_hashes = []
+        seen_hashes = set()
+        for row in msg_rows:
+            ph = _normalize_hash16(row.get("packet_hash"))
+            if ph and ph not in seen_hashes:
+                seen_hashes.add(ph)
+                packet_hashes.append(ph)
+
+        contacts = handler.companion_load_contacts(companion_hash) or []
+
+        # path tuple -> running aggregate
+        aggregates: dict = {}
+        total_observations = 0
+        for ph in packet_hashes:
+            for row in handler.packets_receptions(ph, since, now):
+                path = tuple(row.get("original_path") or [])
+                total_observations += 1
+                stat = aggregates.setdefault(
+                    path,
+                    {
+                        "count": 0,
+                        "first_seen": row["timestamp"],
+                        "last_seen": row["timestamp"],
+                        "rssi_values": [],
+                        "snr_values": [],
+                    },
+                )
+                stat["count"] += 1
+                stat["first_seen"] = min(stat["first_seen"], row["timestamp"])
+                stat["last_seen"] = max(stat["last_seen"], row["timestamp"])
+                if row.get("rssi") is not None:
+                    stat["rssi_values"].append(row["rssi"])
+                if row.get("snr") is not None:
+                    stat["snr_values"].append(row["snr"])
+
+        paths_out = []
+        for path, stat in aggregates.items():
+            path_list = list(path)
+            rssi_values = stat["rssi_values"]
+            snr_values = stat["snr_values"]
+            resolved_path = resolve_path(path_list, contacts)
+            paths_out.append(
+                {
+                    "path": resolved_path,
+                    "count": stat["count"],
+                    "first_seen": stat["first_seen"],
+                    "last_seen": stat["last_seen"],
+                    "rssi_min": min(rssi_values) if rssi_values else None,
+                    "rssi_max": max(rssi_values) if rssi_values else None,
+                    "rssi_avg": (
+                        sum(rssi_values) / len(rssi_values) if rssi_values else None
+                    ),
+                    "snr_min": min(snr_values) if snr_values else None,
+                    "snr_max": max(snr_values) if snr_values else None,
+                    "snr_avg": sum(snr_values) / len(snr_values) if snr_values else None,
+                    "first_hop": resolved_path[0] if resolved_path else None,
+                    "last_hop": resolved_path[-1] if resolved_path else None,
+                }
+            )
+        # Most-observed path first -- the useful default ordering for a
+        # "route diversity" view.
+        paths_out.sort(key=lambda p: p["count"], reverse=True)
+
+        return self._success(
+            {
+                "contact_pubkey": contact_pubkey.lower(),
+                "window": window_seconds,
+                "paths": paths_out,
+                "total_observations": total_observations,
+                "messages_scanned": len(msg_rows),
+                "message_limit": self._CONTACT_PATHS_MESSAGE_LIMIT,
+                "observations_pruned": observations_pruned(since, self.config),
+            }
+        )
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    @require_auth
+    def repeats(self, companion_name=None, packet_hash=None, window=None, **kwargs):
+        """GET .../transmissions/{packet_hash}/repeats?window=24h -- heard
+        repeats of our own transmission: receptions of the same packet_hash
+        after we transmitted it (design doc §10, third row of the table;
+        predicate exactly per §10.3).
+
+        ``packet_hash`` accepts either the full or the already-truncated
+        16-char form; both normalize to the same lookup key.
+        """
+        self._require_get()
+        _bridge, companion_hash = self._resolve(companion_name)
+        handler = self._get_sqlite_handler()
+
+        packet_hash_16 = _normalize_hash16(packet_hash)
+        if not packet_hash_16 or not _is_hex(packet_hash_16):
+            raise cherrypy.HTTPError(400, "Invalid packet_hash")
+
+        window_seconds = self._parse_window(window)
+        now = time.time()
+        since = now - window_seconds
+
+        tx_rows = handler.packets_transmissions(packet_hash_16, since, now)
+        if not tx_rows:
+            raise cherrypy.HTTPError(404, "Transmission not found")
+        transmitted_at = min(row["timestamp"] for row in tx_rows)
+
+        repeat_rows = handler.packets_heard_repeats(packet_hash_16, transmitted_at, now)
+        contacts = handler.companion_load_contacts(companion_hash) or []
+
+        repeats_out = []
+        unique_terminal_hashes = set()
+        for row in repeat_rows:
+            path = row.get("original_path") or []
+            terminal_raw = path[-1] if path else None
+            if terminal_raw is not None:
+                unique_terminal_hashes.add(terminal_raw)
+            terminal_resolved = (
+                resolve_path([terminal_raw], contacts)[0] if terminal_raw is not None else None
+            )
+            repeats_out.append(
+                {
+                    "observed_at": row["timestamp"],
+                    "rssi": row.get("rssi"),
+                    "snr": row.get("snr"),
+                    "path": resolve_path(path, contacts),
+                    "terminal_repeater": terminal_resolved,
+                }
+            )
+
+        return self._success(
+            {
+                "packet_hash": packet_hash_16,
+                "transmitted_at": transmitted_at,
+                "window": window_seconds,
+                # Every matching OTA copy counts (a repeater heard twice
+                # counts twice) vs. distinct terminal hashes -- neither is
+                # collapsed into the other (design doc §10.3). Both, plus
+                # the hash-changing-rebroadcast caveat in §10.3, make these
+                # a lower bound, not an exact repeater census.
+                "repeats": repeats_out,
+                "heard_repeat_count": len(repeats_out),
+                "unique_repeater_count": len(unique_terminal_hashes),
+                "observations_pruned": observations_pruned(since, self.config),
+            }
+        )
 
 
 class PairV1:
