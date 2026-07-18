@@ -4496,9 +4496,6 @@ paths:
               properties:
                 companion_name:
                   type: string
-                device_name:
-                  type: string
-                  description: Accepted for a future audit-log/QR-label use; not otherwise used in v1.
       responses:
         '200':
           description: Pairing code generated
@@ -4859,18 +4856,13 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponseV1'
-        '403':
-          description: |
-            `Insufficient scope for this companion` (or `No auth scope for
-            this companion`). Rendered as the v1 JSON error envelope (see tag
-            description).
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponseV1'
         '404':
           description: |
-            `Companion '{name}' not found`. Rendered as the v1 JSON error envelope (see tag description).
+            `Companion '{name}' not found` — returned both for unknown names
+            and for companions outside the caller's token scope (identical
+            status and message, so a scoped device token cannot enumerate
+            other companion names). Rendered as the v1 JSON error envelope
+            (see tag description).
           content:
             application/json:
               schema:
@@ -4977,18 +4969,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponseV1'
-        '403':
-          description: |
-            Insufficient scope. Rendered as the v1 JSON error envelope (see tag
-            description).
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponseV1'
         '404':
           description: |
-            Companion not found. Rendered as the v1 JSON error envelope (see tag
-            description).
+            Companion not found — also returned for companions outside the
+            caller's token scope (identical status and message, so a scoped
+            device token cannot enumerate other companion names). Rendered as
+            the v1 JSON error envelope (see tag description).
           content:
             application/json:
               schema:
@@ -5061,8 +5047,10 @@ paths:
                 $ref: '#/components/schemas/ErrorResponseV1'
         '404':
           description: |
-            Companion not found. Rendered as the v1 JSON error envelope (see tag
-            description).
+            Companion not found — also returned for companions outside the
+            caller's token scope (identical status and message, so a scoped
+            device token cannot enumerate other companion names). Rendered as
+            the v1 JSON error envelope (see tag description).
           content:
             application/json:
               schema:
@@ -5178,8 +5166,10 @@ paths:
                 $ref: '#/components/schemas/ErrorResponseV1'
         '404':
           description: |
-            Companion not found. Rendered as the v1 JSON error envelope (see tag
-            description).
+            Companion not found — also returned for companions outside the
+            caller's token scope (identical status and message, so a scoped
+            device token cannot enumerate other companion names). Rendered as
+            the v1 JSON error envelope (see tag description).
           content:
             application/json:
               schema:
@@ -5298,18 +5288,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponseV1'
-        '403':
-          description: |
-            Insufficient scope. Rendered as the v1 JSON error envelope (see tag
-            description).
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponseV1'
         '404':
           description: |
-            Companion not found. Rendered as the v1 JSON error envelope (see tag
-            description).
+            Companion not found — also returned for companions outside the
+            caller's token scope (identical status and message, so a scoped
+            device token cannot enumerate other companion names). Rendered as
+            the v1 JSON error envelope (see tag description).
           content:
             application/json:
               schema:
@@ -5383,8 +5367,10 @@ paths:
                 $ref: '#/components/schemas/ErrorResponseV1'
         '404':
           description: |
-            Companion not found. Rendered as the v1 JSON error envelope (see tag
-            description).
+            Companion not found — also returned for companions outside the
+            caller's token scope (identical status and message, so a scoped
+            device token cannot enumerate other companion names). Rendered as
+            the v1 JSON error envelope (see tag description).
           content:
             application/json:
               schema:
@@ -5455,8 +5441,10 @@ paths:
                 $ref: '#/components/schemas/ErrorResponseV1'
         '404':
           description: |
-            Companion not found. Rendered as the v1 JSON error envelope (see tag
-            description).
+            Companion not found — also returned for companions outside the
+            caller's token scope (identical status and message, so a scoped
+            device token cannot enumerate other companion names). Rendered as
+            the v1 JSON error envelope (see tag description).
           content:
             application/json:
               schema:
@@ -5520,8 +5508,10 @@ paths:
                 $ref: '#/components/schemas/ErrorResponseV1'
         '404':
           description: |
-            Companion not found. Rendered as the v1 JSON error envelope (see tag
-            description).
+            Companion not found — also returned for companions outside the
+            caller's token scope (identical status and message, so a scoped
+            device token cannot enumerate other companion names). Rendered as
+            the v1 JSON error envelope (see tag description).
           content:
             application/json:
               schema:
@@ -5588,8 +5578,10 @@ paths:
                 $ref: '#/components/schemas/ErrorResponseV1'
         '404':
           description: |
-            Companion not found. Rendered as the v1 JSON error envelope (see tag
-            description).
+            Companion not found — also returned for companions outside the
+            caller's token scope (identical status and message, so a scoped
+            device token cannot enumerate other companion names). Rendered as
+            the v1 JSON error envelope (see tag description).
           content:
             application/json:
               schema:

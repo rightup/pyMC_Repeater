@@ -269,8 +269,13 @@ class CompanionsV1:
     def _check_scope(name: str) -> None:
         """Enforce the caller's token scope against companion ``name``
         (design doc §11.1): ``admin``, ``companion:*`` (all companions), or
-        ``companion:{name}`` (exact resolved name) are allowed; anything
-        else is a 403.
+        ``companion:{name}`` (exact resolved name) are allowed.
+
+        Out-of-scope access raises 404 with the SAME message ``_resolve``
+        uses for unknown names, not 403 — a 403 would confirm to a scoped
+        device token that some other companion name exists (the
+        ``/companions`` listing is filtered for the same reason). Keep the
+        message in sync with ``_resolve``'s not-found error.
 
         A ``request.user`` dict with no ``scope`` key at all is a
         pre-scope-migration / legacy caller (e.g. a JWT payload predating
@@ -283,11 +288,11 @@ class CompanionsV1:
         """
         user = getattr(cherrypy.request, "user", None)
         if user is None:
-            raise cherrypy.HTTPError(403, "No auth scope for this companion")
+            raise cherrypy.HTTPError(404, f"Companion '{name}' not found")
         scope = user.get("scope", "admin")
         if scope in ("admin", "companion:*", f"companion:{name}"):
             return
-        raise cherrypy.HTTPError(403, "Insufficient scope for this companion")
+        raise cherrypy.HTTPError(404, f"Companion '{name}' not found")
 
     def _get_sqlite_handler(self):
         """Return the repeater's sqlite_handler, or raise 503 (same path as
@@ -1003,9 +1008,11 @@ class PairV1:
     def start(self, **kwargs):
         """Generate a single-use, 5-minute pairing code for a companion.
 
-        Body: ``{companion_name, device_name?}`` (``device_name`` is
-        accepted for a future audit-log/QR-label use but not otherwise
-        used in v1). Response data: ``{code, expires_in, companion_name,
+        Body: ``{companion_name}``. The device's name arrives from the app
+        at the exchange step (``POST /pair``'s required ``name``), so this
+        endpoint deliberately takes no device label — an operator-typed
+        guess would just be superseded seconds later.
+        Response data: ``{code, expires_in, companion_name,
         fingerprint}`` — ``fingerprint`` is the sha256 hexdigest of the
         companion identity's public key; this is what the app pins on
         first pair (TOFU, §11.3) to detect later server substitution even

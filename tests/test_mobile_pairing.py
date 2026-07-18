@@ -382,11 +382,14 @@ class TestScopeEnforcement:
         _bridge, chash = companions._resolve(_NAME)
         assert chash == _HASH
 
-    def test_companion_scope_403_on_other_companion(self, companions):
+    def test_companion_scope_404_on_other_companion(self, companions):
+        """Out-of-scope is indistinguishable from nonexistent — same status
+        AND message shape — so a scoped token can't enumerate names."""
         _set_user(scope=f"companion:{_NAME}")
         with pytest.raises(cherrypy.HTTPError) as exc:
             companions._resolve(_OTHER_NAME)
-        assert exc.value.status == 403
+        assert exc.value.status == 404
+        assert exc.value._message == f"Companion '{_OTHER_NAME}' not found"
 
     def test_wildcard_scope_passes_all_companions(self, companions):
         _set_user(scope="companion:*")
@@ -403,16 +406,16 @@ class TestScopeEnforcement:
         companions._resolve(_NAME)
         companions._resolve(_OTHER_NAME)
 
-    def test_missing_user_403(self, companions):
+    def test_missing_user_404(self, companions):
         with pytest.raises(cherrypy.HTTPError) as exc:
             companions._resolve(_NAME)
-        assert exc.value.status == 403
+        assert exc.value.status == 404
 
-    def test_unrelated_scope_403(self, companions):
+    def test_unrelated_scope_404(self, companions):
         _set_user(scope="something-else")
         with pytest.raises(cherrypy.HTTPError) as exc:
             companions._resolve(_NAME)
-        assert exc.value.status == 403
+        assert exc.value.status == 404
 
     def test_unknown_companion_still_404_regardless_of_scope(self, companions):
         _set_user(scope=f"companion:{_NAME}")
