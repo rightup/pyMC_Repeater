@@ -103,6 +103,7 @@
   <h1>OpenHop Companion</h1>
   <span class="badge" id="mode">connecting…</span>
   <span class="badge" id="node"></span>
+  <span class="badge" id="transport" title="API surface in use"></span>
 </header>
 <div id="err"></div>
 <div class="warn" id="livewarn" style="display:none">
@@ -125,9 +126,15 @@
         <input type="text" id="inject" placeholder="Simulate an inbound message…" autocomplete="off">
         <button class="ghost" id="injectBtn">Receive</button>
       </div>
+      <div class="row" style="margin-top:8px">
+        <input type="text" id="rename" placeholder="Rename this channel (blank = remove)…" autocomplete="off">
+        <button class="ghost" id="renameBtn">Apply</button>
+      </div>
       <div class="hint">
-        Sent messages go out to the mesh. <strong>Receive</strong> simulates traffic
-        arriving — that is what triggers a push. Try including “adam” to fire a mention.
+        Everything here goes over <strong>/api/v1</strong>: snapshot to bootstrap,
+        sync to follow the journal, POST to send. <strong>Receive</strong> simulates
+        inbound mesh traffic — that is what triggers a push. Include “adam” to fire a
+        mention. Renaming a channel proves channel events now reach a syncing client.
       </div>
     </footer>
   </section>
@@ -238,11 +245,12 @@ async function init() {
   mode.textContent = state.mode === "sim" ? "simulator" : "live";
   mode.className = "badge mode-" + state.mode;
   $("node").textContent = state.node_name ? state.node_name + " · 0x" + state.companion_hash : "";
+  $("transport").textContent = (state.transport || "").toUpperCase() + " /api/v1";
   const sel = $("channel");
   (state.channels || []).forEach((c) => {
     const opt = document.createElement("option");
-    opt.value = c.idx;
-    opt.textContent = c.name + "  (" + c.idx + ")";
+    opt.value = c.index;
+    opt.textContent = c.name + "  (" + c.index + ")";
     sel.appendChild(opt);
   });
   if (!(state.channels || []).length) {
@@ -266,8 +274,33 @@ async function init() {
     const evt = JSON.parse(e.data);
     if (evt.kind === "message") addMessage(evt.data);
     else if (evt.kind === "push") addPush(evt.data);
+    else if (evt.kind === "channels") refreshChannels(evt.data.channels);
+    else if (evt.kind === "resync") showError("Cursor expired — re-bootstrapped from snapshot.");
   };
   stream.onerror = () => showError("Event stream disconnected — is the server still running?");
+}
+
+function refreshChannels(channels) {
+  const sel = $("channel");
+  const previous = sel.value;
+  sel.innerHTML = "";
+  (channels || []).forEach((c) => {
+    const opt = document.createElement("option");
+    opt.value = c.index;
+    opt.textContent = c.name + "  (" + c.index + ")";
+    sel.appendChild(opt);
+  });
+  if ([...sel.options].some((o) => o.value === previous)) sel.value = previous;
+  currentChannel = Number(sel.value || 0);
+  renderAll();
+}
+
+async function doRename() {
+  const name = $("rename").value.trim();
+  $("rename").value = "";
+  showError("");
+  try { await post("/api/set_channel", {index: currentChannel, name}); }
+  catch (err) { showError("Channel change failed: " + err.message); }
 }
 
 async function doSend() {
@@ -288,6 +321,8 @@ async function doInject() {
   catch (err) { showError("Receive failed: " + err.message); }
 }
 
+$("renameBtn").onclick = doRename;
+$("rename").onkeydown = (e) => { if (e.key === "Enter") doRename(); };
 $("send").onclick = doSend;
 $("injectBtn").onclick = doInject;
 $("text").onkeydown = (e) => { if (e.key === "Enter") doSend(); };

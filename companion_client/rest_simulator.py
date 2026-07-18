@@ -16,6 +16,7 @@ above it is the shipping code.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import socket
 import threading
@@ -65,6 +66,7 @@ class RestFakeBridge:
             1: SimpleNamespace(name="#howltest", secret=b"\x11" * 16),
         }
         self.channels = _FakeChannels(self._channel_map)
+        self.sent: list = []
         self.contacts_list = [
             SimpleNamespace(
                 public_key=b"\xaa" * 32,
@@ -87,6 +89,19 @@ class RestFakeBridge:
 
     def get_contacts(self):
         return self.contacts_list
+
+    async def send_channel_message(self, channel_idx: int, text: str, **kwargs):
+        """Record an outbound channel send. No radio, so nothing transmits.
+
+        Async because the endpoint awaits the bridge call on the daemon's
+        event loop (``_send_and_capture``).
+        """
+        self.sent.append({"channel_idx": channel_idx, "text": text})
+        return True
+
+    async def send_text(self, pub_key, text: str, **kwargs):
+        self.sent.append({"to": bytes(pub_key).hex(), "text": text})
+        return True
 
     def set_channel_entry(self, idx: int, name: Optional[str]) -> None:
         """Mutate the channel table the snapshot reads, for drift tests."""
@@ -111,6 +126,7 @@ class RestHarness:
     companion_hash: str
     token_manager: object
     jwt_handler: object
+    event_loop: object = None
 
     def admin_token(self, name: str = "admin-token") -> str:
         """Mint an admin-scope API token, standing in for an operator's JWT.
@@ -159,14 +175,26 @@ def start_rest_harness(
             "log.screen": False,
             "log.access_file": "",
             "log.error_file": "",
+            # Match production (web/http_server.py): without this CherryPy
+            # 301-redirects object paths like /pair to /pair/, and stock HTTP
+            # clients downgrade POST to GET when following it. The real server
+            # disables it globally, so a harness that omits it is unfaithful
+            # and invents failures the deployment does not have.
+            "tools.trailing_slash.on": False,
             "jwt_handler": jwt_handler,
             "token_manager": token_manager,
         }
     )
 
+    # POST /messages dispatches a coroutine onto the daemon's loop
+    # (_send_and_capture), so the harness needs a real one running.
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever, daemon=True, name="rest-harness-loop")
+    thread.start()
+
     root = SimpleNamespace()
     root.api = SimpleNamespace()
-    root.api.v1 = MobileAPIEndpoints(daemon_instance=daemon, config={})
+    root.api.v1 = MobileAPIEndpoints(daemon_instance=daemon, config={}, event_loop=loop)
 
     cherrypy.tree.mount(root, "/", {"/": {"request.dispatch": cherrypy.dispatch.Dispatcher()}})
     cherrypy.engine.start()
@@ -179,12 +207,15 @@ def start_rest_harness(
         companion_hash=companion_hash,
         token_manager=token_manager,
         jwt_handler=jwt_handler,
+        event_loop=loop,
     )
 
 
-def stop_rest_harness() -> None:
+def stop_rest_harness(harness: Optional[RestHarness] = None) -> None:
     cherrypy.engine.exit()
     cherrypy.tree.apps.clear()
+    if harness is not None and harness.event_loop is not None:
+        harness.event_loop.call_soon_threadsafe(harness.event_loop.stop)
 
 
 _lock = threading.Lock()

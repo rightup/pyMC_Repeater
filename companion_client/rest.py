@@ -16,6 +16,7 @@ import logging
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -23,19 +24,20 @@ logger = logging.getLogger("companion_client.rest")
 
 
 class _MethodPreservingRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """Keep the HTTP method across a redirect.
+    """Keep the HTTP method across a redirect. Defensive, not a workaround.
 
-    CherryPy mounts object endpoints (``/pair``, ``/devices``) such that the
-    bare path 301-redirects to the trailing-slash form. urllib -- like most
-    clients, following RFC 7231 for 301/302 -- reissues the redirect as GET,
-    so ``POST /api/v1/pair`` arrives as ``GET /api/v1/pair/`` and the server
-    answers ``405 Method not allowed. Use POST.`` The message is actively
-    misleading: the caller *did* use POST.
+    The repeater disables CherryPy's trailing-slash redirect globally
+    (``tools.trailing_slash.on: False`` in ``web/http_server.py``), so against
+    a real deployment ``POST /api/v1/pair`` dispatches directly -- verified
+    against a live instance, which returns the handler's 404 for a bad code
+    rather than a redirect.
 
-    Preserving the method makes the bare and trailing-slash forms behave the
-    same, which is what a caller expects. Real phone clients built on
-    stock HTTP libraries will hit the same downgrade unless they either do
-    this or always send the trailing slash.
+    This handler exists because a CherryPy mount that *omits* that setting
+    does 301 the bare path to ``/pair/``, and urllib -- like most clients,
+    per RFC 7231 for 301/302 -- reissues the redirect as GET. The server then
+    answers ``405 Method not allowed. Use POST.`` to a caller that did use
+    POST. Preserving the method keeps this client working against such a
+    mount instead of failing with a misleading error.
     """
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
@@ -273,6 +275,47 @@ class CompanionRestClient:
             "GET",
             f"/companions/{urllib.parse.quote(companion_name)}/messages",
             params={"limit": limit, "before_id": before_id},
+        )
+
+    def send_message(
+        self,
+        companion_name: str,
+        text: str,
+        *,
+        channel_idx: Optional[int] = None,
+        to: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+    ) -> dict:
+        """Send a channel message (``channel_idx``) or a DM (``to``, hex pubkey).
+
+        ``Idempotency-Key`` is mandatory (design doc §6). A retry with the same
+        key and the same body replays the stored response without touching the
+        radio; the same key with a *different* body is a 409. Only a successful
+        send claims the key, so a radio failure can be retried rather than
+        replaying a cached failure forever.
+
+        A key is generated per call unless supplied. Pass the same key
+        explicitly to retry a send you are unsure landed.
+
+        The response carries ``packet_hash`` on success -- the correlation key
+        for the transmitted packet, for matching later send-state events
+        without waiting on the journal. It is absent when the send failed.
+        """
+        if (channel_idx is None) == (to is None):
+            raise ValueError("exactly one of channel_idx or to is required")
+
+        body: dict = {"text": text}
+        if channel_idx is not None:
+            body["channel_idx"] = channel_idx
+        else:
+            body["to"] = to
+
+        key = idempotency_key or uuid.uuid4().hex
+        return self._data(
+            "POST",
+            f"/companions/{urllib.parse.quote(companion_name)}/messages",
+            body=body,
+            headers={"Idempotency-Key": key},
         )
 
     # -- devices / push ----------------------------------------------------

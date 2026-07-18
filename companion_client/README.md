@@ -34,19 +34,27 @@ package the server uses, so the wire format cannot drift between the two.
 
 ## Web chat UI
 
+Runs on **`/api/v1`**, not the frame protocol — it models what a phone app
+actually does: pair for a device token, `snapshot` to bootstrap, follow the
+journal with `sync`, and `POST .../messages` with an `Idempotency-Key` to send.
+
 ```bash
 python -m companion_client.web.app                 # simulator on :8800
-python -m companion_client.web.app --live --host 192.168.1.50 --port 15050
+python -m companion_client.web.app --live --base-url http://127.0.0.1:8000 \
+    --companion "TestCompanion" --admin-token <token>
 ```
 
-Simulator mode stands up a real frame server, journal, push notifier and
-capture listener in-process. Send messages, hit **Receive** to simulate inbound
-mesh traffic, and watch the resulting push appear — including the difference
-between a `count` push (silent, badge only) and a `mention` push (visible alert
-reading "You were mentioned", never the message text).
+Simulator mode mounts the real `/api/v1` tree in-process with a real
+SQLiteHandler, journal and push notifier, plus a capture listener. Send
+messages, hit **Receive** to simulate inbound mesh traffic, and watch the
+resulting push — the difference between a `count` push (silent, badge only)
+and a `mention` push (visible alert reading "You were mentioned", never the
+message text). **Apply** renames a channel, which demonstrates channel events
+reaching a syncing client.
 
-Live mode connects to a real repeater. Sending is real; receiving depends on
-actual RF traffic, and pushes go wherever that device's registered relay points.
+Live mode needs `--admin-token`: minting a pairing code requires an operator,
+because a device cannot bootstrap itself. Sending there transmits over the
+air.
 
 ## Channels
 

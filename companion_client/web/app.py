@@ -1,22 +1,29 @@
-"""Web chat client -- a browser UI over the same client library the tests use.
+"""Web chat client over the Mobile Companion API v1 (``/api/v1``).
+
+This models what a phone app actually does: pair once for a device token,
+`snapshot` to bootstrap (self, contacts, channels, recent messages), then
+follow the journal with `sync` from the returned cursor, and send with
+`POST .../messages` carrying an Idempotency-Key.
+
+It deliberately does **not** use the TCP frame protocol
+(:mod:`companion_client.client`). That is a separate, lower-level interface;
+the REST tree is the surface a first-party mobile companion lives on, and the
+two are not equivalent -- the frame protocol hands out channel PSK secrets,
+the REST snapshot does not.
 
 Two modes:
 
-* **sim** (default) -- starts an in-process frame server, journal, push notifier
-  and capture listener, so you can send messages, inject inbound traffic, and
-  *watch the push fire* as it happens. This is the mode that models the
-  experience end to end without a radio.
-* **live** -- connects to a real repeater's companion port. Sending is real;
-  receiving depends on actual RF traffic, and pushes go wherever that device's
-  registered relay points.
+* **sim** (default) -- mounts the real `/api/v1` tree in-process with a real
+  SQLiteHandler, journal and push notifier, plus a capture listener. Send
+  messages, simulate inbound traffic, and watch the resulting push.
+* **live** -- points at a running repeater. Needs an admin API token to mint
+  the pairing code; sending transmits over the air.
 
 Run::
 
-    python -m companion_client.web.app            # sim mode on :8800
-    python -m companion_client.web.app --live --host 192.168.1.50 --port 15050
-
-Browser updates arrive over SSE, which is a better fit than WebSockets here:
-the stream is one-way (server -> page) and sending is an ordinary POST.
+    python -m companion_client.web.app
+    python -m companion_client.web.app --live --base-url http://127.0.0.1:8000 \\
+        --companion "TestCompanion" --admin-token <token>
 """
 
 from __future__ import annotations
@@ -31,86 +38,122 @@ from typing import Optional
 
 from aiohttp import web
 
-from companion_client.client import CompanionClient
 from companion_client.push_listener import PushListener
+from companion_client.rest import CompanionRestClient, RestError
 
 logger = logging.getLogger("companion_client.web")
 
 INDEX = Path(__file__).parent / "index.html"
 
+# How often to poll sync. A real app would use background refresh (~minutes)
+# or the SSE /events endpoint; this is a demo, so it stays snappy.
+SYNC_INTERVAL_SEC = 1.0
+
 
 class ChatSession:
-    """Holds the client, the simulator (if any), and the browser event stream."""
-
-    def __init__(self, *, live: bool, host: str, port: int) -> None:
+    def __init__(
+        self,
+        *,
+        live: bool,
+        base_url: str,
+        companion: str,
+        admin_token: Optional[str],
+        device_id: str = "web-client",
+    ) -> None:
         self.live = live
-        self.host = host
-        self.port = port
-        self.client: Optional[CompanionClient] = None
-        self.listener: Optional[PushListener] = None
+        self.base_url = base_url
+        self.companion = companion
+        self.admin_token = admin_token
+        self.device_id = device_id
+
+        self.client: Optional[CompanionRestClient] = None
         self.harness = None
+        self.listener: Optional[PushListener] = None
         self.notifier = None
+        self.journal = None
+
+        self.self_info: dict = {}
+        self.channels: list[dict] = []
+        self.contacts: list[dict] = []
         self.messages: list[dict] = []
+        self.cursor: str = "0"
+
         self._subscribers: list[asyncio.Queue] = []
         self._push_seen = 0
-        self._push_task: Optional[asyncio.Task] = None
+        self._tasks: list[asyncio.Task] = []
 
     # -- startup -----------------------------------------------------------
 
     async def start(self, tmp_dir: Path) -> None:
         if self.live:
-            self.client = CompanionClient(self.host, self.port)
-            await self.client.connect()
+            if not self.admin_token:
+                raise SystemExit(
+                    "live mode needs --admin-token: minting a pairing code "
+                    "requires an operator, a device cannot bootstrap itself"
+                )
+            self.client = CompanionRestClient(self.base_url)
         else:
             await self._start_sim(tmp_dir)
 
-        self.client.on_message(self._handle_message)
-        await self.client.list_channels()
+        await asyncio.to_thread(self._pair)
+        await asyncio.to_thread(self._bootstrap)
+        self._tasks.append(asyncio.create_task(self._sync_loop()))
+        if self.listener is not None:
+            self._tasks.append(asyncio.create_task(self._push_loop()))
 
     async def _start_sim(self, tmp_dir: Path) -> None:
         # Imported here so live mode never needs the repeater package.
-        from companion_client.simulator import start_harness
+        from companion_client.rest_simulator import start_rest_harness
+        from repeater.companion.journal import CompanionEventJournal
         from repeater.companion.push_notifier import CompanionPushNotifier
 
-        self.harness = await start_harness(tmp_dir)
+        self.harness = await asyncio.to_thread(start_rest_harness, tmp_dir)
+        self.base_url = self.harness.base_url
+        self.companion = self.harness.companion_name
+        self.admin_token = self.harness.admin_token()
+        self.client = CompanionRestClient(self.base_url)
+
         self.listener = PushListener().start()
-
-        handler = self.harness.handler
-        token_id = handler.create_api_token("web", "web-hash", scope="companion:x")
-        handler.companion_device_create(
-            self.harness.companion_hash, "web-device", "Web Client", token_id, platform="ios"
-        )
-        handler.companion_device_set_push(
-            "web-device",
-            "a" * 64,
-            push_relay_url=self.listener.url,
-            push_detail="count",
-            mention_push=True,
-            mention_keywords=["adam", "webclient"],
-        )
-
-        # A short interval keeps the demo responsive; production default is 30s.
-        self.notifier = CompanionPushNotifier(handler, min_interval=3.0)
+        self.journal = CompanionEventJournal(self.harness.handler, self.harness.companion_hash)
+        # Short interval keeps the demo responsive; production default is 30s.
+        self.notifier = CompanionPushNotifier(self.harness.handler, min_interval=3.0)
         self.notifier.start()
-        self.harness.journal.register_listener(
-            self.notifier.make_listener(self.harness.companion_hash)
-        )
+        self.journal.register_listener(self.notifier.make_listener(self.harness.companion_hash))
 
-        self.client = CompanionClient("127.0.0.1", self.harness.port)
-        await self.client.connect()
-        self._push_task = asyncio.create_task(self._poll_pushes())
+    def _pair(self) -> None:
+        code = self.client.pair_start(self.companion, self.admin_token)["code"]
+        self.client.pair(code, self.device_id, "Web Client", platform="ios")
+        if self.harness is not None:
+            # Register push so the notifier has somewhere to deliver.
+            self.client.register_push(
+                self.device_id,
+                push_token="a" * 64,
+                push_relay_url=self.listener.url,
+                push_detail="count",
+                mention_push=True,
+                mention_keywords=["adam", "webclient"],
+            )
+
+    def _bootstrap(self) -> None:
+        data, _etag = self.client.snapshot(self.companion)
+        self.self_info = data.get("self", {})
+        self.channels = data.get("channels", [])
+        self.contacts = data.get("contacts", [])
+        self.cursor = str(data.get("cursor", "0"))
+        for message in data.get("messages", []):
+            self.messages.append(self._to_entry(message, direction="in"))
 
     async def stop(self) -> None:
-        if self._push_task:
-            self._push_task.cancel()
-        if self.client:
-            await self.client.close()
+        for task in self._tasks:
+            task.cancel()
         if self.notifier:
             self.notifier.stop()
         if self.listener:
             self.listener.stop()
-        if self.harness:
-            await self.harness.stop()
+        if self.harness is not None:
+            from companion_client.rest_simulator import stop_rest_harness
+
+            await asyncio.to_thread(stop_rest_harness, self.harness)
 
     # -- events ------------------------------------------------------------
 
@@ -129,45 +172,83 @@ class ChatSession:
             queue.put_nowait(event)
 
     def channel_name(self, idx) -> str:
-        for channel in self.client.channels or []:
-            if channel.idx == idx:
-                return channel.name
+        for channel in self.channels:
+            if channel.get("index") == idx:
+                return channel.get("name", f"channel {idx}")
         return f"channel {idx}"
 
-    def _handle_message(self, message) -> None:
-        entry = {
-            "text": message.text,
-            "direction": "in",
-            "channel": message.channel_idx,
-            "channel_name": self.channel_name(message.channel_idx),
-            "timestamp": message.timestamp,
-            "snr": message.snr,
+    def _to_entry(self, message: dict, *, direction: str) -> dict:
+        channel = message.get("channel_idx", 0) or 0
+        return {
+            "text": message.get("text", ""),
+            "direction": direction,
+            "channel": channel,
+            "channel_name": self.channel_name(channel),
+            "timestamp": message.get("timestamp"),
         }
-        self.messages.append(entry)
-        self.emit("message", entry)
 
-    async def _poll_pushes(self) -> None:
-        """Surface captured pushes to the browser.
+    async def _sync_loop(self) -> None:
+        """Follow the journal from the snapshot cursor.
 
-        Polled rather than callback-driven because PushListener runs on its own
-        threads; this keeps everything on the event loop.
+        This is the REST equivalent of the frame protocol's MSG_WAITING push:
+        the client polls `sync` and applies whatever events arrived.
         """
+        while True:
+            try:
+                await asyncio.sleep(SYNC_INTERVAL_SEC)
+                result = await asyncio.to_thread(self.client.sync, self.companion, self.cursor)
+                if result.snapshot_required:
+                    # Cursor fell below the prune floor: the delta would be
+                    # silently incomplete, so re-bootstrap rather than limp on.
+                    logger.warning("snapshot_required; re-bootstrapping")
+                    await asyncio.to_thread(self._bootstrap)
+                    self.emit("resync", {})
+                    continue
+                self.cursor = result.next_cursor
+                for event in result.events:
+                    self._apply_event(event)
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                logger.exception("sync loop error")
+
+    def _apply_event(self, event: dict) -> None:
+        kind = event.get("type")
+        data = event.get("data", {}) or {}
+        if kind == "message":
+            entry = self._to_entry(data, direction="in")
+            self.messages.append(entry)
+            self.emit("message", entry)
+        elif kind == "channel":
+            # The event this UI exists to prove: channel changes now reach a
+            # syncing client instead of needing a re-snapshot.
+            self._apply_channel_change(data)
+        elif kind == "contact":
+            self.emit("contact", data)
+
+    def _apply_channel_change(self, data: dict) -> None:
+        index, name = data.get("index"), data.get("name")
+        self.channels = [c for c in self.channels if c.get("index") != index]
+        if data.get("change") != "remove" and name:
+            self.channels.append({"index": index, "name": name})
+        self.channels.sort(key=lambda c: c.get("index", 0))
+        self.emit("channels", {"channels": self.channels})
+
+    async def _push_loop(self) -> None:
         try:
             while True:
                 await asyncio.sleep(0.2)
-                if self.listener is None:
-                    continue
                 while self._push_seen < len(self.listener.pushes):
                     push = self.listener.pushes[self._push_seen]
                     self._push_seen += 1
                     self.emit("push", {"shape": push.shape, "body": push.body})
         except asyncio.CancelledError:
-            pass
+            return
 
     # -- actions -----------------------------------------------------------
 
     async def send(self, text: str, channel: int = 0) -> dict:
-        await self.client.send_channel_message(channel, text)
+        await asyncio.to_thread(self.client.send_message, self.companion, text, channel_idx=channel)
         entry = {
             "text": text,
             "direction": "out",
@@ -180,13 +261,33 @@ class ChatSession:
         return entry
 
     async def inject(self, text: str, channel: int = 0) -> None:
-        """Simulate a message arriving from the mesh (sim mode only)."""
+        """Simulate inbound mesh traffic (sim mode only).
+
+        Writes the message and journals it, which is what an inbound RF
+        message does -- so it flows to this client through `sync` and to the
+        push notifier at the same time.
+        """
         if self.harness is None:
             raise web.HTTPBadRequest(reason="inject is only available in sim mode")
-        await self.harness.inject_inbound_message(
-            text, f"web-{time.time_ns()}", int(time.time()), channel_idx=channel
+        message = {
+            "text": text,
+            "timestamp": int(time.time()),
+            "packet_hash": f"web{time.time_ns():x}"[:16],
+            "channel_idx": channel,
+            "is_channel": True,
+        }
+        handler = self.harness.handler
+        await asyncio.to_thread(
+            handler.companion_push_message, self.harness.companion_hash, message, 50
         )
-        await self.client.drain_messages()
+        await asyncio.to_thread(self.journal.record_message, message)
+
+    async def set_channel(self, index: int, name: str) -> None:
+        """Journal a channel change, to show it reaching this client via sync."""
+        if self.harness is None:
+            raise web.HTTPBadRequest(reason="only available in sim mode")
+        change = "remove" if not name else "update"
+        await asyncio.to_thread(self.journal.record_channel, index, name or None, change)
 
 
 # --------------------------------------------------------------------------
@@ -200,14 +301,17 @@ async def index(request: web.Request) -> web.Response:
 
 async def state(request: web.Request) -> web.Response:
     session: ChatSession = request.app["session"]
-    info = session.client.self_info
     return web.json_response(
         {
             "mode": "live" if session.live else "sim",
-            "node_name": info.node_name if info else None,
-            "companion_hash": info.companion_hash if info else None,
+            "node_name": session.self_info.get("node_name"),
+            "companion_hash": session.self_info.get("public_key", "")[:2],
+            "companion": session.companion,
+            "transport": "rest",
             "messages": session.messages,
-            "channels": [{"idx": c.idx, "name": c.name} for c in (session.client.channels or [])],
+            "channels": session.channels,
+            "contacts": session.contacts,
+            "cursor": session.cursor,
             "can_inject": session.harness is not None,
         }
     )
@@ -230,7 +334,7 @@ async def events(request: web.Request) -> web.StreamResponse:
                 event = await asyncio.wait_for(queue.get(), timeout=15)
                 await response.write(f"data: {json.dumps(event)}\n\n".encode())
             except asyncio.TimeoutError:
-                await response.write(b": keepalive\n\n")  # keep proxies from closing us
+                await response.write(b": keepalive\n\n")
     except (ConnectionResetError, asyncio.CancelledError):
         pass
     finally:
@@ -246,7 +350,7 @@ async def send(request: web.Request) -> web.Response:
         raise web.HTTPBadRequest(reason="text is required")
     try:
         entry = await session.send(text, int(body.get("channel", 0)))
-    except Exception as exc:
+    except RestError as exc:
         return web.json_response({"error": str(exc)}, status=502)
     return web.json_response(entry)
 
@@ -261,6 +365,13 @@ async def inject(request: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
 
+async def set_channel(request: web.Request) -> web.Response:
+    session: ChatSession = request.app["session"]
+    body = await request.json()
+    await session.set_channel(int(body.get("index", 0)), (body.get("name") or "").strip())
+    return web.json_response({"ok": True})
+
+
 def build_app(session: ChatSession) -> web.Application:
     app = web.Application()
     app["session"] = session
@@ -271,17 +382,20 @@ def build_app(session: ChatSession) -> web.Application:
             web.get("/api/events", events),
             web.post("/api/send", send),
             web.post("/api/inject", inject),
+            web.post("/api/set_channel", set_channel),
         ]
     )
     return app
 
 
 def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(description="OpenHop companion web chat client")
-    parser.add_argument("--live", action="store_true", help="connect to a real repeater")
-    parser.add_argument("--host", default="127.0.0.1", help="repeater host (live mode)")
-    parser.add_argument("--port", type=int, default=15050, help="companion port (live mode)")
-    parser.add_argument("--web-port", type=int, default=8800, help="port to serve the UI on")
+    parser = argparse.ArgumentParser(description="OpenHop companion web chat client (REST)")
+    parser.add_argument("--live", action="store_true", help="use a running repeater")
+    parser.add_argument("--base-url", default="http://127.0.0.1:8000", help="repeater base URL")
+    parser.add_argument("--companion", default="", help="companion identity name (live mode)")
+    parser.add_argument("--admin-token", default=None, help="admin API token (live mode)")
+    parser.add_argument("--device-id", default="web-client")
+    parser.add_argument("--web-port", type=int, default=8800)
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
@@ -289,15 +403,19 @@ def main(argv=None) -> int:
     import tempfile
 
     tmp_dir = Path(tempfile.mkdtemp(prefix="companion-web-"))
-    session = ChatSession(live=args.live, host=args.host, port=args.port)
+    session = ChatSession(
+        live=args.live,
+        base_url=args.base_url,
+        companion=args.companion,
+        admin_token=args.admin_token,
+        device_id=args.device_id,
+    )
 
     async def on_startup(app):
         await session.start(tmp_dir)
-        info = session.client.self_info
         logger.info(
-            "companion %s (0x%s) ready -- open http://127.0.0.1:%s",
-            info.node_name,
-            info.companion_hash,
+            "paired with %s via REST -- open http://127.0.0.1:%s",
+            session.companion,
             args.web_port,
         )
 

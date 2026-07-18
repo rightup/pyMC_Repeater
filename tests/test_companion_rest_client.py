@@ -28,7 +28,7 @@ def harness(tmp_path_factory):
     try:
         yield served
     finally:
-        stop_rest_harness()
+        stop_rest_harness(served)
 
 
 @pytest.fixture
@@ -299,3 +299,57 @@ def test_device_cannot_register_push_for_another_device(paired):
             push_relay_url="https://relay.example/notify",
         )
     assert excinfo.value.status in (403, 404)
+
+
+# --- sending (POST /companions/{name}/messages) ----------------------------
+
+
+def test_send_channel_message_reaches_the_bridge(paired, harness):
+    before = len(harness.bridge.sent)
+    result = paired.send_message(harness.companion_name, "hello over REST", channel_idx=0)
+    assert result["sent"] is True
+    assert harness.bridge.sent[before:] == [{"channel_idx": 0, "text": "hello over REST"}]
+
+
+def test_send_requires_exactly_one_target(paired, harness):
+    """'to' and 'channel_idx' are mutually exclusive; the client refuses before
+    the round trip rather than letting the server 400."""
+    with pytest.raises(ValueError):
+        paired.send_message(harness.companion_name, "x")
+    with pytest.raises(ValueError):
+        paired.send_message(harness.companion_name, "x", channel_idx=0, to="aa" * 32)
+
+
+def test_send_requires_idempotency_key(paired, harness):
+    """The header is mandatory (design doc 6); omitting it is a 400."""
+    with pytest.raises(RestError) as excinfo:
+        paired._data(
+            "POST",
+            f"/companions/{harness.companion_name}/messages",
+            body={"text": "no key", "channel_idx": 0},
+        )
+    assert excinfo.value.status == 400
+
+
+def test_retry_with_same_key_replays_without_touching_the_radio(paired, harness):
+    key = "replay-key-1"
+    first = paired.send_message(harness.companion_name, "once", channel_idx=0, idempotency_key=key)
+    before = len(harness.bridge.sent)
+    second = paired.send_message(harness.companion_name, "once", channel_idx=0, idempotency_key=key)
+
+    assert second == first
+    assert len(harness.bridge.sent) == before, "replay must not re-send over the radio"
+
+
+def test_same_key_different_body_is_409(paired, harness):
+    key = "conflict-key-1"
+    paired.send_message(harness.companion_name, "original", channel_idx=0, idempotency_key=key)
+    with pytest.raises(RestError) as excinfo:
+        paired.send_message(harness.companion_name, "changed", channel_idx=0, idempotency_key=key)
+    assert excinfo.value.status == 409
+
+
+def test_empty_text_is_rejected(paired, harness):
+    with pytest.raises(RestError) as excinfo:
+        paired.send_message(harness.companion_name, "", channel_idx=0)
+    assert excinfo.value.status == 400
