@@ -54,9 +54,9 @@ def _handler(tmp_path):
 
 def _device(handler, device_id="dev-1", token_hash="h1", push_token="apns-1",
             relay="https://relay.example/notify", detail="none",
-            mention_push=None, mention_keywords=None):
+            mention_push=None, mention_keywords=None, platform="ios"):
     token_id = handler.create_api_token("t", token_hash, scope=f"companion:x")
-    handler.companion_device_create(_HASH, device_id, "Phone", token_id, platform="ios")
+    handler.companion_device_create(_HASH, device_id, "Phone", token_id, platform=platform)
     if push_token is not None:
         handler.companion_device_set_push(
             device_id, push_token, push_relay_url=relay, push_detail=detail,
@@ -126,6 +126,54 @@ def test_message_delivers_wake_to_registered_device(tmp_path):
     assert payload["collapse_id"] == _HASH
     # payload-free by default: no badge/alert
     assert "badge_hint" not in payload and "alert" not in payload
+
+
+# --- platform routing hint -----------------------------------------------
+
+
+def test_payload_carries_platform_so_relay_need_not_guess(tmp_path):
+    h = _handler(tmp_path)
+    _device(h, platform="ios")
+    poster = _FakePoster(200)
+    n = _notifier(h, poster, _Clock())
+    n._on_event(_HASH, _message_event())
+    _drive_once(n)
+    assert poster.calls[0]["payload"]["platform"] == "ios"
+
+
+def test_platform_is_normalised(tmp_path):
+    h = _handler(tmp_path)
+    _device(h, platform="  Android  ")  # pairing does not validate this
+    poster = _FakePoster(200)
+    n = _notifier(h, poster, _Clock())
+    n._on_event(_HASH, _message_event())
+    _drive_once(n)
+    assert poster.calls[0]["payload"]["platform"] == "android"
+
+
+@pytest.mark.parametrize("platform", [None, "", "   "])
+def test_platform_omitted_when_device_has_none(tmp_path, platform):
+    """platform is optional at pairing, so the key must simply be absent
+    rather than sent as null -- the relay falls back to token-shape inference."""
+    h = _handler(tmp_path)
+    _device(h, platform=platform)
+    poster = _FakePoster(200)
+    n = _notifier(h, poster, _Clock())
+    n._on_event(_HASH, _message_event())
+    _drive_once(n)
+    assert "platform" not in poster.calls[0]["payload"]
+
+
+def test_platform_present_on_mention_payload_too(tmp_path):
+    h = _handler(tmp_path)
+    _device(h, platform="ios", mention_push=True, mention_keywords=["adam"])
+    poster = _FakePoster(200)
+    n = _notifier(h, poster, _Clock())
+    n._on_event(_HASH, _message_event(text="hey adam"))
+    _drive_once(n)
+    payload = poster.calls[0]["payload"]
+    assert payload["mention"] is True
+    assert payload["platform"] == "ios"
 
 
 def test_device_without_push_token_is_skipped(tmp_path):

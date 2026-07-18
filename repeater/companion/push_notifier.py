@@ -409,11 +409,20 @@ class CompanionPushNotifier:
         (``"You were mentioned"``, never the message text — §11.4) regardless
         of ``push_detail``. The ``mention`` flag tells the relay to send a
         user-visible APNs alert rather than a silent wake, which is what makes
-        a mention prompt."""
+        a mention prompt.
+
+        ``platform`` is included when the device recorded one at pairing, so
+        the relay can route APNs vs FCM directly instead of guessing from the
+        token's shape. It is optional and free-form (the pairing endpoint does
+        not validate it), so the relay must still cope with it being absent or
+        unrecognised — omitting it here is not an error."""
         payload = {
             "push_token": device["push_token"],
             "collapse_id": pending.companion_hash,
         }
+        platform = (device.get("platform") or "").strip().lower()
+        if platform:
+            payload["platform"] = platform
         if pending.mention:
             payload["mention"] = True
             payload["alert"] = _MENTION_ALERT
