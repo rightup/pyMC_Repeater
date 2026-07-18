@@ -717,6 +717,43 @@ Design properties:
   service itself is a separate deliverable** (phase 4). Until then the app
   runs on background refresh alone — functional, just slower.
 
+#### Mentions (time-sensitive) — content-free alert, not `preview`
+
+Mentions (the user @-named in a channel/DM) are the one class where the
+"payload-free wake vs. background-refresh cadence" default is too slow: an
+opportunistic `BGAppRefreshTask` (§12.1) or a coalesced `content-available`
+push can lag well past when a mention matters. But the obvious fix — an
+alert-bearing `push_detail: preview` push — is exactly the case §11.4's
+privacy posture is trying to avoid, because the mention text then transits
+the relay and APNs in the clear.
+
+Resolve this in phase 4 with a **third, distinct push class** rather than
+the `none | count | preview` binary:
+
+- A **content-free "mention" alert** — a real APNs *alert* (so it surfaces
+  promptly, unlike a silent wake iOS may defer/coalesce) whose body is only
+  *"You were mentioned"* (optionally the sender name), **never the message
+  text**. The app enriches on open via `sync`. The relay/APNs learn *that*
+  the device was mentioned, not *what was said* — same low-trust guarantee
+  as the default wake, just prompt.
+
+This needs two additions, both new and phase-4-scoped (no change to phases
+1–3 or the journal contract, whose `message` events already carry the full
+text for client-side rendering):
+
+1. **Server-side mention detection** in the bridge callback. The bridge
+   already decrypts server-side (§11.4), so it can scan message text; it
+   just needs a per-device notion of *what counts as a mention* — the
+   companion's `node_name` by default, plus an optional per-device
+   handle/keyword list stored alongside the device's push registration.
+2. A **per-device mention toggle** independent of `push_detail`, so a
+   mention fires the higher-priority content-free alert even when ordinary
+   traffic is set to a silent wake (`push_detail: none`).
+
+Clients that never register for mention alerts, and repeaters with no
+mention trigger configured, fall back to the payload-free wake — mentions
+then arrive on the normal sync/background-refresh path, just not promptly.
+
 ---
 
 ## 13. Performance and capacity
