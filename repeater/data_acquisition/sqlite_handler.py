@@ -913,6 +913,36 @@ class SQLiteHandler:
                     )
                     logger.info(f"Migration '{migration_name}' applied successfully")
 
+                # Migration 18: per-device mention alerts (design doc §12.2).
+                # mention_push toggles the content-free "you were mentioned"
+                # alert class; mention_keywords is an optional JSON array of
+                # trigger strings (NULL -> default to the companion node_name).
+                migration_name = "add_companion_device_mentions"
+                existing = conn.execute(
+                    "SELECT migration_name FROM migrations WHERE migration_name = ?",
+                    (migration_name,),
+                ).fetchone()
+                if not existing:
+                    cursor = conn.execute("PRAGMA table_info(companion_devices)")
+                    columns = [column[1] for column in cursor.fetchall()]
+                    if "mention_push" not in columns:
+                        conn.execute(
+                            "ALTER TABLE companion_devices "
+                            "ADD COLUMN mention_push INTEGER NOT NULL DEFAULT 0"
+                        )
+                        logger.info("Added mention_push column to companion_devices table")
+                    if "mention_keywords" not in columns:
+                        conn.execute(
+                            "ALTER TABLE companion_devices ADD COLUMN mention_keywords TEXT"
+                        )
+                        logger.info("Added mention_keywords column to companion_devices table")
+
+                    conn.execute(
+                        "INSERT INTO migrations (migration_name, applied_at) VALUES (?, ?)",
+                        (migration_name, time.time()),
+                    )
+                    logger.info(f"Migration '{migration_name}' applied successfully")
+
                 conn.commit()
 
         except Exception as e:
@@ -4604,6 +4634,12 @@ class SQLiteHandler:
             "push_detail": (
                 row["push_detail"] if "push_detail" in row.keys() else "none"
             ),
+            "mention_push": (
+                bool(row["mention_push"]) if "mention_push" in row.keys() else False
+            ),
+            "mention_keywords": (
+                row["mention_keywords"] if "mention_keywords" in row.keys() else None
+            ),
             "created_at": row["created_at"],
             "last_seen": row["last_seen"],
             "last_synced_seq": row["last_synced_seq"],
@@ -4715,14 +4751,19 @@ class SQLiteHandler:
         push_token: str,
         push_relay_url: Optional[str] = None,
         push_detail: Optional[str] = None,
+        mention_push: Optional[bool] = None,
+        mention_keywords: Optional[list] = None,
     ) -> bool:
         """Register/update a device's push credentials (design doc §12.2).
 
         ``push_token`` and ``push_relay_url`` are what the notifier needs to
         reach the client's relay; ``push_detail`` (``none``/``count``/
-        ``preview``) is the per-device content level. ``push_relay_url`` and
-        ``push_detail`` are only written when provided, so a token-refresh
-        call that omits them leaves the existing relay/detail untouched.
+        ``preview``) is the per-device content level. ``mention_push`` toggles
+        the content-free mention-alert class and ``mention_keywords`` is the
+        per-device trigger list (stored as a JSON array; an empty list means
+        "fall back to the companion node_name"). All optional fields are only
+        written when provided, so a token-refresh call that omits them leaves
+        the existing values untouched.
         """
         try:
             updates = ["push_token = ?"]
@@ -4733,6 +4774,12 @@ class SQLiteHandler:
             if push_detail is not None:
                 updates.append("push_detail = ?")
                 params.append(push_detail)
+            if mention_push is not None:
+                updates.append("mention_push = ?")
+                params.append(1 if mention_push else 0)
+            if mention_keywords is not None:
+                updates.append("mention_keywords = ?")
+                params.append(json.dumps(list(mention_keywords)))
             params.append(device_id)
             with self._connect() as conn:
                 cursor = conn.execute(

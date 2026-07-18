@@ -10,6 +10,7 @@ and §11.1 (token scope model).
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
 
@@ -491,3 +492,58 @@ def test_devices_with_push_scoped_to_companion(tmp_path):
 def test_set_push_missing_device_returns_false(tmp_path):
     h = _handler(tmp_path)
     assert h.companion_device_set_push("no-such-device", "tok") is False
+
+
+# --- Mentions (phase 4, migration 18) ------------------------------------
+
+_MENTION_MIGRATION = "add_companion_device_mentions"
+
+
+def test_mention_migration_applies_once(tmp_path):
+    h = _handler(tmp_path)
+    conn = sqlite3.connect(str(h.sqlite_path))
+    applied = conn.execute(
+        "SELECT COUNT(*) FROM migrations WHERE migration_name = ?", (_MENTION_MIGRATION,)
+    ).fetchone()[0]
+    assert applied == 1
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(companion_devices)")}
+    assert {"mention_push", "mention_keywords"} <= cols
+
+
+def test_mention_defaults(tmp_path):
+    h = _handler(tmp_path)
+    device_id = _device_with_token(h)
+    device = h.companion_device_get(device_id)
+    assert device["mention_push"] is False
+    assert device["mention_keywords"] is None
+
+
+def test_set_push_stores_mention_fields(tmp_path):
+    h = _handler(tmp_path)
+    device_id = _device_with_token(h)
+    h.companion_device_set_push(
+        device_id, "tok", mention_push=True, mention_keywords=["adam", "@adam"]
+    )
+    device = h.companion_device_get(device_id)
+    assert device["mention_push"] is True
+    assert json.loads(device["mention_keywords"]) == ["adam", "@adam"]
+
+
+def test_set_push_mention_fields_optional(tmp_path):
+    h = _handler(tmp_path)
+    device_id = _device_with_token(h)
+    h.companion_device_set_push(device_id, "tok", mention_push=True, mention_keywords=["x"])
+    # A later token refresh omitting mention fields leaves them intact.
+    h.companion_device_set_push(device_id, "tok-2")
+    device = h.companion_device_get(device_id)
+    assert device["mention_push"] is True
+    assert json.loads(device["mention_keywords"]) == ["x"]
+
+
+def test_set_push_empty_keywords_clears_to_default(tmp_path):
+    h = _handler(tmp_path)
+    device_id = _device_with_token(h)
+    h.companion_device_set_push(device_id, "tok", mention_keywords=["x"])
+    h.companion_device_set_push(device_id, "tok", mention_keywords=[])
+    device = h.companion_device_get(device_id)
+    assert json.loads(device["mention_keywords"]) == []
