@@ -3499,6 +3499,27 @@ class SQLiteHandler:
             logger.error(f"Failed to save companion contacts: {e}")
             return False
 
+    def companion_delete_contact(self, companion_hash: str, pubkey: bytes) -> bool:
+        """Delete one contact. Returns True only if a row was actually removed.
+
+        Targeted counterpart to ``companion_save_contacts``, which persists a
+        removal only by rewriting the whole table (DELETE-all + re-insert).
+        The API's per-contact delete should not rewrite every row, and needs to
+        distinguish "deleted" from "was not there" for its 404.
+        """
+        try:
+            with self._connect() as conn:
+                cursor = conn.execute(
+                    "DELETE FROM companion_contacts "
+                    "WHERE companion_hash = ? AND pubkey = ?",
+                    (companion_hash, pubkey),
+                )
+                conn.commit()
+                return cursor.rowcount > 0
+        except Exception as e:
+            logger.error(f"Failed to delete companion contact: {e}")
+            return False
+
     def companion_upsert_contact(self, companion_hash: str, contact: dict) -> bool:
         """Insert or update a single contact for a companion in storage."""
         try:

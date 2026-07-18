@@ -221,6 +221,25 @@ class CompanionsV1:
             if action in self._ACTIONS:
                 cherrypy.request.params["companion_name"] = name
                 return getattr(self, action)
+        elif len(vpath) == 3:
+            # /companions/{name}/contacts/{pubkey} and
+            # /companions/{name}/channels/{index} — collection *members*,
+            # not the {pubkey}/{action} sub-resources handled below.
+            collection = vpath[1]
+            if collection == "contacts":
+                name = vpath.pop(0)
+                vpath.pop(0)
+                pubkey = vpath.pop(0)
+                cherrypy.request.params["companion_name"] = name
+                cherrypy.request.params["contact_pubkey"] = pubkey
+                return self.contact
+            if collection == "channels":
+                name = vpath.pop(0)
+                vpath.pop(0)
+                index = vpath.pop(0)
+                cherrypy.request.params["companion_name"] = name
+                cherrypy.request.params["channel_index"] = index
+                return self.channel
         elif len(vpath) == 4:
             collection = vpath[1]
             action = vpath[3]
@@ -1039,6 +1058,216 @@ class CompanionsV1:
         pub_key = self._pub_key_from_hex(contact_pubkey)
         ok = bridge.reset_path(pub_key)
         return self._success({"reset": ok})
+
+    # ------------------------------------------------------------------
+    # Contact and channel management (routed via _cp_dispatch as collection
+    # members). These close the gaps inventoried in
+    # docs/architecture/companion-frame-vs-rest.md: before them a client's
+    # contact list was read-only and a channel could not be joined at all.
+    # ------------------------------------------------------------------
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    @require_auth
+    def contact(self, companion_name=None, contact_pubkey=None, **kwargs):
+        """POST|DELETE .../contacts/{pubkey} — add/update or remove a contact.
+
+        POST body: ``{name?, adv_type?, flags?, out_path_len?, gps_lat?,
+        gps_lon?}``. The pubkey comes from the path, so the body carries only
+        the mutable fields; omitted ones keep their current value on an update
+        and take model defaults on an insert.
+
+        Adverts already auto-add contacts (``autoadd_config`` /
+        ``autoadd_max_hops``), so POST is mainly for the ones auto-add filtered
+        out — wrong type, or too many hops away.
+        """
+        method = cherrypy.request.method
+        if method == "POST":
+            return self._upsert_contact(companion_name, contact_pubkey)
+        if method == "DELETE":
+            return self._delete_contact(companion_name, contact_pubkey)
+        cherrypy.response.headers["Allow"] = "POST, DELETE"
+        raise cherrypy.HTTPError(405, "Method not allowed. Use POST or DELETE.")
+
+    def _upsert_contact(self, companion_name, contact_pubkey):
+        from openhop_core.companion.models import Contact
+
+        bridge, companion_hash = self._resolve(companion_name)
+        pub_key = self._pub_key_from_hex(contact_pubkey)
+        body = self._get_json_body()
+
+        existing = bridge.contacts.get_by_key(pub_key)
+        # Preserve routing state on update: out_path/out_path_len are learned
+        # from the mesh, and a client PATCHing a name must not erase them.
+        contact = Contact(
+            public_key=pub_key,
+            name=body.get("name", getattr(existing, "name", "")),
+            adv_type=int(body.get("adv_type", getattr(existing, "adv_type", 0))),
+            flags=int(body.get("flags", getattr(existing, "flags", 0))),
+            out_path_len=int(body.get("out_path_len", getattr(existing, "out_path_len", -1))),
+            out_path=getattr(existing, "out_path", b""),
+            last_advert_timestamp=getattr(existing, "last_advert_timestamp", 0),
+            lastmod=int(time.time()),
+            gps_lat=float(body.get("gps_lat", getattr(existing, "gps_lat", 0.0))),
+            gps_lon=float(body.get("gps_lon", getattr(existing, "gps_lon", 0.0))),
+        )
+
+        if not bridge.add_update_contact(contact):
+            # The contact store is full (CONTACTS_FULL on the frame surface).
+            raise cherrypy.HTTPError(507, "Contact store is full")
+
+        contact_dict = self._contact_to_storage_dict(contact)
+        handler = self._get_sqlite_handler()
+        if handler:
+            handler.companion_upsert_contact(companion_hash, contact_dict)
+        self._journal_contact(
+            companion_hash, contact_dict, "new" if existing is None else "update"
+        )
+        return self._success({"contact": self._contact_to_json(contact)})
+
+    def _delete_contact(self, companion_name, contact_pubkey):
+        bridge, companion_hash = self._resolve(companion_name)
+        pub_key = self._pub_key_from_hex(contact_pubkey)
+
+        existing = bridge.contacts.get_by_key(pub_key)
+        if existing is None:
+            raise cherrypy.HTTPError(404, "Contact not found")
+
+        removed = bridge.remove_contact(pub_key)
+        handler = self._get_sqlite_handler()
+        if handler:
+            # Targeted delete: companion_save_contacts would rewrite the whole
+            # table just to drop one row.
+            handler.companion_delete_contact(companion_hash, pub_key)
+        if removed:
+            self._journal_contact(
+                companion_hash,
+                {"pubkey": pub_key.hex(), "name": getattr(existing, "name", "")},
+                "removed",
+            )
+        return self._success({"removed": bool(removed)})
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    @require_auth
+    def channel(self, companion_name=None, channel_index=None, **kwargs):
+        """PUT|DELETE .../channels/{index} — join/rename or clear a channel.
+
+        PUT body: ``{name, secret}``. ``secret`` is the channel PSK as hex
+        (32 or 64 chars) and is **write-only** — it is accepted here but never
+        returned by any v1 endpoint, so the surface still never hands out a
+        secret (§11.4). Clients learn the PSK out of band (QR code, invite),
+        exactly as MeshCore clients do.
+
+        Without this a REST-only client could not join a channel at all: the
+        snapshot withholds secrets and there was no way to supply one.
+        """
+        method = cherrypy.request.method
+        if method == "PUT":
+            return self._set_channel(companion_name, channel_index)
+        if method == "DELETE":
+            return self._clear_channel(companion_name, channel_index)
+        cherrypy.response.headers["Allow"] = "PUT, DELETE"
+        raise cherrypy.HTTPError(405, "Method not allowed. Use PUT or DELETE.")
+
+    @staticmethod
+    def _channel_index(raw) -> int:
+        try:
+            index = int(raw)
+        except (TypeError, ValueError):
+            raise cherrypy.HTTPError(400, "Channel index must be an integer") from None
+        if index < 0:
+            raise cherrypy.HTTPError(400, "Channel index must not be negative")
+        return index
+
+    def _set_channel(self, companion_name, channel_index):
+        bridge, companion_hash = self._resolve(companion_name)
+        index = self._channel_index(channel_index)
+        max_channels = getattr(getattr(bridge, "channels", None), "max_channels", 40)
+        if index >= max_channels:
+            raise cherrypy.HTTPError(404, f"Channel index out of range (max {max_channels - 1})")
+
+        body = self._get_json_body()
+        name = (body.get("name") or "").strip()
+        if not name:
+            raise cherrypy.HTTPError(400, "name required (use DELETE to clear a channel)")
+
+        secret_hex = body.get("secret") or ""
+        try:
+            secret = bytes.fromhex(secret_hex)
+        except ValueError:
+            raise cherrypy.HTTPError(400, "secret must be hex") from None
+        if len(secret) not in (16, 32):
+            raise cherrypy.HTTPError(400, "secret must be 16 or 32 bytes (32 or 64 hex chars)")
+
+        if not bridge.set_channel(index, name, secret):
+            raise cherrypy.HTTPError(400, "Channel could not be set")
+
+        self._journal_channel(companion_hash, index, name, "update")
+        # Deliberately does not echo the secret back.
+        return self._success({"channel": {"index": index, "name": name}})
+
+    def _clear_channel(self, companion_name, channel_index):
+        bridge, companion_hash = self._resolve(companion_name)
+        index = self._channel_index(channel_index)
+        if bridge.get_channel(index) is None:
+            raise cherrypy.HTTPError(404, "Channel not configured")
+        if not bridge.set_channel(index, "", b"\x00" * 16):
+            raise cherrypy.HTTPError(400, "Channel could not be cleared")
+        self._journal_channel(companion_hash, index, None, "remove")
+        return self._success({"removed": True})
+
+    # -- journal helpers for the two writers above ---------------------
+
+    def _journal_for(self, companion_hash):
+        handler = self._get_sqlite_handler()
+        if not handler:
+            return None
+        from repeater.companion.journal import CompanionEventJournal
+
+        return CompanionEventJournal(handler, companion_hash)
+
+    def _journal_contact(self, companion_hash, contact_dict, change):
+        journal = self._journal_for(companion_hash)
+        if journal is not None:
+            journal.record_contact(contact_dict, change)
+
+    def _journal_channel(self, companion_hash, index, name, change):
+        journal = self._journal_for(companion_hash)
+        if journal is not None:
+            journal.record_channel(index, name, change)
+
+    @staticmethod
+    def _contact_to_storage_dict(contact) -> dict:
+        """Storage shape (``pubkey`` key, raw bytes), mirroring
+        ``frame_server._contact_to_dict``."""
+        return {
+            "pubkey": contact.public_key,
+            "name": contact.name,
+            "adv_type": contact.adv_type,
+            "flags": contact.flags,
+            "out_path_len": contact.out_path_len,
+            "out_path": contact.out_path,
+            "last_advert_timestamp": contact.last_advert_timestamp,
+            "lastmod": contact.lastmod,
+            "gps_lat": contact.gps_lat,
+            "gps_lon": contact.gps_lon,
+        }
+
+    @staticmethod
+    def _contact_to_json(contact) -> dict:
+        """Wire shape, matching ``snapshot.contacts`` (hex ``public_key``)."""
+        return {
+            "public_key": contact.public_key.hex(),
+            "name": contact.name,
+            "adv_type": contact.adv_type,
+            "flags": contact.flags,
+            "out_path_len": contact.out_path_len,
+            "last_advert_timestamp": contact.last_advert_timestamp,
+            "lastmod": contact.lastmod,
+            "gps_lat": contact.gps_lat,
+            "gps_lon": contact.gps_lon,
+        }
 
     # ------------------------------------------------------------------
     # RF observation surface (design doc §10) -- read-only queries over

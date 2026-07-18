@@ -43,50 +43,52 @@ same companion. This is a genuine advantage of the REST surface, not a gap.
 to send, receive, backfill and confirm messages is present, and in several
 places the REST surface is the stronger one.
 
-## 3. Contacts — the largest real gap
+## 3. Contacts
 
 | Frame command | REST | Status | Recommendation |
 |---|---|---|---|
 | `GET_CONTACTS` | `snapshot.contacts` | ✅ read | None. |
 | `GET_CONTACT_BY_KEY` | — (filter the snapshot list) | ⚠️ | Low priority. Clients hold the list in memory anyway. |
-| `ADD_UPDATE_CONTACT` | — | ❌ | **Recommended.** See below. |
-| `REMOVE_CONTACT` | — | ❌ | **Recommended.** See below. |
+| `ADD_UPDATE_CONTACT` | `POST .../contacts/{pubkey}` | ✅ *(added 2026-07-18)* | None. |
+| `REMOVE_CONTACT` | `DELETE .../contacts/{pubkey}` | ✅ *(added 2026-07-18)* | None. |
 | `IMPORT_CONTACT` / `EXPORT_CONTACT` / `SHARE_CONTACT` | — | ❌ | Optional. Contact sharing is a nice-to-have; add after add/remove. |
 | `RESET_PATH` | `POST .../contacts/{pubkey}/reset_path` | ✅ | None. |
 | `PUSH_CODE_ADVERT` / `NEW_ADVERT` | `contact` journal event | ✅ | None. |
-| `PUSH_CODE_CONTACT_DELETED` | — | ❌ | Add alongside remove — the `contact` event already carries `change: removed` in the design doc, so the shape exists. |
-| `PUSH_CODE_CONTACTS_FULL` | — | ❌ | Low priority; surfaces a full contact store. |
+| `PUSH_CODE_CONTACT_DELETED` | `contact` event, `change: removed` | ✅ *(added 2026-07-18)* | None. |
+| `PUSH_CODE_CONTACTS_FULL` | `507` from `POST .../contacts/{pubkey}` | ✅ *(added 2026-07-18)* | None — surfaced as a status rather than an event, which suits a request/response surface. |
 
-### Why this matters, and how far the workaround goes
+### Resolved 2026-07-18
 
-A REST client's contact list is **read-only**. It cannot add a contact, delete
-one, or import a shared one.
+The contact list used to be read-only here, which was the most likely thing to
+block a real client — deleting a contact is ordinary chat-app behaviour with no
+workaround. `POST` and `DELETE` on `/v1/companions/{name}/contacts/{pubkey}`
+now close it, emitting `contact` journal events (`new` / `update` / `removed`)
+so other synced devices follow along.
 
-The gap is softened by **auto-add**: `base_contacts` adds contacts from received
-adverts automatically, filtered by `autoadd_config` (per contact type) and
-`autoadd_max_hops`. So on a normally-configured repeater, contacts do appear —
-via the snapshot and `contact` journal events — without any client action.
+Two implementation notes:
 
-But the client cannot:
+- **An update preserves learned routing state.** `out_path`, `out_path_len` and
+  advert timestamps come from the mesh; a client renaming a contact must not
+  erase them, so the handler merges onto the existing record rather than
+  replacing it.
+- **A full store returns `507`**, the request/response equivalent of the frame
+  protocol's `PUSH_CODE_CONTACTS_FULL`.
 
-- add a contact that auto-add filtered out (wrong type, too many hops);
-- delete a contact the user no longer wants;
-- change the auto-add policy (`SET_AUTOADD_CONFIG` is also absent);
-- import a contact shared out-of-band.
+Most contacts still arrive on their own via **auto-add**: `base_contacts` adds
+them from received adverts, filtered by `autoadd_config` (per contact type) and
+`autoadd_max_hops`. The new endpoints matter for the ones that filter excludes,
+and for deletion.
 
-**Recommendation: add `POST` and `DELETE` on
-`/v1/companions/{name}/contacts/{pubkey}`.** Deleting a contact is a normal,
-expected operation in any chat app, and its absence is the most likely thing to
-block a real client. Both map directly onto existing bridge calls
-(`add_update_contact`, `remove_contact`) and onto the `contact` journal event
-that already exists.
+Still absent: **auto-add policy is not settable here** (`SET_AUTOADD_CONFIG`),
+and there is no contact import/export blob. Exposing the policy read-only in
+the snapshot would let a client explain *why* an expected contact is missing.
 
 ## 4. Channels
 
 | Frame command | REST | Status | Recommendation |
 |---|---|---|---|
 | `GET_CHANNEL` | `snapshot.channels` | ⚠️ names only | Fine as-is — see the PSK note. |
-| `SET_CHANNEL` | — | ❌ | **Recommended, with a design decision first.** |
+| `SET_CHANNEL` | `PUT .../channels/{index}` | ✅ *(added 2026-07-18)* | None — resolved via option 1 below (write-only PSK). |
 | channel change notification | `channel` journal event | ✅ *(implemented 2026-07-18)* | None. |
 
 The `channel` journal event was **documented in both the design doc §9 and
@@ -95,26 +97,24 @@ phase 2" and not picked up. A client trusting the spec would have waited
 forever for an event that never came. Now implemented, carrying
 `{index, name, change}` and never the PSK.
 
-### The PSK problem
+### The PSK problem, and how it was resolved
 
 `snapshot.channels` returns `{index, name}` and deliberately withholds the
 16-byte secret; the frame protocol's `CHANNEL_INFO` includes it. That is the
-correct privacy posture for a surface reachable over the network.
+correct privacy posture for a surface reachable over the network — but it meant
+a REST-only client **could not join a channel at all**, because joining needs
+the PSK and there was no way to supply one either.
 
-The consequence: **a REST-only client cannot join a channel it does not already
-have.** Joining requires the PSK, which REST will not hand out and has no way to
-accept. A REST client can only use channels already configured on the repeater.
+Resolved with a **write-only secret**: `PUT /v1/companions/{name}/channels/{index}`
+accepts `{name, secret}`, and no v1 endpoint ever returns a secret — not the
+response, not the snapshot, not the `channel` journal event. The client learns
+the PSK out of band (QR code, invite link), exactly as MeshCore clients do.
 
-Three options, in order of preference:
-
-1. **Add `PUT /v1/companions/{name}/channels/{index}` accepting a client-supplied
-   PSK** — write-only, never echoed back. The client learns the PSK
-   out-of-band (QR code, invite link), exactly as MeshCore clients do today.
-   Preserves "the server never hands out secrets" while making join possible.
-2. **Leave it out** and treat channel membership as an operator/web-UI
-   function. Defensible for a single-user repeater, limiting for a shared one.
-3. Expose secrets on the snapshot — **not recommended**, it discards the
-   privacy property §11.4 is built on.
+This keeps the property the design is built on — *the server never hands out
+secrets* — while making join possible. The two rejected alternatives were
+leaving channel membership to the operator/web UI (defensible on a single-user
+repeater, limiting on a shared one) and exposing secrets on the snapshot, which
+would discard §11.4 entirely.
 
 ## 5. Contact actions
 
@@ -208,26 +208,27 @@ The frame protocol has no equivalent of:
 
 ## Summary: what a complete REST chat client still needs
 
-**Blocking-ish (recommended):**
+**Implemented 2026-07-18** — the three that were blocking:
 
-1. **Contact delete** — `DELETE /v1/companions/{name}/contacts/{pubkey}`. Normal
-   chat-app behaviour, no workaround.
-2. **Contact add** — `POST` the same path. Auto-add covers the common case, so
-   this is about the contacts auto-add filters out.
-3. **Channel join** — `PUT /v1/companions/{name}/channels/{index}` taking a
-   write-only PSK. Requires the design decision in §4 first.
+1. ~~Contact delete~~ — `DELETE .../contacts/{pubkey}`, emits
+   `contact` / `change: removed`.
+2. ~~Contact add~~ — `POST .../contacts/{pubkey}`, preserves learned routing
+   state on update, `507` when the store is full.
+3. ~~Channel join~~ — `PUT .../channels/{index}` with a write-only PSK.
 
-**Worth having:**
+**Still worth having:**
 
-4. `PUSH_CODE_CONTACT_DELETED` → a `contact` event with `change: removed`
-   (the design doc already specifies this shape).
-5. Self-advert control: set name/latlon, send advert.
-6. Auto-add policy, at least read-only in the snapshot.
+4. Self-advert control: set name/latlon, send advert.
+5. Auto-add policy (`autoadd_config` / `autoadd_max_hops`), at least read-only
+   in the snapshot, so a client can explain a missing contact.
+6. Contact import/export blob, for out-of-band contact sharing.
+7. `login_result` / `status_response` / `telemetry_response` journal events, if
+   slow multi-hop round trips prove to outlast the synchronous 15s budget (§5).
 
 **Deliberately excluded, and should stay that way:** radio/tuning
 configuration, private key export/import, signing, raw packet transmission,
 socket-session management.
 
 **Everything else is already there.** The core chat loop — send, receive,
-backfill, confirm, push — is complete on `/api/v1`, and in several respects
-better than the frame protocol.
+backfill, confirm, push — plus contact and channel management, is complete on
+`/api/v1`, and in several respects better than the frame protocol.

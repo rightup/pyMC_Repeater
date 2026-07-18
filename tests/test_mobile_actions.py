@@ -91,9 +91,7 @@ class _FakeBridge:
 
 def _daemon(handler, bridge):
     identity_manager = SimpleNamespace(
-        get_identities_by_type=lambda t: (
-            [(_NAME, _FakeIdentity(), {})] if t == "companion" else []
-        )
+        get_identities_by_type=lambda t: [(_NAME, _FakeIdentity(), {})] if t == "companion" else []
     )
     return SimpleNamespace(
         identity_manager=identity_manager,
@@ -345,9 +343,7 @@ class TestContactActions:
         )
         assert result["success"] is True
         assert len(bridge.telemetry_requests) == 1
-        pub_key, want_base, want_location, want_environment, timeout = (
-            bridge.telemetry_requests[0]
-        )
+        pub_key, want_base, want_location, want_environment, timeout = bridge.telemetry_requests[0]
         assert pub_key == bytes.fromhex(_PUBKEY_HEX)
         assert (want_base, want_location, want_environment) == (True, True, True)
 
@@ -397,8 +393,18 @@ class TestDispatchRouting:
         vpath = [_NAME, "contacts", _PUBKEY_HEX, "not_a_real_action"]
         assert endpoints._cp_dispatch(vpath) is None
 
+    def test_three_segment_collection_members_route(self, endpoints):
+        """``contacts/{pubkey}`` and ``channels/{index}`` are members of their
+        collection, distinct from the ``{pubkey}/{action}`` sub-resources.
+        Added 2026-07-18 with contact add/remove and channel join."""
+        # `==` not `is`: attribute access creates a fresh bound method each time.
+        assert endpoints._cp_dispatch([_NAME, "contacts", _PUBKEY_HEX]) == endpoints.contact
+        assert endpoints._cp_dispatch([_NAME, "channels", "3"]) == endpoints.channel
+
+    def test_unknown_three_segment_collection_falls_through(self, endpoints):
+        assert endpoints._cp_dispatch([_NAME, "widgets", "1"]) is None
+
     def test_wrong_length_falls_through(self, endpoints):
-        assert endpoints._cp_dispatch([_NAME, "contacts", _PUBKEY_HEX]) is None
         assert endpoints._cp_dispatch([_NAME]) is None
 
 

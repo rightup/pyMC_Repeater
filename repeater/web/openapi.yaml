@@ -74,18 +74,15 @@ tags:
 
       Gaps a client should know about before designing around them:
 
-      - **Contacts are read-only here.** There is no add, remove, or import;
-        `snapshot.contacts` and the `contact` journal event are the only
-        contact surface. Contacts do appear automatically via advert auto-add
-        (gated by `autoadd_config` / `autoadd_max_hops`, neither of which is
-        settable here), so this bites for contacts auto-add filtered out and
-        for deleting one.
-      - **Channels cannot be joined here.** `snapshot.channels` returns
-        `{index, name}` only — the PSK is withheld by design (§11.4) — and
-        there is no channel-set endpoint, so a client can only use channels
-        already configured on the repeater.
+      - **Contact import/export is absent.** Add and remove exist
+        (`POST`/`DELETE .../contacts/{pubkey}`), but there is no equivalent of
+        the frame protocol's share/export/import blob. Note also that
+        `autoadd_config` / `autoadd_max_hops` — which decide whether an advert
+        auto-adds a contact at all — are not settable here.
       - **Node prefs are observable but not settable.** The `prefs` journal
         event reports changes from any surface; no v1 endpoint causes one.
+      - **Self-advert control is absent**: no set-name, set-latlon, or
+        send-advert.
       - **Radio/tuning configuration, key export/import, signing and raw
         packet transmission are absent on purpose** and should stay that way:
         a device token is network-reachable, and these would turn a leaked one
@@ -5529,6 +5526,253 @@ paths:
         '503':
           description: |
             `Companion event journal not available`. Rendered as the v1 JSON error envelope (see tag description).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponseV1'
+
+  /v1/companions/{name}/contacts/{pubkey}:
+    post:
+      tags: [Mobile Companion API v1]
+      summary: Add or update a contact
+      description: |
+        Upsert the contact identified by `{pubkey}`. The body carries only
+        mutable fields; omitted ones keep their current value on an update and
+        take model defaults on an insert. Learned routing state (`out_path`,
+        advert timestamps) is preserved across an update — a client renaming a
+        contact must not erase what the mesh taught the node.
+
+        Adverts already auto-add contacts (gated by `autoadd_config` and
+        `autoadd_max_hops`, neither settable on this surface), so this is
+        mainly for contacts auto-add filtered out: wrong type, or too many hops
+        away.
+
+        Emits a `contact` journal event (`change: new` or `update`).
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: pubkey
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Contact public key, hex.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name:
+                  type: string
+                adv_type:
+                  type: integer
+                flags:
+                  type: integer
+                out_path_len:
+                  type: integer
+                gps_lat:
+                  type: number
+                gps_lon:
+                  type: number
+      responses:
+        '200':
+          description: Contact upserted.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessResponse'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          contact:
+                            type: object
+        '401':
+          description: Missing/invalid token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponseV1'
+        '404':
+          description: Companion not found or out of scope.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponseV1'
+        '507':
+          description: |
+            Contact store is full — the equivalent of the frame protocol's
+            `PUSH_CODE_CONTACTS_FULL`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponseV1'
+    delete:
+      tags: [Mobile Companion API v1]
+      summary: Remove a contact
+      description: |
+        Delete the contact and its stored row. Emits a `contact` journal event
+        with `change: removed`, so other synced devices drop it too.
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: pubkey
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Removed.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessResponse'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          removed:
+                            type: boolean
+        '404':
+          description: Contact (or companion) not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponseV1'
+
+  /v1/companions/{name}/channels/{index}:
+    put:
+      tags: [Mobile Companion API v1]
+      summary: Join or rename a channel
+      description: |
+        Set channel slot `{index}` to `{name, secret}`.
+
+        **`secret` is write-only.** It is accepted here but never returned by
+        any v1 endpoint — `snapshot.channels` exposes `{index, name}` only, and
+        the `channel` journal event carries no secret either (§11.4). Clients
+        learn the PSK out of band (QR code, invite link), exactly as MeshCore
+        clients do.
+
+        This is what makes channel *joining* possible over REST at all: before
+        it, a client could only use channels already configured on the
+        repeater, because the surface withheld secrets and had no way to accept
+        one.
+
+        Emits a `channel` journal event (`change: update`). Use `DELETE` to
+        clear a slot — an empty `name` here is a `400`.
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: index
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, secret]
+              properties:
+                name:
+                  type: string
+                secret:
+                  type: string
+                  description: |
+                    Channel PSK as hex — 32 or 64 characters (16 or 32 bytes).
+                    Write-only; never returned.
+      responses:
+        '200':
+          description: |
+            Channel set. The response echoes `{index, name}` only — never the
+            secret.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessResponse'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          channel:
+                            type: object
+                            properties:
+                              index:
+                                type: integer
+                              name:
+                                type: string
+        '400':
+          description: |
+            Missing `name`, non-hex `secret`, wrong secret length, or a
+            non-integer index.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponseV1'
+        '404':
+          description: Channel index out of range, or companion not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponseV1'
+    delete:
+      tags: [Mobile Companion API v1]
+      summary: Clear a channel slot
+      description: |
+        Clear the slot. Emits a `channel` journal event with
+        `change: remove` and `name: null`.
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: index
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Cleared.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+        '404':
+          description: Channel not configured, or companion not found.
           content:
             application/json:
               schema:

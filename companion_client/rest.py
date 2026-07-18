@@ -318,6 +318,44 @@ class CompanionRestClient:
             headers={"Idempotency-Key": key},
         )
 
+    # -- contacts and channels ---------------------------------------------
+
+    def upsert_contact(self, companion_name: str, pubkey: str, **fields) -> dict:
+        """Add or update a contact. ``pubkey`` is hex; fields are optional.
+
+        Adverts auto-add contacts already, so this mainly covers the ones
+        auto-add filtered out (wrong type, too many hops).
+        """
+        return self._data(
+            "POST",
+            f"/companions/{urllib.parse.quote(companion_name)}/contacts/{pubkey}",
+            body=fields,
+        )
+
+    def delete_contact(self, companion_name: str, pubkey: str) -> dict:
+        return self._data(
+            "DELETE",
+            f"/companions/{urllib.parse.quote(companion_name)}/contacts/{pubkey}",
+        )
+
+    def set_channel(self, companion_name: str, index: int, name: str, secret: bytes) -> dict:
+        """Join or rename a channel. ``secret`` is the PSK (16 or 32 bytes).
+
+        Write-only: no v1 endpoint ever returns a channel secret, so the PSK
+        must be known out of band. The response echoes only index and name.
+        """
+        return self._data(
+            "PUT",
+            f"/companions/{urllib.parse.quote(companion_name)}/channels/{index}",
+            body={"name": name, "secret": secret.hex()},
+        )
+
+    def clear_channel(self, companion_name: str, index: int) -> dict:
+        return self._data(
+            "DELETE",
+            f"/companions/{urllib.parse.quote(companion_name)}/channels/{index}",
+        )
+
     # -- devices / push ----------------------------------------------------
 
     def devices(self) -> list:

@@ -353,3 +353,198 @@ def test_empty_text_is_rejected(paired, harness):
     with pytest.raises(RestError) as excinfo:
         paired.send_message(harness.companion_name, "", channel_idx=0)
     assert excinfo.value.status == 400
+
+
+# --- contact management ----------------------------------------------------
+# Closes the gap inventoried in docs/architecture/companion-frame-vs-rest.md:
+# before these, a REST client's contact list was read-only.
+
+
+def journal_events(harness, event_type: str) -> list:
+    return [
+        e
+        for e in harness.handler.companion_get_events(harness.companion_hash, 0)
+        if e["event_type"] == event_type
+    ]
+
+
+def test_add_contact_appears_in_snapshot(paired, harness):
+    pubkey = "b1" * 32
+    result = paired.upsert_contact(harness.companion_name, pubkey, name="Bob", adv_type=1)
+    assert result["contact"]["public_key"] == pubkey
+    assert result["contact"]["name"] == "Bob"
+
+    data, _etag = paired.snapshot(harness.companion_name)
+    assert "Bob" in [c["name"] for c in data["contacts"]]
+
+
+def test_add_contact_journals_a_contact_event(paired, harness):
+    before = len(journal_events(harness, "contact"))
+    paired.upsert_contact(harness.companion_name, "b2" * 32, name="Carol")
+    events = journal_events(harness, "contact")
+    assert len(events) == before + 1
+    assert events[-1]["payload"]["change"] == "new"
+
+
+def test_update_preserves_learned_routing_state(paired, harness):
+    """out_path is learned from the mesh; renaming a contact must not erase it."""
+    pubkey = "aa" * 32  # seeded contact "Alice"
+    paired.upsert_contact(harness.companion_name, pubkey, name="Alice Renamed")
+
+    contact = harness.bridge.contacts.get_by_key(bytes.fromhex(pubkey))
+    assert contact.name == "Alice Renamed"
+    assert contact.last_advert_timestamp == 123, "advert state must survive an update"
+
+
+def test_delete_contact_removes_it(paired, harness):
+    pubkey = "b3" * 32
+    paired.upsert_contact(harness.companion_name, pubkey, name="Dave")
+    assert paired.delete_contact(harness.companion_name, pubkey)["removed"] is True
+
+    data, _etag = paired.snapshot(harness.companion_name)
+    assert "Dave" not in [c["name"] for c in data["contacts"]]
+
+
+def test_delete_contact_journals_a_removal(paired, harness):
+    pubkey = "b4" * 32
+    paired.upsert_contact(harness.companion_name, pubkey, name="Erin")
+    before = len(journal_events(harness, "contact"))
+    paired.delete_contact(harness.companion_name, pubkey)
+
+    events = journal_events(harness, "contact")
+    assert len(events) == before + 1
+    assert events[-1]["payload"]["change"] == "removed"
+
+
+def test_delete_unknown_contact_is_404(paired, harness):
+    with pytest.raises(RestError) as excinfo:
+        paired.delete_contact(harness.companion_name, "cc" * 32)
+    assert excinfo.value.status == 404
+
+
+def test_full_contact_store_is_507(paired, harness):
+    """The frame protocol signals this with PUSH_CODE_CONTACTS_FULL.
+
+    Restores the store afterwards: the harness is module-scoped, so leaving it
+    full would fail whichever contact test happened to run next.
+    """
+    added = []
+    with pytest.raises(RestError) as excinfo:
+        for i in range(12):
+            pubkey = f"{0xD0 + i:02x}" * 32
+            paired.upsert_contact(harness.companion_name, pubkey, name=f"n{i}")
+            added.append(pubkey)
+    assert excinfo.value.status == 507
+    assert added, "should have added some before filling"
+
+    for pubkey in added:
+        paired.delete_contact(harness.companion_name, pubkey)
+
+
+def test_contact_endpoint_rejects_get(paired, harness):
+    with pytest.raises(RestError) as excinfo:
+        paired._data("GET", f"/companions/{harness.companion_name}/contacts/{'aa' * 32}")
+    assert excinfo.value.status == 405
+
+
+# --- channel management ----------------------------------------------------
+
+
+def test_join_channel_with_a_psk(paired, harness):
+    """Without this a REST-only client could not join a channel at all: the
+    snapshot withholds secrets and there was no way to supply one."""
+    result = paired.set_channel(harness.companion_name, 4, "#joined", bytes(range(16)))
+    assert result["channel"] == {"index": 4, "name": "#joined"}
+
+    data, _etag = paired.snapshot(harness.companion_name)
+    assert {"index": 4, "name": "#joined"} in data["channels"]
+
+
+def test_join_never_echoes_the_secret_back(paired, harness):
+    secret = bytes([0x5A]) * 16
+    result = paired.set_channel(harness.companion_name, 5, "#quiet", secret)
+    assert secret.hex() not in str(result)
+
+    data, _etag = paired.snapshot(harness.companion_name)
+    assert secret.hex() not in str(data["channels"])
+    for channel in data["channels"]:
+        assert set(channel) == {"index", "name"}
+
+
+def test_join_journals_a_channel_event(paired, harness):
+    before = len(journal_events(harness, "channel"))
+    paired.set_channel(harness.companion_name, 6, "#eventful", bytes(16))
+    events = journal_events(harness, "channel")
+    assert len(events) == before + 1
+    assert events[-1]["payload"] == {"index": 6, "name": "#eventful", "change": "update"}
+
+
+def test_channel_event_from_join_carries_no_secret(paired, harness):
+    secret = bytes([0x7B]) * 32
+    paired.set_channel(harness.companion_name, 7, "#nosecret", secret)
+    events = journal_events(harness, "channel")
+    assert secret.hex() not in str(events[-1]["payload"])
+    assert set(events[-1]["payload"]) == {"index", "name", "change"}
+
+
+@pytest.mark.parametrize("secret", [b"", bytes(8), bytes(20)])
+def test_bad_secret_length_is_400(paired, harness, secret):
+    with pytest.raises(RestError) as excinfo:
+        paired.set_channel(harness.companion_name, 2, "#bad", secret)
+    assert excinfo.value.status == 400
+
+
+def test_non_hex_secret_is_400(paired, harness):
+    with pytest.raises(RestError) as excinfo:
+        paired._data(
+            "PUT",
+            f"/companions/{harness.companion_name}/channels/2",
+            body={"name": "#bad", "secret": "not-hex-at-all"},
+        )
+    assert excinfo.value.status == 400
+
+
+def test_join_without_name_is_400(paired, harness):
+    """Clearing is DELETE, not an empty-name PUT."""
+    with pytest.raises(RestError) as excinfo:
+        paired._data(
+            "PUT",
+            f"/companions/{harness.companion_name}/channels/2",
+            body={"name": "", "secret": bytes(16).hex()},
+        )
+    assert excinfo.value.status == 400
+
+
+def test_channel_index_out_of_range_is_404(paired, harness):
+    with pytest.raises(RestError) as excinfo:
+        paired.set_channel(harness.companion_name, 999, "#nope", bytes(16))
+    assert excinfo.value.status == 404
+
+
+def test_non_integer_channel_index_is_400(paired, harness):
+    with pytest.raises(RestError) as excinfo:
+        paired._data(
+            "PUT",
+            f"/companions/{harness.companion_name}/channels/abc",
+            body={"name": "#x", "secret": bytes(16).hex()},
+        )
+    assert excinfo.value.status == 400
+
+
+def test_clear_channel_removes_it_and_journals(paired, harness):
+    paired.set_channel(harness.companion_name, 3, "#temporary", bytes(16))
+    before = len(journal_events(harness, "channel"))
+
+    assert paired.clear_channel(harness.companion_name, 3)["removed"] is True
+    data, _etag = paired.snapshot(harness.companion_name)
+    assert 3 not in [c["index"] for c in data["channels"]]
+
+    events = journal_events(harness, "channel")
+    assert len(events) == before + 1
+    assert events[-1]["payload"] == {"index": 3, "name": None, "change": "remove"}
+
+
+def test_clear_unconfigured_channel_is_404(paired, harness):
+    with pytest.raises(RestError) as excinfo:
+        paired.clear_channel(harness.companion_name, 2)
+    assert excinfo.value.status == 404

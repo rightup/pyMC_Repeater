@@ -55,6 +55,31 @@ class _FakeChannels:
         return self._channels.get(idx)
 
 
+class _FakeContactStore:
+    """In-memory contact store, keyed by public key."""
+
+    max_contacts = 4
+
+    def __init__(self, contacts: list) -> None:
+        self._by_key = {bytes(c.public_key): c for c in contacts}
+
+    def get_by_key(self, pub_key):
+        return self._by_key.get(bytes(pub_key))
+
+    def add(self, contact) -> bool:
+        key = bytes(contact.public_key)
+        if key not in self._by_key and len(self._by_key) >= self.max_contacts:
+            return False  # store full -> 507
+        self._by_key[key] = contact
+        return True
+
+    def remove(self, pub_key) -> bool:
+        return self._by_key.pop(bytes(pub_key), None) is not None
+
+    def values(self):
+        return list(self._by_key.values())
+
+
 class RestFakeBridge:
     def __init__(self, hash_byte: int = DEFAULT_HASH_BYTE) -> None:
         self._pubkey = bytes([hash_byte]) + b"\x22" * 31
@@ -67,19 +92,22 @@ class RestFakeBridge:
         }
         self.channels = _FakeChannels(self._channel_map)
         self.sent: list = []
-        self.contacts_list = [
-            SimpleNamespace(
-                public_key=b"\xaa" * 32,
-                name="Alice",
-                adv_type=1,
-                flags=0,
-                out_path_len=-1,
-                last_advert_timestamp=123,
-                lastmod=124,
-                gps_lat=0.0,
-                gps_lon=0.0,
-            )
-        ]
+        self.contacts = _FakeContactStore(
+            [
+                SimpleNamespace(
+                    public_key=b"\xaa" * 32,
+                    name="Alice",
+                    adv_type=1,
+                    flags=0,
+                    out_path_len=-1,
+                    out_path=b"",
+                    last_advert_timestamp=123,
+                    lastmod=124,
+                    gps_lat=0.0,
+                    gps_lon=0.0,
+                )
+            ]
+        )
 
     def get_public_key(self) -> bytes:
         return self._pubkey
@@ -88,7 +116,31 @@ class RestFakeBridge:
         return self.prefs
 
     def get_contacts(self):
-        return self.contacts_list
+        return self.contacts.values()
+
+    def add_update_contact(self, contact) -> bool:
+        return self.contacts.add(contact)
+
+    def remove_contact(self, pub_key) -> bool:
+        return self.contacts.remove(pub_key)
+
+    def get_channel(self, idx: int):
+        return self._channel_map.get(idx)
+
+    def reset_path(self, pub_key) -> bool:
+        """Clear a contact's learned outbound path."""
+        contact = self.contacts.get_by_key(pub_key)
+        if contact is None:
+            return False
+        contact.out_path_len = -1
+        contact.out_path = b""
+        return True
+
+    def set_channel(self, idx: int, name: str, secret: bytes) -> bool:
+        if idx >= _FakeChannels.max_channels:
+            return False
+        self.set_channel_entry(idx, name or None)
+        return True
 
     async def send_channel_message(self, channel_idx: int, text: str, **kwargs):
         """Record an outbound channel send. No radio, so nothing transmits.
