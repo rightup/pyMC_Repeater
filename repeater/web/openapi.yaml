@@ -4689,6 +4689,10 @@ paths:
                             push_relay_url:
                               type: string
                               nullable: true
+                            push_detail:
+                              type: string
+                              enum: [none, count, preview]
+                              description: Per-device push content level (design doc §12.2). Defaults to `none`.
                             created_at:
                               type: number
                             last_seen:
@@ -4751,6 +4755,153 @@ paths:
         '404':
           description: |
             `Device '{device_id}' not found`. Rendered as the v1 JSON error envelope (see tag description).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponseV1'
+
+  /v1/devices/{device_id}/push:
+    post:
+      tags: [Mobile Companion API v1]
+      summary: Register a device's push credentials
+      description: |
+        Register (or refresh) the APNs/FCM token, relay URL, and content
+        level for a paired device (design doc §12.2). The repeater's notifier
+        POSTs a wake to `push_relay_url` (as-is — the client registers the
+        full notify endpoint) when the companion journals a new `message`,
+        debounced per device (default 30s collapse window).
+
+        **Payload-free by default.** `push_detail: none` sends only a wake;
+        `count` adds a `badge_hint`; `preview` adds a short `alert` string —
+        opting `preview` in is the only way message text reaches the relay,
+        which is why it defaults off (§11.4).
+
+        The **relay service itself is a separate deliverable** (phase 4): until
+        one is deployed, registration succeeds and the notifier's POSTs simply
+        have no recipient; the app falls back to background-refresh sync.
+
+        Auth: the device's **own** token (the token paired to `device_id`), or
+        `admin`. A scoped device token registering for a *different* device
+        gets `404` (same not-found-folding as the rest of /api/v1 — no
+        cross-device existence leak). A token refresh may omit `push_relay_url`
+        and `push_detail`; the stored values are kept.
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      parameters:
+        - name: device_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [push_token]
+              properties:
+                push_token:
+                  type: string
+                  description: APNs/FCM device token.
+                push_relay_url:
+                  type: string
+                  description: Absolute http(s) URL the notifier POSTs wakes to. Private/LAN targets allowed (self-hosted relays).
+                push_detail:
+                  type: string
+                  enum: [none, count, preview]
+                  description: Content level. Omitted → stored value (default `none`).
+      responses:
+        '200':
+          description: Push registered
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessResponse'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          device_id:
+                            type: string
+                          push_detail:
+                            type: string
+                            enum: [none, count, preview]
+                          registered:
+                            type: boolean
+                            example: true
+        '400':
+          description: |
+            `push_token is required`, an invalid `push_detail`, or a
+            `push_relay_url` that isn't an absolute http(s) URL. Rendered as
+            the v1 JSON error envelope (see tag description).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponseV1'
+        '401':
+          description: Missing/invalid JWT or API token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponseV1'
+        '404':
+          description: |
+            Device not found — also returned when a non-admin token that
+            isn't this device's own attempts the call (no cross-device
+            existence leak). Rendered as the v1 JSON error envelope.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponseV1'
+    delete:
+      tags: [Mobile Companion API v1]
+      summary: Clear a device's push registration
+      description: |
+        Nulls the device's `push_token` (a complete push opt-out — the
+        notifier skips any device without a token). `push_relay_url` and
+        `push_detail` are left in place so a later re-register need only
+        supply a fresh token. Same auth as the POST.
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      parameters:
+        - name: device_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Push unregistered
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessResponse'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          unregistered:
+                            type: boolean
+                            example: true
+                          device_id:
+                            type: string
+        '401':
+          description: Missing/invalid JWT or API token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponseV1'
+        '404':
+          description: |
+            Device not found (or not the caller's own device). Rendered as the
+            v1 JSON error envelope (see tag description).
           content:
             application/json:
               schema:
