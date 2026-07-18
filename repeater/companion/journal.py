@@ -142,6 +142,22 @@ class CompanionEventJournal:
         payload["change"] = change
         return self._append("contact", payload)
 
+    def record_channel(self, index: int, name: Optional[str], change: str = "update") -> Optional[int]:
+        """Journal a channel add/rename/removal (design doc §9: ``type: channel``).
+
+        Deliberately carries only ``index`` and ``name`` — never the PSK
+        secret. This event reaches mobile clients through ``/sync``, and the
+        snapshot surface strips secrets for exactly that reason
+        (``mobile_endpoints.snapshot``); journaling one here would leak it to
+        every synced device and, unlike a snapshot field, it would persist in
+        the journal table.
+
+        ``change`` is ``update`` for an add-or-rename and ``remove`` when the
+        slot was cleared.
+        """
+        payload = {"index": int(index), "name": name, "change": change}
+        return self._append("channel", payload)
+
     def record_prefs(self, fields: dict) -> Optional[int]:
         """Journal a node-prefs change (design doc §9: ``type: prefs``)."""
         payload = _to_json_safe(dict(fields))

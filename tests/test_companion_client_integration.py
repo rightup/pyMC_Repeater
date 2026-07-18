@@ -482,3 +482,136 @@ def test_inbound_message_carries_its_channel(tmp_path):
             await harness.stop()
 
     run(scenario())
+
+
+# --- channel journal events -----------------------------------------------
+# Regression cover for a gap found 2026-07-18: channel changes were never
+# journaled, so a client syncing from the journal could not learn about a
+# channel being added, renamed or removed without re-snapshotting. Contacts
+# already had this via record_contact; channels were "deferred to phase 2"
+# and never picked up.
+
+
+def channel_events(harness) -> list[dict]:
+    return [
+        event
+        for event in harness.handler.companion_get_events(harness.companion_hash, 0)
+        if event["event_type"] == "channel"
+    ]
+
+
+def test_set_channel_journals_an_update(tmp_path):
+    async def scenario():
+        harness = await start_harness(tmp_path)
+        try:
+            client = await connected_client(harness)
+            try:
+                await client.set_channel(7, "#newchan", bytes(32))
+                events = channel_events(harness)
+                assert len(events) == 1
+                assert events[0]["payload"] == {
+                    "index": 7,
+                    "name": "#newchan",
+                    "change": "update",
+                }
+            finally:
+                await client.close()
+        finally:
+            await harness.stop()
+
+    run(scenario())
+
+
+def test_channel_event_never_carries_the_psk_secret(tmp_path):
+    """The journal feeds /sync to mobile clients, and the snapshot surface
+    strips PSK secrets. Leaking one here would reach every synced device and,
+    unlike a snapshot field, persist in the journal table."""
+
+    async def scenario():
+        harness = await start_harness(tmp_path)
+        secret = bytes(range(32))
+        try:
+            client = await connected_client(harness)
+            try:
+                await client.set_channel(4, "#secret-chan", secret)
+                payload = channel_events(harness)[0]["payload"]
+                assert set(payload) == {"index", "name", "change"}
+                assert secret.hex() not in str(payload)
+            finally:
+                await client.close()
+        finally:
+            await harness.stop()
+
+    run(scenario())
+
+
+def test_rename_journals_an_update(tmp_path):
+    async def scenario():
+        harness = await start_harness(tmp_path)
+        try:
+            client = await connected_client(harness)
+            try:
+                await client.set_channel(1, "#renamed", bytes(32))
+                events = channel_events(harness)
+                assert events[-1]["payload"]["name"] == "#renamed"
+                assert events[-1]["payload"]["change"] == "update"
+            finally:
+                await client.close()
+        finally:
+            await harness.stop()
+
+    run(scenario())
+
+
+def test_clearing_a_slot_journals_a_removal(tmp_path):
+    async def scenario():
+        harness = await start_harness(tmp_path)
+        try:
+            client = await connected_client(harness)
+            try:
+                await client.set_channel(1, "", bytes(32))  # empty name clears
+                events = channel_events(harness)
+                assert events[-1]["payload"] == {
+                    "index": 1,
+                    "name": None,
+                    "change": "remove",
+                }
+            finally:
+                await client.close()
+        finally:
+            await harness.stop()
+
+    run(scenario())
+
+
+def test_no_op_set_journals_nothing(tmp_path):
+    """Before/after comparison, not blind trust that the command ran: setting
+    a slot to what it already holds must not produce an event."""
+
+    async def scenario():
+        harness = await start_harness(tmp_path)
+        try:
+            client = await connected_client(harness)
+            try:
+                await client.set_channel(1, "#howltest", bytes(1) * 16)
+                assert channel_events(harness) == []
+            finally:
+                await client.close()
+        finally:
+            await harness.stop()
+
+    run(scenario())
+
+
+def test_bulk_save_at_stop_does_not_journal(tmp_path):
+    """_save_channels also runs on shutdown; journaling there would replay the
+    whole table into the journal on every restart."""
+
+    async def scenario():
+        harness = await start_harness(tmp_path)
+        client = await connected_client(harness)
+        await client.close()
+        await harness.server.stop()
+        assert channel_events(harness) == []
+
+    run(scenario())

@@ -159,6 +159,17 @@ class FakeBridge:
     def get_channel(self, idx: int):
         return self.channels_by_idx.get(idx)
 
+    def set_channel(self, idx: int, name: str, secret: bytes) -> bool:
+        """Add, rename, or clear a slot. An empty name clears it, matching the
+        firmware convention the server's CHANNEL_INFO encoding relies on."""
+        if idx >= _FakeChannelStore.max_channels:
+            return False
+        if not name:
+            self.channels_by_idx.pop(idx, None)
+        else:
+            self.channels_by_idx[idx] = FakeChannel(idx, name, secret)
+        return True
+
     async def send_channel_message(self, channel_idx: int, text: str, timestamp: int = 0) -> bool:
         self.sent_channel_messages.append((channel_idx, text, timestamp))
         return self.channel_send_ok

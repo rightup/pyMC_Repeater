@@ -218,12 +218,48 @@ class CompanionFrameServer(_BaseFrameServer):
             dicts,
         )
 
+    def _channel_state(self, idx) -> Optional[dict]:
+        """Name-only view of one channel slot, or None when unset.
+
+        Secrets are excluded on purpose — see ``journal.record_channel``.
+        """
+        if idx is None:
+            return None
+        ch = self.bridge.get_channel(idx)
+        return None if ch is None else {"index": idx, "name": ch.name}
+
+    async def _cmd_set_channel(self, data: bytes) -> None:
+        """Journal a channel change on top of the core handler.
+
+        The bulk ``_save_channels`` path stays unjournaled (it also runs at
+        stop time, which would replay the whole table on every restart), so
+        the single-slot event is emitted here instead — mirroring how
+        ``_persist_contact`` journals one contact while ``_save_contacts``
+        does not.
+
+        Before/after comparison rather than trusting the command to have
+        succeeded: a rejected or no-op SET_CHANNEL must not produce an event.
+        """
+        idx = data[0] if data else None
+        before = self._channel_state(idx)
+        await super()._cmd_set_channel(data)
+        after = self._channel_state(idx)
+
+        if self.journal is None or after == before:
+            return
+        if after is None:
+            await asyncio.to_thread(self.journal.record_channel, idx, None, "remove")
+        else:
+            await asyncio.to_thread(
+                self.journal.record_channel, idx, after["name"], "update"
+            )
+
     async def _save_channels(self) -> None:
         """Persist channels to SQLite (non-blocking).
 
-        Bulk stop-time save: not journaled (would spam the journal with the
-        entire channel set on every restart). Channel/bulk journal events are
-        deferred to phase 2.
+        Bulk stop-time save: not journaled (it also runs on shutdown, which
+        would replay the entire channel set into the journal on every
+        restart). Single-slot changes are journaled in ``_cmd_set_channel``.
         """
         if not self.sqlite_handler:
             return

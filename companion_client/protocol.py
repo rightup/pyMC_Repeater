@@ -24,6 +24,7 @@ from openhop_core.companion.constants import (
     CMD_DEVICE_QUERY,
     CMD_GET_CHANNEL,
     CMD_GET_CONTACTS,
+    CMD_SET_CHANNEL,
     CMD_SEND_CHANNEL_TXT_MSG,
     CMD_SEND_TXT_MSG,
     CMD_SYNC_NEXT_MESSAGE,
@@ -147,6 +148,18 @@ def cmd_get_channel(channel_idx: int) -> bytes:
     has no request IDs), so callers enumerate by index instead.
     """
     return bytes([CMD_GET_CHANNEL, channel_idx])
+
+
+def cmd_set_channel(channel_idx: int, name: str, secret: bytes = b"") -> bytes:
+    """CMD_SET_CHANNEL: [idx u8][name 32][secret].
+
+    An empty ``name`` clears the slot. The server accepts the secret as 16 or
+    32 raw bytes, or as a 64-char hex string; hex is used here because it is
+    the form the firmware-compatible clients send.
+    """
+    padded = name.encode("utf-8")[:CHANNEL_NAME_SIZE].ljust(CHANNEL_NAME_SIZE, b"\x00")
+    secret_hex = (secret or bytes(32)).hex().encode("ascii")
+    return bytes([CMD_SET_CHANNEL, channel_idx]) + padded + secret_hex
 
 
 def cmd_sync_next_message() -> bytes:

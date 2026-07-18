@@ -11,11 +11,19 @@ client (TCP 15050), out of scope for a curl smoke"*. This is that client.
 
 | Module | Depends on | Purpose |
 |---|---|---|
+| `rest.py` | stdlib | **REST client for `/api/v1`** — pair, snapshot, sync, push |
+| `rest_simulator.py` | `repeater.*` | mounts the real `/api/v1` tree on a port |
 | `protocol.py` | `openhop_core` only | frame codec, command builders, response parsers |
-| `client.py` | `protocol` | async client: connect, send, sync, push handling |
+| `client.py` | `protocol` | async TCP client: connect, send, sync, push handling |
 | `push_listener.py` | stdlib | captures notifier POSTs so pushes are assertable |
 | `simulator.py` | `repeater.*` | in-process frame server + journal for tests/demo |
-| `web/` | `aiohttp` | browser chat UI over the same client |
+| `web/` | `aiohttp` | browser chat UI over the TCP client |
+
+**Two different APIs, not one.** `rest.py` targets the Mobile Companion API v1
+(`/api/v1/*`) — the newer surface a phone app lives on. `client.py` targets the
+TCP frame protocol (port 15050), which is older and separately tested. They are
+not equivalent: the frame protocol hands out channel PSK secrets, the REST
+snapshot deliberately does not.
 
 `protocol.py`, `client.py`, and `push_listener.py` deliberately contain **no
 `repeater.*` import** — they talk to the server over the wire exactly as a
@@ -88,9 +96,33 @@ reserved, not a version — an easy thing to get backwards.
 ## Tests
 
 ```bash
-pytest tests/test_companion_client_protocol.py     # codec, no server
-pytest tests/test_companion_client_integration.py  # real server over TCP
+pytest tests/test_companion_rest_client.py         # /api/v1 over real HTTP
+pytest tests/test_companion_client_protocol.py     # frame codec, no server
+pytest tests/test_companion_client_integration.py  # frame server over TCP
 ```
+
+The REST suite is the one that exercises the new API surface. Existing endpoint
+tests call handlers through `__wrapped__`, which bypasses `require_auth` and
+CherryPy; these drive real HTTP against a real mount, covering the auth gate,
+the pairing-code exchange, bearer tokens, scope enforcement, ETag/304, and the
+JSON envelope.
+
+### Things real HTTP found that direct handler calls could not
+
+- **`POST /api/v1/pair` 301-redirects to `/pair/`, and stock HTTP clients
+  downgrade POST to GET when following it** (RFC 7231 for 301/302). The server
+  then answers `405 Method not allowed. Use POST.` — when the caller *did* use
+  POST. `rest.py` installs a method-preserving redirect handler; a phone client
+  must do the same or always send the trailing slash. Worth fixing server-side
+  with a 308.
+- **The `ETag` header arrives as `Etag`.** CherryPy title-cases it while the
+  spec writes `ETag`. A case-sensitive lookup silently returns `None` and the
+  client loses conditional requests without any error.
+- **`POST /pair` is globally rate-limited** to 10 attempts per 60s across all
+  callers (design doc §11.3, anti-guessing). Tests share one paired device
+  rather than pairing per test.
+- **`GET /devices` is admin-scoped.** A device token manages its own push
+  registration but cannot enumerate the fleet.
 
 The integration suite covers what was previously untestable: the handshake,
 client eviction, channel sends reaching the bridge, the sync/receive path, and

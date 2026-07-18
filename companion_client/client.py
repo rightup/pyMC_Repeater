@@ -190,6 +190,10 @@ class CompanionClient:
         self.channels = channels
         return channels
 
+    async def set_channel(self, channel_idx: int, name: str, secret: bytes = b"") -> None:
+        """Add, rename, or clear (empty ``name``) a channel slot."""
+        await self._command(protocol.cmd_set_channel(channel_idx, name, secret), expect_ok=True)
+
     async def sync_next_message(self) -> Optional[ReceivedMessage]:
         """Pull one queued message, or None when the queue is empty."""
         payload = await self._command(protocol.cmd_sync_next_message())
