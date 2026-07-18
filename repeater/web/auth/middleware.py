@@ -40,6 +40,20 @@ def require_auth(func):
                 }
                 return func(*args, **kwargs)
             else:
+                # Not a valid JWT -- device API tokens may also be sent as a
+                # Bearer value (design doc always allowed this transport).
+                token_info = token_manager.verify_token(token)
+
+                if token_info:
+                    cherrypy.request.user = {
+                        "username": "api_token",
+                        "token_name": token_info["name"],
+                        "token_id": token_info["id"],
+                        "auth_type": "api_token",
+                        "scope": token_info.get("scope", "admin"),
+                    }
+                    return func(*args, **kwargs)
+
                 logger.warning("Invalid or expired JWT token")
 
         request_params = getattr(cherrypy.request, "params", None)

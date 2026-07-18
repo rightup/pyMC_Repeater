@@ -47,6 +47,21 @@ def check_auth():
             }
             return
 
+        # Not a valid JWT -- device API tokens may also be sent as a Bearer
+        # value (design doc always allowed this transport).
+        token_info = token_manager.verify_token(token)
+
+        if token_info:
+            # verify_token already NULL-defaults scope to 'admin' for
+            # pre-migration tokens (design doc §11.1 backward compat).
+            cherrypy.request.user = {
+                "token_id": token_info["id"],
+                "token_name": token_info["name"],
+                "auth_type": "api_token",
+                "scope": token_info.get("scope", "admin"),
+            }
+            return
+
     # Check for JWT token in query parameter (for EventSource/SSE)
     # EventSource doesn't support custom headers, so we use query param
     query_token = cherrypy.request.params.get("token")

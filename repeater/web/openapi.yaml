@@ -67,38 +67,43 @@ tags:
       which remains unchanged and unversioned.
 
       **Envelope:** every JSON response is either
-      `{"success": true, "data": {…}}` or (auth failures only —
-      see below) `{"success": false, "error": "…"}`.
+      `{"success": true, "data": {…}}` or (any error status) `{"success":
+      false, "error": "…", "status": <code>}`.
 
-      **Error rendering:** only `401 Unauthorized` gets converted to the
-      `{"success": false, "error": "…"}` JSON shape — either by the
-      request-authentication step happening entirely inside `require_auth`
-      before the handler runs (`repeater/web/auth/middleware.py`), or by the
-      one globally-registered `error_page.401` handler
+      **Error rendering:** every error status raised anywhere under
+      `/api/v1` — `400`, `401`, `403`, `404`, `409`, `429`, `500`, `503`,
+      `504` — renders as that same JSON envelope. `401` is produced two
+      ways: the request-authentication step happening entirely inside
+      `require_auth` before the handler runs
+      (`repeater/web/auth/middleware.py`), which returns the JSON body
+      directly, or the globally-registered `error_page.401` handler
       (`repeater/web/http_server.py:_json_error_handler`) that runs for the
       tool-level auth gate applied to the whole `/api` tree. Every other
-      error status raised from inside a v1 handler — `400`, `403`, `404`,
-      `409`, `429`, `500`, `503`, `504`, all raised as plain
-      `cherrypy.HTTPError` — has **no** matching `error_page` entry, so
-      CherryPy renders its own default `text/html` error page (the reason
-      phrase appears in that page's body, not as JSON). `@cherrypy.tools.
-      json_out()` only encodes a handler's normal return value; it does not
-      intercept exceptions, so these errors bypass the success/error JSON
-      envelope entirely. The one exception inside this surface:
+      status raised from inside a v1 handler as plain `cherrypy.HTTPError`
+      is caught by the `error_page.default` handler
+      (`repeater/web/http_server.py:_json_error_page_v1`) registered on the
+      `/api/v1` config path — CherryPy prefers a status-specific
+      `error_page.<code>` over `error_page.default` when both apply
+      (`cherrypy._cperror.get_error_page`), so `401`s still go through the
+      global handler above, but both render identical JSON. See
+      `ErrorResponseV1`. The one notable in-code path:
       `CompanionsV1._run_async` (used by every action/send endpoint) catches
       a bridge-coroutine timeout or exception itself and re-raises it as
-      `cherrypy.HTTPError(504` or `500)` — still HTML-rendered per the rule
-      above, just triggered from a caught exception rather than an explicit
-      `raise` in the handler body.
+      `cherrypy.HTTPError(504` or `500)`, which is likewise JSON-rendered by
+      the `/api/v1` default error page.
 
-      **Auth:** `Bearer` JWT (web UI / `admin` scope) or `X-API-Key` scoped
-      device token (`ApiKeyAuth`) — see the security scheme below for scope
-      semantics. `GET .../events` (SSE) additionally accepts the JWT as
-      `?token=` since `EventSource` cannot set custom headers; the token is
-      stripped from `request.params` once consumed. `GET /api/v1/server_info`
-      and `POST /api/v1/pair` (and, by config-path cascade, `POST
-      /api/v1/pair/start`) are exempt from the tree-wide auth gate;
-      `pair/start` re-imposes its own `admin`-scope check in-handler instead.
+      **Auth:** `Bearer` — either a JWT (web UI / `admin` scope) or a scoped
+      device API token minted by `POST /api/v1/pair` — or `X-API-Key` with
+      that same device token (`ApiKeyAuth`). Bearer values are tried as a
+      JWT first; if that fails, the same value is looked up as a device
+      token before the request is rejected, so either credential works via
+      either transport. See the security scheme below for scope semantics.
+      `GET .../events` (SSE) additionally accepts the JWT as `?token=` since
+      `EventSource` cannot set custom headers; the token is stripped from
+      `request.params` once consumed. `GET /api/v1/server_info` and `POST
+      /api/v1/pair` (and, by config-path cascade, `POST /api/v1/pair/start`)
+      are exempt from the tree-wide auth gate; `pair/start` re-imposes its
+      own `admin`-scope check in-handler instead.
 
 paths:
   # ============================================================================
@@ -4462,12 +4467,11 @@ paths:
         '405':
           description: |
             Method not allowed (only `GET`/`OPTIONS`). `Allow: GET` header
-            set; rendered as CherryPy's default HTML error page (see tag
-            description).
+            set; rendered as the v1 JSON error envelope (see tag description).
           content:
-            text/html:
+            application/json:
               schema:
-                type: string
+                $ref: '#/components/schemas/ErrorResponseV1'
 
   /v1/pair/start:
     post:
@@ -4521,34 +4525,32 @@ paths:
                             description: sha256 hexdigest of the companion identity's public key (TOFU pin, §11.3).
         '400':
           description: |
-            `companion_name required`. Rendered as CherryPy's default HTML
-            error page, not the JSON error envelope (see tag description).
+            `companion_name required`. Rendered as the v1 JSON error envelope (see tag description).
           content:
-            text/html:
+            application/json:
               schema:
-                type: string
+                $ref: '#/components/schemas/ErrorResponseV1'
         '401':
           description: Missing/invalid JWT or API token.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ErrorResponse'
+                $ref: '#/components/schemas/ErrorResponseV1'
         '403':
           description: |
-            `Admin scope required`. HTML error page, not JSON (see tag
+            `Admin scope required`. Rendered as the v1 JSON error envelope (see tag
             description).
           content:
-            text/html:
+            application/json:
               schema:
-                type: string
+                $ref: '#/components/schemas/ErrorResponseV1'
         '404':
           description: |
-            `Companion '{companion_name}' not found`. HTML error page, not
-            JSON (see tag description).
+            `Companion '{companion_name}' not found`. Rendered as the v1 JSON error envelope (see tag description).
           content:
-            text/html:
+            application/json:
               schema:
-                type: string
+                $ref: '#/components/schemas/ErrorResponseV1'
 
   /v1/pair:
     post:
@@ -4606,46 +4608,42 @@ paths:
                             example: "companion:field-radio-1"
         '400':
           description: |
-            `code, device_id, and name are required`. HTML error page, not
-            JSON (see tag description).
+            `code, device_id, and name are required`. Rendered as the v1 JSON error envelope (see tag description).
           content:
-            text/html:
+            application/json:
               schema:
-                type: string
+                $ref: '#/components/schemas/ErrorResponseV1'
         '404':
           description: |
-            `Invalid or expired pairing code`. HTML error page, not JSON
-            (see tag description).
+            `Invalid or expired pairing code`. Rendered as the v1 JSON error envelope (see tag description).
           content:
-            text/html:
+            application/json:
               schema:
-                type: string
+                $ref: '#/components/schemas/ErrorResponseV1'
         '409':
           description: |
             `device_id already registered` — the just-minted token is
-            revoked server-side before this response. HTML error page, not
-            JSON (see tag description).
+            revoked server-side before this response. Rendered as the v1 JSON error envelope (see tag description).
           content:
-            text/html:
+            application/json:
               schema:
-                type: string
+                $ref: '#/components/schemas/ErrorResponseV1'
         '429':
           description: |
             `Too many pairing attempts, try again later` (fixed 60s window,
-            max 10 attempts, process-global). HTML error page, not JSON (see
-            tag description).
+            max 10 attempts, process-global). Rendered as the v1 JSON error envelope (see tag description).
           content:
-            text/html:
+            application/json:
               schema:
-                type: string
+                $ref: '#/components/schemas/ErrorResponseV1'
         '500':
           description: |
             `Authentication not configured` (no token manager wired up).
-            HTML error page, not JSON (see tag description).
+            Rendered as the v1 JSON error envelope (see tag description).
           content:
-            text/html:
+            application/json:
               schema:
-                type: string
+                $ref: '#/components/schemas/ErrorResponseV1'
 
   /v1/devices:
     get:
@@ -4704,12 +4702,12 @@ paths:
                               nullable: true
         '403':
           description: |
-            `Admin scope required`. HTML error page, not JSON (see tag
+            `Admin scope required`. Rendered as the v1 JSON error envelope (see tag
             description).
           content:
-            text/html:
+            application/json:
               schema:
-                type: string
+                $ref: '#/components/schemas/ErrorResponseV1'
 
   /v1/devices/{device_id}:
     delete:
@@ -4747,20 +4745,19 @@ paths:
                             type: string
         '403':
           description: |
-            `Admin scope required`. HTML error page, not JSON (see tag
+            `Admin scope required`. Rendered as the v1 JSON error envelope (see tag
             description).
           content:
-            text/html:
+            application/json:
               schema:
-                type: string
+                $ref: '#/components/schemas/ErrorResponseV1'
         '404':
           description: |
-            `Device '{device_id}' not found`. HTML error page, not JSON (see
-            tag description).
+            `Device '{device_id}' not found`. Rendered as the v1 JSON error envelope (see tag description).
           content:
-            text/html:
+            application/json:
               schema:
-                type: string
+                $ref: '#/components/schemas/ErrorResponseV1'
 
   /v1/companions:
     get:
@@ -4793,7 +4790,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ErrorResponse'
+                $ref: '#/components/schemas/ErrorResponseV1'
 
   /v1/companions/{name}/snapshot:
     get:
@@ -4861,24 +4858,23 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ErrorResponse'
+                $ref: '#/components/schemas/ErrorResponseV1'
         '403':
           description: |
             `Insufficient scope for this companion` (or `No auth scope for
-            this companion`). HTML error page, not JSON (see tag
+            this companion`). Rendered as the v1 JSON error envelope (see tag
             description).
           content:
-            text/html:
+            application/json:
               schema:
-                type: string
+                $ref: '#/components/schemas/ErrorResponseV1'
         '404':
           description: |
-            `Companion '{name}' not found`. HTML error page, not JSON (see
-            tag description).
+            `Companion '{name}' not found`. Rendered as the v1 JSON error envelope (see tag description).
           content:
-            text/html:
+            application/json:
               schema:
-                type: string
+                $ref: '#/components/schemas/ErrorResponseV1'
 
   /v1/companions/{name}/sync:
     get:
@@ -4970,34 +4966,33 @@ paths:
                 type: string
         '400':
           description: |
-            `cursor required` or `Invalid cursor`. HTML error page, not JSON
-            (see tag description).
+            `cursor required` or `Invalid cursor`. Rendered as the v1 JSON error envelope (see tag description).
           content:
-            text/html:
+            application/json:
               schema:
-                type: string
+                $ref: '#/components/schemas/ErrorResponseV1'
         '401':
           description: Missing/invalid JWT or API token.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ErrorResponse'
+                $ref: '#/components/schemas/ErrorResponseV1'
         '403':
           description: |
-            Insufficient scope. HTML error page, not JSON (see tag
+            Insufficient scope. Rendered as the v1 JSON error envelope (see tag
             description).
           content:
-            text/html:
+            application/json:
               schema:
-                type: string
+                $ref: '#/components/schemas/ErrorResponseV1'
         '404':
           description: |
-            Companion not found. HTML error page, not JSON (see tag
+            Companion not found. Rendered as the v1 JSON error envelope (see tag
             description).
           content:
-            text/html:
+            application/json:
               schema:
-                type: string
+                $ref: '#/components/schemas/ErrorResponseV1'
 
   /v1/companions/{name}/messages:
     get:
@@ -5052,26 +5047,26 @@ paths:
                             description: Pass as `before_id` to fetch the next (older) page; `null` when this page was empty.
         '400':
           description: |
-            `Invalid before_id`. HTML error page, not JSON (see tag
+            `Invalid before_id`. Rendered as the v1 JSON error envelope (see tag
             description).
           content:
-            text/html:
+            application/json:
               schema:
-                type: string
+                $ref: '#/components/schemas/ErrorResponseV1'
         '401':
           description: Missing/invalid JWT or API token.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ErrorResponse'
+                $ref: '#/components/schemas/ErrorResponseV1'
         '404':
           description: |
-            Companion not found. HTML error page, not JSON (see tag
+            Companion not found. Rendered as the v1 JSON error envelope (see tag
             description).
           content:
-            text/html:
+            application/json:
               schema:
-                type: string
+                $ref: '#/components/schemas/ErrorResponseV1'
 
     post:
       tags: [Mobile Companion API v1]
@@ -5170,44 +5165,43 @@ paths:
           description: |
             Missing `Idempotency-Key` header, invalid JSON body, neither/both
             of `to`/`channel_idx` set, missing `text`, or an invalid `to` hex
-            key. HTML error page, not JSON (see tag description).
+            key. Rendered as the v1 JSON error envelope (see tag description).
           content:
-            text/html:
+            application/json:
               schema:
-                type: string
+                $ref: '#/components/schemas/ErrorResponseV1'
         '401':
           description: Missing/invalid JWT or API token.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ErrorResponse'
+                $ref: '#/components/schemas/ErrorResponseV1'
         '404':
           description: |
-            Companion not found. HTML error page, not JSON (see tag
+            Companion not found. Rendered as the v1 JSON error envelope (see tag
             description).
           content:
-            text/html:
+            application/json:
               schema:
-                type: string
+                $ref: '#/components/schemas/ErrorResponseV1'
         '409':
           description: |
             `Idempotency-Key reuse with different request` — same key,
-            different companion or body. HTML error page, not JSON (see tag
+            different companion or body. Rendered as the v1 JSON error envelope (see tag
             description).
           content:
-            text/html:
+            application/json:
               schema:
-                type: string
+                $ref: '#/components/schemas/ErrorResponseV1'
         '504':
           description: |
             `Timed out waiting for radio response` — the bridge coroutine
             (default 30s) did not complete; the idempotency key is left
-            unclaimed so a retry reaches the radio. HTML error page, not
-            JSON (see tag description).
+            unclaimed so a retry reaches the radio. Rendered as the v1 JSON error envelope (see tag description).
           content:
-            text/html:
+            application/json:
               schema:
-                type: string
+                $ref: '#/components/schemas/ErrorResponseV1'
 
   /v1/companions/{name}/events:
     get:
@@ -5292,42 +5286,41 @@ paths:
                   "snapshot_required":true}\n\n` frame before the stream ends.
         '400':
           description: |
-            `Invalid cursor`. HTML error page, not JSON (see tag
+            `Invalid cursor`. Rendered as the v1 JSON error envelope (see tag
             description).
           content:
-            text/html:
+            application/json:
               schema:
-                type: string
+                $ref: '#/components/schemas/ErrorResponseV1'
         '401':
           description: Missing/invalid JWT or API token.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ErrorResponse'
+                $ref: '#/components/schemas/ErrorResponseV1'
         '403':
           description: |
-            Insufficient scope. HTML error page, not JSON (see tag
+            Insufficient scope. Rendered as the v1 JSON error envelope (see tag
             description).
           content:
-            text/html:
+            application/json:
               schema:
-                type: string
+                $ref: '#/components/schemas/ErrorResponseV1'
         '404':
           description: |
-            Companion not found. HTML error page, not JSON (see tag
+            Companion not found. Rendered as the v1 JSON error envelope (see tag
             description).
           content:
-            text/html:
+            application/json:
               schema:
-                type: string
+                $ref: '#/components/schemas/ErrorResponseV1'
         '503':
           description: |
-            `Companion event journal not available`. HTML error page, not
-            JSON (see tag description).
+            `Companion event journal not available`. Rendered as the v1 JSON error envelope (see tag description).
           content:
-            text/html:
+            application/json:
               schema:
-                type: string
+                $ref: '#/components/schemas/ErrorResponseV1'
 
   /v1/companions/{name}/contacts/{pubkey}/login:
     post:
@@ -5377,42 +5370,40 @@ paths:
                         $ref: '#/components/schemas/MobileActionResult'
         '400':
           description: |
-            Invalid JSON body or invalid public key. HTML error page, not
-            JSON (see tag description).
+            Invalid JSON body or invalid public key. Rendered as the v1 JSON error envelope (see tag description).
           content:
-            text/html:
+            application/json:
               schema:
-                type: string
+                $ref: '#/components/schemas/ErrorResponseV1'
         '401':
           description: Missing/invalid JWT or API token.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ErrorResponse'
+                $ref: '#/components/schemas/ErrorResponseV1'
         '404':
           description: |
-            Companion not found. HTML error page, not JSON (see tag
+            Companion not found. Rendered as the v1 JSON error envelope (see tag
             description).
           content:
-            text/html:
+            application/json:
               schema:
-                type: string
+                $ref: '#/components/schemas/ErrorResponseV1'
         '405':
           description: |
-            Method not allowed (POST only, no OPTIONS exception). HTML error
-            page, not JSON (see tag description).
+            Method not allowed (POST only, no OPTIONS exception). Rendered as the v1 JSON error envelope (see tag description).
           content:
-            text/html:
+            application/json:
               schema:
-                type: string
+                $ref: '#/components/schemas/ErrorResponseV1'
         '504':
           description: |
-            Bridge coroutine timed out. HTML error page, not JSON (see tag
+            Bridge coroutine timed out. Rendered as the v1 JSON error envelope (see tag
             description).
           content:
-            text/html:
+            application/json:
               schema:
-                type: string
+                $ref: '#/components/schemas/ErrorResponseV1'
 
   /v1/companions/{name}/contacts/{pubkey}/status_request:
     post:
@@ -5450,34 +5441,33 @@ paths:
                         $ref: '#/components/schemas/MobileActionResult'
         '400':
           description: |
-            Invalid public key. HTML error page, not JSON (see tag
+            Invalid public key. Rendered as the v1 JSON error envelope (see tag
             description).
           content:
-            text/html:
+            application/json:
               schema:
-                type: string
+                $ref: '#/components/schemas/ErrorResponseV1'
         '401':
           description: Missing/invalid JWT or API token.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ErrorResponse'
+                $ref: '#/components/schemas/ErrorResponseV1'
         '404':
           description: |
-            Companion not found. HTML error page, not JSON (see tag
+            Companion not found. Rendered as the v1 JSON error envelope (see tag
             description).
           content:
-            text/html:
+            application/json:
               schema:
-                type: string
+                $ref: '#/components/schemas/ErrorResponseV1'
         '504':
           description: |
-            Bridge coroutine timed out (outer 20s guard). HTML error page,
-            not JSON (see tag description).
+            Bridge coroutine timed out (outer 20s guard). Rendered as the v1 JSON error envelope (see tag description).
           content:
-            text/html:
+            application/json:
               schema:
-                type: string
+                $ref: '#/components/schemas/ErrorResponseV1'
 
   /v1/companions/{name}/contacts/{pubkey}/telemetry_request:
     post:
@@ -5516,34 +5506,33 @@ paths:
                         $ref: '#/components/schemas/MobileActionResult'
         '400':
           description: |
-            Invalid public key. HTML error page, not JSON (see tag
+            Invalid public key. Rendered as the v1 JSON error envelope (see tag
             description).
           content:
-            text/html:
+            application/json:
               schema:
-                type: string
+                $ref: '#/components/schemas/ErrorResponseV1'
         '401':
           description: Missing/invalid JWT or API token.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ErrorResponse'
+                $ref: '#/components/schemas/ErrorResponseV1'
         '404':
           description: |
-            Companion not found. HTML error page, not JSON (see tag
+            Companion not found. Rendered as the v1 JSON error envelope (see tag
             description).
           content:
-            text/html:
+            application/json:
               schema:
-                type: string
+                $ref: '#/components/schemas/ErrorResponseV1'
         '504':
           description: |
-            Bridge coroutine timed out (outer 25s guard). HTML error page,
-            not JSON (see tag description).
+            Bridge coroutine timed out (outer 25s guard). Rendered as the v1 JSON error envelope (see tag description).
           content:
-            text/html:
+            application/json:
               schema:
-                type: string
+                $ref: '#/components/schemas/ErrorResponseV1'
 
   /v1/companions/{name}/contacts/{pubkey}/reset_path:
     post:
@@ -5585,26 +5574,26 @@ paths:
                             type: boolean
         '400':
           description: |
-            Invalid public key. HTML error page, not JSON (see tag
+            Invalid public key. Rendered as the v1 JSON error envelope (see tag
             description).
           content:
-            text/html:
+            application/json:
               schema:
-                type: string
+                $ref: '#/components/schemas/ErrorResponseV1'
         '401':
           description: Missing/invalid JWT or API token.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ErrorResponse'
+                $ref: '#/components/schemas/ErrorResponseV1'
         '404':
           description: |
-            Companion not found. HTML error page, not JSON (see tag
+            Companion not found. Rendered as the v1 JSON error envelope (see tag
             description).
           content:
-            text/html:
+            application/json:
               schema:
-                type: string
+                $ref: '#/components/schemas/ErrorResponseV1'
 
 components:
   schemas:
@@ -5627,6 +5616,24 @@ components:
         error:
           type: string
           description: Error message
+
+    ErrorResponseV1:
+      description: |
+        Error envelope for the Mobile Companion API v1 tree (`/api/v1/*`).
+        Every non-2xx response under `/v1/*` — auth failures (401), scope
+        rejections (403), not-found (404), validation errors (400/422), and
+        uncaught exceptions (500) alike — renders this same JSON shape
+        instead of CherryPy's default HTML error page
+        (`repeater/web/http_server.py`'s `error_page.401` handler and the
+        `/api/v1` `error_page.default` handler registered alongside it).
+      allOf:
+        - $ref: '#/components/schemas/ErrorResponse'
+        - type: object
+          properties:
+            status:
+              type: integer
+              description: HTTP status code, echoed in the body for convenience.
+              example: 401
 
     NeighborLinkSnapshot:
       type: object
@@ -6479,25 +6486,31 @@ components:
       type: http
       scheme: bearer
       bearerFormat: JWT
-      description: JWT token authentication via Authorization header
+      description: |
+        JWT token authentication via the `Authorization: Bearer` header
+        (web UI / `admin` scope). Also accepts a Mobile Companion API v1
+        (`/api/v1/*`) device token minted by `POST /api/v1/pair`: the auth
+        code (`repeater/web/auth/middleware.py`, `repeater/web/auth/
+        cherrypy_tool.py`) tries the Bearer value as a JWT first, and falls
+        back to a device-token lookup only if JWT verification fails, so a
+        device token works equally well as `Authorization: Bearer <token>`
+        or `X-API-Key: <token>` (see `ApiKeyAuth`).
     ApiKeyAuth:
       type: apiKey
       in: header
       name: X-API-Key
       description: |
-        API key authentication for machine-to-machine access. Also the
-        transport for Mobile Companion API v1 (`/api/v1/*`) device tokens
-        minted by `POST /api/v1/pair` — despite
-        `docs/architecture/mobile-companion-api.md` describing these as
-        `Authorization: Bearer`, the actual auth code
-        (`repeater/web/auth/middleware.py`, `repeater/web/auth/
-        cherrypy_tool.py`) only ever reads device tokens from `X-API-Key`;
-        `Authorization: Bearer` is JWT-only. Each token carries a `scope`
-        recorded at mint time and enforced by `CompanionsV1._check_scope`:
-        `admin` (full access, implied for all pre-scope-migration tokens),
-        `companion:*` (all companion identities), or `companion:{name}`
-        (exactly the one companion identity the token was paired to). A
-        `scope`-less `request.user` (legacy caller) is treated as `admin`.
+        API key authentication for machine-to-machine access, and the
+        original transport for Mobile Companion API v1 (`/api/v1/*`) device
+        tokens minted by `POST /api/v1/pair`. `Authorization: Bearer` now
+        also accepts these tokens (see `BearerAuth`), matching
+        `docs/architecture/mobile-companion-api.md`. Each token carries a
+        `scope` recorded at mint time and enforced by
+        `CompanionsV1._check_scope`: `admin` (full access, implied for all
+        pre-scope-migration tokens), `companion:*` (all companion
+        identities), or `companion:{name}` (exactly the one companion
+        identity the token was paired to). A `scope`-less `request.user`
+        (legacy caller) is treated as `admin`.
 
 # Future security - currently open
 # security:

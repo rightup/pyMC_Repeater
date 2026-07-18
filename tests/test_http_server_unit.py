@@ -171,6 +171,15 @@ def test_http_server_utility_methods(monkeypatch, tmp_path):
     out = server._json_error_handler(401, "no", "", "")
     assert '"success": false' in out
 
+    resp = SimpleNamespace(headers={})
+    monkeypatch.setattr(cherrypy, "response", resp, raising=False)
+    out_v1 = hs._json_error_page_v1("404 Not Found", "not found", "", "")
+    assert resp.headers["Content-Type"] == "application/json"
+    import json as _json
+
+    parsed = _json.loads(out_v1)
+    assert parsed == {"success": False, "error": "not found", "status": 404}
+
     install_called = {"v": False}
     monkeypatch.setattr(hs.cherrypy_cors, "install", lambda: install_called.__setitem__("v", True))
     server._setup_server_cors()

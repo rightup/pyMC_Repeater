@@ -73,6 +73,27 @@ def _install_cheroot_bad_fd_unraisable_filter() -> None:
     _CHEROOT_UNRAISABLE_HOOK_INSTALLED = True
 
 
+def _json_error_page_v1(status, message, traceback, version):
+    """error_page.default handler for the /api/v1 tree.
+
+    CherryPy's default error page renders HTML for any status that doesn't
+    have its own error_page.<code> entry (see cherrypy._cperror.get_error_page:
+    ``pages.get(code) or pages.get('default')``). The Mobile Companion API v1
+    (design doc §7.1) needs a consistent JSON envelope for every error, not
+    just 401s, so this covers everything else (400/403/404/500/...) for
+    requests under /api/v1. It intentionally mirrors HTTPStatsServer's
+    error_page.401 handler's response shape.
+    """
+    # CherryPy passes status as e.g. "404 Not Found"; clients get the bare
+    # code (openapi.yaml documents ErrorResponseV1.status as an integer).
+    try:
+        status_code = int(str(status).split(" ", 1)[0])
+    except ValueError:
+        status_code = status
+    cherrypy.response.headers["Content-Type"] = "application/json"
+    return json.dumps({"success": False, "error": message, "status": status_code})
+
+
 # In-memory log buffer
 class LogBuffer(logging.Handler):
     _SECRET_PATTERNS = (
@@ -510,6 +531,14 @@ class HTTPStatsServer:
                 # descendants) even though that endpoint is admin-only —
                 # it carries its own @require_auth decorator for that
                 # reason (see PairV1.start's docstring in mobile_endpoints.py).
+                "/api/v1": {
+                    # JSON error envelope for the whole v1 tree. Only fires
+                    # for statuses without their own error_page.<code> entry;
+                    # the global error_page.401 above still wins for 401s
+                    # (get_error_page checks pages.get(code) before
+                    # pages.get('default')), but that handler is JSON too.
+                    "error_page.default": _json_error_page_v1,
+                },
                 "/api/v1/server_info": {
                     "tools.require_auth.on": False,
                 },

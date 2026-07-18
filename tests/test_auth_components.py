@@ -8,6 +8,7 @@ import pytest
 from repeater.web.auth.api_tokens import APITokenManager
 from repeater.web.auth.cherrypy_tool import check_auth
 from repeater.web.auth.jwt_handler import JWTHandler
+from repeater.web.auth.middleware import require_auth
 
 
 def test_jwt_handler_create_and_verify_and_invalid_cases():
@@ -128,3 +129,126 @@ def test_check_auth_unauthorized_raises_http_error(monkeypatch):
 
     with pytest.raises(cherrypy.HTTPError):
         check_auth()
+
+
+def test_check_auth_accepts_bearer_api_token(monkeypatch):
+    # Bearer value fails JWT verification but matches a device API token --
+    # the design doc always allowed Bearer as a transport for API tokens.
+    jwt_handler = SimpleNamespace(verify_jwt=lambda _t: None)
+    token_manager = SimpleNamespace(
+        verify_token=lambda k: {"id": 7, "name": "svc", "scope": "read"} if k == "abc" else None
+    )
+    req, _resp = _set_cp(
+        monkeypatch,
+        headers={"Authorization": "Bearer abc"},
+        cfg={"jwt_handler": jwt_handler, "token_manager": token_manager},
+    )
+
+    assert check_auth() is None
+    assert req.user["auth_type"] == "api_token"
+    assert req.user["scope"] == "read"
+    assert req.user["token_id"] == 7
+
+
+def test_check_auth_bearer_invalid_jwt_and_token_still_401s(monkeypatch):
+    jwt_handler = SimpleNamespace(verify_jwt=lambda _t: None)
+    token_manager = SimpleNamespace(verify_token=lambda _k: None)
+    _set_cp(
+        monkeypatch,
+        headers={"Authorization": "Bearer not-a-real-token"},
+        cfg={"jwt_handler": jwt_handler, "token_manager": token_manager},
+    )
+
+    with pytest.raises(cherrypy.HTTPError) as exc_info:
+        check_auth()
+    assert exc_info.value.status == 401
+
+
+def test_check_auth_bearer_jwt_wins_over_token_lookup(monkeypatch):
+    # A valid JWT must never fall through to the API-token lookup.
+    jwt_handler = SimpleNamespace(verify_jwt=lambda _t: {"sub": "admin", "client_id": "c1"})
+    token_manager = SimpleNamespace(
+        verify_token=MagicMock(return_value={"id": 1, "name": "should-not-be-called"})
+    )
+    req, _resp = _set_cp(
+        monkeypatch,
+        headers={"Authorization": "Bearer good-jwt"},
+        cfg={"jwt_handler": jwt_handler, "token_manager": token_manager},
+    )
+
+    assert check_auth() is None
+    assert req.user["auth_type"] == "jwt"
+    token_manager.verify_token.assert_not_called()
+
+
+def _call_require_auth(monkeypatch, **kwargs):
+    """Invoke require_auth's wrapper directly (mirrors _set_cp for check_auth)."""
+    req, resp = _set_cp(monkeypatch, **kwargs)
+
+    @require_auth
+    def handler():
+        return {"success": True}
+
+    return handler, req, resp
+
+
+def test_require_auth_accepts_bearer_api_token(monkeypatch):
+    jwt_handler = SimpleNamespace(verify_jwt=lambda _t: None)
+    token_manager = SimpleNamespace(
+        verify_token=lambda k: {"id": 9, "name": "svc", "scope": "read"} if k == "tok" else None
+    )
+    handler, req, _resp = _call_require_auth(
+        monkeypatch,
+        headers={"Authorization": "Bearer tok"},
+        cfg={"jwt_handler": jwt_handler, "token_manager": token_manager},
+    )
+
+    result = handler()
+    assert result == {"success": True}
+    assert req.user["auth_type"] == "api_token"
+    assert req.user["scope"] == "read"
+
+
+def test_require_auth_bearer_invalid_jwt_and_token_still_401s(monkeypatch):
+    jwt_handler = SimpleNamespace(verify_jwt=lambda _t: None)
+    token_manager = SimpleNamespace(verify_token=lambda _k: None)
+    handler, _req, resp = _call_require_auth(
+        monkeypatch,
+        headers={"Authorization": "Bearer nope"},
+        cfg={"jwt_handler": jwt_handler, "token_manager": token_manager},
+    )
+
+    result = handler()
+    assert resp.status == 401
+    assert result["success"] is False
+
+
+def test_require_auth_bearer_jwt_wins_over_token_lookup(monkeypatch):
+    jwt_handler = SimpleNamespace(verify_jwt=lambda _t: {"sub": "admin", "client_id": "c1"})
+    token_manager = SimpleNamespace(
+        verify_token=MagicMock(return_value={"id": 1, "name": "should-not-be-called"})
+    )
+    handler, req, _resp = _call_require_auth(
+        monkeypatch,
+        headers={"Authorization": "Bearer good-jwt"},
+        cfg={"jwt_handler": jwt_handler, "token_manager": token_manager},
+    )
+
+    result = handler()
+    assert result == {"success": True}
+    assert req.user["auth_type"] == "jwt"
+    token_manager.verify_token.assert_not_called()
+
+
+def test_require_auth_accepts_api_key_unchanged(monkeypatch):
+    jwt_handler = SimpleNamespace(verify_jwt=lambda _t: None)
+    token_manager = SimpleNamespace(verify_token=lambda _k: {"id": 3, "name": "svc"})
+    handler, req, _resp = _call_require_auth(
+        monkeypatch,
+        headers={"X-API-Key": "k"},
+        cfg={"jwt_handler": jwt_handler, "token_manager": token_manager},
+    )
+
+    result = handler()
+    assert result == {"success": True}
+    assert req.user["auth_type"] == "api_token"
