@@ -196,6 +196,26 @@ class CompanionEventJournal:
             "message_send_state", payload, packet_hash=correlation.get("packet_hash")
         )
 
+    def record_rf_reception(self, packet_record: dict) -> Optional[int]:
+        """Journal any packet heard again, regardless of companion relevance
+        (design doc §9: ``type: rf_reception``, opt-in firehose).
+
+        ``packet_record`` is the engine's duplicate-reception dict (the same
+        shape ``RepeaterHandler``'s ``duplicate_observer`` hook receives for
+        every genuine OTA duplicate). Path entries are raw hashes only, same
+        as ``record_message_reception`` — resolving them against contacts is
+        a later phase.
+        """
+        packet_hash = packet_record.get("packet_hash")
+        payload = {
+            "packet_hash": packet_hash,
+            "rssi": packet_record.get("rssi"),
+            "snr": packet_record.get("snr"),
+            "path": packet_record.get("original_path") or [],
+            "observed_at": packet_record.get("timestamp"),
+        }
+        return self._append("rf_reception", payload, packet_hash=packet_hash)
+
     @property
     def epoch(self) -> str:
         """Current journal epoch (design doc §5.3), delegated to storage."""

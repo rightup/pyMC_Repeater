@@ -287,6 +287,11 @@ COMPANION_SETTINGS_ALLOWLIST = frozenset(
         # Persistent opt-in: trim oldest non-favourite contacts to fit max_contacts
         # at load instead of refusing to start when over capacity.
         "trim_contacts_on_overflow",
+        # Opt-in: journal an `rf_reception` event (design doc §9) to this
+        # companion for every genuine OTA duplicate, not just correlated ones.
+        # Default off — at ~50k packets/day it would otherwise dominate the
+        # journal (§9 "Correlated vs. uncorrelated receptions").
+        "rf_reception_events",
         *COMPANION_BRIDGE_SETTING_KEYS,
     }
 )

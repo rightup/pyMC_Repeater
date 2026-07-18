@@ -224,6 +224,86 @@ class TestSnapshotRequired:
         assert exc.value.status == 503
 
 
+# --- rf_reception opt-in filtering (design doc §9) --------------------------
+
+
+class TestRfReceptionFiltering:
+    """rf_reception events are omitted from both the backlog replay and the
+    live tail unless ``?include=rf_receptions`` is given (same rule as
+    sync)."""
+
+    def test_excluded_from_replay_by_default(self, endpoints, handler, journal):
+        _seed(handler, 1)
+        handler.companion_append_event(_HASH, "rf_reception", {"n": "rf"}, packet_hash="ph-rf")
+        handler.companion_append_event(_HASH, "message", {"n": "after"}, packet_hash="ph-2")
+
+        gen = _open_stream(endpoints, cursor="0")
+        # First seeded event, then straight to the second "message" (the
+        # rf_reception in between is skipped, not framed).
+        frame1 = _parse_frame(next(gen))
+        frame2 = _parse_frame(next(gen))
+        assert frame1["event"] == "message"
+        assert frame2["event"] == "message"
+        assert frame2["data"]["data"] == {"n": "after"}
+
+    def test_included_from_replay_with_include_param(self, endpoints, handler, journal):
+        _seed(handler, 1)
+        rf_seq = handler.companion_append_event(
+            _HASH, "rf_reception", {"n": "rf"}, packet_hash="ph-rf"
+        )
+        handler.companion_append_event(_HASH, "message", {"n": "after"}, packet_hash="ph-2")
+
+        gen = _open_stream(endpoints, cursor="0", include="rf_receptions")
+        frame1 = _parse_frame(next(gen))
+        frame2 = _parse_frame(next(gen))
+        frame3 = _parse_frame(next(gen))
+        assert [frame1["event"], frame2["event"], frame3["event"]] == [
+            "message",
+            "rf_reception",
+            "message",
+        ]
+        assert frame2["id"] == str(rf_seq)
+
+    def test_excluded_from_live_tail_by_default(self, endpoints, handler, journal):
+        seqs = _seed(handler, 1)
+        gen = _open_stream(endpoints, cursor=str(seqs[-1]))
+
+        journal.record_rf_reception(
+            {
+                "packet_hash": "AAAA000000000000",
+                "rssi": -70,
+                "snr": 2.0,
+                "original_path": [],
+                "timestamp": 1.0,
+            }
+        )
+        live_seq = journal.record_message({"text": "live-after-rf"})
+
+        parsed = _parse_frame(next(gen))
+        # The rf_reception is skipped on the live queue; the next frame
+        # delivered is the following message event.
+        assert parsed["event"] == "message"
+        assert parsed["id"] == str(live_seq)
+
+    def test_included_from_live_tail_with_include_param(self, endpoints, handler, journal):
+        seqs = _seed(handler, 1)
+        gen = _open_stream(endpoints, cursor=str(seqs[-1]), include="rf_receptions")
+
+        rf_seq = journal.record_rf_reception(
+            {
+                "packet_hash": "BBBB000000000000",
+                "rssi": -65,
+                "snr": 3.0,
+                "original_path": ["11"],
+                "timestamp": 2.0,
+            }
+        )
+
+        parsed = _parse_frame(next(gen))
+        assert parsed["event"] == "rf_reception"
+        assert parsed["id"] == str(rf_seq)
+
+
 # --- Keepalive ------------------------------------------------------------
 
 

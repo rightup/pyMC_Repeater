@@ -94,6 +94,23 @@ def _is_hex(value: str) -> bool:
         return False
 
 
+# Opt-in uncorrelated RF-reception firehose event type (design doc §9
+# "Correlated vs. uncorrelated receptions"). Excluded from sync/SSE output
+# unless the request's ``include`` param names it — see
+# ``_include_rf_receptions``.
+_RF_RECEPTION_EVENT_TYPE = "rf_reception"
+_INCLUDE_RF_RECEPTIONS_TOKEN = "rf_receptions"
+
+
+def _include_rf_receptions(include) -> bool:
+    """Parse the ``?include=`` query param (comma-separated, unknown tokens
+    ignored) and report whether ``rf_receptions`` was requested."""
+    if not include:
+        return False
+    tokens = {tok.strip() for tok in str(include).split(",")}
+    return _INCLUDE_RF_RECEPTIONS_TOKEN in tokens
+
+
 async def _send_and_capture(coro):
     """Await ``coro`` with a fresh ``outbound_send_capture`` holder in scope.
 
@@ -574,12 +591,21 @@ class CompanionsV1:
     @cherrypy.expose
     @cherrypy.tools.json_out()
     @require_auth
-    def sync(self, companion_name=None, cursor=None, limit=None, **kwargs):
+    def sync(self, companion_name=None, cursor=None, limit=None, include=None, **kwargs):
         """Journal delta since ``cursor`` (design doc §7.5).
 
         One indexed range scan over idx_companion_events_sync, bounded by
         ``limit``. A cursor below the prune floor gets snapshot_required
         rather than a silently incomplete delta.
+
+        ``rf_reception`` events (§9, opt-in firehose) are excluded from the
+        returned ``events`` list unless ``?include=rf_receptions`` is given
+        (comma-separated, unknown tokens ignored). The filter is applied
+        after the storage query, so it never changes what the query itself
+        scans: ``next_cursor`` still reflects the last row scanned (matching
+        rows or not), and a client that later opts in simply re-reads those
+        rows from an older cursor — same semantics as any other cursor
+        re-read.
         """
         self._require_get()
         _bridge, companion_hash = self._resolve(companion_name)
@@ -613,6 +639,7 @@ class CompanionsV1:
             )
 
         rows = handler.companion_get_events(companion_hash, cursor_seq, limit_n)
+        want_rf_receptions = _include_rf_receptions(include)
         events = [
             {
                 "seq": row["seq"],
@@ -622,8 +649,13 @@ class CompanionsV1:
                 "data": row.get("payload", {}),
             }
             for row in rows
+            if want_rf_receptions or row["event_type"] != _RF_RECEPTION_EVENT_TYPE
         ]
-        last_seq = events[-1]["seq"] if events else cursor_seq
+        # Cursor tracks the last row the query scanned, not the last row
+        # returned to the client — a filtered-out rf_reception row still
+        # advances it, so a client that opts in later doesn't re-scan rows
+        # it already passed.
+        last_seq = rows[-1]["seq"] if rows else cursor_seq
         return self._success(
             {
                 "journal_epoch": epoch,
@@ -631,7 +663,7 @@ class CompanionsV1:
                 "next_cursor": str(last_seq),
                 # head was read before the page; if the page filled the limit
                 # but didn't reach head, more events are already waiting.
-                "has_more": len(events) == limit_n and last_seq < head,
+                "has_more": len(rows) == limit_n and last_seq < head,
                 "snapshot_required": False,
             }
         )
@@ -790,7 +822,7 @@ class CompanionsV1:
         return f"id: {seq}\nevent: {event_type}\ndata: {data}\n\n"
 
     @cherrypy.expose
-    def events(self, companion_name=None, cursor=None, **kwargs):
+    def events(self, companion_name=None, cursor=None, include=None, **kwargs):
         """GET /api/v1/companions/{name}/events — resumable SSE live stream.
 
         Connect with ``EventSource('.../events?token=JWT')``. Auth is the
@@ -812,9 +844,17 @@ class CompanionsV1:
         queue is consumed (``seq <= last_sent_seq``). Net effect: at most a
         few duplicate events around the handoff, never a gap — the same
         contract sync gives clients that re-poll from an old cursor.
+
+        ``rf_reception`` events (§9, opt-in firehose) are omitted from both
+        the backlog replay and the live tail unless ``?include=rf_receptions``
+        is given — same rule and token format as ``sync``. Skipped rows still
+        advance ``last_sent_seq`` internally (no gap if the client later
+        reconnects with ``include`` after seeing a later id), they are just
+        never framed onto the wire.
         """
         self._require_get()
         _bridge, companion_hash = self._resolve(companion_name)
+        want_rf_receptions = _include_rf_receptions(include)
         handler = self._get_sqlite_handler()
         journal = self._get_journal(companion_hash)
         if journal is None:
@@ -884,6 +924,11 @@ class CompanionsV1:
                         break
                     for row in rows:
                         last_sent_seq = row["seq"]
+                        if (
+                            not want_rf_receptions
+                            and row["event_type"] == _RF_RECEPTION_EVENT_TYPE
+                        ):
+                            continue
                         yield self._sse_frame(row)
                     if len(rows) < 500:
                         break
@@ -904,6 +949,11 @@ class CompanionsV1:
                     if event["seq"] <= last_sent_seq:
                         continue
                     last_sent_seq = event["seq"]
+                    if (
+                        not want_rf_receptions
+                        and event["event_type"] == _RF_RECEPTION_EVENT_TYPE
+                    ):
+                        continue
                     yield self._sse_frame(event)
             except GeneratorExit:
                 pass

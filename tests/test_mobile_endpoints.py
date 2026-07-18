@@ -263,6 +263,69 @@ class TestSync:
         assert cherrypy.serving.response.status == 304
 
 
+# --- Sync: rf_reception opt-in filtering (design doc §9) --------------------
+
+
+class TestSyncRfReceptionFiltering:
+    """rf_reception events (opt-in firehose) are excluded from sync's
+    ``events`` list unless ``?include=rf_receptions`` is given, but the
+    cursor still advances past filtered rows (design doc §9)."""
+
+    @staticmethod
+    def _seed_mixed(handler):
+        seqs = []
+        seqs.append(
+            handler.companion_append_event(_HASH, "message", {"n": 0}, packet_hash="ph-0")
+        )
+        seqs.append(
+            handler.companion_append_event(
+                _HASH, "rf_reception", {"n": 1}, packet_hash="ph-1"
+            )
+        )
+        seqs.append(
+            handler.companion_append_event(_HASH, "message", {"n": 2}, packet_hash="ph-2")
+        )
+        return seqs
+
+    def test_excluded_by_default(self, endpoints, handler):
+        seqs = self._seed_mixed(handler)
+        data = _call(endpoints.sync, companion_name=_NAME, cursor="0")["data"]
+        assert [e["type"] for e in data["events"]] == ["message", "message"]
+        # Cursor still advances past the filtered-out rf_reception row.
+        assert data["next_cursor"] == str(seqs[-1])
+
+    def test_included_with_include_param(self, endpoints, handler):
+        seqs = self._seed_mixed(handler)
+        data = _call(
+            endpoints.sync, companion_name=_NAME, cursor="0", include="rf_receptions"
+        )["data"]
+        assert [e["type"] for e in data["events"]] == ["message", "rf_reception", "message"]
+        assert data["next_cursor"] == str(seqs[-1])
+
+    def test_unknown_include_tokens_ignored(self, endpoints, handler):
+        self._seed_mixed(handler)
+        data = _call(
+            endpoints.sync, companion_name=_NAME, cursor="0", include="bogus,other"
+        )["data"]
+        assert [e["type"] for e in data["events"]] == ["message", "message"]
+
+    def test_include_with_multiple_tokens_still_matches(self, endpoints, handler):
+        self._seed_mixed(handler)
+        data = _call(
+            endpoints.sync, companion_name=_NAME, cursor="0", include="foo,rf_receptions"
+        )["data"]
+        assert [e["type"] for e in data["events"]] == ["message", "rf_reception", "message"]
+
+    def test_has_more_unaffected_by_filtering(self, endpoints, handler):
+        # 3 rows in the page (limit=3), all scanned regardless of filtering;
+        # has_more reflects the unfiltered row count against the limit.
+        self._seed_mixed(handler)
+        data = _call(
+            endpoints.sync, companion_name=_NAME, cursor="0", limit="3"
+        )["data"]
+        assert data["has_more"] is False
+
+
 # --- Messages ----------------------------------------------------------------
 
 

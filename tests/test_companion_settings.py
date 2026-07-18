@@ -153,6 +153,22 @@ class TestMergeCompanionSettingsUpdate:
             merge_companion_settings_update({}, {"max_channels": 64})
 
 
+class TestRfReceptionEventsSetting:
+    """Design doc §9 write gate: default off, per-companion opt-in."""
+
+    def test_allowlist_includes_the_key(self):
+        assert "rf_reception_events" in COMPANION_SETTINGS_ALLOWLIST
+
+    def test_accepted_by_settings_merge(self):
+        merged = merge_companion_settings_update({}, {"rf_reception_events": True})
+        assert merged == {"rf_reception_events": True}
+
+    def test_default_is_false_when_absent(self):
+        # Same lookup pattern main.py uses at both wiring sites.
+        settings = {}
+        assert bool(settings.get("rf_reception_events")) is False
+
+
 class TestValidateCompanionConfigCapacity:
     def test_uses_merged_settings_not_stale_identity(self):
         identity = {

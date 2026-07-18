@@ -114,6 +114,11 @@ class RepeaterDaemon:
         # companion's journal without scanning companion_frame_servers.
         self.correlation_tracker = None
         self.companion_journals: dict[str, object] = {}
+        # Opt-in RF-reception firehose (design doc §9 "Correlated vs.
+        # uncorrelated receptions"): only companions with
+        # settings.rf_reception_events=true get an entry here, so the common
+        # case (nobody opted in) costs one empty-dict lookup per duplicate.
+        self._rf_reception_journals: dict[str, object] = {}
         # Parsed once during the startup preflight; the identity loaders reuse
         # them so config parsing (and its warnings) does not run twice.
         self._room_server_specs: list[IdentitySpec] | None = None
@@ -791,6 +796,8 @@ class RepeaterDaemon:
                 )
                 if journal is not None:
                     self.companion_journals[companion_hash_str] = journal
+                    if bool(settings.get("rf_reception_events")):
+                        self._rf_reception_journals[companion_hash_str] = journal
 
                 _sync_node_name_to_config = _make_sync_node_name_to_config(name)
 
@@ -1054,6 +1061,8 @@ class RepeaterDaemon:
         )
         if journal is not None:
             self.companion_journals[companion_hash_str] = journal
+            if bool(settings.get("rf_reception_events")):
+                self._rf_reception_journals[companion_hash_str] = journal
 
         def _on_companion_prefs_saved(new_node_name: str, _journal=journal) -> None:
             """Journal the prefs change (no config-name sync in hot-reload path)."""
@@ -1178,36 +1187,52 @@ class RepeaterDaemon:
         ``packets`` retention pruning. RepeaterHandler already wraps this
         call in try/except, but errors are caught here too so one bad hit
         (e.g. a journal write failure) never drops the others in the list.
+
+        After the correlation-hit handling above, also journals an opt-in
+        ``rf_reception`` event (design doc §9 "Correlated vs. uncorrelated
+        receptions") to every companion that has enabled
+        ``rf_reception_events`` in its settings, for this same genuine OTA
+        duplicate — regardless of whether it correlated to anything. The
+        common case (no companion opted in) costs one falsy dict check.
         """
-        if self.correlation_tracker is None:
-            return
-        hits = self.correlation_tracker.observe_duplicate(packet_record)
-        if not hits:
-            return
-        sqlite_handler = None
-        if self.repeater_handler and self.repeater_handler.storage:
-            sqlite_handler = self.repeater_handler.storage.sqlite_handler
-        for hit in hits:
-            journal = self.companion_journals.get(hit["companion_hash"])
-            if journal is None:
-                continue
-            try:
-                if hit["direction"] == "in":
-                    journal.record_message_reception(hit)
-                    message_id = hit.get("message_id")
-                    if sqlite_handler is not None and message_id is not None:
-                        sqlite_handler.companion_update_message_observations(
-                            message_id,
-                            hit["observation_count"],
-                            hit["unique_path_count"],
+        if self.correlation_tracker is not None:
+            hits = self.correlation_tracker.observe_duplicate(packet_record)
+            if hits:
+                sqlite_handler = None
+                if self.repeater_handler and self.repeater_handler.storage:
+                    sqlite_handler = self.repeater_handler.storage.sqlite_handler
+                for hit in hits:
+                    journal = self.companion_journals.get(hit["companion_hash"])
+                    if journal is None:
+                        continue
+                    try:
+                        if hit["direction"] == "in":
+                            journal.record_message_reception(hit)
+                            message_id = hit.get("message_id")
+                            if sqlite_handler is not None and message_id is not None:
+                                sqlite_handler.companion_update_message_observations(
+                                    message_id,
+                                    hit["observation_count"],
+                                    hit["unique_path_count"],
+                                )
+                        else:
+                            journal.record_send_state(hit)
+                    except Exception:
+                        logger.exception(
+                            "Companion correlation hit failed for companion=%s packet_hash=%s",
+                            hit.get("companion_hash"),
+                            hit.get("packet_hash"),
                         )
-                else:
-                    journal.record_send_state(hit)
+
+        if not self._rf_reception_journals:
+            return
+        for journal in self._rf_reception_journals.values():
+            try:
+                journal.record_rf_reception(packet_record)
             except Exception:
                 logger.exception(
-                    "Companion correlation hit failed for companion=%s packet_hash=%s",
-                    hit.get("companion_hash"),
-                    hit.get("packet_hash"),
+                    "rf_reception journal write failed for packet_hash=%s",
+                    packet_record.get("packet_hash"),
                 )
 
     def _register_duplicate_logging_hook(self, dedupe_enabled: bool) -> None:

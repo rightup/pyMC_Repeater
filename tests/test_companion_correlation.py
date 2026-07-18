@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import cherrypy
@@ -27,6 +28,7 @@ from repeater.companion.correlation import CompanionCorrelationTracker, outbound
 from repeater.companion.frame_server import CompanionFrameServer
 from repeater.companion.journal import CompanionEventJournal
 from repeater.data_acquisition.sqlite_handler import SQLiteHandler
+from repeater.main import RepeaterDaemon
 from tests.test_engine import _inject_from_wire, _make_config, _make_dispatcher
 
 _HASH = "0x01"
@@ -234,6 +236,42 @@ class TestJournalMessageReception:
         }
 
 
+class TestJournalRfReception:
+    def test_record_rf_reception_shapes_event(self, tmp_path):
+        handler = _handler(tmp_path)
+        journal = CompanionEventJournal(handler, _HASH)
+
+        record = _record(
+            packet_hash="AABBCCDD11223344",
+            original_path=["11", "22"],
+            rssi=-88,
+            snr=1.5,
+            ts=999.0,
+        )
+        seq = journal.record_rf_reception(record)
+        assert seq is not None
+
+        events = handler.companion_get_events(_HASH, 0)
+        assert len(events) == 1
+        assert events[0]["event_type"] == "rf_reception"
+        assert events[0]["packet_hash"] == "AABBCCDD11223344"
+        assert events[0]["payload"] == {
+            "packet_hash": "AABBCCDD11223344",
+            "rssi": -88,
+            "snr": 1.5,
+            "path": ["11", "22"],
+            "observed_at": 999.0,
+        }
+
+    def test_missing_path_defaults_to_empty_list(self, tmp_path):
+        handler = _handler(tmp_path)
+        journal = CompanionEventJournal(handler, _HASH)
+        record = _record(packet_hash="1122334455667788", original_path=None)
+        journal.record_rf_reception(record)
+        events = handler.companion_get_events(_HASH, 0)
+        assert events[0]["payload"]["path"] == []
+
+
 class TestJournalSendState:
     def test_record_send_state_shapes_event(self, tmp_path):
         handler = _handler(tmp_path)
@@ -398,6 +436,84 @@ class TestEngineDuplicateObserverHook:
         handler = _make_handler_with_observer(None)
         pkt = _make_pkt(payload=b"\x10\x20\x30", path=b"\x11")
         handler.record_duplicate(pkt, rssi=-90, snr=1.5)  # must not raise
+
+
+# ===================================================================
+# rf_reception opt-in write gate (main.py: _companion_duplicate_observer)
+# ===================================================================
+
+
+def _daemon_with_observer_state(tmp_path, rf_reception_hashes=()):
+    """Build a RepeaterDaemon with just enough state wired for
+    ``_companion_duplicate_observer`` to run standalone: a real tracker + a
+    real journal per companion, matching how main.py wires them at boot/hot-
+    reload. ``rf_reception_hashes`` names which companion_hash(es) have
+    opted in (design doc §9 write gate, settings.rf_reception_events)."""
+    daemon = RepeaterDaemon({"repeater": {"node_name": "n"}, "logging": {}}, radio=object())
+    sqlite_handler = SQLiteHandler(tmp_path)
+    daemon.repeater_handler = SimpleNamespace(
+        storage=SimpleNamespace(sqlite_handler=sqlite_handler)
+    )
+    daemon.correlation_tracker = CompanionCorrelationTracker(ttl_seconds=300)
+    journal = CompanionEventJournal(sqlite_handler, _HASH)
+    daemon.companion_journals[_HASH] = journal
+    if _HASH in rf_reception_hashes:
+        daemon._rf_reception_journals[_HASH] = journal
+    return daemon, sqlite_handler, journal
+
+
+class TestRfReceptionWriteGate:
+    def test_flag_off_by_default_no_rf_reception_journaled(self, tmp_path):
+        daemon, sqlite_handler, journal = _daemon_with_observer_state(tmp_path)
+        # Uncorrelated duplicate: no tracker registration at all.
+        daemon._companion_duplicate_observer(_record(packet_hash="1111111111111111"))
+        events = sqlite_handler.companion_get_events(_HASH, 0)
+        assert events == []
+
+    def test_flag_off_correlation_hits_still_work(self, tmp_path):
+        daemon, sqlite_handler, journal = _daemon_with_observer_state(tmp_path)
+        h = "2222222222222222"
+        daemon.correlation_tracker.register_inbound(h, _HASH, message_id=9)
+
+        daemon._companion_duplicate_observer(_record(packet_hash=h, original_path=["11"]))
+
+        events = sqlite_handler.companion_get_events(_HASH, 0)
+        assert [e["event_type"] for e in events] == ["message_reception"]
+
+    def test_flag_on_uncorrelated_duplicate_journals_rf_reception(self, tmp_path):
+        daemon, sqlite_handler, journal = _daemon_with_observer_state(
+            tmp_path, rf_reception_hashes=(_HASH,)
+        )
+        record = _record(packet_hash="3333333333333333", original_path=["aa", "bb"], rssi=-77)
+
+        daemon._companion_duplicate_observer(record)
+
+        events = sqlite_handler.companion_get_events(_HASH, 0)
+        assert [e["event_type"] for e in events] == ["rf_reception"]
+        assert events[0]["payload"]["packet_hash"] == "3333333333333333"
+        assert events[0]["payload"]["rssi"] == -77
+        assert events[0]["payload"]["path"] == ["aa", "bb"]
+
+    def test_flag_on_correlated_duplicate_journals_both_events(self, tmp_path):
+        daemon, sqlite_handler, journal = _daemon_with_observer_state(
+            tmp_path, rf_reception_hashes=(_HASH,)
+        )
+        h = "4444444444444444"
+        daemon.correlation_tracker.register_inbound(h, _HASH, message_id=3)
+
+        daemon._companion_duplicate_observer(_record(packet_hash=h, original_path=["cc"]))
+
+        events = sqlite_handler.companion_get_events(_HASH, 0)
+        event_types = {e["event_type"] for e in events}
+        assert event_types == {"message_reception", "rf_reception"}
+
+    def test_no_companions_opted_in_is_a_cheap_noop(self, tmp_path):
+        daemon, sqlite_handler, journal = _daemon_with_observer_state(tmp_path)
+        assert daemon._rf_reception_journals == {}
+        # Should not raise and should not journal anything for an
+        # uncorrelated duplicate.
+        daemon._companion_duplicate_observer(_record(packet_hash="5555555555555555"))
+        assert sqlite_handler.companion_get_events(_HASH, 0) == []
 
 
 # ===================================================================

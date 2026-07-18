@@ -13,7 +13,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 import repeater.main as main_module
-from repeater.companion.utils import CompanionStateLoadError
+from repeater.companion.utils import CompanionStateLoadError, companion_hash_str_from_identity_key
 from repeater.identity_manager import IdentityManager
 from repeater.main import RepeaterDaemon, _load_companion_rows_verified
 
@@ -200,3 +200,115 @@ class TestCompanionInitSurfacesLoadFailure:
                 await daemon.add_companion_from_config(comp_config)
         server_cls.assert_not_called()
         assert daemon.companion_bridges == {}
+
+
+class TestRfReceptionEventsSettingWiring:
+    """Design doc §9 write gate: settings.rf_reception_events is read at both
+    the boot path (_load_companion_identities) and hot-reload path
+    (add_companion_from_config), populating daemon._rf_reception_journals
+    only for opted-in companions."""
+
+    @staticmethod
+    def _empty_sqlite():
+        sqlite = MagicMock()
+        sqlite.companion_count_contacts.return_value = 0
+        sqlite.companion_load_contacts.return_value = []
+        sqlite.companion_count_channels.return_value = 0
+        sqlite.companion_load_channels.return_value = []
+        sqlite.companion_count_messages.return_value = 0
+        sqlite.companion_load_messages.return_value = []
+        return sqlite
+
+    @staticmethod
+    def _daemon_with_companion(sqlite, settings):
+        config = {
+            "repeater": {"node_name": "n"},
+            "logging": {},
+            "identities": {
+                "companions": [
+                    {"name": _NAME, "identity_key": "33" * 32, "settings": settings}
+                ]
+            },
+        }
+        daemon = RepeaterDaemon(config, radio=object())
+        daemon.identity_manager = IdentityManager({})
+        daemon.router = SimpleNamespace(inject_packet=AsyncMock())
+        daemon.repeater_handler = SimpleNamespace(
+            storage=SimpleNamespace(sqlite_handler=sqlite), radio_config={}
+        )
+        return daemon
+
+    @pytest.mark.asyncio
+    async def test_boot_path_default_off_not_registered(self):
+        sqlite = self._empty_sqlite()
+        daemon = self._daemon_with_companion(sqlite, settings={})
+        with (
+            patch("repeater.companion.RepeaterCompanionBridge") as bridge_cls,
+            patch("repeater.companion.CompanionFrameServer") as server_cls,
+        ):
+            bridge_cls.return_value.message_queue.max_size = 100
+            server_cls.return_value.start = AsyncMock()
+            await daemon._load_companion_identities()
+
+        companion_hash_str = companion_hash_str_from_identity_key("33" * 32)
+        assert companion_hash_str in daemon.companion_journals
+        assert companion_hash_str not in daemon._rf_reception_journals
+
+    @pytest.mark.asyncio
+    async def test_boot_path_explicit_true_registers(self):
+        sqlite = self._empty_sqlite()
+        daemon = self._daemon_with_companion(sqlite, settings={"rf_reception_events": True})
+        with (
+            patch("repeater.companion.RepeaterCompanionBridge") as bridge_cls,
+            patch("repeater.companion.CompanionFrameServer") as server_cls,
+        ):
+            bridge_cls.return_value.message_queue.max_size = 100
+            server_cls.return_value.start = AsyncMock()
+            await daemon._load_companion_identities()
+
+        companion_hash_str = companion_hash_str_from_identity_key("33" * 32)
+        assert companion_hash_str in daemon.companion_journals
+        assert companion_hash_str in daemon._rf_reception_journals
+        assert (
+            daemon._rf_reception_journals[companion_hash_str]
+            is daemon.companion_journals[companion_hash_str]
+        )
+
+    @pytest.mark.asyncio
+    async def test_hot_reload_path_explicit_true_registers(self):
+        sqlite = self._empty_sqlite()
+        daemon = self._daemon_with_companion(sqlite, settings={})  # no boot-time companions used
+        daemon.identity_manager = IdentityManager({})
+        comp_config = {
+            "name": "hot-rf",
+            "identity_key": "44" * 32,
+            "settings": {"rf_reception_events": True},
+        }
+        with (
+            patch("repeater.companion.RepeaterCompanionBridge") as bridge_cls,
+            patch("repeater.companion.CompanionFrameServer") as server_cls,
+        ):
+            bridge_cls.return_value.message_queue.max_size = 100
+            server_cls.return_value.start = AsyncMock()
+            await daemon.add_companion_from_config(comp_config)
+
+        companion_hash_str = companion_hash_str_from_identity_key("44" * 32)
+        assert companion_hash_str in daemon._rf_reception_journals
+
+    @pytest.mark.asyncio
+    async def test_hot_reload_path_default_off_not_registered(self):
+        sqlite = self._empty_sqlite()
+        daemon = self._daemon_with_companion(sqlite, settings={})
+        daemon.identity_manager = IdentityManager({})
+        comp_config = {"name": "hot-off", "identity_key": "55" * 32, "settings": {}}
+        with (
+            patch("repeater.companion.RepeaterCompanionBridge") as bridge_cls,
+            patch("repeater.companion.CompanionFrameServer") as server_cls,
+        ):
+            bridge_cls.return_value.message_queue.max_size = 100
+            server_cls.return_value.start = AsyncMock()
+            await daemon.add_companion_from_config(comp_config)
+
+        companion_hash_str = companion_hash_str_from_identity_key("55" * 32)
+        assert companion_hash_str in daemon.companion_journals
+        assert companion_hash_str not in daemon._rf_reception_journals
