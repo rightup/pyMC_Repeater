@@ -479,16 +479,40 @@ registers today, plus message persistence):
 | `message_reception` | another RF copy of a known inbound companion message is heard (different or repeated path) | `message_id`, `packet_hash`, `path` (raw hashes + resolution, §10.5), `rssi`, `snr`, `observed_at`, running `observation_count` / `unique_path_count` |
 | `message_send_state` | outbound send progresses: transmitted, heard repeated by a neighbor, ack confirmed, or failed | `message_id`, `state: sent|heard_repeated|confirmed|failed`, and for `heard_repeated`: the repeat's `path`, terminal repeater hash (+resolution), `rssi`, `snr`, running `heard_repeat_count` / `unique_repeater_count` |
 | `contact` | contact added/updated (advert received, path update, import) | full contact object + `change: new|advert|path|removed` |
-| `channel` | channel added/renamed/removed | channel object |
-| `login_result` | room/repeater login completes | contact pubkey, success, permissions |
-| `status_response` | remote status arrives | contact pubkey + parsed status |
-| `telemetry_response` | remote telemetry arrives (Cayenne LPP, decoded) | contact pubkey + decoded sensor values |
+| `channel` | channel added/renamed/removed | `index`, `name`, `change: update\|remove` — **never the PSK secret** (it would reach every synced device and persist in the journal table; §11.4) |
+| ~~`login_result`~~ | *(NOT IMPLEMENTED — see note below)* | contact pubkey, success, permissions |
+| ~~`status_response`~~ | *(NOT IMPLEMENTED — see note below)* | contact pubkey + parsed status |
+| ~~`telemetry_response`~~ | *(NOT IMPLEMENTED — see note below)* | contact pubkey + decoded sensor values |
 | `prefs` | node prefs changed (any surface: API, frame client, web UI) | changed fields |
 | `rf_reception` | *(flagged, default off)* any packet heard again, regardless of companion relevance | `packet_hash`, `rssi`, `snr`, `path` |
 
 Unknown-type tolerance is mandatory: clients must skip event types they don't
 recognize (log + advance cursor), so the server can add types without a
 version bump.
+
+**Implementation status (audited 2026-07-18).** The journal emits exactly
+`message`, `message_reception`, `message_send_state`, `contact`, `channel`,
+`prefs`, `rf_reception`. The three struck-through rows above were specified
+here but never implemented, and a client waiting on them would wait forever:
+
+- `login_result`, `status_response`, `telemetry_response` — not emitted,
+  because the corresponding REST actions
+  (`POST .../contacts/{pubkey}/login`, `/status_request`,
+  `/telemetry_request`) are **synchronous**: they block on the bridge call
+  with a 15s timeout and return the result inline, rather than acknowledging
+  and reporting later. That is simpler and adequate for a nearby contact, but
+  a multi-hop round trip can exceed 15s, and when it does the caller gets a
+  timeout and the response is **dropped** — where a frame client would still
+  receive `PUSH_CODE_STATUS_RESPONSE` whenever it arrived. If that proves to
+  matter, the fix is to implement these three events and have the actions
+  return `202 Accepted`.
+
+`channel` was likewise documented-but-absent (the emit site was marked
+"deferred to phase 2" in `frame_server._save_channels` and never picked up);
+it is now implemented, emitted from `_cmd_set_channel` on a real change.
+
+See [companion-frame-vs-rest.md](companion-frame-vs-rest.md) for a full
+inventory of frame-protocol features against this API.
 
 **Correlated vs. uncorrelated receptions.** `message_reception` and the
 `heard_repeated` send state are **on by default**: they are bounded by the

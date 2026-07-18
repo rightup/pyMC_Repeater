@@ -66,6 +66,31 @@ tags:
       `/api/companion/*` surface used by the web UI (`companion_endpoints.py`),
       which remains unchanged and unversioned.
 
+      **Not a mirror of the TCP frame protocol.** The two surfaces differ in
+      coverage *and* trust level: the frame protocol (port 15050) hands out
+      channel PSK secrets and can export the node's private key; this one
+      deliberately exposes neither. Most omissions are intentional. See
+      `docs/architecture/companion-frame-vs-rest.md` for the full inventory.
+
+      Gaps a client should know about before designing around them:
+
+      - **Contacts are read-only here.** There is no add, remove, or import;
+        `snapshot.contacts` and the `contact` journal event are the only
+        contact surface. Contacts do appear automatically via advert auto-add
+        (gated by `autoadd_config` / `autoadd_max_hops`, neither of which is
+        settable here), so this bites for contacts auto-add filtered out and
+        for deleting one.
+      - **Channels cannot be joined here.** `snapshot.channels` returns
+        `{index, name}` only — the PSK is withheld by design (§11.4) — and
+        there is no channel-set endpoint, so a client can only use channels
+        already configured on the repeater.
+      - **Node prefs are observable but not settable.** The `prefs` journal
+        event reports changes from any surface; no v1 endpoint causes one.
+      - **Radio/tuning configuration, key export/import, signing and raw
+        packet transmission are absent on purpose** and should stay that way:
+        a device token is network-reachable, and these would turn a leaked one
+        into an identity compromise or an arbitrary-transmit primitive.
+
       **Envelope:** every JSON response is either
       `{"success": true, "data": {…}}` or (any error status) `{"success":
       false, "error": "…", "status": <code>}`.
@@ -5517,6 +5542,17 @@ paths:
         Mirrors the legacy `/api/companion/login` bridge call. No
         idempotency requirement (only message sends transmit a duplicable
         payload, design doc §6). 15s bridge timeout.
+
+        **Synchronous by design.** This blocks on the mesh round trip and
+        returns the result inline, rather than acknowledging and reporting the
+        outcome later via the journal. A multi-hop round trip can exceed the
+        timeout, and when it does the caller gets a timeout error and the
+        response is **dropped** — the frame protocol would still deliver its
+        `PUSH_CODE_*_RESPONSE` whenever it arrived. The design doc §9 lists
+        `login_result` / `status_response` / `telemetry_response` journal
+        events that would fix this; they are **not implemented**. Clients
+        should treat a timeout as "unknown", not "failed".
+
       security:
         - BearerAuth: []
         - ApiKeyAuth: []
@@ -5601,6 +5637,12 @@ paths:
       description: |
         Mirrors the legacy `/api/companion/request_status` bridge call.
         Empty body. Bridge timeout 15s (handler waits up to 20s total).
+
+        Synchronous like `/login`: it blocks on the mesh round trip and
+        returns inline, so a timeout means "unknown", not "failed". See the
+        `/login` description and design doc §9 for the unimplemented
+        journal-event alternative.
+
       security:
         - BearerAuth: []
         - ApiKeyAuth: []
@@ -5668,6 +5710,12 @@ paths:
         Mirrors the legacy `/api/companion/request_telemetry` bridge call,
         always requesting base + location + environment. Empty body. Bridge
         timeout 20s (handler waits up to 25s total).
+
+        Synchronous like `/login`: it blocks on the mesh round trip and
+        returns inline, so a timeout means "unknown", not "failed". See the
+        `/login` description and design doc §9 for the unimplemented
+        journal-event alternative.
+
       security:
         - BearerAuth: []
         - ApiKeyAuth: []
@@ -6956,8 +7004,17 @@ components:
         - `message` — a persisted inbound/outbound message (`data` mirrors a
           `companion_messages` row).
         - `contact` — a contact upsert.
-        - `channel` — a channel-list change.
-        - `prefs` — a bridge-preferences change.
+        - `channel` — a channel slot was added, renamed or cleared:
+          `{index, name, change: "update"|"remove"}`. `name` is `null` when
+          `change` is `"remove"`. The PSK secret is **never** included —
+          the snapshot withholds it (§11.4) and a secret journaled here would
+          reach every synced device *and* persist in the journal table.
+          Emitted on a real change only: a rejected or no-op `SET_CHANNEL`
+          produces nothing, and the bulk save at shutdown is not journaled
+          (it would replay the whole table on every restart).
+        - `prefs` — a bridge-preferences change. Note prefs are **observable
+          but not settable** over `/api/v1`: the event reports changes made on
+          any surface, but no v1 endpoint causes one.
         - `message_reception` — another RF copy of a known inbound message
           (§10.4): `{message_id, packet_hash, path[], rssi, snr, observed_at,
           observation_count, unique_path_count}`.
