@@ -62,6 +62,12 @@ channels (`Public`, `#seattle`, `#weather`, …), another reported 2. The
 simulator ships a small representative table rather than a single hardcoded
 channel, so indexing is exercised the same way.
 
+**Channel indices are per-companion, not global.** On the dev deployment
+`#howltest` is index 1 on SecondCompanion and index 17 on Howl — the same
+channel, different slots. Confirmed over the air: a message sent to index 1
+from one companion arrived at index 17 on the other. Never cache a channel
+index across companions, and always resolve by name.
+
 ## Library use
 
 ```python
@@ -102,6 +108,37 @@ goes out immediately and only the burst behind it is coalesced. The handoff
 describes it as a "trailing-edge debounce (30s collapse)", which undersells it:
 first-message push latency is ~0, not up to 30 seconds.
 
+## Verified over real RF
+
+Transmitted from SecondCompanion to `#howltest` on the live dev repeater
+(910.525 MHz, 22 dBm) and observed on Howl:
+
+```
+>>> TRANSMITTING to #howltest (idx 1): 'openhop companion client test'
+    accepted by frame server (+3.98s)
+  RECEIVED: 'SecondCompanion: openhop companion client test' channel=17 snr=0.0
+```
+
+Real mesh traffic arrived on the same listener, which exercised the genuine
+inbound path — `PUSH_CODE_MSG_WAITING` (0x83) → auto-sync drain → parsed V3
+frames with real SNR:
+
+```
+  RECEIVED: 'WSHV510-1: Good morning everyone' channel=0  snr=1.25
+  RECEIVED: 'Meatball: Wx 98274'               channel=10 snr=-1.5
+```
+
+Two things this surfaced that the simulator could not:
+
+- **Send acceptance is not instant.** `send_channel_message` took ~4s to be
+  acknowledged on a live radio (airtime plus queueing at sf7). The default
+  10s `response_timeout` is adequate but not generous; a slower spreading
+  factor could push against it.
+- **The sender name is inside the message text**, not a separate field:
+  channel messages arrive as `"SenderName: body"`. A chat UI wanting a
+  distinct author line has to split on the first `": "`, and should tolerate
+  a body that itself contains one.
+
 ## Limits
 
 - The bridge is a double; there is no radio. Outbound sends are recorded, not
@@ -111,6 +148,9 @@ first-message push latency is ~0, not up to 30 seconds.
   real.
 - DM (`send_direct_message`) is implemented against the wire format but is not
   covered end-to-end, because the double has no contact store.
+- The push chain has not been exercised on the live instance — that would mean
+  registering a push device in the live database, which is a real mutation of a
+  running deployment. It is covered in the simulator instead.
 - `aiohttp` is needed only for the web UI, not for the library or the tests.
 
 ## Live mode and RF
