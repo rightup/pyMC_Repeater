@@ -397,3 +397,97 @@ def test_row_written_directly_with_null_scope_verifies_as_admin(tmp_path):
     verified = h.verify_api_token("hash-premigration")
     assert verified is not None
     assert verified["scope"] == "admin"
+
+
+# --- Push registration (phase 4, migration 17) ---------------------------
+
+_PUSH_MIGRATION = "add_companion_device_push_detail"
+
+
+def _device_with_token(h, device_id="push-dev", token_hash="hash-push"):
+    token_id = h.create_api_token("t", token_hash)
+    h.companion_device_create(_HASH, device_id, "Phone", token_id, platform="ios")
+    return device_id
+
+
+def test_push_detail_migration_applies_once(tmp_path):
+    h = _handler(tmp_path)
+    conn = sqlite3.connect(str(h.sqlite_path))
+    applied = conn.execute(
+        "SELECT COUNT(*) FROM migrations WHERE migration_name = ?", (_PUSH_MIGRATION,)
+    ).fetchone()[0]
+    assert applied == 1
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(companion_devices)")}
+    assert "push_detail" in cols
+
+
+def test_push_detail_defaults_to_none(tmp_path):
+    h = _handler(tmp_path)
+    device_id = _device_with_token(h)
+    assert h.companion_device_get(device_id)["push_detail"] == "none"
+
+
+def test_set_push_registers_token_relay_and_detail(tmp_path):
+    h = _handler(tmp_path)
+    device_id = _device_with_token(h)
+    ok = h.companion_device_set_push(
+        device_id, "apns-token-abc", push_relay_url="https://relay.example/notify",
+        push_detail="preview",
+    )
+    assert ok is True
+    device = h.companion_device_get(device_id)
+    assert device["push_token"] == "apns-token-abc"
+    assert device["push_relay_url"] == "https://relay.example/notify"
+    assert device["push_detail"] == "preview"
+
+
+def test_set_push_token_refresh_leaves_relay_and_detail(tmp_path):
+    h = _handler(tmp_path)
+    device_id = _device_with_token(h)
+    h.companion_device_set_push(
+        device_id, "tok-1", push_relay_url="https://relay.example/notify",
+        push_detail="count",
+    )
+    # Refresh only the token; omit relay/detail.
+    h.companion_device_set_push(device_id, "tok-2")
+    device = h.companion_device_get(device_id)
+    assert device["push_token"] == "tok-2"
+    assert device["push_relay_url"] == "https://relay.example/notify"
+    assert device["push_detail"] == "count"
+
+
+def test_clear_push_nulls_token_but_keeps_relay(tmp_path):
+    h = _handler(tmp_path)
+    device_id = _device_with_token(h)
+    h.companion_device_set_push(
+        device_id, "tok", push_relay_url="https://relay.example/notify",
+        push_detail="count",
+    )
+    assert h.companion_device_clear_push(device_id) is True
+    device = h.companion_device_get(device_id)
+    assert device["push_token"] is None
+    assert device["push_relay_url"] == "https://relay.example/notify"
+    assert device["push_detail"] == "count"
+
+
+def test_devices_with_push_only_returns_registered(tmp_path):
+    h = _handler(tmp_path)
+    with_push = _device_with_token(h, "dev-push", "hash-a")
+    _device_with_token(h, "dev-nopush", "hash-b")  # never registers a token
+    h.companion_device_set_push(with_push, "tok", push_relay_url="https://r.example")
+
+    rows = h.companion_devices_with_push(_HASH)
+    assert [d["device_id"] for d in rows] == [with_push]
+
+
+def test_devices_with_push_scoped_to_companion(tmp_path):
+    h = _handler(tmp_path)
+    device_id = _device_with_token(h, "dev-other-companion", "hash-c")
+    h.companion_device_set_push(device_id, "tok", push_relay_url="https://r.example")
+    # A different companion hash sees nothing.
+    assert h.companion_devices_with_push("0x99") == []
+
+
+def test_set_push_missing_device_returns_false(tmp_path):
+    h = _handler(tmp_path)
+    assert h.companion_device_set_push("no-such-device", "tok") is False

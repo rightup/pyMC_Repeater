@@ -888,6 +888,31 @@ class SQLiteHandler:
                     )
                     logger.info(f"Migration '{migration_name}' applied successfully")
 
+                # Migration 17: per-device push notification detail level
+                # (design doc §12.2). 'none' = payload-free wake (the default,
+                # keeps the relay low-trust); 'count' = badge hint; 'preview'
+                # = alert text (opt-in, sends content through the relay).
+                migration_name = "add_companion_device_push_detail"
+                existing = conn.execute(
+                    "SELECT migration_name FROM migrations WHERE migration_name = ?",
+                    (migration_name,),
+                ).fetchone()
+                if not existing:
+                    cursor = conn.execute("PRAGMA table_info(companion_devices)")
+                    columns = [column[1] for column in cursor.fetchall()]
+                    if "push_detail" not in columns:
+                        conn.execute(
+                            "ALTER TABLE companion_devices "
+                            "ADD COLUMN push_detail TEXT NOT NULL DEFAULT 'none'"
+                        )
+                        logger.info("Added push_detail column to companion_devices table")
+
+                    conn.execute(
+                        "INSERT INTO migrations (migration_name, applied_at) VALUES (?, ?)",
+                        (migration_name, time.time()),
+                    )
+                    logger.info(f"Migration '{migration_name}' applied successfully")
+
                 conn.commit()
 
         except Exception as e:
@@ -4576,6 +4601,9 @@ class SQLiteHandler:
             "platform": row["platform"],
             "push_token": row["push_token"],
             "push_relay_url": row["push_relay_url"],
+            "push_detail": (
+                row["push_detail"] if "push_detail" in row.keys() else "none"
+            ),
             "created_at": row["created_at"],
             "last_seen": row["last_seen"],
             "last_synced_seq": row["last_synced_seq"],
@@ -4680,3 +4708,81 @@ class SQLiteHandler:
         except Exception as e:
             logger.error(f"Failed to delete companion device {device_id}: {e}")
             return False
+
+    def companion_device_set_push(
+        self,
+        device_id: str,
+        push_token: str,
+        push_relay_url: Optional[str] = None,
+        push_detail: Optional[str] = None,
+    ) -> bool:
+        """Register/update a device's push credentials (design doc §12.2).
+
+        ``push_token`` and ``push_relay_url`` are what the notifier needs to
+        reach the client's relay; ``push_detail`` (``none``/``count``/
+        ``preview``) is the per-device content level. ``push_relay_url`` and
+        ``push_detail`` are only written when provided, so a token-refresh
+        call that omits them leaves the existing relay/detail untouched.
+        """
+        try:
+            updates = ["push_token = ?"]
+            params: List[Any] = [push_token]
+            if push_relay_url is not None:
+                updates.append("push_relay_url = ?")
+                params.append(push_relay_url)
+            if push_detail is not None:
+                updates.append("push_detail = ?")
+                params.append(push_detail)
+            params.append(device_id)
+            with self._connect() as conn:
+                cursor = conn.execute(
+                    f"UPDATE companion_devices SET {', '.join(updates)} WHERE device_id = ?",
+                    params,
+                )
+                conn.commit()
+                return cursor.rowcount > 0
+        except Exception as e:
+            logger.error(f"Failed to set push for companion device {device_id}: {e}")
+            return False
+
+    def companion_device_clear_push(self, device_id: str) -> bool:
+        """Clear a device's push_token (unregister push; design doc §12.2).
+
+        Leaves push_relay_url/push_detail in place so a later re-register only
+        needs to supply the new token. The notifier skips any device whose
+        push_token is NULL, so clearing the token is a complete opt-out.
+        """
+        try:
+            with self._connect() as conn:
+                cursor = conn.execute(
+                    "UPDATE companion_devices SET push_token = NULL WHERE device_id = ?",
+                    (device_id,),
+                )
+                conn.commit()
+                return cursor.rowcount > 0
+        except Exception as e:
+            logger.error(f"Failed to clear push for companion device {device_id}: {e}")
+            return False
+
+    def companion_devices_with_push(self, companion_hash: str) -> List[Dict[str, Any]]:
+        """Return devices for ``companion_hash`` that have a push_token set.
+
+        This is the notifier's fan-out query on a journal event (design doc
+        §12.2): only devices that actually registered for push are returned,
+        so the common "nobody registered" case is a single indexed-ish scan
+        of the small companion_devices table returning nothing.
+        """
+        try:
+            with self._connect() as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute(
+                    "SELECT * FROM companion_devices "
+                    "WHERE companion_hash = ? AND push_token IS NOT NULL",
+                    (companion_hash,),
+                ).fetchall()
+                return [self._companion_device_row_to_dict(row) for row in rows]
+        except Exception as e:
+            logger.error(
+                f"Failed to list push devices for companion {companion_hash}: {e}"
+            )
+            return []
