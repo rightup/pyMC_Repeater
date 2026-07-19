@@ -81,6 +81,6 @@ def test_bridge_accepts_host_radio_callbacks(identity):
         "coding_rate": 5,
         "tx_power_dbm": 19,
         "rx_delay_base": 0,
-        "airtime_factor": 0,
+        "airtime_factor": 1.0,
     }
     assert bridge.get_max_tx_power_dbm() == 20

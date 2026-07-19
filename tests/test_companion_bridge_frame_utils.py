@@ -128,7 +128,7 @@ async def test_frame_server_persistence_paths_and_stop():
         companion_upsert_contact=MagicMock(),
     )
     bridge = SimpleNamespace(
-        message_queue=SimpleNamespace(pop_last=MagicMock()),
+        message_queue=SimpleNamespace(remove=MagicMock(), pop_last=MagicMock()),
         sync_next_message=lambda: None,
         get_contacts=lambda: [],
         channels=SimpleNamespace(max_channels=2),
@@ -147,9 +147,10 @@ async def test_frame_server_persistence_paths_and_stop():
         srv._write_frame = MagicMock()
         srv._build_message_frame = MagicMock(return_value=b"frame")
 
-        await srv._persist_companion_message({"text": "x"})
+        entry = object()
+        await srv._persist_companion_message({"text": "x"}, entry)
         sqlite.companion_push_message.assert_called_once_with("h", {"text": "x"}, None)
-        bridge.message_queue.pop_last.assert_called_once()
+        bridge.message_queue.remove.assert_called_once_with(entry)
 
         msg = srv._sync_next_from_persistence()
         assert msg is not None
