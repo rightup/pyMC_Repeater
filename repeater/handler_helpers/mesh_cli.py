@@ -571,7 +571,8 @@ class MeshCLI:
             return f"> {interval}"
 
         elif param == "flood.advert.interval":
-            interval = self.repeater_config.get("flood_advert_interval_hours", 24)
+            # The engine's flood-advert timer consumes send_advert_interval_hours.
+            interval = self.repeater_config.get("send_advert_interval_hours", 10)
             return f"> {interval}"
 
         elif param == "flood.max":
@@ -736,7 +737,8 @@ class MeshCLI:
                 hours = int(value)
                 if (hours > 0 and hours < 3) or hours > 168:
                     return "Error: interval range is 3-168 hours"
-                self.repeater_config["flood_advert_interval_hours"] = hours
+                # The engine's flood-advert timer consumes send_advert_interval_hours.
+                self.repeater_config["send_advert_interval_hours"] = hours
                 if not self._save_config_and_apply(["repeater"]):
                     return "Error: Failed to save config"
                 return "OK"

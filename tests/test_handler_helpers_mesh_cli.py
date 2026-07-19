@@ -15,6 +15,7 @@ def _base_config():
             "longitude": 3.4,
             "airtime_factor": 1.1,
             "advert_interval_minutes": 120,
+            # Stale orphan key from the old CLI; nothing must read it.
             "flood_advert_interval_hours": 24,
             "max_flood_hops": 20,
             "rx_delay_base": 0.2,
@@ -221,6 +222,10 @@ def test_cmd_set_updates_and_validation_errors():
 
     assert cli._cmd_set("advert.interval 59").startswith("Error: interval range")
     assert cli._cmd_set("flood.advert.interval 2").startswith("Error: interval range")
+    assert cli._cmd_set("flood.advert.interval 12") == "OK"
+    # The engine's timer key is updated; the stale orphan key is left alone.
+    assert cfg["repeater"]["send_advert_interval_hours"] == 12
+    assert cfg["repeater"]["flood_advert_interval_hours"] == 24
     assert cli._cmd_set("flood.max 100") == "Error: max 64"
     assert cli._cmd_set("rxdelay -1") == "Error: cannot be negative"
     assert cli._cmd_set("txdelay -1") == "Error: cannot be negative"
@@ -528,3 +533,15 @@ def test_cmd_set_radio_commands_stage_without_live_apply():
 
     assert mgr.save_to_file.call_count == 3
     mgr.live_update_daemon.assert_not_called()
+
+
+def test_cmd_get_flood_advert_interval_reads_engine_key():
+    cfg = _base_config()
+    cli = MeshCLI("/tmp/cfg.yaml", cfg, _cfg_mgr())
+
+    # The orphan flood_advert_interval_hours (24) must be ignored; the engine
+    # key is absent so the engine default (10) is reported.
+    assert cli._cmd_get("flood.advert.interval") == "> 10"
+
+    cfg["repeater"]["send_advert_interval_hours"] = 6
+    assert cli._cmd_get("flood.advert.interval") == "> 6"
