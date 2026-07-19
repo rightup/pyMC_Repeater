@@ -36,9 +36,9 @@ def _base_config():
     }
 
 
-def _cfg_mgr(save_ok=True, err=None):
+def _cfg_mgr(save_ok=True):
     return SimpleNamespace(
-        save_to_file=MagicMock(return_value=(save_ok, err)),
+        save_to_file=MagicMock(return_value=save_ok),
         live_update_daemon=MagicMock(),
     )
 
@@ -97,9 +97,10 @@ def test_cmd_password_save_success_failure_and_exception():
     assert cli_ok._cmd_password("password newpw") == "password now: newpw"
     ok_mgr.live_update_daemon.assert_called_once_with(["security"])
 
-    bad_mgr = _cfg_mgr(save_ok=False, err="disk")
+    bad_mgr = _cfg_mgr(save_ok=False)
     cli_bad = MeshCLI("/tmp/cfg.yaml", _base_config(), bad_mgr)
     assert "Failed to save config" in cli_bad._cmd_password("password x")
+    bad_mgr.live_update_daemon.assert_not_called()
 
     ex_mgr = SimpleNamespace(
         save_to_file=MagicMock(side_effect=RuntimeError("boom")),
@@ -442,3 +443,12 @@ def test_discovery_auto_add_skips_local_node_and_persists_remote():
     )
     assert remote_result["auto_added"] is True
     storage.record_advert.assert_called_once()
+
+
+def test_cmd_set_save_failure_reports_error_and_skips_live_update():
+    mgr = _cfg_mgr(save_ok=False)
+    cli = MeshCLI("/tmp/cfg.yaml", _base_config(), mgr)
+
+    for command in ("af 2.0", "name x", "freq 915", "guest.password g", "flood.max 8"):
+        assert cli._cmd_set(command) == "Error: Failed to save config"
+    mgr.live_update_daemon.assert_not_called()
