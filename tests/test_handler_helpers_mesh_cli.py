@@ -227,9 +227,13 @@ def test_cmd_set_updates_and_validation_errors():
     assert cfg["repeater"]["send_advert_interval_hours"] == 12
     assert cfg["repeater"]["flood_advert_interval_hours"] == 24
     assert cli._cmd_set("flood.max 100") == "Error: max 64"
-    assert cli._cmd_set("rxdelay -1") == "Error: cannot be negative"
-    assert cli._cmd_set("txdelay -1") == "Error: cannot be negative"
-    assert cli._cmd_set("direct.txdelay -1") == "Error: cannot be negative"
+    assert cli._cmd_set("rxdelay -1") == "Error, must be 0-20"
+    assert cli._cmd_set("rxdelay 20.5") == "Error, must be 0-20"
+    assert cli._cmd_set("rxdelay 20") == "OK"
+    assert cli._cmd_set("txdelay -1") == "Error, must be 0-2"
+    assert cli._cmd_set("txdelay 2.5") == "Error, must be 0-2"
+    assert cli._cmd_set("direct.txdelay -1") == "Error, must be 0-2"
+    assert cli._cmd_set("direct.txdelay 2.5") == "Error, must be 0-2"
 
     assert cli._cmd_set("agc.reset.interval 10") == "OK - interval rounded to 8"
     assert cli._cmd_set("bad") == "Error: Missing value"
@@ -545,3 +549,60 @@ def test_cmd_get_flood_advert_interval_reads_engine_key():
 
     cfg["repeater"]["send_advert_interval_hours"] = 6
     assert cli._cmd_get("flood.advert.interval") == "> 6"
+
+
+def test_cli_set_commands_persist_with_real_config_manager(tmp_path):
+    """Every CLI set command must work against the real ConfigManager bool save
+    contract: reply OK and leave the change on disk."""
+    import yaml
+
+    from repeater.config_manager import ConfigManager
+
+    config_path = tmp_path / "config.yaml"
+    cfg = _base_config()
+    manager = ConfigManager(config_path=str(config_path), config=cfg, daemon_instance=None)
+    cli = MeshCLI(str(config_path), cfg, manager)
+
+    commands = [
+        "af 1.5",
+        "name node-b",
+        "repeat off",
+        "lat 10.5",
+        "lon -3.25",
+        "radio 869.618 250 9 6",
+        "freq 915.125",
+        "tx 17",
+        "guest.password gpw",
+        "owner.info Bob|Lab",
+        "allow.read.only on",
+        "advert.interval 90",
+        "flood.advert.interval 12",
+        "flood.max 8",
+        "path.hash.mode 1",
+        "loop.detect moderate",
+        "rxdelay 4.5",
+        "txdelay 1.5",
+        "direct.txdelay 0.25",
+        "multi.acks 1",
+        "int.thresh -110",
+        "agc.reset.interval 8",
+    ]
+    for command in commands:
+        reply = cli._cmd_set(command)
+        assert reply.startswith("OK"), f"set {command!r} replied {reply!r}"
+
+    assert cli._cmd_password("password newadminpw") == "password now: newadminpw"
+
+    saved = yaml.safe_load(config_path.read_text())
+    assert saved["repeater"]["airtime_factor"] == 1.5
+    assert saved["repeater"]["node_name"] == "node-b"
+    assert saved["repeater"]["mode"] == "monitor"
+    assert saved["radio"]["frequency"] == 915125000
+    assert saved["radio"]["bandwidth"] == 250000
+    assert saved["repeater"]["security"]["guest_password"] == "gpw"
+    assert saved["repeater"]["security"]["admin_password"] == "newadminpw"
+    assert saved["repeater"]["security"]["allow_read_only"] is True
+    assert saved["repeater"]["send_advert_interval_hours"] == 12
+    assert saved["delays"]["rx_delay_base"] == 4.5
+    assert saved["delays"]["tx_delay_factor"] == 1.5
+    assert saved["delays"]["direct_tx_delay_factor"] == 0.25

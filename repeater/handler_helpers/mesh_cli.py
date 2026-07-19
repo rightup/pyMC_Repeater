@@ -56,7 +56,7 @@ class MeshCLI:
             self.config_manager.live_update_daemon(sections)
         return True
 
-    def _get_security_config(self):
+    def _get_security_config(self) -> Dict[str, Any]:
         """Return the repeater login security section (the one LoginHelper reads)."""
         security = self.repeater_config.get("security")
         return security if isinstance(security, dict) else {}
@@ -357,9 +357,9 @@ class MeshCLI:
                 "  set flood.max <hops>   Max flood hops (max 64)\n"
                 "  set path.hash.mode <0-2>  Path hash mode (0=1B,1=2B,2=3B)\n"
                 "  set loop.detect <off|minimal|moderate|strict>  Flood loop detection\n"
-                "  set rxdelay <val>      RX delay base (>=0)\n"
-                "  set txdelay <val>      TX delay factor (>=0)\n"
-                "  set direct.txdelay <val>  Direct TX delay (>=0)\n"
+                "  set rxdelay <val>      RX delay base (0-20)\n"
+                "  set txdelay <val>      TX delay factor (0-2)\n"
+                "  set direct.txdelay <val>  Direct TX delay (0-2)\n"
                 "  set multi.acks <n>     Multi-ack count\n"
                 "  set int.thresh <dbm>   Interference threshold\n"
                 "  set agc.reset.interval <n>  AGC reset (rounded to x4)"
@@ -772,8 +772,8 @@ class MeshCLI:
 
             elif key == "rxdelay":
                 delay = float(value)
-                if delay < 0:
-                    return "Error: cannot be negative"
+                if delay < 0 or delay > 20.0:
+                    return "Error, must be 0-20"
                 self.config.setdefault("delays", {})["rx_delay_base"] = delay
                 if not self._save_config_and_apply(["repeater", "delays"]):
                     return "Error: Failed to save config"
@@ -781,8 +781,8 @@ class MeshCLI:
 
             elif key == "txdelay":
                 delay = float(value)
-                if delay < 0:
-                    return "Error: cannot be negative"
+                if delay < 0 or delay > 2.0:
+                    return "Error, must be 0-2"
                 self.config.setdefault("delays", {})["tx_delay_factor"] = delay
                 if not self._save_config_and_apply(["repeater", "delays"]):
                     return "Error: Failed to save config"
@@ -790,8 +790,8 @@ class MeshCLI:
 
             elif key == "direct.txdelay":
                 delay = float(value)
-                if delay < 0:
-                    return "Error: cannot be negative"
+                if delay < 0 or delay > 2.0:
+                    return "Error, must be 0-2"
                 self.config.setdefault("delays", {})["direct_tx_delay_factor"] = delay
                 if not self._save_config_and_apply(["repeater", "delays"]):
                     return "Error: Failed to save config"
