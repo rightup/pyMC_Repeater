@@ -135,11 +135,16 @@ class TraceHelper:
             logger.info(f"Path SNRs: [{', '.join(path_snrs)}], Hashes: [{', '.join(path_hashes)}]")
 
             should_forward = self._should_forward_trace(packet, trace_bytes, flags, hash_width)
+            mode_blocked = should_forward and not self._relay_allowed()
+            if mode_blocked:
+                should_forward = False
+                logger.info("Trace relay suppressed (repeat disabled)")
 
             if should_forward:
                 await self._forward_trace_packet(packet, num_hops)
             else:
-                self._log_no_forward_reason(packet, trace_bytes, hash_width)
+                if not mode_blocked:
+                    self._log_no_forward_reason(packet, trace_bytes, hash_width)
                 if (
                     self.on_trace_complete
                     and self._is_trace_complete(packet, trace_bytes, hash_width)
@@ -270,6 +275,20 @@ class TraceHelper:
                 path_hashes.append(f"0x{trace_hops[i].hex()}")
 
         return path_snrs, path_hashes
+
+    def _relay_allowed(self) -> bool:
+        """Firmware gates intermediate-hop TRACE relay on ``allowPacketForward``
+        (Mesh.cpp), so a repeater that is not forwarding (monitor / no_tx mode)
+        must not relay traces. Locally originated pings are injected directly
+        and never pass through this gate.
+        """
+        config = getattr(self.repeater_handler, "config", None)
+        mode = "forward"
+        if isinstance(config, dict):
+            mode = config.get("repeater", {}).get("mode", "forward")
+        if mode not in ("forward", "monitor", "no_tx"):
+            mode = "forward"
+        return mode == "forward"
 
     def _should_forward_trace(
         self, packet, trace_bytes: bytes, flags: int, hash_width: int

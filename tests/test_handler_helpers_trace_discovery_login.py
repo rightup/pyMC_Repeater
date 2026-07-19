@@ -201,6 +201,70 @@ async def test_trace_helper_forward_trace_packet_updates_recent_record_and_injec
     packet_injector.assert_awaited_once()
 
 
+def _trace_relay_helper(mode, forward=True):
+    """TraceHelper wired so _should_forward_trace says yes; mode comes from config."""
+    repeater_handler = MagicMock()
+    repeater_handler.is_duplicate.return_value = False
+    repeater_handler.calculate_packet_score.return_value = 0.9
+    repeater_handler.config = {"repeater": {"mode": mode}}
+    helper = TraceHelper(
+        local_hash=0x42,
+        local_identity=FakeIdentity(0x42),
+        repeater_handler=repeater_handler,
+    )
+    helper._forward_trace_packet = AsyncMock()
+    helper._extract_path_info = MagicMock(return_value=([], []))
+    helper._should_forward_trace = MagicMock(return_value=forward)
+    helper.trace_handler._parse_trace_payload = MagicMock(
+        return_value={
+            "valid": True,
+            "trace_path_bytes": b"\x42\x43",
+            "flags": 0,
+            "trace_hops": [b"\x42", b"\x43"],
+            "trace_path": [0x42, 0x43],
+            "tag": 1234,
+        }
+    )
+    helper.trace_handler._format_trace_response = MagicMock(return_value="trace ok")
+    return helper
+
+
+@pytest.mark.asyncio
+async def test_trace_relay_suppressed_in_monitor_and_no_tx_mode():
+    # Firmware gates TRACE relay on allowPacketForward, so a repeater with
+    # repeat off must not relay an intermediate-hop trace.
+    for mode in ("monitor", "no_tx"):
+        helper = _trace_relay_helper(mode)
+        packet = DummyPacket(path=b"\x01", payload=b"\xaa\xbb\xcc")
+        await helper.process_trace_packet(packet)
+        helper._forward_trace_packet.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_trace_relay_allowed_in_forward_and_unknown_mode():
+    for mode in ("forward", "weird-mode"):
+        helper = _trace_relay_helper(mode)
+        packet = DummyPacket(path=b"\x01", payload=b"\xaa\xbb\xcc")
+        await helper.process_trace_packet(packet)
+        helper._forward_trace_packet.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_trace_ping_response_still_matches_in_monitor_mode():
+    # Ping origination/response handling is not relay: a pending ping must
+    # resolve even when the repeater is not forwarding.
+    helper = _trace_relay_helper("monitor", forward=False)
+    tag = 555
+    helper.trace_handler._parse_trace_payload.return_value["tag"] = tag
+    evt = helper.register_ping(tag, 0x42)
+
+    packet = DummyPacket(path=b"\x01", payload=b"\xaa\xbb\xcc")
+    await helper.process_trace_packet(packet)
+
+    assert evt.is_set()
+    helper._forward_trace_packet.assert_not_awaited()
+
+
 def test_trace_helper_cleanup_stale_pings():
     helper = TraceHelper(
         local_hash=0x42, local_identity=FakeIdentity(0x42), repeater_handler=MagicMock()
