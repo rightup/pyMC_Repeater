@@ -33,6 +33,9 @@ class LoginHelper:
 
         self.handlers = {}
         self.acls = {}  # Per-identity ACLs keyed by hash_byte
+        # The repeater identity's ACL, kept so live config updates can re-apply
+        # repeater.security without re-registering the identity.
+        self._repeater_acl = None
         self._pending_tasks = set()
         # Shared across all identities so the node's total anon-reply rate is
         # bounded (mirrors firmware anon_limiter: ~4 requests / 2 min).
@@ -116,6 +119,8 @@ class LoginHelper:
         )
 
         self.acls[hash_byte] = identity_acl
+        if identity_type != "room_server":
+            self._repeater_acl = identity_acl
         logger.info(f"Created ACL for {identity_type} '{name}': hash=0x{hash_byte:02X}")
 
         # Create auth callback that uses this identity's ACL
@@ -179,6 +184,34 @@ class LoginHelper:
         self.handlers[hash_byte] = anon_handler
 
         logger.info(f"Registered {identity_type} '{name}' login handler: hash=0x{hash_byte:02X}")
+
+    def refresh_repeater_security(self, config: dict = None) -> bool:
+        """Re-apply ``repeater.security`` from config to the live repeater ACL.
+
+        The ACL captures its passwords at registration, so without this a saved
+        password change would only take effect after a restart. Room-server ACLs
+        keep their per-identity ``settings`` passwords and are not touched.
+        """
+        acl = self._repeater_acl
+        if acl is None:
+            return False
+
+        cfg = config if isinstance(config, dict) else self.config
+        security = (cfg or {}).get("repeater", {}).get("security", {}) or {}
+
+        acl.admin_password = security.get("admin_password") or ""
+        acl.guest_password = security.get("guest_password") or ""
+        acl.allow_read_only = bool(security.get("allow_read_only", False))
+        try:
+            acl.max_clients = int(security.get("max_clients", acl.max_clients))
+        except (TypeError, ValueError):
+            logger.warning(
+                "Ignoring invalid repeater.security.max_clients=%r during security refresh",
+                security.get("max_clients"),
+            )
+
+        logger.info("Refreshed repeater ACL security settings from config")
+        return True
 
     def _format_region_names(self) -> str:
         """Build the comma-separated region-names string for an anon regions reply.

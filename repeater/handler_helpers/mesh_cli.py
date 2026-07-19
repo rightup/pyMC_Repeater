@@ -55,6 +55,11 @@ class MeshCLI:
             self.config_manager.live_update_daemon(sections)
         return True
 
+    def _get_security_config(self):
+        """Return the repeater login security section (the one LoginHelper reads)."""
+        security = self.repeater_config.get("security")
+        return security if isinstance(security, dict) else {}
+
     def _get_node_name(self) -> str:
         """Return the configured node name, preferring the newer key when present."""
         return self.repeater_config.get("node_name") or self.repeater_config.get("name", "Unknown")
@@ -463,15 +468,12 @@ class MeshCLI:
         if not new_password:
             return "Error: Password cannot be empty"
 
-        # Update security config
-        if "security" not in self.config:
-            self.config["security"] = {}
-
-        self.config["security"]["password"] = new_password
+        # LoginHelper authenticates from repeater.security.admin_password.
+        self.repeater_config.setdefault("security", {})["admin_password"] = new_password
 
         # Save config and live update
         try:
-            if not self._save_config_and_apply(["security"]):
+            if not self._save_config_and_apply(["repeater"]):
                 logger.error("Failed to save password: config save failed")
                 return "Error: Failed to save config"
             return f"password now: {new_password}"
@@ -552,7 +554,7 @@ class MeshCLI:
             return f"> {role}"
 
         elif param == "guest.password":
-            guest_pw = self.config.get("security", {}).get("guest_password", "")
+            guest_pw = self._get_security_config().get("guest_password") or ""
             return f"> {guest_pw}"
 
         elif param == "owner.info":
@@ -560,7 +562,7 @@ class MeshCLI:
             return f"> {owner_info}"
 
         elif param == "allow.read.only":
-            allow = self.config.get("security", {}).get("allow_read_only", False)
+            allow = self._get_security_config().get("allow_read_only", False)
             return f"> {'on' if allow else 'off'}"
 
         elif param == "advert.interval":
@@ -691,10 +693,9 @@ class MeshCLI:
                 return "OK"
 
             elif key == "guest.password":
-                if "security" not in self.config:
-                    self.config["security"] = {}
-                self.config["security"]["guest_password"] = value
-                if not self._save_config_and_apply(["security"]):
+                # LoginHelper authenticates from repeater.security.guest_password.
+                self.repeater_config.setdefault("security", {})["guest_password"] = value
+                if not self._save_config_and_apply(["repeater"]):
                     return "Error: Failed to save config"
                 return "OK"
 
@@ -705,10 +706,11 @@ class MeshCLI:
                 return "OK"
 
             elif key == "allow.read.only":
-                if "security" not in self.config:
-                    self.config["security"] = {}
-                self.config["security"]["allow_read_only"] = value.lower() == "on"
-                if not self._save_config_and_apply(["security"]):
+                # LoginHelper reads repeater.security.allow_read_only.
+                self.repeater_config.setdefault("security", {})["allow_read_only"] = (
+                    value.lower() == "on"
+                )
+                if not self._save_config_and_apply(["repeater"]):
                     return "Error: Failed to save config"
                 return "OK"
 

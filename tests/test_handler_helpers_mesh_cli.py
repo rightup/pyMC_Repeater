@@ -23,6 +23,12 @@ def _base_config():
             "multi_acks": 2,
             "interference_threshold": -115,
             "agc_reset_interval": 8,
+            "security": {
+                "admin_password": "adminpw",
+                "guest_password": "guest",
+                "allow_read_only": True,
+                "max_clients": 5,
+            },
         },
         "radio": {
             "frequency": 915000000,
@@ -32,7 +38,8 @@ def _base_config():
             "tx_power": 22,
         },
         "mesh": {"path_hash_mode": 0, "loop_detect": "minimal"},
-        "security": {"guest_password": "guest", "allow_read_only": True},
+        # Decoy: the legacy top-level section the CLI must no longer touch.
+        "security": {"guest_password": "stale-top-level", "allow_read_only": False},
     }
 
 
@@ -95,7 +102,10 @@ def test_cmd_password_save_success_failure_and_exception():
 
     assert cli_ok._cmd_password("password   ") == "Error: Password cannot be empty"
     assert cli_ok._cmd_password("password newpw") == "password now: newpw"
-    ok_mgr.live_update_daemon.assert_called_once_with(["security"])
+    # The password must land where LoginHelper reads it, not the legacy top-level section.
+    assert cfg["repeater"]["security"]["admin_password"] == "newpw"
+    assert "password" not in cfg["security"]
+    ok_mgr.live_update_daemon.assert_called_once_with(["repeater"])
 
     bad_mgr = _cfg_mgr(save_ok=False)
     cli_bad = MeshCLI("/tmp/cfg.yaml", _base_config(), bad_mgr)
@@ -185,9 +195,12 @@ def test_cmd_set_updates_and_validation_errors():
     assert cli._cmd_set("freq 868000000").startswith("OK")
     assert cli._cmd_set("tx 17") == "OK"
     assert cli._cmd_set("guest.password g") == "OK"
+    assert cfg["repeater"]["security"]["guest_password"] == "g"
+    assert cfg["security"]["guest_password"] == "stale-top-level"
     assert cli._cmd_set("owner.info Alice|Ops") == "OK"
     assert cfg["repeater"]["owner_info"] == "Alice\nOps"
     assert cli._cmd_set("allow.read.only off") == "OK"
+    assert cfg["repeater"]["security"]["allow_read_only"] is False
     assert cli._cmd_set("path.hash.mode 2") == "OK"
     assert cfg["mesh"]["path_hash_mode"] == 2
     assert cli._cmd_set("path.hash.mode 3") == "Error: path.hash.mode must be 0, 1, or 2"
@@ -452,3 +465,43 @@ def test_cmd_set_save_failure_reports_error_and_skips_live_update():
     for command in ("af 2.0", "name x", "freq 915", "guest.password g", "flood.max 8"):
         assert cli._cmd_set(command) == "Error: Failed to save config"
     mgr.live_update_daemon.assert_not_called()
+
+
+def test_cmd_get_reads_repeater_security_section():
+    cli = MeshCLI("/tmp/cfg.yaml", _base_config(), _cfg_mgr())
+
+    # Values come from repeater.security, not the legacy top-level decoy.
+    assert cli._cmd_get("guest.password") == "> guest"
+    assert cli._cmd_get("allow.read.only") == "> on"
+
+
+def test_cli_password_change_applies_to_live_repeater_acl(tmp_path):
+    """A CLI password change must reach the running LoginHelper ACL, so the
+    next login attempt authenticates against the new password."""
+    from repeater.config_manager import ConfigManager
+    from repeater.handler_helpers.login import LoginHelper
+
+    cfg = _base_config()
+    login_helper = LoginHelper(identity_manager=None, config=cfg)
+    identity = SimpleNamespace(get_public_key=lambda: b"\x42" + b"\x00" * 31)
+    login_helper.register_identity(
+        name="repeater", identity=identity, identity_type="repeater", config=cfg
+    )
+    acl = login_helper.get_acl_for_identity(0x42)
+    assert acl.admin_password == "adminpw"
+    assert acl.guest_password == "guest"
+
+    daemon = SimpleNamespace(config=cfg, login_helper=login_helper)
+    manager = ConfigManager(
+        config_path=str(tmp_path / "config.yaml"), config=cfg, daemon_instance=daemon
+    )
+    cli = MeshCLI(str(tmp_path / "config.yaml"), cfg, manager)
+
+    assert cli._cmd_password("password fresh-secret") == "password now: fresh-secret"
+    assert acl.admin_password == "fresh-secret"
+
+    assert cli._cmd_set("guest.password fresh-guest") == "OK"
+    assert acl.guest_password == "fresh-guest"
+
+    assert cli._cmd_set("allow.read.only off") == "OK"
+    assert acl.allow_read_only is False

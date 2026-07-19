@@ -275,6 +275,14 @@ class ConfigManager:
                         self.daemon.repeater_handler.reload_runtime_config()
                         logger.info("Reloaded RepeaterHandler runtime config")
 
+            # Re-apply login security when the repeater section changed; the
+            # repeater ACL captures repeater.security at registration, so a
+            # saved password change must be pushed to the live ACL explicitly.
+            if "repeater" in sections and self.daemon:
+                login_helper = getattr(self.daemon, "login_helper", None)
+                if login_helper is not None and hasattr(login_helper, "refresh_repeater_security"):
+                    login_helper.refresh_repeater_security(daemon_config)
+
             # Also reload advert_helper config if repeater section changed
             if self.daemon and hasattr(self.daemon, "advert_helper") and self.daemon.advert_helper:
                 if "repeater" in sections:
