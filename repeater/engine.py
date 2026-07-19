@@ -1706,12 +1706,17 @@ class RepeaterHandler(BaseHandler):
                 if current_time - self.last_db_cleanup >= 21600:
                     if self.storage:
                         try:
-                            retention_days = (
-                                self.config.get("storage", {})
-                                .get("retention", {})
-                                .get("sqlite_cleanup_days", 31)
+                            retention_cfg = self.config.get("storage", {}).get(
+                                "retention", {}
                             )
-                            self.storage.cleanup_old_data(days=retention_days)
+                            retention_days = retention_cfg.get("sqlite_cleanup_days", 31)
+                            companion_events_days = retention_cfg.get(
+                                "companion_events_days", 31
+                            )
+                            self.storage.cleanup_old_data(
+                                days=retention_days,
+                                companion_events_days=companion_events_days,
+                            )
                             logger.info("Cleaned up SQLite data older than %d days", retention_days)
                         except Exception as e:
                             logger.warning(f"SQLite cleanup failed: {e}")
@@ -1809,8 +1814,8 @@ class RepeaterHandler(BaseHandler):
                 ):
                     self.neighbour_link_tracker.evict_stalest_locked()
 
-            # Note: Radio config changes require restart as they affect hardware
-            # Note: Airtime manager has its own config reference that gets updated
+            # Radio hardware apply and AirtimeManager modulation refresh are
+            # handled by ConfigManager after a successful live radio update.
 
             logger.info("Runtime configuration reloaded successfully")
         except Exception as e:

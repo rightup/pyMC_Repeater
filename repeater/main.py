@@ -564,6 +564,7 @@ class RepeaterDaemon:
                 engine=self.repeater_handler,
                 neighbor_tracker=self.advert_helper,
                 config=self.config,
+                sensor_manager=self.sensor_manager,
             )
             # Register repeater identity for protocol requests
             self.protocol_request_helper.register_identity(

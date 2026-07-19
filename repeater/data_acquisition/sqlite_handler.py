@@ -2351,7 +2351,15 @@ class SQLiteHandler:
             logger.error(f"Failed to vacuum database: {e}")
             raise
 
-    def cleanup_old_data(self, days: int = 7):
+    def cleanup_old_data(self, days: int = 7, companion_events_days: Optional[int] = None):
+        """Prune retention-bounded tables.
+
+        ``companion_events_days`` is forwarded from engine.py
+        (``storage.retention.companion_events_days``, default 31). Accepted here
+        so the periodic cleanup call cannot TypeError and silently skip all
+        SQLite pruning. Companion journal/history pruning is layered on by the
+        companion-api storage work once those tables exist.
+        """
         try:
             cutoff = time.time() - (days * 24 * 3600)
 

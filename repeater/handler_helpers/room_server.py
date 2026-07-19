@@ -321,17 +321,15 @@ class RoomServer:
                     f"{len(all_clients)} authenticated client(s)"
                 )
 
-                # Update client's sync_since to this message's timestamp
-                # This prevents the author from receiving their own message back
-                # Also update activity timestamp (they're clearly active if posting)
-                logger.debug(
-                    f"Room '{self.room_name}': Updating author's sync_since to {post_timestamp} "
-                    f"to prevent echo"
-                )
+                # Refresh the author's activity timestamp (they're clearly active
+                # if posting). The sync_since watermark is deliberately NOT
+                # advanced here: it moves only when a push is ACKed, and self-echo
+                # is already prevented by the author exclusion in the
+                # unsynced-message query. Advancing it on post would skip other
+                # authors' older, still-unsynced messages for this client.
                 self.db.upsert_client_sync(
                     room_hash=f"0x{self.room_hash:02X}",
                     client_pubkey=client_pubkey.hex(),
-                    sync_since=post_timestamp,  # Don't send this message back to author
                     last_activity=time.time(),
                 )
 

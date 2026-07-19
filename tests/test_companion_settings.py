@@ -531,10 +531,11 @@ class TestPersistSkipWhenOff:
     def test_skips_persistence_when_retention_zero(self):
         import asyncio
 
+        entry = object()
         fs = self._frame_server(0)
-        asyncio.run(fs._persist_companion_message({"text": "x"}))
+        asyncio.run(fs._persist_companion_message({"text": "x"}, entry))
         fs.sqlite_handler.companion_push_message.assert_not_called()
-        fs.bridge.message_queue.pop_last.assert_called_once()
+        fs.bridge.message_queue.remove.assert_called_once_with(entry)
 
     def test_persists_with_retention(self):
         import asyncio

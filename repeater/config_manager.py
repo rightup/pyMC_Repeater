@@ -142,11 +142,21 @@ class ConfigManager:
                         return False
 
             self._sync_repeater_handler_radio_config(radio_cfg)
+            self._refresh_airtime_radio_params()
             logger.info("Applied live radio configuration to running daemon")
             return True
         except Exception as e:
             logger.error(f"Failed to apply live radio config: {e}", exc_info=True)
             return False
+
+    def _refresh_airtime_radio_params(self) -> None:
+        repeater_handler = getattr(self.daemon, "repeater_handler", None)
+        airtime_mgr = getattr(repeater_handler, "airtime_mgr", None) if repeater_handler else None
+        if airtime_mgr is None or not hasattr(airtime_mgr, "refresh_radio_params"):
+            return
+        # Use the full radio section so preamble_length is included; the live
+        # hardware snapshot intentionally omits fields the radio API does not set.
+        airtime_mgr.refresh_radio_params(self.config.get("radio", {}) or {})
 
     @staticmethod
     def _parse_bool(value: Any, default: bool = True) -> bool:
