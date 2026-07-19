@@ -354,7 +354,7 @@ class MeshCLI:
                 "  set allow.read.only on|off  Read-only access\n"
                 "  set advert.interval <min>   60-240 minutes\n"
                 "  set flood.advert.interval <hr>  3-168 hours\n"
-                "  set flood.max <hops>   Max flood hops (max 64)\n"
+                "  set flood.max <hops>   Max flood hops (max 64; 0 = unlimited, unlike firmware)\n"
                 "  set path.hash.mode <0-2>  Path hash mode (0=1B,1=2B,2=3B)\n"
                 "  set loop.detect <off|minimal|moderate|strict>  Flood loop detection\n"
                 "  set rxdelay <val>      RX delay base (0-20)\n"
