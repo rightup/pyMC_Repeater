@@ -316,9 +316,15 @@ class PacketRouter:
 
         consumed = False
         if has_companion:
-            bridge_result = await companion_bridges[dest_hash].process_received_packet(packet)
-            if bridge_result.authenticated:
-                consumed = True
+            # A raising bridge must not abort the candidate loop: the colliding
+            # room-server / repeater identity below still gets offered the packet.
+            try:
+                bridge_result = await companion_bridges[dest_hash].process_received_packet(packet)
+            except Exception as e:
+                logger.debug("Companion bridge candidate error: %s", e)
+            else:
+                if bridge_result.authenticated:
+                    consumed = True
         # Offer to the room-server / repeater identity when it shares the hash
         # (collision) or when no local companion claims it at all (normal
         # server-owned + remote-forward handling).
