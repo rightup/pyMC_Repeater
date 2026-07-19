@@ -189,11 +189,19 @@ def test_cmd_set_updates_and_validation_errors():
     assert cli._cmd_set("repeat off").endswith("OFF")
     assert cfg["repeater"]["mode"] == "monitor"
 
-    assert cli._cmd_set("radio 900000000 250000 9 6").startswith("OK")
-    assert cfg["radio"]["frequency"] == 900000000.0
+    # CLI input is MHz/kHz (firmware parity); the config stores Hz.
+    assert cli._cmd_set("radio 900 250 9 6").startswith("OK")
+    assert cfg["radio"]["frequency"] == 900000000
+    assert cfg["radio"]["bandwidth"] == 250000
+    assert cfg["radio"]["spreading_factor"] == 9
+    assert cfg["radio"]["coding_rate"] == 6
+    assert cli._cmd_set("radio 100 250 9 6") == "Error, invalid radio params"
+    assert cli._cmd_set("radio 900 250 4 6") == "Error, invalid radio params"
 
-    assert cli._cmd_set("freq 868000000").startswith("OK")
-    assert cli._cmd_set("tx 17") == "OK"
+    assert cli._cmd_set("freq 868.5").startswith("OK")
+    assert cfg["radio"]["frequency"] == 868500000
+    assert cli._cmd_set("tx 17") == "OK - restart repeater to apply"
+    assert cfg["radio"]["tx_power"] == 17
     assert cli._cmd_set("guest.password g") == "OK"
     assert cfg["repeater"]["security"]["guest_password"] == "g"
     assert cfg["security"]["guest_password"] == "stale-top-level"
@@ -505,3 +513,18 @@ def test_cli_password_change_applies_to_live_repeater_acl(tmp_path):
 
     assert cli._cmd_set("allow.read.only off") == "OK"
     assert acl.allow_read_only is False
+
+
+def test_cmd_set_radio_commands_stage_without_live_apply():
+    """Radio changes match firmware reboot-to-apply: saved to disk, never
+    live-applied (a live retune would cut off the admin mid-session)."""
+    cfg = _base_config()
+    mgr = _cfg_mgr()
+    cli = MeshCLI("/tmp/cfg.yaml", cfg, mgr)
+
+    assert cli._cmd_set("radio 900 250 9 6") == "OK - restart repeater to apply"
+    assert cli._cmd_set("freq 868.5") == "OK - restart repeater to apply"
+    assert cli._cmd_set("tx 17") == "OK - restart repeater to apply"
+
+    assert mgr.save_to_file.call_count == 3
+    mgr.live_update_daemon.assert_not_called()

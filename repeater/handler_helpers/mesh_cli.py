@@ -45,7 +45,8 @@ class MeshCLI:
         ``ConfigManager.save_to_file`` returns a bare bool; the tuple form is
         tolerated for older manager doubles. Live update only runs after a
         successful save so a failed write never half-applies a change. Pass
-        no sections to stage a change: saved to disk, applied on restart.
+        no sections to stage a change: saved to disk, applied on restart
+        (radio parameters, matching firmware's reboot-to-apply).
         """
         result = self.config_manager.save_to_file()
         saved = result[0] if isinstance(result, tuple) else bool(result)
@@ -660,37 +661,45 @@ class MeshCLI:
                 return "OK"
 
             elif key == "radio":
-                # Format: freq bw sf cr
+                # Format: freq(MHz) bw(kHz) sf cr — the config stores Hz.
                 radio_parts = value.split()
                 if len(radio_parts) != 4:
                     return "Error: Expected freq bw sf cr"
 
-                if "radio" not in self.config:
-                    self.config["radio"] = {}
+                freq_mhz = float(radio_parts[0])
+                bw_khz = float(radio_parts[1])
+                sf = int(radio_parts[2])
+                cr = int(radio_parts[3])
+                if not (
+                    150.0 <= freq_mhz <= 2500.0
+                    and 7.0 <= bw_khz <= 500.0
+                    and 5 <= sf <= 12
+                    and 5 <= cr <= 8
+                ):
+                    return "Error, invalid radio params"
 
-                self.config["radio"]["frequency"] = float(radio_parts[0])
-                self.config["radio"]["bandwidth"] = float(radio_parts[1])
-                self.config["radio"]["spreading_factor"] = int(radio_parts[2])
-                self.config["radio"]["coding_rate"] = int(radio_parts[3])
-                if not self._save_config_and_apply(["radio"]):
+                radio_config = self.config.setdefault("radio", {})
+                radio_config["frequency"] = int(round(freq_mhz * 1_000_000))
+                radio_config["bandwidth"] = int(round(bw_khz * 1_000))
+                radio_config["spreading_factor"] = sf
+                radio_config["coding_rate"] = cr
+                if not self._save_config_and_apply():
                     return "Error: Failed to save config"
                 return "OK - restart repeater to apply"
 
             elif key == "freq":
-                if "radio" not in self.config:
-                    self.config["radio"] = {}
-                self.config["radio"]["frequency"] = float(value)
-                if not self._save_config_and_apply(["radio"]):
+                # CLI input is MHz (firmware parity); the config stores Hz.
+                freq_mhz = float(value)
+                self.config.setdefault("radio", {})["frequency"] = int(round(freq_mhz * 1_000_000))
+                if not self._save_config_and_apply():
                     return "Error: Failed to save config"
                 return "OK - restart repeater to apply"
 
             elif key == "tx":
-                if "radio" not in self.config:
-                    self.config["radio"] = {}
-                self.config["radio"]["tx_power"] = int(value)
-                if not self._save_config_and_apply(["radio"]):
+                self.config.setdefault("radio", {})["tx_power"] = int(value)
+                if not self._save_config_and_apply():
                     return "Error: Failed to save config"
-                return "OK"
+                return "OK - restart repeater to apply"
 
             elif key == "guest.password":
                 # LoginHelper authenticates from repeater.security.guest_password.
