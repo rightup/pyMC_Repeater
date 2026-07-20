@@ -176,7 +176,7 @@ class LogBuffer(logging.Handler):
 
 
 # Global log buffer instance
-_log_buffer = LogBuffer(max_lines=1000)
+_log_buffer = LogBuffer(max_lines=300)
 
 
 class DocEndpoint:

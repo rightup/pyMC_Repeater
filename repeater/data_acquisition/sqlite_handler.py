@@ -1642,6 +1642,175 @@ class SQLiteHandler:
             logger.error(f"Failed to get packet stats: {e}")
             return {}
 
+    def get_metrics_data(
+        self,
+        start_time: Optional[int] = None,
+        end_time: Optional[int] = None,
+        resolution: str = "average",
+    ) -> dict:
+        resolution_key = str(resolution or "average").lower()
+        gauge_aggregates = {
+            "average": "AVG",
+            "max": "MAX",
+            "min": "MIN",
+        }
+        gauge_aggregate = gauge_aggregates.get(resolution_key, "AVG")
+
+        if end_time is None:
+            end_ts = int(time.time())
+        else:
+            end_ts = int(end_time)
+
+        if start_time is None:
+            start_ts = end_ts - (24 * 3600)
+        else:
+            start_ts = int(start_time)
+
+        if end_ts < start_ts:
+            start_ts, end_ts = end_ts, start_ts
+
+        range_seconds = max(0, end_ts - start_ts)
+        if range_seconds <= 7 * 24 * 3600:
+            bucket_seconds = 60
+        elif range_seconds <= 30 * 24 * 3600:
+            bucket_seconds = 300
+        else:
+            bucket_seconds = 3600
+
+        aligned_start = int(start_ts / bucket_seconds) * bucket_seconds
+        aligned_end = int(end_ts / bucket_seconds) * bucket_seconds
+        timestamps = list(range(aligned_start, aligned_end + bucket_seconds, bucket_seconds))
+
+        metric_names = [
+            "rx_count",
+            "tx_count",
+            "drop_count",
+            "avg_rssi",
+            "avg_snr",
+            "avg_length",
+            "avg_score",
+            "neighbor_count",
+        ]
+        packet_type_names = [f"type_{i}" for i in range(16)] + ["type_other"]
+
+        metrics = {
+            "rx_count": [],
+            "tx_count": [],
+            "drop_count": [],
+            "avg_rssi": [],
+            "avg_snr": [],
+            "avg_length": [],
+            "avg_score": [],
+            # Historical neighbor counts are not stored in packets, so the
+            # existing schema cannot reconstruct past values per time bucket.
+            "neighbor_count": [],
+        }
+        packet_types = {name: [] for name in packet_type_names}
+
+        bucket_metrics = {
+            ts: {
+                "rx_count": 0,
+                "tx_count": 0,
+                "drop_count": 0,
+                "avg_rssi": None,
+                "avg_snr": None,
+                "avg_length": None,
+                "avg_score": None,
+                "neighbor_count": None,
+            }
+            for ts in timestamps
+        }
+        bucket_packet_types = {ts: {name: 0 for name in packet_type_names} for ts in timestamps}
+
+        try:
+            with self._connect() as conn:
+                conn.row_factory = sqlite3.Row
+
+                aggregate_rows = conn.execute(
+                    f"""
+                    SELECT
+                        CAST(timestamp / ? AS INTEGER) * ? AS bucket_ts,
+                        COUNT(*) AS rx_count,
+                        SUM(CASE WHEN transmitted = 1 THEN 1 ELSE 0 END) AS tx_count,
+                        SUM(CASE WHEN transmitted = 0 THEN 1 ELSE 0 END) AS drop_count,
+                        {gauge_aggregate}(rssi) AS avg_rssi,
+                        {gauge_aggregate}(snr) AS avg_snr,
+                        {gauge_aggregate}(length) AS avg_length,
+                        {gauge_aggregate}(score) AS avg_score
+                    FROM packets INDEXED BY idx_packets_timestamp
+                    WHERE timestamp >= ? AND timestamp <= ?
+                    GROUP BY bucket_ts
+                    ORDER BY bucket_ts ASC
+                    """,
+                    (bucket_seconds, bucket_seconds, start_ts, end_ts),
+                ).fetchall()
+
+                packet_type_rows = conn.execute(
+                    """
+                    SELECT
+                        CAST(timestamp / ? AS INTEGER) * ? AS bucket_ts,
+                        CASE
+                            WHEN type BETWEEN 0 AND 15 THEN CAST(type AS INTEGER)
+                            ELSE 16
+                        END AS type_bucket,
+                        COUNT(*) AS count
+                    FROM packets INDEXED BY idx_packets_timestamp
+                    WHERE timestamp >= ? AND timestamp <= ?
+                    GROUP BY bucket_ts, type_bucket
+                    ORDER BY bucket_ts ASC, type_bucket ASC
+                    """,
+                    (bucket_seconds, bucket_seconds, start_ts, end_ts),
+                ).fetchall()
+
+            for row in aggregate_rows:
+                bucket_ts = int(row["bucket_ts"])
+                if bucket_ts not in bucket_metrics:
+                    continue
+
+                bucket_metrics[bucket_ts] = {
+                    "rx_count": int(row["rx_count"] or 0),
+                    "tx_count": int(row["tx_count"] or 0),
+                    "drop_count": int(row["drop_count"] or 0),
+                    "avg_rssi": row["avg_rssi"],
+                    "avg_snr": row["avg_snr"],
+                    "avg_length": row["avg_length"],
+                    "avg_score": row["avg_score"],
+                    "neighbor_count": None,
+                }
+
+            for row in packet_type_rows:
+                bucket_ts = int(row["bucket_ts"])
+                if bucket_ts not in bucket_packet_types:
+                    continue
+
+                type_bucket = int(row["type_bucket"])
+                type_name = f"type_{type_bucket}" if 0 <= type_bucket <= 15 else "type_other"
+                bucket_packet_types[bucket_ts][type_name] = int(row["count"] or 0)
+
+            for timestamp in timestamps:
+                bucket = bucket_metrics[timestamp]
+                for name in metric_names:
+                    metrics[name].append(bucket[name])
+
+                packet_bucket = bucket_packet_types[timestamp]
+                for name in packet_type_names:
+                    packet_types[name].append(packet_bucket[name])
+
+            return {
+                "start_time": aligned_start,
+                "end_time": aligned_end,
+                "step": bucket_seconds,
+                "timestamps": timestamps,
+                "data_sources": metric_names + packet_type_names,
+                "packet_types": packet_types,
+                "metrics": metrics,
+                "data_source": "sqlite",
+                "counter_mode": "bucket_count",
+            }
+        except Exception as e:
+            logger.error(f"Failed to get SQLite metrics data: {e}", exc_info=True)
+            raise
+
     def get_recent_packets(self, limit: int = 100) -> list:
         try:
             with self._connect() as conn:

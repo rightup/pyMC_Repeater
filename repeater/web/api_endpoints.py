@@ -503,9 +503,15 @@ class APIEndpoints:
                     previous = item
             return output
 
-        rx_values = _counter_delta(metrics.get("rx_count", []))
-        tx_values = _counter_delta(metrics.get("tx_count", []))
-        drop_values = _counter_delta(metrics.get("drop_count", []))
+        def _counter_values(values: list) -> list[float]:
+            return [float(item or 0.0) for item in values]
+
+        counter_mode = rrd_data.get("counter_mode")
+        counter_processor = _counter_values if counter_mode == "bucket_count" else _counter_delta
+
+        rx_values = counter_processor(metrics.get("rx_count", []))
+        tx_values = counter_processor(metrics.get("tx_count", []))
+        drop_values = counter_processor(metrics.get("drop_count", []))
         rssi_values = metrics.get("avg_rssi", []) or []
         snr_values = metrics.get("avg_snr", []) or []
 
@@ -3322,8 +3328,8 @@ class APIEndpoints:
             params = self._get_params(
                 {"start_time": None, "end_time": None, "resolution": "average"}
             )
-            data = self._get_storage().get_rrd_data(**params)
-            return self._success(data) if data else self._error("No RRD data available")
+            data = self._get_storage().get_metrics_data(**params)
+            return self._success(data)
         except ValueError as e:
             return self._error(f"Invalid parameter format: {e}")
         except Exception as e:
@@ -3392,12 +3398,16 @@ class APIEndpoints:
             hours = int(hours)
             start_time, end_time = self._get_time_range(hours)
 
-            rrd_data = self._get_storage().get_rrd_data(
+            metrics_data = self._get_storage().get_metrics_data(
                 start_time=start_time, end_time=end_time, resolution=resolution
             )
 
-            if not rrd_data or "metrics" not in rrd_data:
-                return self._error("No RRD data available")
+            if (
+                not metrics_data
+                or "metrics" not in metrics_data
+                or "timestamps" not in metrics_data
+            ):
+                return self._error("No metrics data available")
 
             metric_names = {
                 "rx_count": "Received Packets",
@@ -3416,18 +3426,18 @@ class APIEndpoints:
             if metrics != "all":
                 requested_metrics = [m.strip() for m in metrics.split(",")]
             else:
-                requested_metrics = list(rrd_data["metrics"].keys())
+                requested_metrics = list(metrics_data["metrics"].keys())
                 requested_metrics.append("policy_events")
 
-            timestamps_ms = [ts * 1000 for ts in rrd_data["timestamps"]]
+            timestamps_ms = [ts * 1000 for ts in metrics_data["timestamps"]]
             series = []
 
             for metric_key in requested_metrics:
                 if metric_key == "policy_events":
-                    bucket_seconds = max(1, int(rrd_data.get("step", 60)))
+                    bucket_seconds = max(1, int(metrics_data.get("step", 60)))
                     policy_rows = self._get_storage().get_policy_event_counts(
-                        start_timestamp=rrd_data["start_time"],
-                        end_timestamp=rrd_data["end_time"],
+                        start_timestamp=metrics_data["start_time"],
+                        end_timestamp=metrics_data["end_time"],
                         bucket_seconds=bucket_seconds,
                     )
                     policy_by_bucket = {
@@ -3435,7 +3445,7 @@ class APIEndpoints:
                         for row in policy_rows
                     }
                     chart_data = []
-                    for ts in rrd_data["timestamps"]:
+                    for ts in metrics_data["timestamps"]:
                         bucket_ts = int(ts / bucket_seconds) * bucket_seconds
                         chart_data.append([ts * 1000, policy_by_bucket.get(bucket_ts, 0)])
 
@@ -3448,14 +3458,19 @@ class APIEndpoints:
                     )
                     continue
 
-                if metric_key in rrd_data["metrics"]:
+                if metric_key in metrics_data["metrics"]:
                     if metric_key in counter_metrics:
-                        chart_data = self._process_counter_data(
-                            rrd_data["metrics"][metric_key], timestamps_ms
-                        )
+                        if metrics_data.get("counter_mode") == "bucket_count":
+                            chart_data = self._process_gauge_data(
+                                metrics_data["metrics"][metric_key], timestamps_ms
+                            )
+                        else:
+                            chart_data = self._process_counter_data(
+                                metrics_data["metrics"][metric_key], timestamps_ms
+                            )
                     else:
                         chart_data = self._process_gauge_data(
-                            rrd_data["metrics"][metric_key], timestamps_ms
+                            metrics_data["metrics"][metric_key], timestamps_ms
                         )
 
                     series.append(
@@ -3467,11 +3482,12 @@ class APIEndpoints:
                     )
 
             graph_data = {
-                "start_time": rrd_data["start_time"],
-                "end_time": rrd_data["end_time"],
-                "step": rrd_data["step"],
-                "timestamps": rrd_data["timestamps"],
+                "start_time": metrics_data["start_time"],
+                "end_time": metrics_data["end_time"],
+                "step": metrics_data["step"],
+                "timestamps": metrics_data["timestamps"],
                 "series": series,
+                "data_source": metrics_data.get("data_source", "rrd"),
             }
 
             return self._success(graph_data)
@@ -7559,9 +7575,12 @@ class APIEndpoints:
             storage = self._get_storage()
             stats = storage.sqlite_handler.get_table_stats()
 
-            # Add RRD file size if it exists
             rrd_path = storage.sqlite_handler.storage_dir / "metrics.rrd"
-            stats["rrd_size_bytes"] = rrd_path.stat().st_size if rrd_path.exists() else 0
+            rrd_exists = rrd_path.exists()
+            stats["rrd_enabled"] = bool(getattr(storage, "rrd_enabled", True))
+            stats["rrd_available"] = bool(getattr(storage, "rrd_handler", None)) and rrd_exists
+            stats["metrics_data_source"] = "rrd" if stats["rrd_available"] else "sqlite"
+            stats["rrd_size_bytes"] = rrd_path.stat().st_size if rrd_exists else 0
 
             return {"success": True, "data": stats}
         except Exception as e:

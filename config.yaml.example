@@ -140,6 +140,11 @@ repeater:
 policy:
   policy_file: "policy.yaml"
 
+metrics:
+  # Store historical metrics in RRDtool when available.
+  # When disabled, chart APIs calculate metrics from repeater.db.
+  rrd_enabled: true
+
 # Local GPS receiver. When enabled, the daemon reads NMEA sentences from the
 # configured source and exposes parsed data at /api/gps.
 gps:

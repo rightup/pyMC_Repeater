@@ -702,3 +702,141 @@ def test_cleanup_old_data_accepts_companion_events_days(tmp_path):
     with h._connect() as conn:
         count = conn.execute("SELECT COUNT(*) FROM packets").fetchone()[0]
     assert count == 0
+
+
+def test_get_metrics_data_returns_aligned_buckets_and_equal_length_arrays(tmp_path):
+    h = _make_handler(tmp_path)
+
+    packets = [
+        {
+            "timestamp": 61,
+            "type": 0,
+            "route": 1,
+            "length": 10,
+            "rssi": -80,
+            "snr": 5.0,
+            "score": 0.2,
+            "transmitted": False,
+            "packet_hash": "metrics-1",
+        },
+        {
+            "timestamp": 62,
+            "type": 19,
+            "route": 1,
+            "length": 20,
+            "rssi": -90,
+            "snr": 3.0,
+            "score": 0.4,
+            "transmitted": True,
+            "packet_hash": "metrics-2",
+        },
+        {
+            "timestamp": 121,
+            "type": 5,
+            "route": 1,
+            "length": 30,
+            "rssi": -70,
+            "snr": 10.0,
+            "score": 0.8,
+            "transmitted": True,
+            "packet_hash": "metrics-3",
+        },
+    ]
+    for record in packets:
+        h.store_packet(record)
+
+    out = h.get_metrics_data(start_time=61, end_time=239, resolution="average")
+
+    assert out["data_source"] == "sqlite"
+    assert out["counter_mode"] == "bucket_count"
+    assert out["start_time"] == 60
+    assert out["end_time"] == 180
+    assert out["step"] == 60
+    assert out["timestamps"] == [60, 120, 180]
+
+    expected_length = len(out["timestamps"])
+    for values in out["metrics"].values():
+        assert len(values) == expected_length
+    for values in out["packet_types"].values():
+        assert len(values) == expected_length
+
+    assert out["metrics"]["rx_count"] == [2, 1, 0]
+    assert out["metrics"]["tx_count"] == [1, 1, 0]
+    assert out["metrics"]["drop_count"] == [1, 0, 0]
+    assert out["metrics"]["avg_length"] == [15.0, 30.0, None]
+    assert out["metrics"]["neighbor_count"] == [None, None, None]
+
+    assert out["packet_types"]["type_0"] == [1, 0, 0]
+    assert out["packet_types"]["type_5"] == [0, 1, 0]
+    assert out["packet_types"]["type_other"] == [1, 0, 0]
+    assert out["packet_types"]["type_15"] == [0, 0, 0]
+
+
+def test_get_metrics_data_empty_buckets_use_zero_counters_and_null_gauges(tmp_path):
+    h = _make_handler(tmp_path)
+
+    out = h.get_metrics_data(start_time=0, end_time=120, resolution="average")
+
+    assert out["timestamps"] == [0, 60, 120]
+    assert out["metrics"]["rx_count"] == [0, 0, 0]
+    assert out["metrics"]["tx_count"] == [0, 0, 0]
+    assert out["metrics"]["drop_count"] == [0, 0, 0]
+    assert out["metrics"]["avg_rssi"] == [None, None, None]
+    assert out["metrics"]["avg_snr"] == [None, None, None]
+    assert out["metrics"]["avg_length"] == [None, None, None]
+    assert out["metrics"]["avg_score"] == [None, None, None]
+    assert out["packet_types"]["type_0"] == [0, 0, 0]
+    assert out["packet_types"]["type_other"] == [0, 0, 0]
+
+
+@pytest.mark.parametrize(
+    ("resolution", "expected_rssi", "expected_snr", "expected_length", "expected_score"),
+    [
+        ("average", -75.0, 4.0, 15.0, 0.5),
+        ("max", -70, 6.0, 20, 0.8),
+        ("min", -80, 2.0, 10, 0.2),
+    ],
+)
+def test_get_metrics_data_applies_requested_gauge_aggregation(
+    tmp_path,
+    resolution,
+    expected_rssi,
+    expected_snr,
+    expected_length,
+    expected_score,
+):
+    h = _make_handler(tmp_path)
+
+    h.store_packet(
+        {
+            "timestamp": 61,
+            "type": 1,
+            "route": 1,
+            "length": 10,
+            "rssi": -80,
+            "snr": 2.0,
+            "score": 0.2,
+            "transmitted": False,
+            "packet_hash": f"agg-{resolution}-1",
+        }
+    )
+    h.store_packet(
+        {
+            "timestamp": 62,
+            "type": 1,
+            "route": 1,
+            "length": 20,
+            "rssi": -70,
+            "snr": 6.0,
+            "score": 0.8,
+            "transmitted": True,
+            "packet_hash": f"agg-{resolution}-2",
+        }
+    )
+
+    out = h.get_metrics_data(start_time=60, end_time=119, resolution=resolution)
+
+    assert out["metrics"]["avg_rssi"] == [expected_rssi]
+    assert out["metrics"]["avg_snr"] == [expected_snr]
+    assert out["metrics"]["avg_length"] == [expected_length]
+    assert out["metrics"]["avg_score"] == [expected_score]
