@@ -273,14 +273,21 @@ class PacketRouter:
             return {}
         return companion_bridges
 
-    async def _fan_out_to_bridges(self, packet, bridges, *, context: str) -> bool:
-        """Offer packet to each bridge; True if any bridge authenticated it.
+    async def _fan_out_to_bridges(self, packet, bridges, *, context: str) -> tuple:
+        """Offer packet to each bridge; report ``(delivered, authenticated)``.
 
         Accepts a dict of bridges — pass a single-entry dict for targeted delivery
         to the bridge that owns ``dest_hash``. A bridge that raises is logged and
         skipped; ``result.authenticated`` is read directly (every bridge returns a
         HandlerResult) so a broken contract surfaces instead of being hidden.
+
+        ``delivered`` is True when at least one bridge completed without raising —
+        the signal callers must use before ``_mark_delivered_to_companions`` so a
+        delivery where every bridge raised is retried on the next copy instead of
+        being suppressed for the dedupe TTL. ``authenticated`` is True when any
+        bridge authenticated the packet.
         """
+        delivered = False
         authenticated = False
         for bridge in bridges.values():
             try:
@@ -288,9 +295,10 @@ class PacketRouter:
             except Exception as e:
                 logger.debug("Companion bridge %s error: %s", context, e)
                 continue
+            delivered = True
             if result.authenticated is True:
                 authenticated = True
-        return authenticated
+        return delivered, authenticated
 
     async def _consume_via_local_candidates(
         self, packet, metadata: dict, dest_hash, helper, process_method_name: str
@@ -316,9 +324,15 @@ class PacketRouter:
 
         consumed = False
         if has_companion:
-            bridge_result = await companion_bridges[dest_hash].process_received_packet(packet)
-            if bridge_result.authenticated:
-                consumed = True
+            # A raising bridge must not abort the candidate loop: the colliding
+            # room-server / repeater identity below still gets offered the packet.
+            try:
+                bridge_result = await companion_bridges[dest_hash].process_received_packet(packet)
+            except Exception as e:
+                logger.debug("Companion bridge candidate error: %s", e)
+            else:
+                if bridge_result.authenticated:
+                    consumed = True
         # Offer to the room-server / repeater identity when it shares the hash
         # (collision) or when no local companion claims it at all (normal
         # server-owned + remote-forward handling).
@@ -632,21 +646,21 @@ class PacketRouter:
             companion_bridges = self._companion_bridges_for_packet(packet, metadata)
             if dest_hash is not None and dest_hash in companion_bridges:
                 if not self._was_delivered_to_companions(packet):
-                    consumed = (
-                        await self._fan_out_to_bridges(
-                            packet, {dest_hash: companion_bridges[dest_hash]}, context="PATH"
-                        )
-                        or consumed
+                    delivered, authenticated = await self._fan_out_to_bridges(
+                        packet, {dest_hash: companion_bridges[dest_hash]}, context="PATH"
                     )
-                    self._mark_delivered_to_companions(packet)
+                    consumed = authenticated or consumed
+                    if delivered:
+                        self._mark_delivered_to_companions(packet)
             elif companion_bridges and not self._was_delivered_to_companions(packet):
                 # Dest not in bridges: path-return with ephemeral dest (e.g. multi-hop login).
                 # Deliver to all bridges; each will try to decrypt and ignore if not relevant.
-                consumed = (
-                    await self._fan_out_to_bridges(packet, companion_bridges, context="PATH")
-                    or consumed
+                delivered, authenticated = await self._fan_out_to_bridges(
+                    packet, companion_bridges, context="PATH"
                 )
-                self._mark_delivered_to_companions(packet)
+                consumed = authenticated or consumed
+                if delivered:
+                    self._mark_delivered_to_companions(packet)
                 logger.debug(
                     "PATH dest=0x%02x (anon) delivered to %d bridge(s) for matching",
                     dest_hash or 0,
@@ -668,13 +682,13 @@ class PacketRouter:
             companion_bridges = self._companion_bridges_for_packet(packet, metadata)
             local_hash = getattr(self.daemon, "local_hash", None)
             if dest_hash is not None and dest_hash in companion_bridges:
-                consumed = await self._fan_out_to_bridges(
+                _, consumed = await self._fan_out_to_bridges(
                     packet, {dest_hash: companion_bridges[dest_hash]}, context="RESPONSE"
                 )
                 logger.info("RESPONSE dest=0x%02x delivered to companion bridge", dest_hash)
             elif dest_hash == local_hash and companion_bridges:
                 # Response addressed to this repeater (e.g. path-based reply to first hop)
-                consumed = await self._fan_out_to_bridges(
+                _, consumed = await self._fan_out_to_bridges(
                     packet, companion_bridges, context="RESPONSE"
                 )
                 logger.info(
@@ -686,7 +700,7 @@ class PacketRouter:
                 # Dest not in bridges and not local: likely ANON_REQ response (dest = ephemeral
                 # sender hash). Deliver to all bridges; each will try to decrypt and ignore if
                 # not relevant (firmware-like behavior, works with multiple companion bridges).
-                consumed = await self._fan_out_to_bridges(
+                _, consumed = await self._fan_out_to_bridges(
                     packet, companion_bridges, context="RESPONSE"
                 )
                 logger.debug(
@@ -711,8 +725,11 @@ class PacketRouter:
             companion_bridges = self._companion_bridges_for_packet(packet, metadata)
             final_hop = _is_direct_final_hop(packet)
             if companion_bridges and (final_hop or not self._was_delivered_to_companions(packet)):
-                await self._fan_out_to_bridges(packet, companion_bridges, context="RESPONSE")
-                self._mark_delivered_to_companions(packet)
+                delivered, _ = await self._fan_out_to_bridges(
+                    packet, companion_bridges, context="RESPONSE"
+                )
+                if delivered:
+                    self._mark_delivered_to_companions(packet)
             if companion_bridges and final_hop:
                 # DIRECT with empty path: we're the final hop, so consume after delivery.
                 processed_by_injection = True

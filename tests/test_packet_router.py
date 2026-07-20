@@ -1321,3 +1321,106 @@ class TestInjectedTxRawEcho(unittest.IsolatedAsyncioTestCase):
         ok = await router.inject_packet(_make_packet())
 
         self.assertTrue(ok)
+
+
+class TestCompanionDeliveryFailureHandling(unittest.IsolatedAsyncioTestCase):
+    """Dedupe marking and candidate-loop behaviour when companion bridges raise."""
+
+    async def test_path_all_bridges_raising_is_retried_on_next_copy(self):
+        """A PATH delivery where every bridge raised must not be marked
+        delivered; the next mesh copy gets another delivery attempt."""
+        daemon = _make_daemon()
+        bridge = _make_bridge()
+        bridge.process_received_packet = AsyncMock(side_effect=RuntimeError("bridge down"))
+        daemon.companion_bridges = {0x01: bridge}
+        router = PacketRouter(daemon)
+        pkt = _make_packet(PathHandler.payload_type())
+        pkt.payload = bytes([0x01, 0xAA])
+
+        await router._route_packet(pkt)
+        self.assertEqual(bridge.process_received_packet.await_count, 1)
+
+        # Bridge recovers; the second copy must be delivered, not TTL-suppressed.
+        recovered = AsyncMock(return_value=HandlerResult.not_for_us())
+        bridge.process_received_packet = recovered
+        await router._route_packet(pkt)
+        recovered.assert_awaited_once()
+
+    async def test_path_partial_bridge_failure_still_marks_delivered(self):
+        """One healthy bridge is a delivery: the duplicate copy stays suppressed."""
+        daemon = _make_daemon()
+        raising = _make_bridge()
+        raising.process_received_packet = AsyncMock(side_effect=RuntimeError("boom"))
+        healthy = _make_bridge()
+        healthy.process_received_packet = AsyncMock(return_value=HandlerResult.not_for_us())
+        daemon.companion_bridges = {0x01: raising, 0x02: healthy}
+        router = PacketRouter(daemon)
+        pkt = _make_packet(PathHandler.payload_type())
+        # Dest not in bridges: anon path-return, delivered to all bridges.
+        pkt.payload = bytes([0xEE, 0xAA])
+
+        await router._route_packet(pkt)
+        await router._route_packet(pkt)
+
+        healthy.process_received_packet.assert_awaited_once()
+        raising.process_received_packet.assert_awaited_once()
+
+    async def test_protocol_response_all_bridges_raising_is_retried_on_next_copy(self):
+        daemon = _make_daemon()
+        bridge = _make_bridge()
+        bridge.process_received_packet = AsyncMock(side_effect=RuntimeError("bridge down"))
+        daemon.companion_bridges = {0x01: bridge}
+        router = PacketRouter(daemon)
+        pkt = _make_packet(ProtocolResponseHandler.payload_type())
+        pkt.header = ROUTE_TYPE_FLOOD  # not a final hop: dedupe decides delivery
+
+        with patch("repeater.packet_router.PathHandler.payload_type", return_value=0x55):
+            await router._route_packet(pkt)
+            self.assertEqual(bridge.process_received_packet.await_count, 1)
+
+            recovered = AsyncMock(return_value=HandlerResult.not_for_us())
+            bridge.process_received_packet = recovered
+            await router._route_packet(pkt)
+            recovered.assert_awaited_once()
+
+    async def test_login_candidate_bridge_error_still_offers_local_identity(self):
+        """A raising companion bridge must not abort the candidate loop: the
+        hash-colliding room-server/repeater identity still gets the packet."""
+        daemon = _make_daemon()
+        bridge = _make_bridge()
+        bridge.process_received_packet = AsyncMock(side_effect=RuntimeError("bridge down"))
+        daemon.companion_bridges = {0xF5: bridge}
+        daemon.login_helper = MagicMock()
+        daemon.login_helper.handlers = {0xF5: MagicMock()}
+        daemon.login_helper.process_login_packet = AsyncMock(return_value=True)
+        daemon.repeater_handler = AsyncMock()
+        daemon.repeater_handler.storage = MagicMock()
+        daemon.repeater_handler.record_packet_only = MagicMock()
+        router = PacketRouter(daemon)
+        pkt = _make_packet(LoginServerHandler.payload_type())
+        pkt.payload = bytes([0xF5, 0x01])
+
+        await router._route_packet(pkt)
+
+        bridge.process_received_packet.assert_awaited_once()
+        daemon.login_helper.process_login_packet.assert_awaited_once()
+        # The colliding identity consumed it, so the engine must not re-forward.
+        daemon.repeater_handler.assert_not_awaited()
+
+    async def test_text_candidate_bridge_error_leaves_packet_for_engine(self):
+        """Bridge raises and no local identity claims the text: the packet must
+        still reach the forwarding engine instead of dying with the exception."""
+        daemon = _make_daemon()
+        bridge = _make_bridge()
+        bridge.process_received_packet = AsyncMock(side_effect=RuntimeError("bridge down"))
+        daemon.companion_bridges = {0xF5: bridge}
+        daemon.text_helper = MagicMock()
+        daemon.text_helper.handlers = {}
+        daemon.text_helper.process_text_packet = AsyncMock(return_value=False)
+        router = PacketRouter(daemon)
+        pkt = _make_packet(TextMessageHandler.payload_type())
+        pkt.payload = bytes([0xF5, 0x01])
+
+        await router._route_packet(pkt)
+
+        daemon.repeater_handler.assert_awaited_once()
