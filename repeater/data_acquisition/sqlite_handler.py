@@ -1112,13 +1112,11 @@ class SQLiteHandler:
             if end_timestamp < start_timestamp:
                 start_timestamp, end_timestamp = end_timestamp, start_timestamp
 
-            tx_filter = "(transmitted = 1 OR lbt_attempts > 0 OR drop_reason LIKE 'TX failed%')"
-
             with self._connect() as conn:
                 conn.row_factory = sqlite3.Row
 
-                aggregate_rows = conn.execute(  # nosec B608 - internal SQL template with controlled fragments
-                    f"""
+                aggregate_rows = conn.execute(
+                    """
                     WITH tx_packets AS (
                         SELECT
                             CAST(timestamp / ? AS INTEGER) * ? AS bucket_ts,
@@ -1135,7 +1133,7 @@ class SQLiteHandler:
                         FROM packets INDEXED BY idx_packets_timestamp
                         WHERE timestamp >= ?
                           AND timestamp <= ?
-                          AND {tx_filter}
+                                                    AND (transmitted = 1 OR lbt_attempts > 0 OR drop_reason LIKE 'TX failed%')
                     )
                     SELECT
                         bucket_ts,
@@ -1164,8 +1162,8 @@ class SQLiteHandler:
                     ),
                 ).fetchall()
 
-                dist_rows = conn.execute(  # nosec B608 - internal SQL template with controlled fragments
-                    f"""
+                dist_rows = conn.execute(
+                    """
                     WITH tx_packets AS (
                         SELECT
                             CAST(timestamp / ? AS INTEGER) * ? AS bucket_ts,
@@ -1176,7 +1174,7 @@ class SQLiteHandler:
                         FROM packets INDEXED BY idx_packets_timestamp
                         WHERE timestamp >= ?
                           AND timestamp <= ?
-                          AND {tx_filter}
+                                                    AND (transmitted = 1 OR lbt_attempts > 0 OR drop_reason LIKE 'TX failed%')
                     )
                     SELECT bucket_ts, attempts_total, COUNT(*) AS cnt
                     FROM tx_packets
@@ -1191,8 +1189,8 @@ class SQLiteHandler:
                     ),
                 ).fetchall()
 
-                type_rows = conn.execute(  # nosec B608 - internal SQL template with controlled fragments
-                    f"""
+                type_rows = conn.execute(
+                    """
                     WITH tx_packets AS (
                         SELECT
                             CAST(timestamp / ? AS INTEGER) * ? AS bucket_ts,
@@ -1209,7 +1207,7 @@ class SQLiteHandler:
                         FROM packets INDEXED BY idx_packets_timestamp
                         WHERE timestamp >= ?
                           AND timestamp <= ?
-                          AND {tx_filter}
+                                                    AND (transmitted = 1 OR lbt_attempts > 0 OR drop_reason LIKE 'TX failed%')
                     )
                     SELECT
                         bucket_ts,
@@ -1726,22 +1724,57 @@ class SQLiteHandler:
             with self._connect() as conn:
                 conn.row_factory = sqlite3.Row
 
-                aggregate_rows = conn.execute(  # nosec B608 - internal SQL template with controlled fragments
-                    f"""
+                if gauge_aggregate == "MAX":
+                    aggregate_query = """
                     SELECT
                         CAST(timestamp / ? AS INTEGER) * ? AS bucket_ts,
                         COUNT(*) AS rx_count,
                         SUM(CASE WHEN transmitted = 1 THEN 1 ELSE 0 END) AS tx_count,
                         SUM(CASE WHEN transmitted = 0 THEN 1 ELSE 0 END) AS drop_count,
-                        {gauge_aggregate}(rssi) AS avg_rssi,
-                        {gauge_aggregate}(snr) AS avg_snr,
-                        {gauge_aggregate}(length) AS avg_length,
-                        {gauge_aggregate}(score) AS avg_score
+                        MAX(rssi) AS avg_rssi,
+                        MAX(snr) AS avg_snr,
+                        MAX(length) AS avg_length,
+                        MAX(score) AS avg_score
                     FROM packets INDEXED BY idx_packets_timestamp
                     WHERE timestamp >= ? AND timestamp <= ?
                     GROUP BY bucket_ts
                     ORDER BY bucket_ts ASC
-                    """,
+                    """
+                elif gauge_aggregate == "MIN":
+                    aggregate_query = """
+                    SELECT
+                        CAST(timestamp / ? AS INTEGER) * ? AS bucket_ts,
+                        COUNT(*) AS rx_count,
+                        SUM(CASE WHEN transmitted = 1 THEN 1 ELSE 0 END) AS tx_count,
+                        SUM(CASE WHEN transmitted = 0 THEN 1 ELSE 0 END) AS drop_count,
+                        MIN(rssi) AS avg_rssi,
+                        MIN(snr) AS avg_snr,
+                        MIN(length) AS avg_length,
+                        MIN(score) AS avg_score
+                    FROM packets INDEXED BY idx_packets_timestamp
+                    WHERE timestamp >= ? AND timestamp <= ?
+                    GROUP BY bucket_ts
+                    ORDER BY bucket_ts ASC
+                    """
+                else:
+                    aggregate_query = """
+                    SELECT
+                        CAST(timestamp / ? AS INTEGER) * ? AS bucket_ts,
+                        COUNT(*) AS rx_count,
+                        SUM(CASE WHEN transmitted = 1 THEN 1 ELSE 0 END) AS tx_count,
+                        SUM(CASE WHEN transmitted = 0 THEN 1 ELSE 0 END) AS drop_count,
+                        AVG(rssi) AS avg_rssi,
+                        AVG(snr) AS avg_snr,
+                        AVG(length) AS avg_length,
+                        AVG(score) AS avg_score
+                    FROM packets INDEXED BY idx_packets_timestamp
+                    WHERE timestamp >= ? AND timestamp <= ?
+                    GROUP BY bucket_ts
+                    ORDER BY bucket_ts ASC
+                    """
+
+                aggregate_rows = conn.execute(
+                    aggregate_query,
                     (bucket_seconds, bucket_seconds, start_ts, end_ts),
                 ).fetchall()
 
@@ -3105,30 +3138,104 @@ class SQLiteHandler:
         try:
             with self._connect() as conn:
                 now = time.time()
-                update_fields = dict(kwargs)
-                update_fields["updated_at"] = now
+                sync_since = kwargs.get("sync_since", 0)
+                pending_ack_crc = kwargs.get("pending_ack_crc", 0)
+                push_post_timestamp = kwargs.get("push_post_timestamp", 0)
+                ack_timeout_time = kwargs.get("ack_timeout_time", 0)
+                push_failures = kwargs.get("push_failures", 0)
+                last_activity = kwargs.get("last_activity")
+                if last_activity is None:
+                    last_activity = now
 
-                # INSERT must satisfy NOT NULL columns (last_activity), while
-                # ON CONFLICT updates should only touch supplied fields.
-                insert_fields = dict(update_fields)
-                if insert_fields.get("last_activity") is None:
-                    insert_fields["last_activity"] = now
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO room_client_sync (
+                        room_hash,
+                        client_pubkey,
+                        sync_since,
+                        pending_ack_crc,
+                        push_post_timestamp,
+                        ack_timeout_time,
+                        push_failures,
+                        last_activity,
+                        updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        room_hash,
+                        client_pubkey,
+                        sync_since,
+                        pending_ack_crc,
+                        push_post_timestamp,
+                        ack_timeout_time,
+                        push_failures,
+                        last_activity,
+                        now,
+                    ),
+                )
 
-                columns = ["room_hash", "client_pubkey"] + list(insert_fields.keys())
-                placeholders = ["?"] * len(columns)
-                values = [room_hash, client_pubkey] + list(insert_fields.values())
-
-                # Update only supplied columns on conflict so partial updates don't
-                # reset counters/state such as push_failures.
-                update_set = ", ".join(f"{col}=excluded.{col}" for col in update_fields.keys())
-                conn.execute(  # nosec B608 - internal SQL template with controlled fragments
-                    f"""
-                    INSERT INTO room_client_sync ({", ".join(columns)})
-                    VALUES ({", ".join(placeholders)})
-                    ON CONFLICT(room_hash, client_pubkey)
-                    DO UPDATE SET {update_set}
-                """,
-                    values,
+                if "sync_since" in kwargs:
+                    conn.execute(
+                        """
+                        UPDATE room_client_sync
+                        SET sync_since = ?
+                        WHERE room_hash = ? AND client_pubkey = ?
+                        """,
+                        (kwargs["sync_since"], room_hash, client_pubkey),
+                    )
+                if "pending_ack_crc" in kwargs:
+                    conn.execute(
+                        """
+                        UPDATE room_client_sync
+                        SET pending_ack_crc = ?
+                        WHERE room_hash = ? AND client_pubkey = ?
+                        """,
+                        (kwargs["pending_ack_crc"], room_hash, client_pubkey),
+                    )
+                if "push_post_timestamp" in kwargs:
+                    conn.execute(
+                        """
+                        UPDATE room_client_sync
+                        SET push_post_timestamp = ?
+                        WHERE room_hash = ? AND client_pubkey = ?
+                        """,
+                        (kwargs["push_post_timestamp"], room_hash, client_pubkey),
+                    )
+                if "ack_timeout_time" in kwargs:
+                    conn.execute(
+                        """
+                        UPDATE room_client_sync
+                        SET ack_timeout_time = ?
+                        WHERE room_hash = ? AND client_pubkey = ?
+                        """,
+                        (kwargs["ack_timeout_time"], room_hash, client_pubkey),
+                    )
+                if "push_failures" in kwargs:
+                    conn.execute(
+                        """
+                        UPDATE room_client_sync
+                        SET push_failures = ?
+                        WHERE room_hash = ? AND client_pubkey = ?
+                        """,
+                        (kwargs["push_failures"], room_hash, client_pubkey),
+                    )
+                if "last_activity" in kwargs:
+                    conn.execute(
+                        """
+                        UPDATE room_client_sync
+                        SET last_activity = ?
+                        WHERE room_hash = ? AND client_pubkey = ?
+                        """,
+                        (last_activity, room_hash, client_pubkey),
+                    )
+                conn.execute(
+                    """
+                    UPDATE room_client_sync
+                    SET updated_at = ?
+                    WHERE room_hash = ? AND client_pubkey = ?
+                    """,
+                    (now, room_hash, client_pubkey),
                 )
                 conn.commit()
                 return True
