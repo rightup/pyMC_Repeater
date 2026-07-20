@@ -179,7 +179,7 @@ class ConfigManager:
 
         http_cfg = self.config.get("http", {}) if isinstance(self.config, dict) else {}
         enabled = self._parse_bool(http_cfg.get("enabled", True), default=True)
-        host = str(http_cfg.get("host", "0.0.0.0") or "0.0.0.0")
+        host = str(http_cfg.get("host", "0.0.0.0") or "0.0.0.0")  # nosec B104 - intentional LAN bind default
 
         try:
             port = int(http_cfg.get("port", 8000))

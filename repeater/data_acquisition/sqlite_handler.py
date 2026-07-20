@@ -1117,7 +1117,7 @@ class SQLiteHandler:
             with self._connect() as conn:
                 conn.row_factory = sqlite3.Row
 
-                aggregate_rows = conn.execute(
+                aggregate_rows = conn.execute(  # nosec B608 - internal SQL template with controlled fragments
                     f"""
                     WITH tx_packets AS (
                         SELECT
@@ -1164,7 +1164,7 @@ class SQLiteHandler:
                     ),
                 ).fetchall()
 
-                dist_rows = conn.execute(
+                dist_rows = conn.execute(  # nosec B608 - internal SQL template with controlled fragments
                     f"""
                     WITH tx_packets AS (
                         SELECT
@@ -1191,7 +1191,7 @@ class SQLiteHandler:
                     ),
                 ).fetchall()
 
-                type_rows = conn.execute(
+                type_rows = conn.execute(  # nosec B608 - internal SQL template with controlled fragments
                     f"""
                     WITH tx_packets AS (
                         SELECT
@@ -1726,7 +1726,7 @@ class SQLiteHandler:
             with self._connect() as conn:
                 conn.row_factory = sqlite3.Row
 
-                aggregate_rows = conn.execute(
+                aggregate_rows = conn.execute(  # nosec B608 - internal SQL template with controlled fragments
                     f"""
                     SELECT
                         CAST(timestamp / ? AS INTEGER) * ? AS bucket_ts,
@@ -3121,7 +3121,7 @@ class SQLiteHandler:
                 # Update only supplied columns on conflict so partial updates don't
                 # reset counters/state such as push_failures.
                 update_set = ", ".join(f"{col}=excluded.{col}" for col in update_fields.keys())
-                conn.execute(
+                conn.execute(  # nosec B608 - internal SQL template with controlled fragments
                     f"""
                     INSERT INTO room_client_sync ({", ".join(columns)})
                     VALUES ({", ".join(placeholders)})

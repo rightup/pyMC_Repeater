@@ -233,7 +233,7 @@ def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
     if "http" not in config:
         config["http"] = {
             "enabled": True,
-            "host": "0.0.0.0",
+            "host": "0.0.0.0",  # nosec B104 - intentional LAN bind default
             "port": 8000,
         }
 
