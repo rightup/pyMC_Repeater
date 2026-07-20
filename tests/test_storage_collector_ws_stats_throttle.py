@@ -1,8 +1,8 @@
+import builtins
+import importlib.util
 import sys
 import threading
 import types
-import builtins
-import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
