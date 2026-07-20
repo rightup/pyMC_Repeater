@@ -1706,13 +1706,9 @@ class RepeaterHandler(BaseHandler):
                 if current_time - self.last_db_cleanup >= 21600:
                     if self.storage:
                         try:
-                            retention_cfg = self.config.get("storage", {}).get(
-                                "retention", {}
-                            )
+                            retention_cfg = self.config.get("storage", {}).get("retention", {})
                             retention_days = retention_cfg.get("sqlite_cleanup_days", 31)
-                            companion_events_days = retention_cfg.get(
-                                "companion_events_days", 31
-                            )
+                            companion_events_days = retention_cfg.get("companion_events_days", 31)
                             self.storage.cleanup_old_data(
                                 days=retention_days,
                                 companion_events_days=companion_events_days,

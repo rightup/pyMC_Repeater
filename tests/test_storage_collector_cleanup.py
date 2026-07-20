@@ -20,9 +20,7 @@ def _bare_collector() -> StorageCollector:
 def test_cleanup_passes_companion_events_days_through():
     collector = _bare_collector()
     collector.cleanup_old_data(days=10, companion_events_days=20)
-    collector.sqlite_handler.cleanup_old_data.assert_called_once_with(
-        10, companion_events_days=20
-    )
+    collector.sqlite_handler.cleanup_old_data.assert_called_once_with(10, companion_events_days=20)
 
 
 def test_cleanup_defaults_match_engine_callsite():
@@ -30,6 +28,4 @@ def test_cleanup_defaults_match_engine_callsite():
     # for any older callers that only know about ``days``.
     collector = _bare_collector()
     collector.cleanup_old_data(days=7)
-    collector.sqlite_handler.cleanup_old_data.assert_called_once_with(
-        7, companion_events_days=None
-    )
+    collector.sqlite_handler.cleanup_old_data.assert_called_once_with(7, companion_events_days=None)
