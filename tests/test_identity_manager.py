@@ -1,4 +1,6 @@
-from repeater.identity_manager import IdentityManager
+import pytest
+
+from repeater.identity_manager import IdentityConfigurationError, IdentityManager, IdentitySpec
 
 
 class _FakeIdentity:
@@ -24,6 +26,17 @@ def test_identity_manager_register_lookup_and_collision_paths():
     assert mgr.get_identity_by_name("alpha")[0] is id_a
 
     assert mgr.register_identity("beta", id_b_collision, {"k": 2}, "room_server") is False
+
+
+def test_identity_manager_rejects_duplicate_names_without_mutating_state():
+    mgr = IdentityManager(config={})
+    id_a = _FakeIdentity(bytes([0x11]) + b"A" * 31)
+    id_b = _FakeIdentity(bytes([0x22]) + b"B" * 31)
+
+    assert mgr.register_identity("alpha", id_a, {}, "repeater") is True
+    assert "already registered" in mgr.registration_error("alpha", id_b)
+    assert mgr.validate_identity("alpha", id_b) is False
+    assert mgr.get_identity_by_hash(0x22) is None
 
 
 def test_identity_manager_list_and_type_filtering():
@@ -56,3 +69,60 @@ def test_identity_manager_list_handles_none_identity_fields():
     listed = mgr.list_identities()
     assert listed[0]["address"] == "N/A"
     assert listed[0]["public_key"] is None
+
+
+def test_validate_specs_rejects_intra_batch_hash_collision():
+    mgr = IdentityManager(config={})
+    id_a = _FakeIdentity(bytes([0x11]) + b"A" * 31)
+    id_b = _FakeIdentity(bytes([0x11]) + b"B" * 31)
+
+    with pytest.raises(IdentityConfigurationError, match="one-byte public-key prefixes"):
+        mgr.validate_specs(
+            [
+                IdentitySpec("alpha", id_a, {}, "repeater"),
+                IdentitySpec("beta", id_b, {}, "companion"),
+            ]
+        )
+
+
+def test_validate_specs_rejects_intra_batch_duplicate_name():
+    mgr = IdentityManager(config={})
+    id_a = _FakeIdentity(bytes([0x11]) + b"A" * 31)
+    id_b = _FakeIdentity(bytes([0x22]) + b"B" * 31)
+
+    with pytest.raises(IdentityConfigurationError, match="repeater:alpha"):
+        mgr.validate_specs(
+            [
+                IdentitySpec("alpha", id_a, {}, "repeater"),
+                IdentitySpec("alpha", id_b, {}, "companion"),
+            ]
+        )
+
+
+def test_validate_specs_rejects_registered_collisions_without_mutation():
+    mgr = IdentityManager(config={})
+    id_a = _FakeIdentity(bytes([0x11]) + b"A" * 31)
+    id_hash_collision = _FakeIdentity(bytes([0x11]) + b"B" * 31)
+    id_name_collision = _FakeIdentity(bytes([0x22]) + b"C" * 31)
+
+    assert mgr.register_identity("alpha", id_a, {}, "repeater") is True
+
+    with pytest.raises(IdentityConfigurationError, match="conflicts"):
+        mgr.validate_specs([IdentitySpec("beta", id_hash_collision, {}, "companion")])
+    with pytest.raises(IdentityConfigurationError, match="already registered"):
+        mgr.validate_specs([IdentitySpec("alpha", id_name_collision, {}, "companion")])
+
+    # Validation never registers anything.
+    assert mgr.get_identity_by_hash(0x22) is None
+    assert mgr.get_identity_by_name("beta") is None
+
+
+def test_validate_specs_accepts_distinct_batch():
+    mgr = IdentityManager(config={})
+    mgr.validate_specs(
+        [
+            IdentitySpec("alpha", _FakeIdentity(bytes([0x11]) + b"A" * 31), {}, "repeater"),
+            IdentitySpec("beta", _FakeIdentity(bytes([0x22]) + b"B" * 31), {}, "room_server"),
+            IdentitySpec("gamma", _FakeIdentity(bytes([0x33]) + b"C" * 31), {}, "companion"),
+        ]
+    )

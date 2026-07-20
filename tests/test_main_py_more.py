@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from repeater.identity_manager import IdentityManager
 from repeater.main import RepeaterDaemon
 
 
@@ -43,7 +44,7 @@ async def test_load_additional_identities_valid_and_invalid_entries():
     }
 
     daemon = RepeaterDaemon(cfg, radio=object())
-    daemon.identity_manager = SimpleNamespace(list_identities=lambda: [1, 2])
+    daemon.identity_manager = IdentityManager({})
     daemon._register_identity_everywhere = MagicMock(return_value=True)
 
     with patch("openhop_core.LocalIdentity", _FakeLocalIdentity):

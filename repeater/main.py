@@ -1,12 +1,14 @@
 import asyncio
 import functools
-import inspect
 import logging
 import os
 import signal
 import socket
 import sys
 import time
+
+from openhop_core.companion.radio_capabilities import resolve_max_tx_power_dbm
+from openhop_core.protocol.constants import PAYLOAD_TYPE_RAW_CUSTOM
 
 from repeater.companion.utils import (
     CompanionContactCapacityError,
@@ -32,7 +34,8 @@ from repeater.handler_helpers import (
     TextHelper,
     TraceHelper,
 )
-from repeater.identity_manager import IdentityManager
+from repeater.identity_manager import IdentityConfigurationError, IdentityManager, IdentitySpec
+from repeater.logging_utils import normalize_log_level
 from repeater.packet_router import PacketRouter
 from repeater.sensors import SensorManager
 from repeater.utils_packet import create_scoped_advert_packet
@@ -104,20 +107,111 @@ class RepeaterDaemon:
         self.router = None
         self.companion_bridges: dict[int, object] = {}
         self.companion_frame_servers: list = []
+        # Parsed once during the startup preflight; the identity loaders reuse
+        # them so config parsing (and its warnings) does not run twice.
+        self._room_server_specs: list[IdentitySpec] | None = None
+        self._companion_specs: list[IdentitySpec] | None = None
         self._shutdown_started = False
         self._main_task = None
         self.radio_status = "unknown"
         self.radio_error = None
 
-        log_level = config.get("logging", {}).get("level", "INFO")
+        log_level = normalize_log_level(config.get("logging", {}).get("level", "INFO"))
         logging.basicConfig(
-            level=getattr(logging, log_level),
+            level=log_level,
             format=config.get("logging", {}).get("format"),
         )
 
         root_logger = logging.getLogger()
-        _log_buffer.setLevel(getattr(logging, log_level))
+        _log_buffer.setLevel(log_level)
         root_logger.addHandler(_log_buffer)
+
+    def _configured_identity_specs(self, identity_type: str) -> list[IdentitySpec]:
+        """Build valid configured local identities without registering them.
+
+        Invalid optional room-server or companion entries retain the existing
+        skip-and-log behavior.  Valid entries are returned for collision
+        validation before they can create helper, database, or TCP state.
+        """
+        from openhop_core import LocalIdentity
+
+        config_key = {
+            "room_server": "room_servers",
+            "companion": "companions",
+        }[identity_type]
+        configs = self.config.get("identities", {}).get(config_key) or []
+        specs = []
+
+        for identity_config in configs:
+            name = identity_config.get("name")
+            identity_key = identity_config.get("identity_key")
+            label = "Companion" if identity_type == "companion" else "Room server"
+
+            if not name or not identity_key:
+                logger.warning("Skipping %s config: missing name or identity_key", label.lower())
+                continue
+
+            try:
+                if isinstance(identity_key, str):
+                    key_hex = (
+                        normalize_companion_identity_key(identity_key)
+                        if identity_type == "companion"
+                        else identity_key
+                    )
+                    identity_key_bytes = bytes.fromhex(key_hex)
+                elif isinstance(identity_key, bytes):
+                    identity_key_bytes = identity_key
+                else:
+                    logger.error("%s '%s' identity_key has unknown type", label, name)
+                    continue
+            except ValueError as error:
+                logger.error("%s '%s' identity_key invalid hex: %s", label, name, error)
+                continue
+
+            if len(identity_key_bytes) not in (32, 64):
+                logger.error(
+                    "%s '%s' identity_key must be 32 bytes (hex) or 64 bytes "
+                    "(MeshCore firmware key)",
+                    label,
+                    name,
+                )
+                continue
+
+            try:
+                identity = LocalIdentity(seed=identity_key_bytes)
+            except Exception as error:
+                logger.error("Failed to create %s identity '%s': %s", label.lower(), name, error)
+                continue
+
+            specs.append(
+                IdentitySpec(
+                    name=name,
+                    identity=identity,
+                    config=identity_config,
+                    identity_type=identity_type,
+                )
+            )
+
+        return specs
+
+    def _preflight_configured_local_identities(self, local_identity) -> None:
+        """Validate every configured local identity before stateful setup begins.
+
+        The parsed room-server and companion specs are cached so the identity
+        loaders reuse them instead of re-parsing the config (and re-logging
+        every invalid entry). Collision rules live in
+        ``IdentityManager.validate_specs``; at this point the manager holds no
+        registered identities, so this is a pure batch check.
+        """
+        self._room_server_specs = self._configured_identity_specs("room_server")
+        self._companion_specs = self._configured_identity_specs("companion")
+        specs = [
+            IdentitySpec("repeater", local_identity, self.config, "repeater"),
+            *self._room_server_specs,
+            *self._companion_specs,
+        ]
+        manager = self.identity_manager or IdentityManager(self.config)
+        manager.validate_specs(specs)
 
     async def initialize(self):
 
@@ -238,14 +332,19 @@ class RepeaterDaemon:
                 self.config.get("repeater", {}).get("dispatcher_dedupe_enabled", False)
             )
             self.dispatcher = Dispatcher(self.radio, dedupe_enabled=dedupe_enabled)
+            # Flood reception-quality delay base (MeshCore "set rxdelay");
+            # 0 keeps flood processing immediate, the firmware default.
+            self.dispatcher.rx_delay_base = float(
+                self.config.get("delays", {}).get("rx_delay_base", 0.0)
+            )
             logger.info("Dispatcher initialized")
             logger.info("Dispatcher dedupe enabled: %s", dedupe_enabled)
 
-            # Initialize Identity Manager for additional identities (e.g., room servers)
+            # Track every local identity, including the default repeater.
             self.identity_manager = IdentityManager(self.config)
             logger.info("Identity manager initialized")
 
-            # Set up default repeater identity (not managed by identity manager)
+            # Set up the default repeater identity.
             identity_key = self.config.get("repeater", {}).get("identity_key")
             if not identity_key:
                 logger.error("No identity key found in configuration. Cannot init repeater.")
@@ -254,6 +353,19 @@ class RepeaterDaemon:
             local_identity = LocalIdentity(seed=identity_key)
             self.local_identity = local_identity
             self.dispatcher.local_identity = local_identity
+
+            # A one-byte public-key prefix selects local routing, companion
+            # bridges, and companion SQLite namespaces.  Reject all configured
+            # collisions before helpers, databases, or companion TCP servers
+            # have any state to overwrite.
+            self._preflight_configured_local_identities(local_identity)
+            if not self.identity_manager.register_identity(
+                name="repeater",
+                identity=local_identity,
+                config=self.config,
+                identity_type="repeater",
+            ):
+                raise IdentityConfigurationError("Failed to register repeater identity")
 
             pubkey = local_identity.get_public_key()
             self.local_hash = pubkey[0]
@@ -265,8 +377,6 @@ class RepeaterDaemon:
 
             # Load additional identities from config (e.g., room servers)
             await self._load_additional_identities()
-
-            self.dispatcher._is_own_packet = lambda pkt: False
 
             self.repeater_handler = RepeaterHandler(
                 self.config,
@@ -284,6 +394,10 @@ class RepeaterDaemon:
             # All received packets flow through router → helpers → repeater engine
             self.dispatcher.register_fallback_handler(self._router_callback)
             logger.info("Packet router registered as fallback (catches all packets)")
+
+            # Final-hop RAW_CUSTOM is local-only. Direct packets with remaining
+            # hops are handed to the router; flood RAW_CUSTOM is discarded.
+            self._register_raw_custom_handler()
 
             # Set default path hash mode for flood 0-hop packets (adverts, etc.)
             path_hash_mode = self.config.get("mesh", {}).get("path_hash_mode", 0)
@@ -450,6 +564,7 @@ class RepeaterDaemon:
                 engine=self.repeater_handler,
                 neighbor_tracker=self.advert_helper,
                 config=self.config,
+                sensor_manager=self.sensor_manager,
             )
             # Register repeater identity for protocol requests
             self.protocol_request_helper.register_identity(
@@ -494,49 +609,19 @@ class RepeaterDaemon:
             raise
 
     async def _load_additional_identities(self):
-        from openhop_core import LocalIdentity
+        room_specs = self._room_server_specs
+        if room_specs is None:
+            room_specs = self._configured_identity_specs("room_server")
+        self.identity_manager.validate_specs(room_specs)
 
-        identities_config = self.config.get("identities", {})
-
-        # Load room server identities
-        room_servers = identities_config.get("room_servers") or []
-        for room_config in room_servers:
+        for spec in room_specs:
+            name, room_identity = spec.name, spec.identity
             try:
-                name = room_config.get("name")
-                identity_key = room_config.get("identity_key")
-
-                if not name or not identity_key:
-                    logger.warning("Skipping room server config: missing name or identity_key")
-                    continue
-
-                # Convert identity_key to bytes if it's a hex string
-                if isinstance(identity_key, bytes):
-                    identity_key_bytes = identity_key
-                elif isinstance(identity_key, str):
-                    try:
-                        identity_key_bytes = bytes.fromhex(identity_key)
-                        if len(identity_key_bytes) not in (32, 64):
-                            logger.error(
-                                f"Identity key for '{name}' is invalid length: {len(identity_key_bytes)} bytes (expected 32 or 64)"
-                            )
-                            continue
-                    except ValueError as e:
-                        logger.error(f"Identity key for '{name}' is not valid hex: {e}")
-                        continue
-                else:
-                    logger.error(
-                        f"Identity key for '{name}' has unknown type: {type(identity_key)}"
-                    )
-                    continue
-
-                # Create the identity
-                room_identity = LocalIdentity(seed=identity_key_bytes)
-
                 # Register with the manager and all helpers
                 success = self._register_identity_everywhere(
                     name=name,
                     identity=room_identity,
-                    config=room_config,
+                    config=spec.config,
                     identity_type="room_server",
                 )
 
@@ -546,7 +631,13 @@ class RepeaterDaemon:
                         f"Loaded room server '{name}': hash=0x{room_hash:02x}, "
                         f"address={room_identity.get_address_bytes().hex()}"
                     )
+                else:
+                    raise IdentityConfigurationError(
+                        f"Failed to register room server identity '{name}'"
+                    )
 
+            except IdentityConfigurationError:
+                raise
             except Exception as e:
                 logger.error(f"Failed to load room server identity '{name}': {e}")
 
@@ -554,20 +645,63 @@ class RepeaterDaemon:
         total_identities = len(self.identity_manager.list_identities())
         logger.info(f"Identity manager loaded {total_identities} total identities")
 
+    def _get_companion_radio_settings(self) -> dict:
+        """Return the current repeater radio settings for virtual companions.
+
+        The values are read-only to companion sessions.  Prefer attributes of
+        the active backend, then retain the configured value when a backend
+        cannot expose that field.
+        """
+        config = (
+            self.repeater_handler.radio_config
+            if self.repeater_handler
+            else self.config.get("radio", {})
+        )
+        settings = dict(config) if isinstance(config, dict) else {}
+        radio = self.radio
+        if radio is None:
+            return settings
+
+        for config_key, attr in (
+            ("frequency", "frequency"),
+            ("bandwidth", "bandwidth"),
+            ("spreading_factor", "spreading_factor"),
+            ("coding_rate", "coding_rate"),
+            ("tx_power", "tx_power"),
+        ):
+            value = getattr(radio, attr, None)
+            if value is not None:
+                settings[config_key] = value
+        return settings
+
+    def _get_companion_max_tx_power_dbm(self):
+        """Return the active backend's TX limit when it declares one.
+
+        The backend can expose a ``get_max_tx_power_dbm`` method, a
+        ``max_tx_power_dbm`` attribute (SX1262 backends declare their 22 dBm
+        driver limit this way), or a validated deployment setting.
+        Returning ``None`` lets Core use its generic protocol fallback.
+        """
+        return resolve_max_tx_power_dbm(self.radio, self._get_companion_radio_settings())
+
     async def _load_companion_identities(self) -> None:
         """Load companion identities from config and create CompanionBridge + frame server for each."""
-        from openhop_core import LocalIdentity
-
         from repeater.companion import CompanionFrameServer, RepeaterCompanionBridge
 
-        companions_config = self.config.get("identities", {}).get("companions") or []
-        if not companions_config:
+        companion_specs = self._companion_specs
+        if companion_specs is None:
+            companion_specs = self._configured_identity_specs("companion")
+        if not companion_specs:
             return
+
+        # Validate the complete companion set before any bridge can restore or
+        # mutate a hash-keyed SQLite namespace, or any TCP server can bind.
+        self.identity_manager.validate_specs(companion_specs)
 
         sqlite_handler = None
         if self.repeater_handler and self.repeater_handler.storage:
             sqlite_handler = self.repeater_handler.storage.sqlite_handler
-        if not sqlite_handler and companions_config:
+        if not sqlite_handler:
             logger.warning(
                 "Companion persistence disabled: no storage (contacts/channels will not survive restart or disconnect)"
             )
@@ -578,37 +712,10 @@ class RepeaterDaemon:
             else self.config.get("radio", {})
         )
 
-        for comp_config in companions_config:
+        for spec in companion_specs:
+            name, identity, comp_config = spec.name, spec.identity, spec.config
             try:
-                name = comp_config.get("name")
-                identity_key = comp_config.get("identity_key")
                 settings = comp_config.get("settings") or {}
-
-                if not name or not identity_key:
-                    logger.warning("Skipping companion config: missing name or identity_key")
-                    continue
-
-                if isinstance(identity_key, str):
-                    try:
-                        identity_key_bytes = bytes.fromhex(
-                            normalize_companion_identity_key(identity_key)
-                        )
-                    except ValueError as e:
-                        logger.error(f"Companion '{name}' identity_key invalid hex: {e}")
-                        continue
-                elif isinstance(identity_key, bytes):
-                    identity_key_bytes = identity_key
-                else:
-                    logger.error(f"Companion '{name}' identity_key has unknown type")
-                    continue
-
-                if len(identity_key_bytes) not in (32, 64):
-                    logger.error(
-                        f"Companion '{name}' identity_key must be 32 bytes (hex) or 64 bytes (MeshCore firmware key)"
-                    )
-                    continue
-
-                identity = LocalIdentity(seed=identity_key_bytes)
                 pubkey = identity.get_public_key()
                 companion_hash = pubkey[0]
                 companion_hash_str = f"0x{companion_hash:02x}"
@@ -669,6 +776,8 @@ class RepeaterDaemon:
                     ),
                     node_name=node_name,
                     radio_config=radio_config,
+                    radio_settings_getter=self._get_companion_radio_settings,
+                    max_tx_power_getter=self._get_companion_max_tx_power_dbm,
                     sqlite_handler=sqlite_handler,
                     companion_hash=companion_hash_str,
                     on_prefs_saved=_make_sync_node_name_to_config(name),
@@ -707,12 +816,18 @@ class RepeaterDaemon:
                 await frame_server.start()
                 self.companion_frame_servers.append(frame_server)
 
-                self.identity_manager.register_identity(
+                if not self.identity_manager.register_identity(
                     name=name,
                     identity=identity,
                     config=comp_config,
                     identity_type="companion",
-                )
+                ):
+                    # The complete set was prevalidated above.  A failure here
+                    # signals a concurrent/configuration error and must not be
+                    # silently treated as a running companion.
+                    raise IdentityConfigurationError(
+                        f"Failed to register companion identity '{name}'"
+                    )
 
                 limits = format_companion_bridge_limits(bridge_kwargs)
                 logger.info(
@@ -725,20 +840,22 @@ class RepeaterDaemon:
                 logger.error("%s", e)
             except CompanionStateLoadError as e:
                 logger.error("Companion init aborted: %s", e)
+            except IdentityConfigurationError:
+                raise
             except Exception as e:
                 logger.error(f"Failed to load companion '{name}': {e}", exc_info=True)
 
     async def _restore_companion_state(
         self, sqlite_handler, bridge, companion_hash_str: str, name: str
     ) -> None:
-        """Restore persisted contacts/channels/messages from SQLite into a bridge.
+        """Restore persisted contacts and channels from SQLite into a bridge.
 
         Each load is cross-checked against the table's row count for this
         companion and retried once on mismatch; raises CompanionStateLoadError
         when persisted rows exist but cannot be loaded, so the companion fails
         init loudly instead of starting with an empty store.
         """
-        from openhop_core.companion.models import Channel, QueuedMessage
+        from openhop_core.companion.models import Channel
 
         contact_rows, contact_count = await _load_companion_rows_verified(
             sqlite_handler.companion_load_contacts,
@@ -790,63 +907,15 @@ class RepeaterDaemon:
                     row.get("name", ""),
                 )
 
-        # Preload queued messages, bounded by offline_queue_size (0 disables
-        # offline storage entirely).
-        loaded_messages = 0
-        message_count = 0
-        retention = getattr(bridge.message_queue, "max_size", None)
-        if retention != 0:
-            message_rows, message_count = await _load_companion_rows_verified(
-                sqlite_handler.companion_load_messages,
-                sqlite_handler.companion_count_messages,
-                "messages",
-                companion_hash_str,
-                name,
-                limit=retention or 100,
-            )
-            loaded_messages = len(message_rows)
-            # openhop_core < the sender_prefix change (paired with fd43d86) has no
-            # QueuedMessage.sender_prefix; drop the prefix there instead of failing init.
-            supports_sender_prefix = "sender_prefix" in inspect.signature(QueuedMessage).parameters
-            if message_rows and not supports_sender_prefix:
-                logger.warning(
-                    "Companion %s ('%s'): installed openhop_core QueuedMessage has no "
-                    "sender_prefix field; persisted sender prefixes will be dropped "
-                    "(update openhop_core to restore signed room-post authors)",
-                    companion_hash_str,
-                    name,
-                )
-            for msg_dict in message_rows:
-                sk = msg_dict.get("sender_key", b"")
-                if isinstance(sk, str):
-                    sk = bytes.fromhex(sk)
-                sp = msg_dict.get("sender_prefix", b"")
-                if isinstance(sp, str):
-                    sp = bytes.fromhex(sp) if sp else b""
-                msg_kwargs = dict(
-                    sender_key=sk,
-                    txt_type=msg_dict.get("txt_type", 0),
-                    timestamp=msg_dict.get("timestamp", 0),
-                    text=msg_dict.get("text", ""),
-                    is_channel=bool(msg_dict.get("is_channel", False)),
-                    channel_idx=msg_dict.get("channel_idx", 0),
-                    path_len=msg_dict.get("path_len", 0),
-                )
-                if supports_sender_prefix:
-                    msg_kwargs["sender_prefix"] = sp
-                bridge.message_queue.push(QueuedMessage(**msg_kwargs))
-
         logger.info(
-            "Companion %s ('%s'): restored %d/%d contact(s), %d/%d channel(s), "
-            "%d/%d message(s) from SQLite",
+            "Companion %s ('%s'): restored %d/%d contact(s), %d/%d channel(s); "
+            "queued messages remain in SQLite",
             companion_hash_str,
             name,
             len(contact_rows),
             contact_count,
             len(channel_rows),
             channel_count,
-            loaded_messages,
-            message_count,
         )
 
     async def add_companion_from_config(self, comp_config: dict) -> None:
@@ -890,6 +959,12 @@ class RepeaterDaemon:
         pubkey = identity.get_public_key()
         companion_hash = pubkey[0]
         companion_hash_str = f"0x{companion_hash:02x}"
+
+        if self.identity_manager is None:
+            raise RuntimeError("Identity manager must be initialized before adding a companion")
+        registration_error = self.identity_manager.registration_error(name, identity)
+        if registration_error:
+            raise ValueError(f"Cannot add companion: {registration_error}")
 
         if companion_hash in self.companion_bridges:
             raise ValueError(f"Companion with hash 0x{companion_hash:02x} already loaded")
@@ -936,6 +1011,8 @@ class RepeaterDaemon:
             ),
             node_name=node_name,
             radio_config=radio_config,
+            radio_settings_getter=self._get_companion_radio_settings,
+            max_tx_power_getter=self._get_companion_max_tx_power_dbm,
             sqlite_handler=sqlite_handler,
             companion_hash=companion_hash_str,
             **bridge_kwargs,
@@ -967,12 +1044,13 @@ class RepeaterDaemon:
         await frame_server.start()
         self.companion_frame_servers.append(frame_server)
 
-        self.identity_manager.register_identity(
+        if not self.identity_manager.register_identity(
             name=name,
             identity=identity,
             config=comp_config,
             identity_type="companion",
-        )
+        ):
+            raise IdentityConfigurationError(f"Failed to register companion identity '{name}'")
 
         limits = format_companion_bridge_limits(bridge_kwargs)
         logger.info(
@@ -1000,6 +1078,34 @@ class RepeaterDaemon:
                 fs.push_rx_raw(snr, rssi, data)
             except Exception as e:
                 logger.debug("Push RX raw to companion: %s", e)
+
+    def _register_raw_custom_handler(self) -> None:
+        """Register firmware-compatible RAW_CUSTOM handling ahead of fallback routing."""
+        if self.dispatcher:
+            self.dispatcher.register_handler(
+                PAYLOAD_TYPE_RAW_CUSTOM, self._on_raw_data_for_companions
+            )
+
+    async def _on_raw_data_for_companions(self, packet) -> None:
+        """Deliver final direct RAW_CUSTOM packets and route direct intermediate hops."""
+        if not packet.is_route_direct():
+            return
+
+        if getattr(packet, "path", None):
+            await self._router_callback(packet)
+            return
+
+        handler = self.repeater_handler
+        if handler:
+            if handler.is_duplicate(packet):
+                return
+            handler.mark_seen(packet)
+
+        for bridge in self.companion_bridges.values():
+            try:
+                await bridge.process_received_packet(packet)
+            except Exception as e:
+                logger.debug("Companion bridge RAW_CUSTOM error: %s", e)
 
     def _register_duplicate_logging_hook(self, dedupe_enabled: bool) -> None:
         """Register pre-dedup duplicate logging only when dispatcher dedupe is active."""
@@ -1271,10 +1377,17 @@ class RepeaterDaemon:
                 scope_label="advert",
             )
 
-            # Send via dispatcher
-            await self.dispatcher.send_packet(packet, wait_for_ack=False)
+            injector = getattr(getattr(self, "router", None), "inject_packet", None)
+            if callable(injector):
+                sent = await injector(packet, wait_for_ack=False)
+            else:
+                sent = await self.dispatcher.send_packet(packet, wait_for_ack=False)
 
-            if self.repeater_handler:
+            if not sent:
+                logger.error("Failed to send advert: packet transmission was rejected")
+                return False
+
+            if not callable(injector) and self.repeater_handler:
                 self.repeater_handler.mark_seen(packet)
                 pkt_hash = packet.calculate_packet_hash().hex()[:16]
                 self.dispatcher.packet_filter.track_packet(pkt_hash)

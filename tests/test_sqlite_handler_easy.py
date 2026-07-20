@@ -200,6 +200,114 @@ def test_store_packet_returns_inserted_row_id(tmp_path):
     assert row[3] == 3
 
 
+def test_packets_table_has_upstream_columns_and_index(tmp_path):
+    h = _make_handler(tmp_path)
+
+    with h._connect() as conn:
+        cols = conn.execute("PRAGMA table_info(packets)").fetchall()
+        col_names = {col[1] for col in cols}
+        idx_rows = conn.execute("PRAGMA index_list(packets)").fetchall()
+        idx_names = {row[1] for row in idx_rows}
+
+    assert "upstream_hash" in col_names
+    assert "upstream_hash_size" in col_names
+    assert "idx_packets_upstream_time" in idx_names
+
+
+def test_store_packet_persists_upstream_fields(tmp_path):
+    h = _make_handler(tmp_path)
+
+    packet_id = h.store_packet(
+        {
+            "timestamp": 200.0,
+            "type": 1,
+            "route": 1,
+            "length": 9,
+            "transmitted": False,
+            "packet_hash": "pkt-upstream",
+            "upstream_hash": "AB",
+            "upstream_hash_size": 2,
+            "original_path": ["CD", "AB"],
+        }
+    )
+
+    row = h.get_packet_by_id(int(packet_id))
+    assert row is not None
+    assert row["upstream_hash"] == "AB"
+    assert row["upstream_hash_size"] == 2
+
+
+def test_neighbor_link_history_uses_packets_table_and_filters_hash_and_size(tmp_path):
+    h = _make_handler(tmp_path)
+    base_ts = 1_700_000_000.0
+
+    h.store_packet(
+        {
+            "timestamp": base_ts,
+            "type": 4,
+            "route": 1,
+            "length": 10,
+            "rssi": -80,
+            "snr": 3.5,
+            "score": 0.4,
+            "is_duplicate": False,
+            "packet_hash": "match-1",
+            "upstream_hash": "AA",
+            "upstream_hash_size": 1,
+            "original_path": ["10", "AA"],
+        }
+    )
+    h.store_packet(
+        {
+            "timestamp": base_ts + 1.0,
+            "type": 5,
+            "route": 1,
+            "length": 11,
+            "rssi": -82,
+            "snr": 2.5,
+            "score": 0.35,
+            "is_duplicate": True,
+            "packet_hash": "match-2",
+            "upstream_hash": "AA",
+            "upstream_hash_size": 1,
+            "original_path": ["20", "30", "AA"],
+        }
+    )
+    # Same hash but different width: must not be merged.
+    h.store_packet(
+        {
+            "timestamp": base_ts + 2.0,
+            "type": 6,
+            "route": 1,
+            "length": 12,
+            "packet_hash": "wrong-width",
+            "upstream_hash": "AA",
+            "upstream_hash_size": 2,
+            "original_path": ["00AA"],
+        }
+    )
+    # Different hash: must be filtered out.
+    h.store_packet(
+        {
+            "timestamp": base_ts + 3.0,
+            "type": 7,
+            "route": 1,
+            "length": 13,
+            "packet_hash": "wrong-hash",
+            "upstream_hash": "BB",
+            "upstream_hash_size": 1,
+            "original_path": ["BB"],
+        }
+    )
+
+    rows = h.get_neighbor_link_history(peer_hash="aa", path_hash_size=1, hours=50000, limit=100)
+
+    assert [row["packet_hash"] for row in rows] == ["match-1", "match-2"]
+    assert rows[0]["path_hop_count"] == 2
+    assert rows[1]["path_hop_count"] == 3
+    assert rows[1]["is_duplicate"] is True
+
+
 def test_recent_packet_queries_include_ids_and_preserve_duplicate_hash_rows(tmp_path):
     h = _make_handler(tmp_path)
 
@@ -568,3 +676,167 @@ def test_get_lbt_diagnostics_empty_range_preserves_no_data_distinction(tmp_path)
         assert bucket["avg_attempts"] is None
     assert out["packet_types"] == []
     assert out["packet_type_buckets"] == []
+
+
+def test_cleanup_old_data_accepts_companion_events_days(tmp_path):
+    """engine.py forwards companion_events_days; accepting it must not break
+    packet retention cleanup (the pre-fix TypeError was swallowed upstream).
+    """
+    import time
+
+    h = _make_handler(tmp_path)
+    old_ts = time.time() - (40 * 86400)
+    h.store_packet(
+        {
+            "timestamp": old_ts,
+            "type": 1,
+            "route": 2,
+            "length": 3,
+            "transmitted": False,
+            "packet_hash": "pkt-old",
+        }
+    )
+
+    h.cleanup_old_data(days=31, companion_events_days=14)
+
+    with h._connect() as conn:
+        count = conn.execute("SELECT COUNT(*) FROM packets").fetchone()[0]
+    assert count == 0
+
+
+def test_get_metrics_data_returns_aligned_buckets_and_equal_length_arrays(tmp_path):
+    h = _make_handler(tmp_path)
+
+    packets = [
+        {
+            "timestamp": 61,
+            "type": 0,
+            "route": 1,
+            "length": 10,
+            "rssi": -80,
+            "snr": 5.0,
+            "score": 0.2,
+            "transmitted": False,
+            "packet_hash": "metrics-1",
+        },
+        {
+            "timestamp": 62,
+            "type": 19,
+            "route": 1,
+            "length": 20,
+            "rssi": -90,
+            "snr": 3.0,
+            "score": 0.4,
+            "transmitted": True,
+            "packet_hash": "metrics-2",
+        },
+        {
+            "timestamp": 121,
+            "type": 5,
+            "route": 1,
+            "length": 30,
+            "rssi": -70,
+            "snr": 10.0,
+            "score": 0.8,
+            "transmitted": True,
+            "packet_hash": "metrics-3",
+        },
+    ]
+    for record in packets:
+        h.store_packet(record)
+
+    out = h.get_metrics_data(start_time=61, end_time=239, resolution="average")
+
+    assert out["data_source"] == "sqlite"
+    assert out["counter_mode"] == "bucket_count"
+    assert out["start_time"] == 60
+    assert out["end_time"] == 180
+    assert out["step"] == 60
+    assert out["timestamps"] == [60, 120, 180]
+
+    expected_length = len(out["timestamps"])
+    for values in out["metrics"].values():
+        assert len(values) == expected_length
+    for values in out["packet_types"].values():
+        assert len(values) == expected_length
+
+    assert out["metrics"]["rx_count"] == [2, 1, 0]
+    assert out["metrics"]["tx_count"] == [1, 1, 0]
+    assert out["metrics"]["drop_count"] == [1, 0, 0]
+    assert out["metrics"]["avg_length"] == [15.0, 30.0, None]
+    assert out["metrics"]["neighbor_count"] == [None, None, None]
+
+    assert out["packet_types"]["type_0"] == [1, 0, 0]
+    assert out["packet_types"]["type_5"] == [0, 1, 0]
+    assert out["packet_types"]["type_other"] == [1, 0, 0]
+    assert out["packet_types"]["type_15"] == [0, 0, 0]
+
+
+def test_get_metrics_data_empty_buckets_use_zero_counters_and_null_gauges(tmp_path):
+    h = _make_handler(tmp_path)
+
+    out = h.get_metrics_data(start_time=0, end_time=120, resolution="average")
+
+    assert out["timestamps"] == [0, 60, 120]
+    assert out["metrics"]["rx_count"] == [0, 0, 0]
+    assert out["metrics"]["tx_count"] == [0, 0, 0]
+    assert out["metrics"]["drop_count"] == [0, 0, 0]
+    assert out["metrics"]["avg_rssi"] == [None, None, None]
+    assert out["metrics"]["avg_snr"] == [None, None, None]
+    assert out["metrics"]["avg_length"] == [None, None, None]
+    assert out["metrics"]["avg_score"] == [None, None, None]
+    assert out["packet_types"]["type_0"] == [0, 0, 0]
+    assert out["packet_types"]["type_other"] == [0, 0, 0]
+
+
+@pytest.mark.parametrize(
+    ("resolution", "expected_rssi", "expected_snr", "expected_length", "expected_score"),
+    [
+        ("average", -75.0, 4.0, 15.0, 0.5),
+        ("max", -70, 6.0, 20, 0.8),
+        ("min", -80, 2.0, 10, 0.2),
+    ],
+)
+def test_get_metrics_data_applies_requested_gauge_aggregation(
+    tmp_path,
+    resolution,
+    expected_rssi,
+    expected_snr,
+    expected_length,
+    expected_score,
+):
+    h = _make_handler(tmp_path)
+
+    h.store_packet(
+        {
+            "timestamp": 61,
+            "type": 1,
+            "route": 1,
+            "length": 10,
+            "rssi": -80,
+            "snr": 2.0,
+            "score": 0.2,
+            "transmitted": False,
+            "packet_hash": f"agg-{resolution}-1",
+        }
+    )
+    h.store_packet(
+        {
+            "timestamp": 62,
+            "type": 1,
+            "route": 1,
+            "length": 20,
+            "rssi": -70,
+            "snr": 6.0,
+            "score": 0.8,
+            "transmitted": True,
+            "packet_hash": f"agg-{resolution}-2",
+        }
+    )
+
+    out = h.get_metrics_data(start_time=60, end_time=119, resolution=resolution)
+
+    assert out["metrics"]["avg_rssi"] == [expected_rssi]
+    assert out["metrics"]["avg_snr"] == [expected_snr]
+    assert out["metrics"]["avg_length"] == [expected_length]
+    assert out["metrics"]["avg_score"] == [expected_score]

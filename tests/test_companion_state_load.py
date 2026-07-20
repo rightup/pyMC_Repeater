@@ -14,6 +14,7 @@ import pytest
 
 import repeater.main as main_module
 from repeater.companion.utils import CompanionStateLoadError
+from repeater.identity_manager import IdentityManager
 from repeater.main import RepeaterDaemon, _load_companion_rows_verified
 
 _HASH = "0xab"
@@ -94,7 +95,7 @@ class TestRestoreCompanionState:
         return RepeaterDaemon({"repeater": {"node_name": "n"}, "logging": {}}, radio=object())
 
     @pytest.mark.asyncio
-    async def test_restores_all_state(self):
+    async def test_restores_contacts_and_channels_without_preloading_messages(self):
         daemon = self._daemon()
         bridge = self._bridge()
         sqlite = self._sqlite(
@@ -106,7 +107,9 @@ class TestRestoreCompanionState:
         bridge.contacts.load_from_dicts.assert_called_once()
         bridge.channels.set.assert_called_once()
         assert bridge.channels.set.call_args[0][0] == 1
-        bridge.message_queue.push.assert_called_once()
+        sqlite.companion_load_messages.assert_not_called()
+        sqlite.companion_count_messages.assert_not_called()
+        bridge.message_queue.push.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_channel_load_failure_raises_before_bridge_touch(self):
@@ -130,49 +133,6 @@ class TestRestoreCompanionState:
             await daemon._restore_companion_state(sqlite, bridge, _HASH, _NAME)
         assert any("rejected persisted channel" in r.message for r in caplog.records)
 
-    @pytest.mark.asyncio
-    async def test_old_core_without_sender_prefix_drops_prefix(self, caplog):
-        # openhop_core releases before the sender_prefix change reject the kwarg;
-        # message restore must degrade (drop the prefix) instead of failing init.
-        from dataclasses import dataclass, field
-
-        @dataclass
-        class LegacyQueuedMessage:
-            sender_key: bytes = b""
-            txt_type: int = 0
-            timestamp: int = 0
-            text: str = ""
-            is_channel: bool = False
-            channel_idx: int = 0
-            path_len: int = 0
-            snr: float = 0.0
-            rssi: int = 0
-            channel_data_payload: bytes = field(default=b"")
-
-        daemon = self._daemon()
-        bridge = self._bridge()
-        sqlite = self._sqlite(
-            messages=[{"sender_key": b"", "text": "hi", "sender_prefix": b"\xab\xcd"}]
-        )
-        with (
-            patch("openhop_core.companion.models.QueuedMessage", LegacyQueuedMessage),
-            caplog.at_level(logging.WARNING),
-        ):
-            await daemon._restore_companion_state(sqlite, bridge, _HASH, _NAME)
-        bridge.message_queue.push.assert_called_once()
-        pushed = bridge.message_queue.push.call_args[0][0]
-        assert isinstance(pushed, LegacyQueuedMessage)
-        assert pushed.text == "hi"
-        assert any("sender prefixes will be dropped" in r.message for r in caplog.records)
-
-    @pytest.mark.asyncio
-    async def test_zero_retention_skips_message_load(self):
-        daemon = self._daemon()
-        bridge = self._bridge(max_size=0)
-        sqlite = self._sqlite()
-        await daemon._restore_companion_state(sqlite, bridge, _HASH, _NAME)
-        sqlite.companion_load_messages.assert_not_called()
-
 
 class TestCompanionInitSurfacesLoadFailure:
     @staticmethod
@@ -187,6 +147,7 @@ class TestCompanionInitSurfacesLoadFailure:
             },
         }
         daemon = RepeaterDaemon(config, radio=object())
+        daemon.identity_manager = IdentityManager({})
         daemon.router = SimpleNamespace(inject_packet=AsyncMock())
         daemon.repeater_handler = SimpleNamespace(
             storage=SimpleNamespace(sqlite_handler=sqlite), radio_config={}
@@ -228,7 +189,7 @@ class TestCompanionInitSurfacesLoadFailure:
     async def test_add_companion_from_config_raises(self):
         sqlite = self._failing_sqlite()
         daemon = self._daemon_with_companion(sqlite)
-        daemon.identity_manager = SimpleNamespace(named_identities={})
+        daemon.identity_manager = IdentityManager({})
         comp_config = {"name": "hot-comp", "identity_key": "22" * 32, "settings": {}}
         with (
             patch("repeater.companion.RepeaterCompanionBridge") as bridge_cls,

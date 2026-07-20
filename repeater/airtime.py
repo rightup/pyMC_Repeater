@@ -1,7 +1,8 @@
 import logging
-import math
 import time
-from typing import Tuple
+from typing import Optional, Tuple
+
+from openhop_core.protocol.packet_utils import calculate_lora_airtime_ms
 
 logger = logging.getLogger("AirtimeManager")
 
@@ -15,16 +16,27 @@ class AirtimeManager:
         )
 
         # Store radio settings for airtime calculations
-        self.spreading_factor = self.radio_config.get("spreading_factor", 7)
-        self.bandwidth = self.radio_config.get("bandwidth", 125000)
-        self.coding_rate = self.radio_config.get("coding_rate", 5)
-        self.preamble_length = self.radio_config.get("preamble_length", 8)
+        self.refresh_radio_params(self.radio_config)
 
         # Track airtime in rolling window
         self.tx_history = []  # [(timestamp, airtime_ms), ...]
         self.window_size = 60  # seconds
         self.total_airtime_ms = 0
         self.total_rx_airtime_ms = 0
+
+    def refresh_radio_params(self, radio_config: Optional[dict] = None) -> None:
+        """Reload cached modulation params used by airtime estimation.
+
+        Call after a successful live radio reconfiguration. Does not reset
+        TX/RX history or duty-cycle totals.
+        """
+        if radio_config is None:
+            radio_config = self.config.get("radio", {}) or {}
+        self.radio_config = radio_config
+        self.spreading_factor = self.radio_config.get("spreading_factor", 7)
+        self.bandwidth = self.radio_config.get("bandwidth", 125000)
+        self.coding_rate = self.radio_config.get("coding_rate", 5)
+        self.preamble_length = self.radio_config.get("preamble_length", 8)
 
     def calculate_airtime(
         self,
@@ -37,9 +49,12 @@ class AirtimeManager:
         explicit_header: bool = True,
     ) -> float:
         """
-        Calculate LoRa packet airtime using the Semtech reference formula.
+        Calculate LoRa packet airtime via the shared core estimator.
 
-        Reference: https://www.semtech.com/design-support/lora-calculator
+        Delegates to ``calculate_lora_airtime_ms``, which matches RadioLib's
+        ``getTimeOnAir`` (the firmware reference), including its symbol-time
+        low-data-rate-optimization auto rule. Coding rate accepts either the
+        denominator form (5..8) or the legacy index form (1..4).
 
         Args:
             payload_len: Payload length in bytes
@@ -53,33 +68,15 @@ class AirtimeManager:
         Returns:
             Airtime in milliseconds
         """
-        sf = spreading_factor or self.spreading_factor
-        bw_hz = bandwidth_hz or self.bandwidth
-        cr = coding_rate or self.coding_rate
-        preamble_len = preamble_len or self.preamble_length
-        crc = 1 if crc_enabled else 0
-        h = 0 if explicit_header else 1  # H=0 for explicit, H=1 for implicit
-
-        # Low data rate optimization: required for SF11/SF12 at 125kHz
-        de = 1 if (sf >= 11 and bw_hz <= 125000) else 0
-
-        # Symbol time in milliseconds: T_sym = 2^SF / BW_kHz
-        t_sym = (2**sf) / (bw_hz / 1000)
-
-        # Preamble time: T_preamble = (n_preamble + 4.25) * T_sym
-        t_preamble = (preamble_len + 4.25) * t_sym
-
-        # Payload symbol calculation (Semtech formula):
-        # n_payload = 8 + ceil(max(8*PL - 4*SF + 28 + 16*CRC - 20*H, 0) / (4*(SF - 2*DE))) * CR
-        numerator = max(8 * payload_len - 4 * sf + 28 + 16 * crc - 20 * h, 0)
-        denominator = 4 * (sf - 2 * de)
-        n_payload = 8 + math.ceil(numerator / denominator) * cr
-
-        # Payload time
-        t_payload = n_payload * t_sym
-
-        # Total packet airtime
-        return t_preamble + t_payload
+        return calculate_lora_airtime_ms(
+            payload_len,
+            spreading_factor or self.spreading_factor,
+            bandwidth_hz or self.bandwidth,
+            coding_rate or self.coding_rate,
+            preamble_len or self.preamble_length,
+            crc_enabled=crc_enabled,
+            explicit_header=explicit_header,
+        )
 
     def can_transmit(self, airtime_ms: float) -> Tuple[bool, float]:
         enforcement_enabled = self.config.get("duty_cycle", {}).get("enforcement_enabled", True)

@@ -54,16 +54,31 @@ class CompanionFrameServer(_BaseFrameServer):
         )
         self.sqlite_handler = sqlite_handler
 
+    async def start(self) -> None:
+        """Start persistence before accepting companion client connections."""
+        if self.sqlite_handler:
+            self.bridge.on_message_event(self._on_message_event)
+            self.bridge.on_channel_message_event(self._on_channel_message_event)
+            self.bridge.on_channel_data_event(self._on_channel_data_event)
+        await super().start()
+
     # -----------------------------------------------------------------
     # Persistence hook overrides
     # -----------------------------------------------------------------
 
-    async def _persist_companion_message(self, msg_dict: dict) -> None:
-        """Persist message to SQLite and pop from bridge queue.
+    async def _persist_companion_message(self, msg_dict: dict, queue_entry=None) -> None:
+        """Persist message to SQLite and remove it from the bridge queue.
 
         The bridge's ``offline_queue_size`` (``message_queue.max_size``) doubles
         as the SQLite retention limit: 0 disables offline storage entirely, so the
         message is dropped instead of persisted.
+
+        ``queue_entry`` is the exact in-memory entry this message came from.  The
+        persisted entry is removed by identity (``message_queue.remove``) rather
+        than by ``pop_last``: pushes happen synchronously in sibling receive
+        tasks, so during the awaited ``to_thread`` another task can append a newer
+        entry and ``pop_last`` would remove that one instead — duplicating this
+        message and losing the newer one.
         """
         if not self.sqlite_handler:
             return
@@ -74,15 +89,37 @@ class CompanionFrameServer(_BaseFrameServer):
             getattr(self.bridge.message_queue, "_max_size", None),
         )
         if retention == 0:
-            self.bridge.message_queue.pop_last()
+            self._remove_queue_entry(queue_entry)
             return
-        await asyncio.to_thread(
+        persisted = await asyncio.to_thread(
             self.sqlite_handler.companion_push_message,
             self.companion_hash,
             msg_dict,
             retention,
         )
-        self.bridge.message_queue.pop_last()
+        if persisted:
+            self._remove_queue_entry(queue_entry)
+        else:
+            logger.debug(
+                "Companion %s: retaining message in memory after SQLite queue rejection",
+                self.companion_hash,
+            )
+
+    def _remove_queue_entry(self, queue_entry) -> None:
+        """Remove exactly the persisted entry from the bridge queue by identity.
+
+        Falling back to ``pop_last`` when ``queue_entry`` is None would reopen the
+        interleaving race (it could evict a newer, unpersisted entry), so an event
+        from an older core that carries no entry is left in memory: a possible
+        duplicate is preferable to losing a message.
+        """
+        if queue_entry is None:
+            logger.debug(
+                "Companion %s: no queue entry on persisted message; leaving in memory",
+                self.companion_hash,
+            )
+            return
+        self.bridge.message_queue.remove(queue_entry)
 
     def _sync_next_from_persistence(self) -> Optional[QueuedMessage]:
         """Retrieve next message from SQLite when bridge queue is empty."""
@@ -102,6 +139,10 @@ class CompanionFrameServer(_BaseFrameServer):
             is_channel=bool(msg_dict.get("is_channel", False)),
             channel_idx=msg_dict.get("channel_idx", 0),
             path_len=msg_dict.get("path_len", 0),
+            snr=float(msg_dict.get("snr") or 0.0),
+            rssi=int(msg_dict.get("rssi") or 0),
+            channel_data_type=int(msg_dict.get("channel_data_type") or 0),
+            channel_data_payload=bytes(msg_dict.get("channel_data_payload") or b""),
             sender_prefix=sender_prefix,
         )
 
@@ -123,6 +164,16 @@ class CompanionFrameServer(_BaseFrameServer):
     def _contact_to_dict(c) -> dict:
         """Convert a Contact object to a persistence dict."""
         pk = c.public_key if isinstance(c.public_key, bytes) else bytes.fromhex(c.public_key)
+        raw_advert = getattr(c, "last_advert_packet", None)
+        if isinstance(raw_advert, bytearray):
+            raw_advert = bytes(raw_advert)
+        elif isinstance(raw_advert, str):
+            try:
+                raw_advert = bytes.fromhex(raw_advert)
+            except ValueError:
+                raw_advert = None
+        elif not isinstance(raw_advert, bytes):
+            raw_advert = None
         return {
             "pubkey": pk,
             "name": c.name,
@@ -135,6 +186,7 @@ class CompanionFrameServer(_BaseFrameServer):
                 else (bytes.fromhex(c.out_path) if c.out_path else b"")
             ),
             "last_advert_timestamp": c.last_advert_timestamp,
+            "last_advert_packet": raw_advert,
             "lastmod": c.lastmod,
             "gps_lat": c.gps_lat,
             "gps_lon": c.gps_lon,

@@ -39,6 +39,28 @@ class MeshCLI:
         self.repeater_config = config.get("repeater", {})
         self.mesh_config = config.setdefault("mesh", {})
 
+    def _save_config_and_apply(self, sections=None) -> bool:
+        """Persist the config, then live-apply the changed sections.
+
+        ``ConfigManager.save_to_file`` returns a bare bool; the tuple form is
+        tolerated for older manager doubles. Live update only runs after a
+        successful save so a failed write never half-applies a change. Pass
+        no sections to stage a change: saved to disk, applied on restart
+        (radio parameters, matching firmware's reboot-to-apply).
+        """
+        result = self.config_manager.save_to_file()
+        saved = result[0] if isinstance(result, tuple) else bool(result)
+        if not saved:
+            return False
+        if sections:
+            self.config_manager.live_update_daemon(sections)
+        return True
+
+    def _get_security_config(self) -> Dict[str, Any]:
+        """Return the repeater login security section (the one LoginHelper reads)."""
+        security = self.repeater_config.get("security")
+        return security if isinstance(security, dict) else {}
+
     def _get_node_name(self) -> str:
         """Return the configured node name, preferring the newer key when present."""
         return self.repeater_config.get("node_name") or self.repeater_config.get("name", "Unknown")
@@ -332,12 +354,12 @@ class MeshCLI:
                 "  set allow.read.only on|off  Read-only access\n"
                 "  set advert.interval <min>   60-240 minutes\n"
                 "  set flood.advert.interval <hr>  3-168 hours\n"
-                "  set flood.max <hops>   Max flood hops (max 64)\n"
+                "  set flood.max <hops>   Max flood hops (max 64; 0 = unlimited, unlike firmware)\n"
                 "  set path.hash.mode <0-2>  Path hash mode (0=1B,1=2B,2=3B)\n"
                 "  set loop.detect <off|minimal|moderate|strict>  Flood loop detection\n"
-                "  set rxdelay <val>      RX delay base (>=0)\n"
-                "  set txdelay <val>      TX delay factor (>=0)\n"
-                "  set direct.txdelay <val>  Direct TX delay (>=0)\n"
+                "  set rxdelay <val>      RX delay base (0-20)\n"
+                "  set txdelay <val>      TX delay factor (0-2)\n"
+                "  set direct.txdelay <val>  Direct TX delay (0-2)\n"
                 "  set multi.acks <n>     Multi-ack count\n"
                 "  set int.thresh <dbm>   Interference threshold\n"
                 "  set agc.reset.interval <n>  AGC reset (rounded to x4)"
@@ -447,19 +469,14 @@ class MeshCLI:
         if not new_password:
             return "Error: Password cannot be empty"
 
-        # Update security config
-        if "security" not in self.config:
-            self.config["security"] = {}
-
-        self.config["security"]["password"] = new_password
+        # LoginHelper authenticates from repeater.security.admin_password.
+        self.repeater_config.setdefault("security", {})["admin_password"] = new_password
 
         # Save config and live update
         try:
-            saved, err = self.config_manager.save_to_file()
-            if not saved:
-                logger.error(f"Failed to save password: {err}")
-                return f"Error: Failed to save config: {err}"
-            self.config_manager.live_update_daemon(["security"])
+            if not self._save_config_and_apply(["repeater"]):
+                logger.error("Failed to save password: config save failed")
+                return "Error: Failed to save config"
             return f"password now: {new_password}"
         except Exception as e:
             logger.error(f"Failed to save password: {e}")
@@ -538,7 +555,7 @@ class MeshCLI:
             return f"> {role}"
 
         elif param == "guest.password":
-            guest_pw = self.config.get("security", {}).get("guest_password", "")
+            guest_pw = self._get_security_config().get("guest_password") or ""
             return f"> {guest_pw}"
 
         elif param == "owner.info":
@@ -546,7 +563,7 @@ class MeshCLI:
             return f"> {owner_info}"
 
         elif param == "allow.read.only":
-            allow = self.config.get("security", {}).get("allow_read_only", False)
+            allow = self._get_security_config().get("allow_read_only", False)
             return f"> {'on' if allow else 'off'}"
 
         elif param == "advert.interval":
@@ -554,7 +571,8 @@ class MeshCLI:
             return f"> {interval}"
 
         elif param == "flood.advert.interval":
-            interval = self.repeater_config.get("flood_advert_interval_hours", 24)
+            # The engine's flood-advert timer consumes send_advert_interval_hours.
+            interval = self.repeater_config.get("send_advert_interval_hours", 10)
             return f"> {interval}"
 
         elif param == "flood.max":
@@ -570,15 +588,21 @@ class MeshCLI:
             return f"> {loop_detect}"
 
         elif param == "rxdelay":
-            delay = self.repeater_config.get("rx_delay_base", 0.0)
+            # The flood RX delay base lives in the delays section (the value
+            # the dispatcher and web API use), not the repeater section.
+            delay = self.config.get("delays", {}).get("rx_delay_base", 0.0)
             return f"> {delay}"
 
         elif param == "txdelay":
-            delay = self.repeater_config.get("tx_delay_factor", 1.0)
+            # The TX delay factor lives in the delays section (the value the
+            # engine consumes), not the repeater section.
+            delay = self.config.get("delays", {}).get("tx_delay_factor", 1.0)
             return f"> {delay}"
 
         elif param == "direct.txdelay":
-            delay = self.repeater_config.get("direct_tx_delay_factor", 0.5)
+            # The direct TX delay factor lives in the delays section (the
+            # value the engine consumes), not the repeater section.
+            delay = self.config.get("delays", {}).get("direct_tx_delay_factor", 0.5)
             return f"> {delay}"
 
         elif param == "multi.acks":
@@ -609,87 +633,95 @@ class MeshCLI:
         try:
             if key == "af":
                 self.repeater_config["airtime_factor"] = float(value)
-                saved, _ = self.config_manager.save_to_file()
-                self.config_manager.live_update_daemon(["repeater"])
+                if not self._save_config_and_apply(["repeater"]):
+                    return "Error: Failed to save config"
                 return "OK"
 
             elif key == "name":
                 self._set_node_name(value)
-                saved, _ = self.config_manager.save_to_file()
-                self.config_manager.live_update_daemon(["repeater"])
+                if not self._save_config_and_apply(["repeater"]):
+                    return "Error: Failed to save config"
                 return "OK"
 
             elif key == "repeat":
                 self.repeater_config["mode"] = "forward" if value.lower() == "on" else "monitor"
-                saved, _ = self.config_manager.save_to_file()
-                self.config_manager.live_update_daemon(["repeater"])
+                if not self._save_config_and_apply(["repeater"]):
+                    return "Error: Failed to save config"
                 return f"OK - repeat is now {'ON' if self.repeater_config['mode'] == 'forward' else 'OFF'}"
 
             elif key == "lat":
                 self.repeater_config["latitude"] = float(value)
-                saved, _ = self.config_manager.save_to_file()
-                self.config_manager.live_update_daemon(["repeater"])
+                if not self._save_config_and_apply(["repeater"]):
+                    return "Error: Failed to save config"
                 return "OK"
 
             elif key == "lon":
                 self.repeater_config["longitude"] = float(value)
-                saved, _ = self.config_manager.save_to_file()
-                self.config_manager.live_update_daemon(["repeater"])
+                if not self._save_config_and_apply(["repeater"]):
+                    return "Error: Failed to save config"
                 return "OK"
 
             elif key == "radio":
-                # Format: freq bw sf cr
+                # Format: freq(MHz) bw(kHz) sf cr — the config stores Hz.
                 radio_parts = value.split()
                 if len(radio_parts) != 4:
                     return "Error: Expected freq bw sf cr"
 
-                if "radio" not in self.config:
-                    self.config["radio"] = {}
+                freq_mhz = float(radio_parts[0])
+                bw_khz = float(radio_parts[1])
+                sf = int(radio_parts[2])
+                cr = int(radio_parts[3])
+                if not (
+                    150.0 <= freq_mhz <= 2500.0
+                    and 7.0 <= bw_khz <= 500.0
+                    and 5 <= sf <= 12
+                    and 5 <= cr <= 8
+                ):
+                    return "Error, invalid radio params"
 
-                self.config["radio"]["frequency"] = float(radio_parts[0])
-                self.config["radio"]["bandwidth"] = float(radio_parts[1])
-                self.config["radio"]["spreading_factor"] = int(radio_parts[2])
-                self.config["radio"]["coding_rate"] = int(radio_parts[3])
-                saved, _ = self.config_manager.save_to_file()
-                self.config_manager.live_update_daemon(["radio"])
+                radio_config = self.config.setdefault("radio", {})
+                radio_config["frequency"] = int(round(freq_mhz * 1_000_000))
+                radio_config["bandwidth"] = int(round(bw_khz * 1_000))
+                radio_config["spreading_factor"] = sf
+                radio_config["coding_rate"] = cr
+                if not self._save_config_and_apply():
+                    return "Error: Failed to save config"
                 return "OK - restart repeater to apply"
 
             elif key == "freq":
-                if "radio" not in self.config:
-                    self.config["radio"] = {}
-                self.config["radio"]["frequency"] = float(value)
-                saved, _ = self.config_manager.save_to_file()
-                self.config_manager.live_update_daemon(["radio"])
+                # CLI input is MHz (firmware parity); the config stores Hz.
+                freq_mhz = float(value)
+                self.config.setdefault("radio", {})["frequency"] = int(round(freq_mhz * 1_000_000))
+                if not self._save_config_and_apply():
+                    return "Error: Failed to save config"
                 return "OK - restart repeater to apply"
 
             elif key == "tx":
-                if "radio" not in self.config:
-                    self.config["radio"] = {}
-                self.config["radio"]["tx_power"] = int(value)
-                saved, _ = self.config_manager.save_to_file()
-                self.config_manager.live_update_daemon(["radio"])
-                return "OK"
+                self.config.setdefault("radio", {})["tx_power"] = int(value)
+                if not self._save_config_and_apply():
+                    return "Error: Failed to save config"
+                return "OK - restart repeater to apply"
 
             elif key == "guest.password":
-                if "security" not in self.config:
-                    self.config["security"] = {}
-                self.config["security"]["guest_password"] = value
-                saved, _ = self.config_manager.save_to_file()
-                self.config_manager.live_update_daemon(["security"])
+                # LoginHelper authenticates from repeater.security.guest_password.
+                self.repeater_config.setdefault("security", {})["guest_password"] = value
+                if not self._save_config_and_apply(["repeater"]):
+                    return "Error: Failed to save config"
                 return "OK"
 
             elif key == "owner.info":
                 self.repeater_config["owner_info"] = value.replace("|", "\n")
-                saved, _ = self.config_manager.save_to_file()
-                self.config_manager.live_update_daemon(["repeater"])
+                if not self._save_config_and_apply(["repeater"]):
+                    return "Error: Failed to save config"
                 return "OK"
 
             elif key == "allow.read.only":
-                if "security" not in self.config:
-                    self.config["security"] = {}
-                self.config["security"]["allow_read_only"] = value.lower() == "on"
-                saved, _ = self.config_manager.save_to_file()
-                self.config_manager.live_update_daemon(["security"])
+                # LoginHelper reads repeater.security.allow_read_only.
+                self.repeater_config.setdefault("security", {})["allow_read_only"] = (
+                    value.lower() == "on"
+                )
+                if not self._save_config_and_apply(["repeater"]):
+                    return "Error: Failed to save config"
                 return "OK"
 
             elif key == "advert.interval":
@@ -697,17 +729,18 @@ class MeshCLI:
                 if mins > 0 and (mins < 60 or mins > 240):
                     return "Error: interval range is 60-240 minutes"
                 self.repeater_config["advert_interval_minutes"] = mins
-                saved, _ = self.config_manager.save_to_file()
-                self.config_manager.live_update_daemon(["repeater"])
+                if not self._save_config_and_apply(["repeater"]):
+                    return "Error: Failed to save config"
                 return "OK"
 
             elif key == "flood.advert.interval":
                 hours = int(value)
                 if (hours > 0 and hours < 3) or hours > 168:
                     return "Error: interval range is 3-168 hours"
-                self.repeater_config["flood_advert_interval_hours"] = hours
-                saved, _ = self.config_manager.save_to_file()
-                self.config_manager.live_update_daemon(["repeater"])
+                # The engine's flood-advert timer consumes send_advert_interval_hours.
+                self.repeater_config["send_advert_interval_hours"] = hours
+                if not self._save_config_and_apply(["repeater"]):
+                    return "Error: Failed to save config"
                 return "OK"
 
             elif key == "flood.max":
@@ -715,8 +748,8 @@ class MeshCLI:
                 if max_val > 64:
                     return "Error: max 64"
                 self.repeater_config["max_flood_hops"] = max_val
-                saved, _ = self.config_manager.save_to_file()
-                self.config_manager.live_update_daemon(["repeater"])
+                if not self._save_config_and_apply(["repeater"]):
+                    return "Error: Failed to save config"
                 return "OK"
 
             elif key == "path.hash.mode":
@@ -724,8 +757,8 @@ class MeshCLI:
                 if mode not in (0, 1, 2):
                     return "Error: path.hash.mode must be 0, 1, or 2"
                 self.mesh_config["path_hash_mode"] = mode
-                saved, _ = self.config_manager.save_to_file()
-                self.config_manager.live_update_daemon(["mesh"])
+                if not self._save_config_and_apply(["mesh"]):
+                    return "Error: Failed to save config"
                 return "OK"
 
             elif key == "loop.detect":
@@ -733,47 +766,47 @@ class MeshCLI:
                 if mode not in ("off", "minimal", "moderate", "strict"):
                     return "Error: loop.detect must be off, minimal, moderate, or strict"
                 self.mesh_config["loop_detect"] = mode
-                saved, _ = self.config_manager.save_to_file()
-                self.config_manager.live_update_daemon(["mesh"])
+                if not self._save_config_and_apply(["mesh"]):
+                    return "Error: Failed to save config"
                 return "OK"
 
             elif key == "rxdelay":
                 delay = float(value)
-                if delay < 0:
-                    return "Error: cannot be negative"
-                self.repeater_config["rx_delay_base"] = delay
-                saved, _ = self.config_manager.save_to_file()
-                self.config_manager.live_update_daemon(["repeater", "delays"])
+                if delay < 0 or delay > 20.0:
+                    return "Error, must be 0-20"
+                self.config.setdefault("delays", {})["rx_delay_base"] = delay
+                if not self._save_config_and_apply(["repeater", "delays"]):
+                    return "Error: Failed to save config"
                 return "OK"
 
             elif key == "txdelay":
                 delay = float(value)
-                if delay < 0:
-                    return "Error: cannot be negative"
-                self.repeater_config["tx_delay_factor"] = delay
-                saved, _ = self.config_manager.save_to_file()
-                self.config_manager.live_update_daemon(["repeater", "delays"])
+                if delay < 0 or delay > 2.0:
+                    return "Error, must be 0-2"
+                self.config.setdefault("delays", {})["tx_delay_factor"] = delay
+                if not self._save_config_and_apply(["repeater", "delays"]):
+                    return "Error: Failed to save config"
                 return "OK"
 
             elif key == "direct.txdelay":
                 delay = float(value)
-                if delay < 0:
-                    return "Error: cannot be negative"
-                self.repeater_config["direct_tx_delay_factor"] = delay
-                saved, _ = self.config_manager.save_to_file()
-                self.config_manager.live_update_daemon(["repeater", "delays"])
+                if delay < 0 or delay > 2.0:
+                    return "Error, must be 0-2"
+                self.config.setdefault("delays", {})["direct_tx_delay_factor"] = delay
+                if not self._save_config_and_apply(["repeater", "delays"]):
+                    return "Error: Failed to save config"
                 return "OK"
 
             elif key == "multi.acks":
                 self.repeater_config["multi_acks"] = int(value)
-                saved, _ = self.config_manager.save_to_file()
-                self.config_manager.live_update_daemon(["repeater"])
+                if not self._save_config_and_apply(["repeater"]):
+                    return "Error: Failed to save config"
                 return "OK"
 
             elif key == "int.thresh":
                 self.repeater_config["interference_threshold"] = int(value)
-                saved, _ = self.config_manager.save_to_file()
-                self.config_manager.live_update_daemon(["repeater"])
+                if not self._save_config_and_apply(["repeater"]):
+                    return "Error: Failed to save config"
                 return "OK"
 
             elif key == "agc.reset.interval":
@@ -781,8 +814,8 @@ class MeshCLI:
                 # Round to nearest multiple of 4
                 rounded = (interval // 4) * 4
                 self.repeater_config["agc_reset_interval"] = rounded
-                saved, _ = self.config_manager.save_to_file()
-                self.config_manager.live_update_daemon(["repeater"])
+                if not self._save_config_and_apply(["repeater"]):
+                    return "Error: Failed to save config"
                 return f"OK - interval rounded to {rounded}"
 
             else:

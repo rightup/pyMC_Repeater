@@ -18,7 +18,8 @@ def _semtech_airtime_ms(payload_len: int, sf: int, bw_hz: int, cr: int, preamble
     """
     crc = 1
     h = 0  # explicit header
-    de = 1 if (sf >= 11 and bw_hz <= 125000) else 0
+    # LDRO follows the radio driver's auto rule: on when symbol time >= 16 ms
+    de = 1 if (2**sf) / (bw_hz / 1000) >= 16.0 else 0
     t_sym = (2**sf) / (bw_hz / 1000)
     t_preamble = (preamble + 4.25) * t_sym
     numerator = max(8 * payload_len - 4 * sf + 28 + 16 * crc - 20 * h, 0)

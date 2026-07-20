@@ -35,11 +35,24 @@ repeater:
   # Enable quality-based packet filtering and adaptive delays
   use_score_for_tx: false
 
+  # Multi-ack redundancy (0 = off, 1 = on; matches MeshCore's multi.acks pref).
+  # When on, a relayed routed ACK is preceded by a MULTIPART-wrapped copy so
+  # ACKs survive lossy links. Also settable via the mesh CLI: set multi.acks
+  multi_acks: 0
+
   # Score threshold for quality monitoring (future use)
   # Currently reserved for potential future features like dashboard alerts,
   # proactive statistics collection, or advanced filtering strategies.
   # Changing this value has no effect on current packet processing.
   score_threshold: 0.3
+
+  # Observation-only upstream neighbour link metrics.
+  # These metrics are currently not used for forwarding, dedupe, TX delay,
+  # route selection, or packet acceptance decisions yet ;-0.
+  neighbour_link_metrics_enabled: true
+  neighbour_link_ewma_alpha: 0.20
+  neighbour_link_ttl_seconds: 86400
+  neighbour_link_max_entries: 512
 
   # Automatic advertisement interval in hours
   # The repeater will send an advertisement packet at this interval
@@ -126,6 +139,11 @@ repeater:
 # Relative paths are resolved from this config file directory.
 policy:
   policy_file: "policy.yaml"
+
+metrics:
+  # Store historical metrics in RRDtool when available.
+  # When disabled, chart APIs calculate metrics from repeater.db.
+  rrd_enabled: true
 
 # Local GPS receiver. When enabled, the daemon reads NMEA sentences from the
 # configured source and exposes parsed data at /api/gps.
@@ -483,10 +501,12 @@ sx1262:
   is_waveshare: false
 
 delays:
-  # TX delay factor for flood mode (multiplier)
+  # Flood TX delay: airtime multiplier, NOT seconds. The actual pre-transmit
+  # delay is a random value in [0, 5 * packet_airtime * factor] seconds.
   tx_delay_factor: 1.0
 
-  # TX delay factor for direct mode (faster)
+  # Direct TX delay: same random 0-5*airtime*factor window, usually lower so
+  # directed traffic clears faster.
   direct_tx_delay_factor: 0.5
 
 duty_cycle:
@@ -507,6 +527,10 @@ storage:
   retention:
     # Clean up SQLite records older than this many days
     sqlite_cleanup_days: 31
+    # Companion event journal / soft-consumed message history retention.
+    # Independent of sqlite_cleanup_days so packet RF history and companion
+    # sync history can be sized separately. Defaults to 31 when omitted.
+    companion_events_days: 31
 
     # RRD archives are managed automatically:
     # - 1 minute resolution for 1 week
@@ -613,7 +637,7 @@ glass:
   cert_store_dir: "/etc/openhop_repeater/glass"
 
 logging:
-  # Log level: DEBUG, INFO, WARNING, ERROR
+  # Log level: TRACE, DEBUG, INFO, WARNING, ERROR
   level: INFO
 
   # Log format

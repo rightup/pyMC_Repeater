@@ -22,6 +22,11 @@ class StorageCollector:
         self.glass_publish_callback = None
         self._pending_tasks = set()
 
+        metrics_config = config.get("metrics")
+        if not isinstance(metrics_config, dict):
+            metrics_config = {}
+        self.rrd_enabled = bool(metrics_config.get("rrd_enabled", True))
+
         # Dedicated single writer thread for all blocking storage work (the SQLite
         # write, the cumulative-counts aggregate, RRD updates, and network
         # publishing). This keeps that work off the asyncio event loop, which it
@@ -37,7 +42,16 @@ class StorageCollector:
         self.storage_dir.mkdir(parents=True, exist_ok=True)
 
         self.sqlite_handler = SQLiteHandler(self.storage_dir)
-        self.rrd_handler = RRDToolHandler(self.storage_dir)
+        self.rrd_handler = None
+        if self.rrd_enabled:
+            candidate_rrd_handler = RRDToolHandler(self.storage_dir)
+            if candidate_rrd_handler.available and candidate_rrd_handler.rrd_path.exists():
+                self.rrd_handler = candidate_rrd_handler
+                logger.info("RRDtool metrics enabled")
+            else:
+                logger.warning("RRDtool requested but unavailable; using SQLite metrics fallback")
+        else:
+            logger.info("RRDtool metrics disabled; SQLite metrics fallback will be used")
 
         # Initialize MQTT handler only when at least one broker is configured
         self.mqtt_handler = None
@@ -218,8 +232,11 @@ class StorageCollector:
         packet_id = self.sqlite_handler.store_packet(packet_record)
         if packet_id is not None:
             packet_record["id"] = packet_id
-        cumulative_counts = self.sqlite_handler.get_cumulative_counts()
-        self.rrd_handler.update_packet_metrics(packet_record, cumulative_counts)
+
+        if self.rrd_handler is not None:
+            cumulative_counts = self.sqlite_handler.get_cumulative_counts()
+            self.rrd_handler.update_packet_metrics(packet_record, cumulative_counts)
+
         self._publish_packet_sync(packet_record, skip_mqtt)
 
     def _publish_packet_sync(self, packet_record: dict, skip_mqtt: bool):
@@ -441,20 +458,79 @@ class StorageCollector:
     def get_packet_by_id(self, packet_id: int) -> Optional[dict]:
         return self.sqlite_handler.get_packet_by_id(packet_id)
 
+    def get_neighbor_link_history(
+        self,
+        *,
+        peer_hash: str,
+        path_hash_size: int,
+        hours: int = 24,
+        limit: int = 1000,
+    ) -> list:
+        return self.sqlite_handler.get_neighbor_link_history(
+            peer_hash=peer_hash,
+            path_hash_size=path_hash_size,
+            hours=hours,
+            limit=limit,
+        )
+
     def get_rrd_data(
         self,
         start_time: Optional[int] = None,
         end_time: Optional[int] = None,
         resolution: str = "average",
     ) -> Optional[dict]:
-        return self.rrd_handler.get_data(start_time, end_time, resolution)
+        return self.get_metrics_data(start_time, end_time, resolution)
+
+    def get_metrics_data(
+        self,
+        start_time: Optional[int] = None,
+        end_time: Optional[int] = None,
+        resolution: str = "average",
+    ) -> dict:
+        if self.rrd_handler is not None:
+            try:
+                rrd_data = self.rrd_handler.get_data(start_time, end_time, resolution)
+            except Exception as e:
+                logger.warning(
+                    f"RRDtool metrics read failed; using SQLite metrics fallback: {e}",
+                    exc_info=True,
+                )
+            else:
+                if self._metrics_data_is_valid(rrd_data):
+                    rrd_data.setdefault("data_source", "rrd")
+                    return rrd_data
+
+                logger.warning(
+                    "RRDtool metrics read returned no usable data; using SQLite metrics fallback"
+                )
+
+        sqlite_data = self.sqlite_handler.get_metrics_data(start_time, end_time, resolution)
+        sqlite_data.setdefault("data_source", "sqlite")
+        return sqlite_data
+
+    def _metrics_data_is_valid(self, metrics_data: Optional[dict]) -> bool:
+        if not isinstance(metrics_data, dict):
+            return False
+        if not isinstance(metrics_data.get("metrics"), dict):
+            return False
+        if not isinstance(metrics_data.get("timestamps"), list):
+            return False
+        return True
 
     def get_packet_type_stats(self, hours: int = 24) -> dict:
-        rrd_stats = self.rrd_handler.get_packet_type_stats(hours)
-        if rrd_stats:
-            return rrd_stats
+        if self.rrd_handler is not None:
+            try:
+                rrd_stats = self.rrd_handler.get_packet_type_stats(hours)
+            except Exception as e:
+                logger.warning(
+                    f"RRDtool packet type stats failed; using SQLite fallback: {e}",
+                    exc_info=True,
+                )
+            else:
+                if rrd_stats:
+                    return rrd_stats
 
-        logger.warning("Falling back to SQLite for packet type stats")
+            logger.warning("Falling back to SQLite for packet type stats")
         return self.sqlite_handler.get_packet_type_stats(hours)
 
     def get_route_stats(self, hours: int = 24) -> dict:
@@ -486,8 +562,8 @@ class StorageCollector:
             logger.debug(f"Could not lookup node name for {pubkey[:8] if pubkey else 'None'}: {e}")
             return None
 
-    def cleanup_old_data(self, days: int = 7):
-        self.sqlite_handler.cleanup_old_data(days)
+    def cleanup_old_data(self, days: int = 7, companion_events_days: Optional[int] = None):
+        self.sqlite_handler.cleanup_old_data(days, companion_events_days=companion_events_days)
 
     def get_noise_floor_history(self, hours: int = 24, limit: int = None) -> list:
         return self.sqlite_handler.get_noise_floor_history(hours, limit)

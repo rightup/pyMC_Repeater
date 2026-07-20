@@ -1,10 +1,19 @@
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
 from repeater.companion.constants import STATS_TYPE_CORE, STATS_TYPE_PACKETS, STATS_TYPE_RADIO
-from repeater.main import RepeaterDaemon, main as repeater_main
+from repeater.main import RepeaterDaemon
+from repeater.main import main as repeater_main
+from openhop_core.node.dispatcher import Dispatcher
+from openhop_core.protocol import PacketBuilder
+from openhop_core.protocol.constants import (
+    PAYLOAD_TYPE_RAW_CUSTOM,
+    ROUTE_TYPE_FLOOD,
+    ROUTE_TYPE_TRANSPORT_DIRECT,
+    ROUTE_TYPE_TRANSPORT_FLOOD,
+)
 
 
 class _FakeIdentity:
@@ -179,6 +188,114 @@ async def test_raw_rx_and_duplicate_logging_hooks():
 
 
 @pytest.mark.asyncio
+async def test_raw_custom_route_type_matrix_is_direct_only_and_first_seen():
+    daemon = RepeaterDaemon(_base_config(), radio=object())
+    dispatcher = SimpleNamespace(register_handler=MagicMock())
+    daemon.dispatcher = dispatcher
+    daemon.router = SimpleNamespace(enqueue=AsyncMock())
+    first_bridge = SimpleNamespace(process_received_packet=AsyncMock())
+    second_bridge = SimpleNamespace(process_received_packet=AsyncMock())
+    daemon.companion_bridges = {1: first_bridge, 2: second_bridge}
+    engine = SimpleNamespace(
+        is_duplicate=MagicMock(side_effect=[False, True, False]), mark_seen=MagicMock()
+    )
+    daemon.repeater_handler = engine
+
+    daemon._register_raw_custom_handler()
+    dispatcher.register_handler.assert_called_once_with(
+        PAYLOAD_TYPE_RAW_CUSTOM, daemon._on_raw_data_for_companions
+    )
+
+    # Firmware wire vector: RAW_CUSTOM (0x0f), version 0, DIRECT (0x02).
+    direct_packet = PacketBuilder.create_raw_data(b"\xa5")
+    assert direct_packet.header == 0x3E
+    assert direct_packet.write_to() == b"\x3e\x00\xa5"
+    await daemon._on_raw_data_for_companions(direct_packet)
+    await daemon._on_raw_data_for_companions(direct_packet)
+
+    # Firmware also treats TRANSPORT_DIRECT as direct routing.
+    transport_direct_packet = PacketBuilder.create_raw_data(b"\xa6")
+    transport_direct_packet.header = (PAYLOAD_TYPE_RAW_CUSTOM << 2) | ROUTE_TYPE_TRANSPORT_DIRECT
+    transport_direct_packet.transport_codes = [0x1234, 0x5678]
+    assert transport_direct_packet.header == 0x3F
+    assert transport_direct_packet.write_to() == b"\x3f\x34\x12\x78\x56\x00\xa6"
+    await daemon._on_raw_data_for_companions(transport_direct_packet)
+
+    first_bridge.process_received_packet.assert_has_awaits(
+        [call(direct_packet), call(transport_direct_packet)]
+    )
+    second_bridge.process_received_packet.assert_has_awaits(
+        [call(direct_packet), call(transport_direct_packet)]
+    )
+    engine.mark_seen.assert_has_calls([call(direct_packet), call(transport_direct_packet)])
+
+    # A direct packet with a remaining hop is router traffic, not local raw data.
+    intermediate_direct_packet = PacketBuilder.create_raw_data(b"\xa9")
+    intermediate_direct_packet.path_len = 1
+    intermediate_direct_packet.path = bytearray([0x42])
+    assert intermediate_direct_packet.write_to() == b"\x3e\x01\x42\xa9"
+    await daemon._on_raw_data_for_companions(intermediate_direct_packet)
+    daemon.router.enqueue.assert_awaited_once_with(intermediate_direct_packet)
+
+    # The corresponding FLOOD vector is discarded rather than delivered or routed.
+    flood_packet = PacketBuilder.create_raw_data(b"\xa7")
+    flood_packet.header = (PAYLOAD_TYPE_RAW_CUSTOM << 2) | ROUTE_TYPE_FLOOD
+    assert flood_packet.header == 0x3D
+    assert flood_packet.write_to() == b"\x3d\x00\xa7"
+    await daemon._on_raw_data_for_companions(flood_packet)
+
+    transport_flood_packet = PacketBuilder.create_raw_data(b"\xa8")
+    transport_flood_packet.header = (PAYLOAD_TYPE_RAW_CUSTOM << 2) | ROUTE_TYPE_TRANSPORT_FLOOD
+    transport_flood_packet.transport_codes = [0x1234, 0x5678]
+    assert transport_flood_packet.header == 0x3C
+    assert transport_flood_packet.write_to() == b"\x3c\x34\x12\x78\x56\x00\xa8"
+    await daemon._on_raw_data_for_companions(transport_flood_packet)
+
+    assert engine.is_duplicate.call_count == 3
+    daemon.router.enqueue.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_final_raw_custom_dispatcher_handler_bypasses_router_and_repeater_forwarding():
+    daemon = RepeaterDaemon(_base_config(), radio=object())
+    radio = SimpleNamespace(
+        set_rx_callback=MagicMock(),
+        get_last_rssi=lambda: -80,
+        get_last_snr=lambda: 2.0,
+    )
+    dispatcher = Dispatcher(radio, dedupe_enabled=False)
+    daemon.dispatcher = dispatcher
+    daemon.router = SimpleNamespace(enqueue=AsyncMock())
+    daemon.repeater_handler = SimpleNamespace(
+        is_duplicate=MagicMock(return_value=False), mark_seen=MagicMock()
+    )
+    bridge = SimpleNamespace(process_received_packet=AsyncMock())
+    daemon.companion_bridges = {1: bridge}
+    dispatcher.register_fallback_handler(daemon._router_callback)
+    daemon._register_raw_custom_handler()
+
+    packet = PacketBuilder.create_raw_data(b"\xde\xad")
+    await dispatcher._process_received_packet(packet.write_to(), rssi=-81, snr=3.0)
+
+    bridge.process_received_packet.assert_awaited_once()
+    delivered = bridge.process_received_packet.await_args.args[0]
+    assert delivered.header == 0x3E
+    assert bytes(delivered.payload) == b"\xde\xad"
+    daemon.router.enqueue.assert_not_awaited()
+
+    intermediate = PacketBuilder.create_raw_data(b"\xbe")
+    intermediate.path_len = 1
+    intermediate.path = bytearray([0x42])
+    await dispatcher._process_received_packet(intermediate.write_to(), rssi=-81, snr=3.0)
+    daemon.router.enqueue.assert_awaited_once()
+
+    flood_packet = PacketBuilder.create_raw_data(b"\xef")
+    flood_packet.header = (PAYLOAD_TYPE_RAW_CUSTOM << 2) | ROUTE_TYPE_FLOOD
+    await dispatcher._process_received_packet(flood_packet.write_to(), rssi=-81, snr=3.0)
+    daemon.router.enqueue.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_deliver_control_data_filters_non_discovery_and_pushes_valid():
     daemon = RepeaterDaemon(_base_config(), radio=object())
     fs_ok = SimpleNamespace(push_control_data=AsyncMock())
@@ -262,6 +379,30 @@ async def test_send_advert_branches_and_success_path():
     daemon.dispatcher.send_packet.assert_awaited_once_with(packet, wait_for_ack=False)
     daemon.repeater_handler.mark_seen.assert_called_once_with(packet)
     daemon.dispatcher.packet_filter.track_packet.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_send_advert_returns_false_when_dispatch_rejects():
+    daemon = RepeaterDaemon(_base_config(), radio=object())
+    daemon.dispatcher = SimpleNamespace(
+        send_packet=AsyncMock(return_value=False),
+        packet_filter=SimpleNamespace(track_packet=MagicMock()),
+    )
+    daemon.local_identity = _FakeIdentity(b"\x21" + b"x" * 31)
+    daemon.config["repeater"]["mode"] = "forward"
+    daemon.repeater_handler = SimpleNamespace(mark_seen=MagicMock())
+    daemon.gps_service = SimpleNamespace(
+        get_repeater_location=lambda: {"latitude": 9.1, "longitude": 8.2, "source": "gps"}
+    )
+
+    packet = SimpleNamespace(calculate_packet_hash=lambda: b"\xab" * 16)
+    with patch("openhop_core.protocol.PacketBuilder.create_advert", return_value=packet):
+        ok = await daemon.send_advert()
+
+    assert ok is False
+    daemon.dispatcher.send_packet.assert_awaited_once_with(packet, wait_for_ack=False)
+    daemon.repeater_handler.mark_seen.assert_not_called()
+    daemon.dispatcher.packet_filter.track_packet.assert_not_called()
 
 
 @pytest.mark.asyncio

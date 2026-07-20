@@ -64,7 +64,10 @@ class ACL:
         sync_since: int = None,
     ) -> None:
         now = int(time.time())
-        client.last_timestamp = timestamp
+        # Monotonic: the replay watermark must never move backwards, even if
+        # another accepted request advanced it between the replay check and
+        # this write.
+        client.last_timestamp = max(client.last_timestamp, timestamp)
         client.last_activity = now
         client.last_login_success = now
         client.shared_secret = shared_secret

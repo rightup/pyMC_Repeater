@@ -4,6 +4,8 @@ from typing import Any, Dict, List, Optional
 
 import yaml
 
+from repeater.logging_utils import normalize_log_level
+
 logger = logging.getLogger("ConfigManager")
 
 
@@ -140,11 +142,21 @@ class ConfigManager:
                         return False
 
             self._sync_repeater_handler_radio_config(radio_cfg)
+            self._refresh_airtime_radio_params()
             logger.info("Applied live radio configuration to running daemon")
             return True
         except Exception as e:
             logger.error(f"Failed to apply live radio config: {e}", exc_info=True)
             return False
+
+    def _refresh_airtime_radio_params(self) -> None:
+        repeater_handler = getattr(self.daemon, "repeater_handler", None)
+        airtime_mgr = getattr(repeater_handler, "airtime_mgr", None) if repeater_handler else None
+        if airtime_mgr is None or not hasattr(airtime_mgr, "refresh_radio_params"):
+            return
+        # Use the full radio section so preamble_length is included; the live
+        # hardware snapshot intentionally omits fields the radio API does not set.
+        airtime_mgr.refresh_radio_params(self.config.get("radio", {}) or {})
 
     @staticmethod
     def _parse_bool(value: Any, default: bool = True) -> bool:
@@ -167,7 +179,7 @@ class ConfigManager:
 
         http_cfg = self.config.get("http", {}) if isinstance(self.config, dict) else {}
         enabled = self._parse_bool(http_cfg.get("enabled", True), default=True)
-        host = str(http_cfg.get("host", "0.0.0.0") or "0.0.0.0")
+        host = str(http_cfg.get("host", "0.0.0.0") or "0.0.0.0")  # nosec B104 - intentional LAN bind default
 
         try:
             port = int(http_cfg.get("port", 8000))
@@ -191,6 +203,36 @@ class ConfigManager:
         else:
             logger.warning("Failed live HTTP config apply: %s", message)
         return success
+
+    def _apply_live_logging_config(self) -> bool:
+        if not self.daemon:
+            logger.warning("Daemon not available for logging live update")
+            return False
+
+        logging_cfg = self.config.get("logging", {}) if isinstance(self.config, dict) else {}
+        level = normalize_log_level(logging_cfg.get("level", "INFO"))
+
+        root_logger = logging.getLogger()
+        root_logger.setLevel(level)
+
+        repeater_logger = logging.getLogger("RepeaterDaemon")
+        repeater_logger.setLevel(level)
+
+        sx1262_logger = logging.getLogger("SX1262_wrapper")
+        sx1262_logger.setLevel(level)
+
+        mqtt_logger = logging.getLogger("MQTTHandler")
+        mqtt_logger.setLevel(level)
+
+        buffer = getattr(self.daemon, "_log_buffer", None)
+        if buffer is not None:
+            buffer.setLevel(level)
+
+        logger.info(
+            "Applied live logging config: level=%s",
+            logging.getLevelName(level) if isinstance(level, int) else level,
+        )
+        return True
 
     def save_to_file(self) -> bool:
         """
@@ -240,7 +282,16 @@ class ConfigManager:
 
             # Default sections to update if not specified
             if sections is None:
-                sections = ["repeater", "delays", "radio", "acl", "identities", "glass", "http"]
+                sections = [
+                    "repeater",
+                    "delays",
+                    "radio",
+                    "acl",
+                    "identities",
+                    "glass",
+                    "http",
+                    "logging",
+                ]
 
             # Update each section
             for section in sections:
@@ -265,12 +316,29 @@ class ConfigManager:
                         self.daemon.repeater_handler.reload_runtime_config()
                         logger.info("Reloaded RepeaterHandler runtime config")
 
+            # Re-apply login security when the repeater section changed; the
+            # repeater ACL captures repeater.security at registration, so a
+            # saved password change must be pushed to the live ACL explicitly.
+            if "repeater" in sections and self.daemon:
+                login_helper = getattr(self.daemon, "login_helper", None)
+                if login_helper is not None and hasattr(login_helper, "refresh_repeater_security"):
+                    login_helper.refresh_repeater_security(daemon_config)
+
             # Also reload advert_helper config if repeater section changed
             if self.daemon and hasattr(self.daemon, "advert_helper") and self.daemon.advert_helper:
                 if "repeater" in sections:
                     if hasattr(self.daemon.advert_helper, "reload_config"):
                         self.daemon.advert_helper.reload_config()
                         logger.info("Reloaded AdvertHelper config")
+
+            # Re-apply the flood reception delay base when delays changed
+            if "delays" in sections and self.daemon and getattr(self.daemon, "dispatcher", None):
+                delays_cfg = self.daemon.config.get("delays", {})
+                self.daemon.dispatcher.rx_delay_base = float(delays_cfg.get("rx_delay_base", 0.0))
+                logger.info(
+                    f"Reloaded flood RX delay base: delays.rx_delay_base="
+                    f"{self.daemon.dispatcher.rx_delay_base}"
+                )
 
             # Re-apply dispatcher path hash mode when mesh section changed
             if "mesh" in sections and self.daemon and hasattr(self.daemon, "dispatcher"):
@@ -296,6 +364,9 @@ class ConfigManager:
 
             if "http" in sections:
                 live_update_ok = self._apply_live_http_config() and live_update_ok
+
+            if "logging" in sections:
+                live_update_ok = self._apply_live_logging_config() and live_update_ok
 
             return live_update_ok
 

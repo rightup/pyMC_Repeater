@@ -87,6 +87,8 @@ POLICY_GROUP_KINDS = {
 # GET    /api/packet_stats?hours=24 - Get packet statistics
 # GET    /api/packet_type_stats?hours=24 - Get packet type statistics
 # GET    /api/route_stats?hours=24 - Get route statistics
+# GET    /api/neighbor_links?active_within_seconds=900 - Get in-memory observed upstream neighbour links
+# GET    /api/neighbor_link_history?peer_hash=AB&path_hash_size=1&hours=24&limit=1000 - Get observed upstream history from packets table
 # GET    /api/recent_packets?limit=100 - Get recent packets
 # GET    /api/filtered_packets?type=4&route=1&start_timestamp=X&end_timestamp=Y&limit=1000 - Get filtered packets
 # GET    /api/packet_by_hash?packet_hash=abc123 - Get specific packet by hash
@@ -501,9 +503,15 @@ class APIEndpoints:
                     previous = item
             return output
 
-        rx_values = _counter_delta(metrics.get("rx_count", []))
-        tx_values = _counter_delta(metrics.get("tx_count", []))
-        drop_values = _counter_delta(metrics.get("drop_count", []))
+        def _counter_values(values: list) -> list[float]:
+            return [float(item or 0.0) for item in values]
+
+        counter_mode = rrd_data.get("counter_mode")
+        counter_processor = _counter_values if counter_mode == "bucket_count" else _counter_delta
+
+        rx_values = counter_processor(metrics.get("rx_count", []))
+        tx_values = counter_processor(metrics.get("tx_count", []))
+        drop_values = counter_processor(metrics.get("drop_count", []))
         rssi_values = metrics.get("avg_rssi", []) or []
         snr_values = metrics.get("avg_snr", []) or []
 
@@ -3078,6 +3086,73 @@ class APIEndpoints:
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
+    def neighbor_links(self, active_within_seconds=90, limit=500):
+        try:
+            handler = getattr(self.daemon_instance, "repeater_handler", None)
+            tracker = (
+                getattr(handler, "neighbour_link_tracker", None) if handler is not None else None
+            )
+            if tracker is None or not hasattr(tracker, "snapshot"):
+                return self._error("Repeater handler not initialized")
+
+            active_window = float(active_within_seconds)
+            row_limit = int(limit)
+            if row_limit < 1:
+                raise ValueError("limit must be >= 1")
+
+            links = tracker.snapshot(active_within_seconds=active_window)
+            links = links[:row_limit]
+            return self._success(
+                {
+                    "links": links,
+                    "active_within_seconds": active_window,
+                    "limit": row_limit,
+                    "count": len(links),
+                }
+            )
+        except ValueError as e:
+            return self._error(f"Invalid parameter format: {e}")
+        except Exception as e:
+            logger.error(f"Error getting neighbor links: {e}")
+            return self._error(e)
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    def neighbor_link_history(self, peer_hash=None, path_hash_size=None, hours=24, limit=1000):
+        try:
+            if not peer_hash:
+                return self._error("peer_hash parameter required")
+            if path_hash_size is None:
+                return self._error("path_hash_size parameter required")
+
+            size = int(path_hash_size)
+            window_hours = int(hours)
+            row_limit = int(limit)
+
+            rows = self._get_storage().get_neighbor_link_history(
+                peer_hash=str(peer_hash),
+                path_hash_size=size,
+                hours=window_hours,
+                limit=row_limit,
+            )
+            return self._success(
+                {
+                    "peer_hash": str(peer_hash).upper(),
+                    "path_hash_size": size,
+                    "hours": window_hours,
+                    "limit": row_limit,
+                    "rows": rows,
+                    "count": len(rows),
+                }
+            )
+        except ValueError as e:
+            return self._error(f"Invalid parameter format: {e}")
+        except Exception as e:
+            logger.error(f"Error getting neighbor link history: {e}")
+            return self._error(e)
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
     def recent_packets(self, limit=100):
         try:
             limit = int(limit)
@@ -3253,8 +3328,8 @@ class APIEndpoints:
             params = self._get_params(
                 {"start_time": None, "end_time": None, "resolution": "average"}
             )
-            data = self._get_storage().get_rrd_data(**params)
-            return self._success(data) if data else self._error("No RRD data available")
+            data = self._get_storage().get_metrics_data(**params)
+            return self._success(data)
         except ValueError as e:
             return self._error(f"Invalid parameter format: {e}")
         except Exception as e:
@@ -3323,12 +3398,16 @@ class APIEndpoints:
             hours = int(hours)
             start_time, end_time = self._get_time_range(hours)
 
-            rrd_data = self._get_storage().get_rrd_data(
+            metrics_data = self._get_storage().get_metrics_data(
                 start_time=start_time, end_time=end_time, resolution=resolution
             )
 
-            if not rrd_data or "metrics" not in rrd_data:
-                return self._error("No RRD data available")
+            if (
+                not metrics_data
+                or "metrics" not in metrics_data
+                or "timestamps" not in metrics_data
+            ):
+                return self._error("No metrics data available")
 
             metric_names = {
                 "rx_count": "Received Packets",
@@ -3347,18 +3426,18 @@ class APIEndpoints:
             if metrics != "all":
                 requested_metrics = [m.strip() for m in metrics.split(",")]
             else:
-                requested_metrics = list(rrd_data["metrics"].keys())
+                requested_metrics = list(metrics_data["metrics"].keys())
                 requested_metrics.append("policy_events")
 
-            timestamps_ms = [ts * 1000 for ts in rrd_data["timestamps"]]
+            timestamps_ms = [ts * 1000 for ts in metrics_data["timestamps"]]
             series = []
 
             for metric_key in requested_metrics:
                 if metric_key == "policy_events":
-                    bucket_seconds = max(1, int(rrd_data.get("step", 60)))
+                    bucket_seconds = max(1, int(metrics_data.get("step", 60)))
                     policy_rows = self._get_storage().get_policy_event_counts(
-                        start_timestamp=rrd_data["start_time"],
-                        end_timestamp=rrd_data["end_time"],
+                        start_timestamp=metrics_data["start_time"],
+                        end_timestamp=metrics_data["end_time"],
                         bucket_seconds=bucket_seconds,
                     )
                     policy_by_bucket = {
@@ -3366,7 +3445,7 @@ class APIEndpoints:
                         for row in policy_rows
                     }
                     chart_data = []
-                    for ts in rrd_data["timestamps"]:
+                    for ts in metrics_data["timestamps"]:
                         bucket_ts = int(ts / bucket_seconds) * bucket_seconds
                         chart_data.append([ts * 1000, policy_by_bucket.get(bucket_ts, 0)])
 
@@ -3379,14 +3458,19 @@ class APIEndpoints:
                     )
                     continue
 
-                if metric_key in rrd_data["metrics"]:
+                if metric_key in metrics_data["metrics"]:
                     if metric_key in counter_metrics:
-                        chart_data = self._process_counter_data(
-                            rrd_data["metrics"][metric_key], timestamps_ms
-                        )
+                        if metrics_data.get("counter_mode") == "bucket_count":
+                            chart_data = self._process_gauge_data(
+                                metrics_data["metrics"][metric_key], timestamps_ms
+                            )
+                        else:
+                            chart_data = self._process_counter_data(
+                                metrics_data["metrics"][metric_key], timestamps_ms
+                            )
                     else:
                         chart_data = self._process_gauge_data(
-                            rrd_data["metrics"][metric_key], timestamps_ms
+                            metrics_data["metrics"][metric_key], timestamps_ms
                         )
 
                     series.append(
@@ -3398,11 +3482,12 @@ class APIEndpoints:
                     )
 
             graph_data = {
-                "start_time": rrd_data["start_time"],
-                "end_time": rrd_data["end_time"],
-                "step": rrd_data["step"],
-                "timestamps": rrd_data["timestamps"],
+                "start_time": metrics_data["start_time"],
+                "end_time": metrics_data["end_time"],
+                "step": metrics_data["step"],
+                "timestamps": metrics_data["timestamps"],
                 "series": series,
+                "data_source": metrics_data.get("data_source", "rrd"),
             }
 
             return self._success(graph_data)
@@ -3868,8 +3953,8 @@ class APIEndpoints:
             "bandwidth": 62500,          # Bandwidth in Hz (valid: 7.8, 10.4, 15.6, 20.8, 31.25, 41.7, 62.5, 125, 250, 500 kHz)
             "spreading_factor": 8,       # Spreading factor (5-12)
             "coding_rate": 8,            # Coding rate (5-8 for 4/5 to 4/8)
-            "tx_delay_factor": 1.0,      # TX delay factor (0.0-5.0)
-            "direct_tx_delay_factor": 0.5,  # Direct TX delay (0.0-5.0)
+            "tx_delay_factor": 1.0,      # Flood TX delay airtime multiplier (0.0-5.0)
+            "direct_tx_delay_factor": 0.5,  # Direct TX delay airtime multiplier (0.0-5.0)
             "rx_delay_base": 0.0,        # RX delay base (>= 0)
             "node_name": "MyNode",       # Node name
             "owner_info": "Owner text",   # Owner info text
@@ -5977,11 +6062,18 @@ class APIEndpoints:
                 scope_label="room server advert",
             )
 
-            # Send via dispatcher
-            await self.daemon_instance.dispatcher.send_packet(packet, wait_for_ack=False)
+            injector = getattr(getattr(self.daemon_instance, "router", None), "inject_packet", None)
+            if callable(injector):
+                sent = await injector(packet, wait_for_ack=False)
+            else:
+                sent = await self.daemon_instance.dispatcher.send_packet(packet, wait_for_ack=False)
 
-            # Mark as seen to prevent re-forwarding
-            if self.daemon_instance.repeater_handler:
+            if not sent:
+                logger.error("Failed to send room server advert: packet transmission was rejected")
+                return False
+
+            # Mark as seen only when bypassing the engine and sending directly.
+            if not callable(injector) and self.daemon_instance.repeater_handler:
                 self.daemon_instance.repeater_handler.mark_seen(packet)
                 logger.debug(f"Marked room server advert '{node_name}' as seen in duplicate cache")
 
@@ -7483,9 +7575,12 @@ class APIEndpoints:
             storage = self._get_storage()
             stats = storage.sqlite_handler.get_table_stats()
 
-            # Add RRD file size if it exists
             rrd_path = storage.sqlite_handler.storage_dir / "metrics.rrd"
-            stats["rrd_size_bytes"] = rrd_path.stat().st_size if rrd_path.exists() else 0
+            rrd_exists = rrd_path.exists()
+            stats["rrd_enabled"] = bool(getattr(storage, "rrd_enabled", True))
+            stats["rrd_available"] = bool(getattr(storage, "rrd_handler", None)) and rrd_exists
+            stats["metrics_data_source"] = "rrd" if stats["rrd_available"] else "sqlite"
+            stats["rrd_size_bytes"] = rrd_path.stat().st_size if rrd_exists else 0
 
             return {"success": True, "data": stats}
         except Exception as e:

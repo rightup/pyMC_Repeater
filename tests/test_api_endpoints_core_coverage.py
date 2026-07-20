@@ -720,6 +720,53 @@ def test_packet_and_route_stats_endpoints(cherrypy_ctx):
     storage.get_route_stats.assert_called_once_with(hours=6)
 
 
+def test_neighbor_links_endpoint_returns_snapshot(cherrypy_ctx):
+    del cherrypy_ctx
+    api = _make_api()
+    tracker = SimpleNamespace(
+        snapshot=MagicMock(
+            return_value=[
+                {"peer_hash": "AB", "sample_count": 2},
+                {"peer_hash": "CD", "sample_count": 1},
+            ]
+        )
+    )
+    repeater_handler = SimpleNamespace(neighbour_link_tracker=tracker)
+    api.daemon_instance = SimpleNamespace(repeater_handler=repeater_handler)
+
+    result = api.neighbor_links(active_within_seconds="120", limit="1")
+
+    assert result["success"] is True
+    assert result["data"]["count"] == 1
+    assert result["data"]["active_within_seconds"] == 120.0
+    assert result["data"]["limit"] == 1
+    assert result["data"]["links"][0]["peer_hash"] == "AB"
+    tracker.snapshot.assert_called_once_with(active_within_seconds=120.0)
+
+
+def test_neighbor_link_history_endpoint_filters_by_hash_and_size(cherrypy_ctx):
+    del cherrypy_ctx
+    api = _make_api()
+    rows = [{"packet_hash": "A1", "path_hop_count": 3}]
+    storage = SimpleNamespace(get_neighbor_link_history=MagicMock(return_value=rows))
+    _attach_storage(api, storage)
+
+    result = api.neighbor_link_history(peer_hash="ab", path_hash_size="2", hours="12", limit="50")
+
+    assert result["success"] is True
+    assert result["data"]["peer_hash"] == "AB"
+    assert result["data"]["path_hash_size"] == 2
+    assert result["data"]["hours"] == 12
+    assert result["data"]["limit"] == 50
+    assert result["data"]["rows"] == rows
+    storage.get_neighbor_link_history.assert_called_once_with(
+        peer_hash="ab",
+        path_hash_size=2,
+        hours=12,
+        limit=50,
+    )
+
+
 def test_recent_packets_and_bulk_packets(cherrypy_ctx):
     del cherrypy_ctx
     api = _make_api()
@@ -835,17 +882,71 @@ def test_db_stats_options_success_and_error(cherrypy_ctx, tmp_path):
         get_table_stats=MagicMock(return_value={"packets": {"rows": 10}}),
         storage_dir=tmp_path,
     )
-    _attach_storage(api, SimpleNamespace(sqlite_handler=sqlite_handler))
+    _attach_storage(
+        api,
+        SimpleNamespace(
+            sqlite_handler=sqlite_handler,
+            rrd_enabled=True,
+            rrd_handler=object(),
+        ),
+    )
 
     result = api.db_stats()
     assert result["success"] is True
     assert result["data"]["packets"]["rows"] == 10
+    assert result["data"]["rrd_enabled"] is True
+    assert result["data"]["rrd_available"] is True
+    assert result["data"]["metrics_data_source"] == "rrd"
     assert result["data"]["rrd_size_bytes"] == 6
+
+    sqlite_handler.storage_dir = tmp_path / "missing"
+    sqlite_handler.storage_dir.mkdir()
+    _attach_storage(
+        api,
+        SimpleNamespace(
+            sqlite_handler=sqlite_handler,
+            rrd_enabled=False,
+            rrd_handler=None,
+        ),
+    )
+
+    missing_rrd = api.db_stats()
+    assert missing_rrd["success"] is True
+    assert missing_rrd["data"]["rrd_enabled"] is False
+    assert missing_rrd["data"]["rrd_available"] is False
+    assert missing_rrd["data"]["metrics_data_source"] == "sqlite"
+    assert missing_rrd["data"]["rrd_size_bytes"] == 0
 
     sqlite_handler.get_table_stats.side_effect = RuntimeError("stats failed")
     err = api.db_stats()
     assert err["success"] is False
     assert "stats failed" in err["error"]
+
+
+def test_rrd_data_endpoint_succeeds_with_sqlite_metrics(cherrypy_ctx):
+    del cherrypy_ctx
+    api = _make_api()
+    storage = SimpleNamespace(
+        get_metrics_data=MagicMock(
+            return_value={
+                "start_time": 0,
+                "end_time": 60,
+                "step": 60,
+                "timestamps": [0, 60],
+                "data_sources": ["rx_count"],
+                "packet_types": {"type_0": [0, 0]},
+                "metrics": {"rx_count": [1, 2]},
+                "data_source": "sqlite",
+                "counter_mode": "bucket_count",
+            }
+        )
+    )
+    _attach_storage(api, storage)
+
+    out = api.rrd_data()
+
+    assert out["success"] is True
+    assert out["data"]["data_source"] == "sqlite"
 
 
 def test_db_purge_validation_and_results(cherrypy_ctx):
@@ -1546,6 +1647,39 @@ def test_room_server_advert_applies_default_region_scope():
     dispatcher.send_packet.assert_awaited_once_with(packet, wait_for_ack=False)
 
 
+def test_room_server_advert_returns_false_when_send_rejected():
+    from openhop_core.protocol.constants import ROUTE_TYPE_FLOOD
+
+    api = _make_api({"mesh": {"default_region": "alpha"}, "repeater": {}})
+    dispatcher = SimpleNamespace(send_packet=AsyncMock(return_value=False))
+    api.daemon_instance = SimpleNamespace(dispatcher=dispatcher, repeater_handler=None)
+
+    packet = SimpleNamespace(
+        header=ROUTE_TYPE_FLOOD,
+        transport_codes=[0, 0],
+        get_payload_type=lambda: 3,
+        get_payload=lambda: b"room_server_advert_payload",
+    )
+
+    with (
+        patch("openhop_core.protocol.PacketBuilder.create_advert", return_value=packet),
+        patch("openhop_core.protocol.transport_keys.get_auto_key_for", return_value=b"\x01" * 16),
+        patch("openhop_core.protocol.transport_keys.calc_transport_code", return_value=0xCAFE),
+    ):
+        result = asyncio.run(
+            api._send_room_server_advert_async(
+                identity=SimpleNamespace(),
+                node_name="RoomAlpha",
+                latitude=1.0,
+                longitude=2.0,
+                disable_fwd=False,
+            )
+        )
+
+    assert result is False
+    dispatcher.send_packet.assert_awaited_once_with(packet, wait_for_ack=False)
+
+
 def test_set_mode_and_set_duty_cycle_paths(cherrypy_ctx):
     request, _ = cherrypy_ctx
     api = _make_api({"repeater": {}, "duty_cycle": {}})
@@ -1711,7 +1845,7 @@ def test_metrics_graph_data_includes_policy_events(cherrypy_ctx):
     del cherrypy_ctx
     api = _make_api()
     storage = SimpleNamespace(
-        get_rrd_data=MagicMock(
+        get_metrics_data=MagicMock(
             return_value={
                 "start_time": 100,
                 "end_time": 220,
@@ -1741,6 +1875,75 @@ def test_metrics_graph_data_includes_policy_events(cherrypy_ctx):
     assert "policy_events" in series_by_type
     assert series_by_type["policy_events"]["name"] == "Policy Events"
     assert series_by_type["policy_events"]["data"] == [[100000, 1], [160000, 3], [220000, 2]]
+    assert out["data"]["data_source"] == "rrd"
+
+
+def test_metrics_graph_data_uses_sqlite_bucket_counts_without_counter_delta(cherrypy_ctx):
+    del cherrypy_ctx
+    api = _make_api()
+    storage = SimpleNamespace(
+        get_metrics_data=MagicMock(
+            return_value={
+                "start_time": 0,
+                "end_time": 60,
+                "step": 60,
+                "timestamps": [0, 60],
+                "metrics": {
+                    "rx_count": [2, 4],
+                    "avg_rssi": [None, -80.0],
+                },
+                "packet_types": {},
+                "data_source": "sqlite",
+                "counter_mode": "bucket_count",
+            }
+        ),
+        get_policy_event_counts=MagicMock(return_value=[]),
+    )
+    _attach_storage(api, storage)
+
+    out = api.metrics_graph_data(hours="24", resolution="average", metrics="rx_count,avg_rssi")
+
+    assert out["success"] is True
+    series_by_type = {item["type"]: item for item in out["data"]["series"]}
+    assert series_by_type["rx_count"]["data"] == [[0, 2], [60000, 4]]
+    assert series_by_type["avg_rssi"]["data"] == [[0, 0], [60000, -80.0]]
+    assert out["data"]["data_source"] == "sqlite"
+
+
+def test_metrics_graph_data_empty_sqlite_payload_is_successful(cherrypy_ctx):
+    del cherrypy_ctx
+    api = _make_api()
+    storage = SimpleNamespace(
+        get_metrics_data=MagicMock(
+            return_value={
+                "start_time": 0,
+                "end_time": 0,
+                "step": 60,
+                "timestamps": [0],
+                "metrics": {
+                    "rx_count": [0],
+                    "tx_count": [0],
+                    "drop_count": [0],
+                    "avg_rssi": [None],
+                    "avg_snr": [None],
+                    "avg_length": [None],
+                    "avg_score": [None],
+                    "neighbor_count": [None],
+                },
+                "packet_types": {},
+                "data_source": "sqlite",
+                "counter_mode": "bucket_count",
+            }
+        ),
+        get_policy_event_counts=MagicMock(return_value=[]),
+    )
+    _attach_storage(api, storage)
+
+    out = api.metrics_graph_data(hours="24", resolution="average", metrics="rx_count")
+
+    assert out["success"] is True
+    assert out["data"]["series"][0]["data"] == [[0, 0]]
+    assert out["data"]["data_source"] == "sqlite"
 
 
 def test_lbt_diagnostics_aligns_with_rrd_and_returns_correlations(cherrypy_ctx):
