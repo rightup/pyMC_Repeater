@@ -30,6 +30,10 @@ class SQLiteHandler:
         # every write, which would defeat the cache under load.
         self._cumulative_counts_cache = {"timestamp": 0.0, "value": None}
         self._cumulative_counts_ttl_sec = 3.0
+        # Optional callback fired after any transport_keys (region) write, so the
+        # daemon can rebuild the flood-reply RegionMap. Fired after commit, in the
+        # writer's thread; see set_transport_keys_changed_callback.
+        self._transport_keys_changed_cb = None
         # Thread-local storage for persistent SQLite connections.
         # Opening a new connection on every DB call is expensive on SD-card
         # storage: each sqlite3.connect() call triggers file-system operations
@@ -79,6 +83,26 @@ class SQLiteHandler:
     def _invalidate_hot_caches(self) -> None:
         self._packet_stats_cache.clear()
         self._neighbors_cache = {"timestamp": 0.0, "value": None}
+
+    def set_transport_keys_changed_callback(self, callback) -> None:
+        """Register a callback fired after any transport_keys (region) write.
+
+        The daemon uses this to rebuild the flood-reply RegionMap when a named
+        region is added, removed, or has its flood policy changed (CLI, web API,
+        or Glass sync all funnel through the create/update/delete/sync methods
+        below). The callback runs after the write commits, in the writer's
+        thread; pass ``None`` to clear it.
+        """
+        self._transport_keys_changed_cb = callback
+
+    def _notify_transport_keys_changed(self) -> None:
+        callback = self._transport_keys_changed_cb
+        if callback is None:
+            return
+        try:
+            callback()
+        except Exception as e:
+            logger.error(f"transport_keys change callback failed: {e}", exc_info=True)
 
     def _init_database(self):
         try:
@@ -2798,7 +2822,9 @@ class SQLiteHandler:
                         current_time,
                     ),
                 )
-                return cursor.lastrowid
+                new_id = cursor.lastrowid
+            self._notify_transport_keys_changed()
+            return new_id
         except Exception as e:
             logger.error(f"Failed to create transport key: {e}")
             return None
@@ -2917,7 +2943,10 @@ class SQLiteHandler:
                     """,
                     params,
                 )
-                return cursor.rowcount > 0
+                changed = cursor.rowcount > 0
+            if changed:
+                self._notify_transport_keys_changed()
+            return changed
         except Exception as e:
             logger.error(f"Failed to update transport key: {e}")
             return False
@@ -2926,7 +2955,10 @@ class SQLiteHandler:
         try:
             with self._connect() as conn:
                 cursor = conn.execute("DELETE FROM transport_keys WHERE id = ?", (key_id,))
-                return cursor.rowcount > 0
+                changed = cursor.rowcount > 0
+            if changed:
+                self._notify_transport_keys_changed()
+            return changed
         except Exception as e:
             logger.error(f"Failed to delete transport key: {e}")
             return False
@@ -3043,6 +3075,7 @@ class SQLiteHandler:
                 db_ids[node["node_id"]] = int(cursor.lastrowid)
             conn.commit()
 
+        self._notify_transport_keys_changed()
         return {"applied_nodes": len(ordered), "generated_keys": generated_keys}
 
     def delete_advert(self, advert_id: int) -> bool:

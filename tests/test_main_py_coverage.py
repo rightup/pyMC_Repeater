@@ -1,9 +1,11 @@
+import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
 from repeater.companion.constants import STATS_TYPE_CORE, STATS_TYPE_PACKETS, STATS_TYPE_RADIO
+from repeater.identity_manager import IdentityConfigurationError
 from repeater.main import RepeaterDaemon
 from repeater.main import main as repeater_main
 from openhop_core.node.dispatcher import Dispatcher
@@ -533,3 +535,35 @@ def test_main_entrypoint_success_and_fatal_paths(monkeypatch):
             repeater_main()
 
     exit_mock.assert_called_once_with(1)
+
+
+def test_main_identity_config_error_exits_cleanly_without_traceback(caplog):
+    """A configured-identity collision exits 1 with a clean message and no
+    stack-trace dump (regression: the fatal handler used to log exc_info=True
+    for every exception)."""
+
+    class _Args:
+        config = "/tmp/test.yaml"
+        log_level = None
+
+    fake_daemon = SimpleNamespace(run=MagicMock(return_value=object()))
+    err = IdentityConfigurationError(
+        "Local identity 'companion:B' (hash=0x77) conflicts with 'companion:A'"
+    )
+
+    with (
+        patch("argparse.ArgumentParser.parse_args", return_value=_Args()),
+        patch("repeater.main.load_config", return_value=_base_config()),
+        patch("repeater.main.RepeaterDaemon", return_value=fake_daemon),
+        patch("asyncio.run", side_effect=err),
+        patch("sys.exit", side_effect=SystemExit(1)) as exit_mock,
+        caplog.at_level(logging.ERROR),
+    ):
+        with pytest.raises(SystemExit):
+            repeater_main()
+
+    exit_mock.assert_called_once_with(1)
+    config_errors = [r for r in caplog.records if "Identity configuration error" in r.getMessage()]
+    assert len(config_errors) == 1
+    assert config_errors[0].exc_info is None  # no traceback attached
+    assert not any("Fatal error" in r.getMessage() for r in caplog.records)

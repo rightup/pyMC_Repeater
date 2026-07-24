@@ -37,6 +37,7 @@ from repeater.handler_helpers import (
 from repeater.identity_manager import IdentityConfigurationError, IdentityManager, IdentitySpec
 from repeater.logging_utils import normalize_log_level
 from repeater.packet_router import PacketRouter
+from repeater.region_map_builder import build_region_map
 from repeater.sensors import SensorManager
 from repeater.utils_packet import create_scoped_advert_packet
 from repeater.web.http_server import HTTPStatsServer, _log_buffer
@@ -107,6 +108,11 @@ class RepeaterDaemon:
         self.router = None
         self.companion_bridges: dict[int, object] = {}
         self.companion_frame_servers: list = []
+        # Shared RegionMap describing the named regions this repeater serves.
+        # Wired into the dispatcher and every companion bridge so core can
+        # re-scope flood replies to the region their request arrived under
+        # (firmware sendFloodReply parity). Rebuilt on any transport_keys change.
+        self._region_map = None
         # Parsed once during the startup preflight; the identity loaders reuse
         # them so config parsing (and its warnings) does not run twice.
         self._room_server_specs: list[IdentitySpec] | None = None
@@ -212,6 +218,56 @@ class RepeaterDaemon:
         ]
         manager = self.identity_manager or IdentityManager(self.config)
         manager.validate_specs(specs)
+
+    def _get_sqlite_handler(self):
+        """Return the shared SQLiteHandler, or None if storage is unavailable."""
+        handler = self.repeater_handler
+        storage = getattr(handler, "storage", None) if handler else None
+        return getattr(storage, "sqlite_handler", None) if storage else None
+
+    def _init_region_map(self) -> None:
+        """Build the shared RegionMap, wire it into the dispatcher, and hook rebuilds.
+
+        Called once storage is available (right after ``repeater_handler`` is
+        created) and before any companion bridge is built, so the dispatcher and
+        every bridge share the same instance. Runtime region edits (transport_keys
+        CRUD from the CLI, web API, or Glass sync) fire the storage change hook,
+        which reruns ``refresh_region_map``.
+        """
+        sqlite_handler = self._get_sqlite_handler()
+        self._region_map = build_region_map(self.config, sqlite_handler)
+        if self.dispatcher is not None:
+            self.dispatcher.region_map = self._region_map
+        if sqlite_handler is not None and hasattr(
+            sqlite_handler, "set_transport_keys_changed_callback"
+        ):
+            sqlite_handler.set_transport_keys_changed_callback(self.refresh_region_map)
+        logger.info(
+            "Region map initialized with %d served region(s)",
+            len(self._region_map.regions),
+        )
+
+    def refresh_region_map(self) -> None:
+        """Rebuild the RegionMap and reassign it to the dispatcher and all bridges.
+
+        Fires from the storage transport_keys change hook whenever a named region
+        is added, removed, or has its flood policy changed. A fresh instance is
+        reassigned (rather than mutated in place) because this may run in a
+        cherrypy worker thread while ``find_match`` iterates the map on the RX
+        hot path in the event-loop thread: an attribute rebind is atomic under
+        the GIL, so an in-flight match keeps using the old, fully-built map.
+        New bridges pick up the current instance at creation time.
+        """
+        new_map = build_region_map(self.config, self._get_sqlite_handler())
+        self._region_map = new_map
+        if self.dispatcher is not None:
+            self.dispatcher.region_map = new_map
+        for bridge in list(self.companion_bridges.values()):
+            try:
+                bridge.region_map = new_map
+            except Exception:
+                logger.debug("Failed to update region map on a companion bridge", exc_info=True)
+        logger.info("Region map refreshed with %d served region(s)", len(new_map.regions))
 
     async def initialize(self):
 
@@ -385,6 +441,11 @@ class RepeaterDaemon:
                 local_hash_bytes=self.local_hash_bytes,
                 send_advert_func=self.send_advert,
             )
+
+            # Storage now exists: build the served-region map and wire it into the
+            # dispatcher so flood replies are re-scoped to their request's region.
+            # Runs before any companion bridge is created so all share one instance.
+            self._init_region_map()
 
             # Create router
             self.router = PacketRouter(self)
@@ -784,6 +845,10 @@ class RepeaterDaemon:
                     **bridge_kwargs,
                 )
 
+                # Share the dispatcher's served-region map so this bridge re-scopes
+                # its own flood replies to the region the request arrived under.
+                bridge.region_map = self._region_map
+
                 # Restore persisted state (contacts/channels/messages) from SQLite.
                 # Raises CompanionStateLoadError instead of continuing with an
                 # empty store when persisted rows exist but cannot be loaded.
@@ -962,7 +1027,7 @@ class RepeaterDaemon:
 
         if self.identity_manager is None:
             raise RuntimeError("Identity manager must be initialized before adding a companion")
-        registration_error = self.identity_manager.registration_error(name, identity)
+        registration_error = self.identity_manager.registration_error(name, identity, "companion")
         if registration_error:
             raise ValueError(f"Cannot add companion: {registration_error}")
 
@@ -1017,6 +1082,10 @@ class RepeaterDaemon:
             companion_hash=companion_hash_str,
             **bridge_kwargs,
         )
+
+        # Share the current served-region map (hot-reload path) so this bridge
+        # re-scopes its flood replies to the region the request arrived under.
+        bridge.region_map = self._region_map
 
         # Restore persisted state; raises CompanionStateLoadError when persisted
         # rows exist but cannot be loaded (hot-reload callers surface the error).
@@ -1704,6 +1773,11 @@ def main():
         asyncio.run(daemon.run())
     except KeyboardInterrupt:
         logger.info("Repeater stopped")
+    except IdentityConfigurationError as e:
+        # A misconfigured local identity is an actionable config problem, not a
+        # crash: report just the message so the fix is obvious, no stack trace.
+        logger.error("Identity configuration error: %s", e)
+        sys.exit(1)
     except Exception as e:
         logger.error(f"Fatal error: {e}", exc_info=True)
         sys.exit(1)

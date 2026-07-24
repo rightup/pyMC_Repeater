@@ -21,17 +21,37 @@ class _SeedFirstByteIdentity:
         return self._public_key[:3]
 
 
-def _config(*, companions=()):
+def _config(*, companions=(), room_servers=()):
     return {
         "repeater": {"node_name": "n", "identity_key": b"\x10" * 32},
         "logging": {},
-        "identities": {"companions": list(companions)},
+        "identities": {
+            "companions": list(companions),
+            "room_servers": list(room_servers),
+        },
     }
 
 
-def test_startup_preflight_rejects_default_repeater_hash_collision():
+def test_startup_preflight_allows_companion_sharing_repeater_prefix():
+    """A companion may share the repeater's one-byte prefix: they live in
+    separate runtime stores (companion_bridges vs helper.handlers) and DB
+    tables, and the packet router disambiguates them on-air by HMAC."""
     daemon = RepeaterDaemon(
         _config(companions=({"name": "comp", "identity_key": "10" * 32},)),
+        radio=object(),
+    )
+    local_identity = _SeedFirstByteIdentity(b"\x10" * 32)
+
+    with patch("openhop_core.LocalIdentity", _SeedFirstByteIdentity):
+        # Must not raise: the cross-namespace collision is representable.
+        daemon._preflight_configured_local_identities(local_identity)
+
+
+def test_startup_preflight_rejects_repeater_room_server_prefix_collision():
+    """The repeater and a room server share the server namespace (the login/
+    text helper handlers[hash] slot), so a prefix collision is still rejected."""
+    daemon = RepeaterDaemon(
+        _config(room_servers=({"name": "room", "identity_key": "10" * 32},)),
         radio=object(),
     )
     local_identity = _SeedFirstByteIdentity(b"\x10" * 32)
@@ -93,10 +113,12 @@ async def test_invalid_config_entry_logs_once_across_preflight_and_load(caplog):
 
 @pytest.mark.asyncio
 async def test_hot_added_companion_collision_is_rejected_before_stateful_setup():
+    # A second companion sharing an already-registered companion's prefix must
+    # be rejected (same companion namespace: companion_bridges + companion_* DB).
     daemon = RepeaterDaemon(_config(), radio=object())
     daemon.identity_manager = IdentityManager({})
     daemon.identity_manager.register_identity(
-        "repeater", _SeedFirstByteIdentity(b"\x33" * 32), {}, "repeater"
+        "existing", _SeedFirstByteIdentity(b"\x33" * 32), {}, "companion"
     )
 
     comp_config = {"name": "comp", "identity_key": "33" * 32, "settings": {}}
