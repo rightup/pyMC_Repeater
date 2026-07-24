@@ -1773,6 +1773,11 @@ def main():
         asyncio.run(daemon.run())
     except KeyboardInterrupt:
         logger.info("Repeater stopped")
+    except IdentityConfigurationError as e:
+        # A misconfigured local identity is an actionable config problem, not a
+        # crash: report just the message so the fix is obvious, no stack trace.
+        logger.error("Identity configuration error: %s", e)
+        sys.exit(1)
     except Exception as e:
         logger.error(f"Fatal error: {e}", exc_info=True)
         sys.exit(1)
