@@ -2,6 +2,8 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, Optional, Tuple
 
+from repeater.exceptions import ConfigurationError
+
 logger = logging.getLogger("IdentityManager")
 
 
@@ -22,7 +24,7 @@ def _namespace_for(identity_type: str) -> str:
     return "companion" if identity_type == "companion" else "server"
 
 
-class IdentityConfigurationError(RuntimeError):
+class IdentityConfigurationError(ConfigurationError):
     """A configured local identity cannot be represented safely."""
 
 
