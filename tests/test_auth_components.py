@@ -8,6 +8,7 @@ import pytest
 from repeater.web.auth.api_tokens import APITokenManager
 from repeater.web.auth.cherrypy_tool import check_auth
 from repeater.web.auth.jwt_handler import JWTHandler
+from repeater.web.auth.middleware import require_auth
 
 
 def test_jwt_handler_create_and_verify_and_invalid_cases():
@@ -65,10 +66,28 @@ def _set_cp(monkeypatch, method="GET", path="/api/private", headers=None, params
     return req, resp
 
 
-def test_check_auth_skips_options_and_login(monkeypatch):
-    _set_cp(monkeypatch, method="OPTIONS")
-    assert check_auth() is None
+def test_check_auth_options_terminates_request_before_handler_dispatch(monkeypatch):
+    handler = MagicMock(return_value={"secret": "must-not-run"})
+    req, resp = _set_cp(monkeypatch, method="OPTIONS")
+    req.handler = handler
 
+    assert check_auth() is None
+    assert req.handler is None
+    assert resp.status == 204
+
+
+def test_require_auth_options_does_not_invoke_wrapped_handler(monkeypatch):
+    handler = MagicMock(return_value={"secret": "must-not-run"})
+    _req, resp = _set_cp(monkeypatch, method="OPTIONS")
+
+    result = require_auth(handler)()
+
+    assert result == b""
+    handler.assert_not_called()
+    assert resp.status == 204
+
+
+def test_check_auth_skips_public_login(monkeypatch):
     _set_cp(monkeypatch, method="GET", path="/auth/login")
     assert check_auth() is None
 

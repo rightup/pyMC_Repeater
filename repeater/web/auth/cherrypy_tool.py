@@ -14,8 +14,10 @@ def check_auth():
     Sets cherrypy.request.user on success.
     Returns 401 JSON response on failure.
     """
-    # Skip auth check for OPTIONS requests (CORS preflight)
+    # Terminate CORS preflight before CherryPy dispatches the protected handler.
     if cherrypy.request.method == "OPTIONS":
+        cherrypy.response.status = 204
+        cherrypy.request.handler = None
         return
 
     # Skip auth check for /auth/login endpoint

@@ -46,6 +46,21 @@ _ORIGINAL_UNRAISABLEHOOK = sys.unraisablehook
 _CHEROOT_UNRAISABLE_HOOK_INSTALLED = False
 
 
+def _cors_response_headers(
+    methods: str = "GET, POST, PUT, DELETE, OPTIONS",
+) -> list[tuple[str, str]]:
+    """Return wildcard CORS headers for header-authenticated API requests.
+
+    Browser credentials are intentionally disabled: wildcard origins cannot be
+    combined with Access-Control-Allow-Credentials.
+    """
+    return [
+        ("Access-Control-Allow-Origin", "*"),
+        ("Access-Control-Allow-Methods", methods),
+        ("Access-Control-Allow-Headers", "Authorization, Content-Type, X-API-Key"),
+    ]
+
+
 def _looks_like_cheroot_makefile_context(unraisable: object) -> bool:
     context = (
         f"{getattr(unraisable, 'object', '')!r} {getattr(unraisable, 'err_msg', '')!r}".lower()
@@ -276,6 +291,12 @@ class StatsApp:
         guessed_type, _ = mimetypes.guess_type(str(target))
         cherrypy.response.headers["Content-Type"] = guessed_type or "application/octet-stream"
         return target.read_bytes()
+
+    @cherrypy.expose
+    def favicon_ico(self):
+        """Serve the favicon bundled with the compiled frontend."""
+        self._resolve_html_dir()
+        return self._serve_static_file(self.html_dir, ("favicon.ico",))
 
     @cherrypy.expose
     def index(self, **kwargs):
@@ -539,12 +560,7 @@ class HTTPStatsServer:
                 cors_config = {
                     "cors.expose.on": True,
                     "tools.response_headers.on": True,
-                    "tools.response_headers.headers": [
-                        ("Access-Control-Allow-Origin", "*"),
-                        ("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS"),
-                        ("Access-Control-Allow-Headers", "Authorization, Content-Type, X-API-Key"),
-                        ("Access-Control-Allow-Credentials", "true"),
-                    ],
+                    "tools.response_headers.headers": _cors_response_headers(),
                     # Disable automatic trailing slash redirects to prevent CORS issues
                     "tools.trailing_slash.on": False,
                 }
@@ -609,14 +625,7 @@ class HTTPStatsServer:
             if self._cors_enabled:
                 auth_config["/"]["cors.expose.on"] = True
                 # Add CORS headers for OPTIONS requests
-                auth_config["/"]["tools.response_headers.headers"].extend(
-                    [
-                        ("Access-Control-Allow-Origin", "*"),
-                        ("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS"),
-                        ("Access-Control-Allow-Headers", "Authorization, Content-Type, X-API-Key"),
-                        ("Access-Control-Allow-Credentials", "true"),
-                    ]
-                )
+                auth_config["/"]["tools.response_headers.headers"].extend(_cors_response_headers())
 
             cherrypy.tree.mount(self.auth_app, "/auth", auth_config)
 
@@ -634,11 +643,7 @@ class HTTPStatsServer:
             if self._cors_enabled:
                 doc_config["/"]["cors.expose.on"] = True
                 doc_config["/"]["tools.response_headers.headers"].extend(
-                    [
-                        ("Access-Control-Allow-Origin", "*"),
-                        ("Access-Control-Allow-Methods", "GET, POST, OPTIONS"),
-                        ("Access-Control-Allow-Headers", "Authorization, Content-Type, X-API-Key"),
-                    ]
+                    _cors_response_headers("GET, POST, OPTIONS")
                 )
 
             cherrypy.tree.mount(self.doc_app, "/doc", doc_config)
