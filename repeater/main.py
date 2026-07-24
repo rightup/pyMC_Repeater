@@ -850,6 +850,15 @@ class RepeaterDaemon:
                 # its own flood replies to the region the request arrived under.
                 bridge.region_map = self._region_map
 
+                # Feed this bridge every pre-dedup copy of a flood reply so its
+                # return-path teacher can pick the best-received route rather than
+                # the first-arrived one. The router hands a bridge only the first
+                # copy (later ones are dropped by the engine's seen-table) and the
+                # pre-dedup firehose lives on the dispatcher, which the bridge does
+                # not own -- so the host has to wire it.
+                if self.dispatcher:
+                    self.dispatcher.add_raw_packet_subscriber(bridge.note_flood_copy)
+
                 # Restore persisted state (contacts/channels/messages) from SQLite.
                 # Raises CompanionStateLoadError instead of continuing with an
                 # empty store when persisted rows exist but cannot be loaded.
@@ -1087,6 +1096,15 @@ class RepeaterDaemon:
         # Share the current served-region map (hot-reload path) so this bridge
         # re-scopes its flood replies to the region the request arrived under.
         bridge.region_map = self._region_map
+
+        # Feed this bridge every pre-dedup copy of a flood reply so its
+        # return-path teacher can pick the best-received route rather than
+        # the first-arrived one. The router hands a bridge only the first
+        # copy (later ones are dropped by the engine's seen-table) and the
+        # pre-dedup firehose lives on the dispatcher, which the bridge does
+        # not own -- so the host has to wire it.
+        if self.dispatcher:
+            self.dispatcher.add_raw_packet_subscriber(bridge.note_flood_copy)
 
         # Restore persisted state; raises CompanionStateLoadError when persisted
         # rows exist but cannot be loaded (hot-reload callers surface the error).
