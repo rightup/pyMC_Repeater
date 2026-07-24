@@ -10,9 +10,10 @@ def require_auth(func):
 
     @wraps(func)
     def wrapper(*args, **kwargs):
-        # Skip authentication for OPTIONS requests (CORS preflight)
+        # Terminate CORS preflight without invoking the protected handler.
         if cherrypy.request.method == "OPTIONS":
-            return func(*args, **kwargs)
+            cherrypy.response.status = 204
+            return b""
 
         # Get auth handlers from global cherrypy config (not app config)
         jwt_handler = cherrypy.config.get("jwt_handler")

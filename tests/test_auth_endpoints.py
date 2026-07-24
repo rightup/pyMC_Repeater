@@ -67,8 +67,9 @@ def test_auth_api_endpoints_constructs_tokens_endpoint():
 def test_tokens_index_options_and_missing_manager(cp_ctx):
     endpoint = TokensAPIEndpoint()
 
-    cp_ctx(method="OPTIONS")
-    assert endpoint.index() == {}
+    _req, response, _cfg = cp_ctx(method="OPTIONS")
+    assert endpoint.index() == b""
+    assert response.status == 204
 
     cp_ctx(method="GET", headers={"Authorization": "Bearer x"})
     with pytest.raises(cherrypy.HTTPError):

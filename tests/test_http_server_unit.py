@@ -130,6 +130,20 @@ def test_stats_app_index_and_default_routing(monkeypatch, tmp_path):
     assert app.default("route") == "<html>ok</html>"
 
 
+def test_stats_app_exposes_compiled_ui_favicon(monkeypatch, tmp_path):
+    favicon = b"compiled-ui-favicon"
+    (tmp_path / "favicon.ico").write_bytes(favicon)
+
+    fake_api = SimpleNamespace(config_manager=object(), docs=lambda: "d")
+    monkeypatch.setattr(hs, "APIEndpoints", lambda *args, **kwargs: fake_api)
+    monkeypatch.setattr(cherrypy, "response", SimpleNamespace(headers={}), raising=False)
+
+    app = hs.StatsApp(config={"web": {"web_path": str(tmp_path)}})
+
+    assert app.favicon_ico() == favicon
+    assert cherrypy.response.headers["Content-Type"] == "image/x-icon"
+
+
 def test_stats_app_index_error_paths(monkeypatch, tmp_path):
     fake_api = SimpleNamespace(config_manager=object(), docs=lambda: "d")
     monkeypatch.setattr(hs, "APIEndpoints", lambda *args, **kwargs: fake_api)
@@ -185,3 +199,12 @@ def test_http_server_utility_methods(monkeypatch, tmp_path):
     )
     server.stop()
     assert exited["v"] is True
+
+
+def test_cors_response_headers_allow_bearer_preflight_without_credentials():
+    headers = dict(hs._cors_response_headers())
+
+    assert headers["Access-Control-Allow-Origin"] == "*"
+    assert "OPTIONS" in headers["Access-Control-Allow-Methods"]
+    assert "Authorization" in headers["Access-Control-Allow-Headers"]
+    assert "Access-Control-Allow-Credentials" not in headers
