@@ -25,6 +25,7 @@ from repeater.config_manager import ConfigManager
 from repeater.data_acquisition.glass_handler import GlassHandler
 from repeater.data_acquisition.gps_service import GPSService
 from repeater.engine import RepeaterHandler
+from repeater.exceptions import ConfigurationError
 from repeater.handler_helpers import (
     AdvertHelper,
     DiscoveryHelper,
@@ -404,7 +405,7 @@ class RepeaterDaemon:
             identity_key = self.config.get("repeater", {}).get("identity_key")
             if not identity_key:
                 logger.error("No identity key found in configuration. Cannot init repeater.")
-                raise RuntimeError("Identity key is required for repeater operation")
+                raise ConfigurationError("Identity key is required for repeater operation")
 
             local_identity = LocalIdentity(seed=identity_key)
             self.local_identity = local_identity
@@ -1755,28 +1756,29 @@ def main():
 
     args = parser.parse_args()
 
-    # Load configuration
-    config = load_config(args.config)
-    config_path = args.config if args.config else "/etc/openhop_repeater/config.yaml"
-
-    if args.log_level:
-        if "logging" not in config:
-            config["logging"] = {}
-        config["logging"]["level"] = args.log_level
-
-    # Don't initialize radio here - it will be done inside the async event loop
-    daemon = RepeaterDaemon(config, radio=None)
-    daemon.config_path = config_path
-
-    # Run
+    # Load configuration, build the daemon, and run it. Config mistakes (a
+    # missing or invalid config file, a missing required key, colliding local
+    # identities) surface as ConfigurationError and exit cleanly with just the
+    # message; only unexpected failures get the full traceback.
     try:
+        config = load_config(args.config)
+        config_path = args.config if args.config else "/etc/openhop_repeater/config.yaml"
+
+        if args.log_level:
+            if "logging" not in config:
+                config["logging"] = {}
+            config["logging"]["level"] = args.log_level
+
+        # Don't initialize radio here - it will be done inside the async event loop
+        daemon = RepeaterDaemon(config, radio=None)
+        daemon.config_path = config_path
+
         asyncio.run(daemon.run())
     except KeyboardInterrupt:
         logger.info("Repeater stopped")
-    except IdentityConfigurationError as e:
-        # A misconfigured local identity is an actionable config problem, not a
-        # crash: report just the message so the fix is obvious, no stack trace.
-        logger.error("Identity configuration error: %s", e)
+    except ConfigurationError as e:
+        # An actionable config problem, not a crash: report just the message.
+        logger.error("Configuration error: %s", e)
         sys.exit(1)
     except Exception as e:
         logger.error(f"Fatal error: {e}", exc_info=True)

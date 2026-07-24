@@ -6,6 +6,7 @@ from typing import Any, Dict, Optional, overload
 
 import yaml
 
+from repeater.exceptions import ConfigurationError
 from repeater.policy_engine import default_policy_engine_config
 
 logger = logging.getLogger("Config")
@@ -202,7 +203,7 @@ def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
 
     # Check if config file exists
     if not Path(config_path).exists():
-        raise FileNotFoundError(
+        raise ConfigurationError(
             f"Configuration file not found: {config_path}\n"
             f"Please create a config file. Example: \n"
             f"  sudo cp {Path(config_path).parent}/config.yaml.example {config_path}\n"
@@ -215,7 +216,7 @@ def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
             config = yaml.safe_load(f) or {}
             logger.info(f"Loaded config from {config_path}")
     except Exception as e:
-        raise RuntimeError(f"Failed to load configuration from {config_path}: {e}") from e
+        raise ConfigurationError(f"Failed to load configuration from {config_path}: {e}") from e
 
     storage_dir = resolve_storage_dir(config, config_path=config_path)
     if "storage" not in config or not isinstance(config.get("storage"), dict):

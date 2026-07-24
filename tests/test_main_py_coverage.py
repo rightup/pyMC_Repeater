@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 import pytest
 
 from repeater.companion.constants import STATS_TYPE_CORE, STATS_TYPE_PACKETS, STATS_TYPE_RADIO
+from repeater.exceptions import ConfigurationError
 from repeater.identity_manager import IdentityConfigurationError
 from repeater.main import RepeaterDaemon
 from repeater.main import main as repeater_main
@@ -538,7 +539,8 @@ def test_main_entrypoint_success_and_fatal_paths(monkeypatch):
 
 
 def test_main_identity_config_error_exits_cleanly_without_traceback(caplog):
-    """A configured-identity collision exits 1 with a clean message and no
+    """A configured-identity collision (an IdentityConfigurationError, which is
+    a ConfigurationError subclass) exits 1 with a clean message and no
     stack-trace dump (regression: the fatal handler used to log exc_info=True
     for every exception)."""
 
@@ -563,7 +565,62 @@ def test_main_identity_config_error_exits_cleanly_without_traceback(caplog):
             repeater_main()
 
     exit_mock.assert_called_once_with(1)
-    config_errors = [r for r in caplog.records if "Identity configuration error" in r.getMessage()]
+    config_errors = [r for r in caplog.records if "Configuration error" in r.getMessage()]
     assert len(config_errors) == 1
     assert config_errors[0].exc_info is None  # no traceback attached
     assert not any("Fatal error" in r.getMessage() for r in caplog.records)
+
+
+def test_main_config_load_error_exits_cleanly_without_traceback(caplog):
+    """A ConfigurationError from load_config (missing/invalid config file) is
+    now inside the try, so it also exits 1 cleanly rather than dumping a trace
+    from before the event loop starts."""
+
+    class _Args:
+        config = "/tmp/missing.yaml"
+        log_level = None
+
+    with (
+        patch("argparse.ArgumentParser.parse_args", return_value=_Args()),
+        patch(
+            "repeater.main.load_config",
+            side_effect=ConfigurationError("Configuration file not found: /tmp/missing.yaml"),
+        ),
+        patch("sys.exit", side_effect=SystemExit(1)) as exit_mock,
+        caplog.at_level(logging.ERROR),
+    ):
+        with pytest.raises(SystemExit):
+            repeater_main()
+
+    exit_mock.assert_called_once_with(1)
+    config_errors = [r for r in caplog.records if "Configuration error" in r.getMessage()]
+    assert len(config_errors) == 1
+    assert config_errors[0].exc_info is None
+    assert not any("Fatal error" in r.getMessage() for r in caplog.records)
+
+
+def test_main_unexpected_error_keeps_traceback(caplog):
+    """A genuine, non-config failure still logs 'Fatal error' with a traceback."""
+
+    class _Args:
+        config = "/tmp/test.yaml"
+        log_level = None
+
+    fake_daemon = SimpleNamespace(run=MagicMock(return_value=object()))
+
+    with (
+        patch("argparse.ArgumentParser.parse_args", return_value=_Args()),
+        patch("repeater.main.load_config", return_value=_base_config()),
+        patch("repeater.main.RepeaterDaemon", return_value=fake_daemon),
+        patch("asyncio.run", side_effect=RuntimeError("boom")),
+        patch("sys.exit", side_effect=SystemExit(1)) as exit_mock,
+        caplog.at_level(logging.ERROR),
+    ):
+        with pytest.raises(SystemExit):
+            repeater_main()
+
+    exit_mock.assert_called_once_with(1)
+    fatal = [r for r in caplog.records if "Fatal error" in r.getMessage()]
+    assert len(fatal) == 1
+    assert fatal[0].exc_info is not None  # traceback preserved for real crashes
+    assert not any("Configuration error" in r.getMessage() for r in caplog.records)
