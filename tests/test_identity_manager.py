@@ -34,8 +34,8 @@ def test_identity_manager_rejects_duplicate_names_without_mutating_state():
     id_b = _FakeIdentity(bytes([0x22]) + b"B" * 31)
 
     assert mgr.register_identity("alpha", id_a, {}, "repeater") is True
-    assert "already registered" in mgr.registration_error("alpha", id_b)
-    assert mgr.validate_identity("alpha", id_b) is False
+    assert "already registered" in mgr.registration_error("alpha", id_b, "companion")
+    assert mgr.validate_identity("alpha", id_b, "companion") is False
     assert mgr.get_identity_by_hash(0x22) is None
 
 
@@ -63,15 +63,17 @@ def test_identity_manager_list_and_type_filtering():
 
 def test_identity_manager_list_handles_none_identity_fields():
     mgr = IdentityManager(config={})
-    mgr.identities[0x44] = (None, {}, "repeater")
-    mgr.registered_hashes[0x44] = "repeater:ghost"
+    mgr.identities[(0x44, "server")] = (None, {}, "repeater")
+    mgr.registered_hashes[(0x44, "server")] = "repeater:ghost"
 
     listed = mgr.list_identities()
     assert listed[0]["address"] == "N/A"
     assert listed[0]["public_key"] is None
 
 
-def test_validate_specs_rejects_intra_batch_hash_collision():
+def test_validate_specs_rejects_intra_batch_same_namespace_hash_collision():
+    """Two server-side identities (repeater + room server) share the login/
+    text helper handlers[hash] slot, so a prefix collision is unrepresentable."""
     mgr = IdentityManager(config={})
     id_a = _FakeIdentity(bytes([0x11]) + b"A" * 31)
     id_b = _FakeIdentity(bytes([0x11]) + b"B" * 31)
@@ -80,9 +82,61 @@ def test_validate_specs_rejects_intra_batch_hash_collision():
         mgr.validate_specs(
             [
                 IdentitySpec("alpha", id_a, {}, "repeater"),
+                IdentitySpec("beta", id_b, {}, "room_server"),
+            ]
+        )
+
+
+def test_validate_specs_rejects_two_companions_same_prefix():
+    """Two companions share companion_bridges[hash] and the companion_* DB
+    keying, so their prefix must be unique."""
+    mgr = IdentityManager(config={})
+    id_a = _FakeIdentity(bytes([0x11]) + b"A" * 31)
+    id_b = _FakeIdentity(bytes([0x11]) + b"B" * 31)
+
+    with pytest.raises(IdentityConfigurationError, match="one-byte public-key prefixes"):
+        mgr.validate_specs(
+            [
+                IdentitySpec("alpha", id_a, {}, "companion"),
                 IdentitySpec("beta", id_b, {}, "companion"),
             ]
         )
+
+
+def test_validate_specs_allows_companion_sharing_prefix_with_server_identity():
+    """A companion and a server-side identity live in separate runtime stores
+    and DB tables (the router disambiguates by HMAC), so they may share a
+    one-byte prefix. Verified for both the repeater and a room server."""
+    mgr = IdentityManager(config={})
+    repeater = _FakeIdentity(bytes([0x11]) + b"R" * 31)
+    room = _FakeIdentity(bytes([0x22]) + b"S" * 31)
+    comp_vs_repeater = _FakeIdentity(bytes([0x11]) + b"C" * 31)
+    comp_vs_room = _FakeIdentity(bytes([0x22]) + b"D" * 31)
+
+    mgr.validate_specs(
+        [
+            IdentitySpec("rep", repeater, {}, "repeater"),
+            IdentitySpec("room", room, {}, "room_server"),
+            IdentitySpec("comp-a", comp_vs_repeater, {}, "companion"),
+            IdentitySpec("comp-b", comp_vs_room, {}, "companion"),
+        ]
+    )
+
+
+def test_register_companion_sharing_repeater_prefix_keeps_both():
+    """Cross-namespace registration keeps both entries addressable."""
+    mgr = IdentityManager(config={})
+    repeater = _FakeIdentity(bytes([0x11]) + b"R" * 31)
+    companion = _FakeIdentity(bytes([0x11]) + b"C" * 31)
+
+    assert mgr.register_identity("rep", repeater, {}, "repeater") is True
+    assert mgr.register_identity("comp", companion, {}, "companion") is True
+
+    assert mgr.get_identity_by_hash(0x11, "server")[0] is repeater
+    assert mgr.get_identity_by_hash(0x11, "companion")[0] is companion
+    assert mgr.has_identity(0x11, "server") is True
+    assert mgr.has_identity(0x11, "companion") is True
+    assert len(mgr.list_identities()) == 2
 
 
 def test_validate_specs_rejects_intra_batch_duplicate_name():
@@ -107,8 +161,9 @@ def test_validate_specs_rejects_registered_collisions_without_mutation():
 
     assert mgr.register_identity("alpha", id_a, {}, "repeater") is True
 
+    # A room server (server namespace) collides with the registered repeater.
     with pytest.raises(IdentityConfigurationError, match="conflicts"):
-        mgr.validate_specs([IdentitySpec("beta", id_hash_collision, {}, "companion")])
+        mgr.validate_specs([IdentitySpec("beta", id_hash_collision, {}, "room_server")])
     with pytest.raises(IdentityConfigurationError, match="already registered"):
         mgr.validate_specs([IdentitySpec("alpha", id_name_collision, {}, "companion")])
 

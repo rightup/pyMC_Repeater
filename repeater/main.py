@@ -1027,7 +1027,7 @@ class RepeaterDaemon:
 
         if self.identity_manager is None:
             raise RuntimeError("Identity manager must be initialized before adding a companion")
-        registration_error = self.identity_manager.registration_error(name, identity)
+        registration_error = self.identity_manager.registration_error(name, identity, "companion")
         if registration_error:
             raise ValueError(f"Cannot add companion: {registration_error}")
 
