@@ -48,11 +48,11 @@ apt-get install -y \
 log_info "Installing Python build dependencies..."
 apt-get install -y \
     dh-python \
-    pybuild-plugin-pyproject \
     python3-all \
     python3-setuptools \
     python3-setuptools-scm \
     python3-wheel \
+    python3-pip \
     python3-dev
 
 # Install Python runtime dependencies (for building)
@@ -62,10 +62,12 @@ apt-get install -y \
     python3-cherrypy3 \
     python3-paho-mqtt \
     python3-psutil \
-    python3-serial \
-    python3-jwt \
-    python3-ws4py \
-    python3-rrdtool
+    python3-jwt || {
+        log_warn "python3-jwt not available via apt, will be installed via pip during build"
+    }
+
+# Note: cherrypy-cors is not available in Debian repos
+# For development testing: pip install cherrypy-cors
 
 # Clean up
 log_info "Cleaning up..."

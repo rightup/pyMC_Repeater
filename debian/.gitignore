@@ -1,6 +1,3 @@
-# Re-include Debian source metadata when the root `DEBIAN/` rule is matched
-# case-insensitively. Generated package output is ignored below.
-!*
 *.debhelper
 *.debhelper.log
 *.substvars

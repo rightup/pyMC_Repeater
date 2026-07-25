@@ -4,11 +4,11 @@ Priority: optional
 Maintainer: Rightup <rightup@pymc.dev>
 Build-Depends: debhelper-compat (= 13),
                dh-python,
-               pybuild-plugin-pyproject,
-               python3-all (>= 3.10),
+               python3-all,
                python3-setuptools,
                python3-setuptools-scm,
                python3-wheel,
+               python3-pip,
                python3-yaml,
                python3-cherrypy3,
                python3-paho-mqtt,
@@ -16,24 +16,21 @@ Build-Depends: debhelper-compat (= 13),
                git
 Standards-Version: 4.6.2
 Homepage: https://github.com/openhop-dev/openhop_repeater
-Rules-Requires-Root: no
-X-Python3-Version: >= 3.10
+X-Python3-Version: >= 3.9
 
 Package: openhop-repeater
 Architecture: all
 Depends: ${python3:Depends},
          ${misc:Depends},
-         adduser,
-         python3 (>= 3.10),
-         python3-openhop-core,
          python3-yaml,
          python3-cherrypy3,
          python3-paho-mqtt,
          python3-psutil,
-         python3-serial,
          python3-jwt,
-         python3-ws4py,
-         python3-rrdtool
+         python3-pip,
+         python3-rrdtool,
+         libffi-dev,
+         jq
 Recommends: python3-periphery,
             python3-spidev
 Description: PyMC Repeater Daemon
@@ -42,5 +39,5 @@ Description: PyMC Repeater Daemon
  This package provides the openhop-repeater service for managing
  mesh network repeater functionality with a web interface.
  .
- The openhop_core runtime is supplied by the companion
- python3-openhop-core Debian package.
+ Note: This package will install openhop_core, cherrypy-cors, and ws4py
+ from PyPI during postinst as they are not available in Debian repos.

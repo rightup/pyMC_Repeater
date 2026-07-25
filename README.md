@@ -157,13 +157,6 @@ For development tools:
 pip install -e ".[dev]"
 ```
 
-### Debian package builds
-
-The Debian package uses distribution-managed dependencies and does not download
-Python packages from its maintainer scripts. Before building or installing the
-`.deb`, configure a package source that provides `python3-openhop-core`; it is a
-declared runtime dependency and is not bundled in this repository.
-
 ## Configuration
 
 The main configuration file is created during installation:

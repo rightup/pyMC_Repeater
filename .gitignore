@@ -17,7 +17,6 @@ eggs/
 lib/
 lib64/
 parts/
-data-bak/
 sdist/
 var/
 wheels/
@@ -26,10 +25,7 @@ share/python-wheels/
 *.egg-info/
 .installed.cfg
 *.egg
-# Keep generated package control trees out of Git. The lowercase source
-# `debian/` directory is explicitly re-included for case-insensitive filesystems.
-/DEBIAN/
-!/debian/
+DEBIAN/
 debian/files
 debian/.debhelper/
 debian/openhop-repeater/

@@ -1,3 +1,0 @@
-config.yaml.example usr/share/openhop-repeater/
-radio-presets.json var/lib/openhop_repeater/
-radio-settings.json var/lib/openhop_repeater/
