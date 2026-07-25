@@ -16,6 +16,7 @@ docs/architecture/mobile-companion-api.md §7:
 - ``GET /api/v1/companions/{name}/sync?cursor=&limit=`` — journal delta (§7.5)
 - ``GET /api/v1/companions/{name}/messages?before_id=&limit=`` — history page
 - ``POST /api/v1/companions/{name}/messages`` — send DM/channel message (§7.3)
+- ``POST /api/v1/companions/{name}/advert`` — send the selected companion's advert
 - ``GET /api/v1/companions/{name}/events`` — resumable SSE live stream (§8)
 - ``POST /api/v1/companions/{name}/contacts/{pubkey}/login`` — room login (§7.3)
 - ``GET /api/v1/companions/{name}/contacts/{pubkey}/connection`` — login state
@@ -541,7 +542,7 @@ class MobileAPIEndpoints:
 class CompanionsV1:
     """``/api/v1/companions`` collection and per-companion sync/action resources."""
 
-    _ACTIONS = ("snapshot", "sync", "messages", "events")
+    _ACTIONS = ("snapshot", "sync", "messages", "advert", "events")
     # Sub-resource actions under /companions/{name}/contacts/{pubkey}/{action}
     # (§7.3). POST actions have no idempotency requirement.
     # Login/status/telemetry transmit RF and synchronously return their
@@ -1935,6 +1936,27 @@ class CompanionsV1:
             return self._message_history(companion_name, before_id, limit)
         cherrypy.response.headers["Allow"] = "GET, POST"
         raise cherrypy.HTTPError(405, "Method not allowed. Use GET or POST.")
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    @require_auth
+    def advert(self, companion_name=None, **kwargs):
+        """POST .../advert — send this companion's own advert.
+
+        ``mode: flood`` uses the persisted flood scope; ``mode: local`` sends
+        the same advert as a direct zero-hop packet. This is the API equivalent
+        of the legacy Frame ``CMD_SEND_SELF_ADVERT`` command.
+        """
+        self._require_post()
+        bridge, _companion_hash = self._resolve(companion_name)
+        body = self._get_json_body()
+        reject_unknown_fields(body, {"mode"})
+        mode = body.get("mode")
+        if mode not in ("flood", "local"):
+            raise cherrypy.HTTPError(400, "mode must be 'flood' or 'local'")
+        self._admit_rf()
+        sent = self._run_async(bridge.advertise(flood=mode == "flood"))
+        return self._success({"sent": bool(sent), "mode": mode})
 
     def _message_history(self, companion_name, before_id, limit):
         _bridge, companion_hash = self._resolve(companion_name)

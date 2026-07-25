@@ -50,6 +50,7 @@ def test_mobile_v1_dynamic_routes_and_methods_are_collected_exactly():
         "/v1/companions/{}/snapshot": {"GET"},
         "/v1/companions/{}/sync": {"GET"},
         "/v1/companions/{}/messages": {"GET", "POST"},
+        "/v1/companions/{}/advert": {"POST"},
         "/v1/companions/{}/events": {"GET"},
         "/v1/companions/{}/contacts/{}": {"POST", "DELETE"},
         "/v1/companions/{}/channels/{}": {"PUT", "DELETE"},

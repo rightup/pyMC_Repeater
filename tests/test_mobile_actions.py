@@ -69,6 +69,7 @@ class _FakeBridge:
         self.status_requests = []
         self.telemetry_requests = []
         self.reset_paths = []
+        self.adverts = []
         # Configurable results
         self.text_result = SentResult(success=True, is_flood=False, expected_ack=123)
         self.channel_result = True
@@ -133,6 +134,10 @@ class _FakeBridge:
             (pub_key, want_base, want_location, want_environment, timeout)
         )
         return {"success": True, "sensors": {}}
+
+    async def advertise(self, flood=True):
+        self.adverts.append(flood)
+        return True
 
     def reset_path(self, pub_key):
         self.reset_paths.append(pub_key)
@@ -1459,6 +1464,24 @@ class TestContactActions:
         assert len(bridge.status_requests) == 1
         assert bridge.status_requests[0][0] == bytes.fromhex(_PUBKEY_HEX)
 
+    @pytest.mark.parametrize(("mode", "flood"), (("flood", True), ("local", False)))
+    def test_advert_uses_selected_companion_bridge(self, endpoints, bridge, mode, flood):
+        _post(endpoints, {"mode": mode}, idempotency_key=None)
+
+        result = endpoints.advert.__wrapped__(endpoints, companion_name=_NAME)
+
+        assert result == {"success": True, "data": {"sent": True, "mode": mode}}
+        assert bridge.adverts == [flood]
+
+    def test_advert_rejects_unknown_mode_before_radio_send(self, endpoints, bridge):
+        _post(endpoints, {"mode": "broadcast"}, idempotency_key=None)
+
+        with pytest.raises(cherrypy.HTTPError) as exc:
+            endpoints.advert.__wrapped__(endpoints, companion_name=_NAME)
+
+        assert exc.value.status == 400
+        assert bridge.adverts == []
+
     def test_telemetry_request_dispatch(self, endpoints, bridge):
         cherrypy.serving.request.method = "POST"
         result = endpoints.telemetry_request.__wrapped__(
@@ -1736,6 +1759,12 @@ class TestDispatchRouting:
         vpath = [_NAME, "messages"]
         handler_fn = endpoints._cp_dispatch(vpath)
         assert handler_fn == endpoints.messages
+        assert cherrypy.request.params["companion_name"] == _NAME
+
+    def test_advert_route_len2(self, endpoints):
+        vpath = [_NAME, "advert"]
+        handler_fn = endpoints._cp_dispatch(vpath)
+        assert handler_fn == endpoints.advert
         assert cherrypy.request.params["companion_name"] == _NAME
 
     def test_contacts_action_route_len4(self, endpoints):

@@ -7225,6 +7225,100 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponseV1'
 
+  /v1/companions/{name}/advert:
+    post:
+      tags: [Mobile Companion API v1]
+      summary: Send the selected companion's advert
+      description: |
+        Sends the active companion's own signed advertisement. `flood` uses
+        the companion's persisted flood scope; `local` sends the same advert
+        as a direct zero-hop packet. This is the API equivalent of the legacy
+        Frame `CMD_SEND_SELF_ADVERT` command and works whether or not the
+        optional Frame listener is enabled.
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/CompanionRegistrationName'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [mode]
+              additionalProperties: false
+              properties:
+                mode:
+                  type: string
+                  enum: [flood, local]
+      responses:
+        '200':
+          description: Advert transmission was attempted.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessResponse'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        required: [sent, mode]
+                        additionalProperties: false
+                        properties:
+                          sent:
+                            type: boolean
+                          mode:
+                            type: string
+                            enum: [flood, local]
+        '400':
+          description: Missing or invalid advert mode.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponseV1'
+        '401':
+          description: Missing/invalid JWT or API token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponseV1'
+        '404':
+          description: Companion not found or outside the caller's token scope.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponseV1'
+        '405':
+          description: Method not allowed (POST only).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponseV1'
+        '429':
+          description: RF admission limit exceeded. Includes `Retry-After`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponseV1'
+        '500':
+          $ref: '#/components/responses/OperationFailedV1'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaTypeV1'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailableV1'
+        '504':
+          description: Timed out waiting for the companion event loop.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponseV1'
+
   /v1/companions/{name}/contacts/{pubkey}/status_request:
     post:
       tags: [Mobile Companion API v1]
