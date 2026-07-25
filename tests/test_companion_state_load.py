@@ -13,8 +13,15 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 import repeater.main as main_module
-from repeater.companion.utils import CompanionStateLoadError, companion_hash_str_from_identity_key
-from repeater.identity_manager import IdentityManager
+from repeater.companion.utils import (
+    CompanionStateLoadError,
+    DEFAULT_COMPANION_TCP_PORT,
+    DEFAULT_COMPANION_TCP_TIMEOUT_SEC,
+    companion_hash_str_from_identity_key,
+)
+from repeater.companion.journal import CompanionEventJournal
+from repeater.data_acquisition.sqlite_handler import SQLiteHandler
+from repeater.identity_manager import IdentityConfigurationError, IdentityManager
 from repeater.main import RepeaterDaemon, _load_companion_rows_verified
 
 _HASH = "0xab"
@@ -134,6 +141,65 @@ class TestRestoreCompanionState:
         assert any("rejected persisted channel" in r.message for r in caplog.records)
 
 
+class TestDefaultPublicChannelProvision:
+    class _Channels:
+        def __init__(self):
+            self.values = {}
+
+        def remove(self, index):
+            self.values.pop(index, None)
+
+    class _Bridge:
+        def __init__(self):
+            self.channels = TestDefaultPublicChannelProvision._Channels()
+
+        def get_channel(self, index):
+            return self.channels.values.get(index)
+
+        def set_channel(self, index, name, secret):
+            self.channels.values[index] = SimpleNamespace(name=name, secret=secret)
+            return True
+
+    @pytest.mark.asyncio
+    async def test_reprovision_is_durable_and_advances_old_cursor(self, tmp_path):
+        handler = SQLiteHandler(tmp_path)
+        journal = CompanionEventJournal(handler, _HASH)
+        # An earlier explicit clear is already visible to synced clients.
+        journal.store_channel(0, None, None)
+        before = handler.companion_sync_state(_HASH)
+        bridge = self._Bridge()
+
+        await RepeaterDaemon._ensure_default_companion_channel(bridge, journal)
+
+        page = handler.companion_sync_page(
+            _HASH,
+            before["epoch"],
+            before["head"],
+            10,
+        )
+        assert len(page["events"]) == 1
+        assert page["events"][0]["event_type"] == "channel"
+        assert page["events"][0]["payload"] == {
+            "index": 0,
+            "name": "Public",
+            "change": "update",
+        }
+        assert handler.companion_sync_state(_HASH)["cursor"] != before["cursor"]
+        assert handler.companion_load_channels(_HASH)[0]["name"] == "Public"
+
+    @pytest.mark.asyncio
+    async def test_storage_failure_rolls_back_in_memory_channel(self):
+        bridge = self._Bridge()
+        journal = SimpleNamespace(
+            store_channel=MagicMock(side_effect=RuntimeError("disk unavailable"))
+        )
+
+        with pytest.raises(RuntimeError, match="disk unavailable"):
+            await RepeaterDaemon._ensure_default_companion_channel(bridge, journal)
+
+        assert bridge.get_channel(0) is None
+
+
 class TestCompanionInitSurfacesLoadFailure:
     @staticmethod
     def _daemon_with_companion(sqlite):
@@ -247,12 +313,18 @@ class TestRfReceptionEventsSettingWiring:
             patch("repeater.companion.CompanionFrameServer") as server_cls,
         ):
             bridge_cls.return_value.message_queue.max_size = 100
+            bridge_cls.return_value.start = AsyncMock()
             server_cls.return_value.start = AsyncMock()
             await daemon._load_companion_identities()
 
         companion_hash_str = companion_hash_str_from_identity_key("33" * 32)
         assert companion_hash_str in daemon.companion_journals
         assert companion_hash_str not in daemon._rf_reception_journals
+        assert server_cls.call_args.kwargs["port"] == DEFAULT_COMPANION_TCP_PORT
+        assert (
+            server_cls.call_args.kwargs["client_idle_timeout_sec"]
+            == DEFAULT_COMPANION_TCP_TIMEOUT_SEC
+        )
 
     @pytest.mark.asyncio
     async def test_boot_path_explicit_true_registers(self):
@@ -263,6 +335,7 @@ class TestRfReceptionEventsSettingWiring:
             patch("repeater.companion.CompanionFrameServer") as server_cls,
         ):
             bridge_cls.return_value.message_queue.max_size = 100
+            bridge_cls.return_value.start = AsyncMock()
             server_cls.return_value.start = AsyncMock()
             await daemon._load_companion_identities()
 
@@ -282,13 +355,14 @@ class TestRfReceptionEventsSettingWiring:
         comp_config = {
             "name": "hot-rf",
             "identity_key": "44" * 32,
-            "settings": {"rf_reception_events": True},
+            "settings": {"rf_reception_events": True, "tcp_port": 5001},
         }
         with (
             patch("repeater.companion.RepeaterCompanionBridge") as bridge_cls,
             patch("repeater.companion.CompanionFrameServer") as server_cls,
         ):
             bridge_cls.return_value.message_queue.max_size = 100
+            bridge_cls.return_value.start = AsyncMock()
             server_cls.return_value.start = AsyncMock()
             await daemon.add_companion_from_config(comp_config)
 
@@ -298,7 +372,7 @@ class TestRfReceptionEventsSettingWiring:
     @pytest.mark.asyncio
     async def test_hot_reload_path_default_off_not_registered(self):
         sqlite = self._empty_sqlite()
-        daemon = self._daemon_with_companion(sqlite, settings={})
+        daemon = self._daemon_with_companion(sqlite, settings={"tcp_port": 5001})
         daemon.identity_manager = IdentityManager({})
         comp_config = {"name": "hot-off", "identity_key": "55" * 32, "settings": {}}
         with (
@@ -306,9 +380,132 @@ class TestRfReceptionEventsSettingWiring:
             patch("repeater.companion.CompanionFrameServer") as server_cls,
         ):
             bridge_cls.return_value.message_queue.max_size = 100
+            bridge_cls.return_value.start = AsyncMock()
             server_cls.return_value.start = AsyncMock()
             await daemon.add_companion_from_config(comp_config)
 
         companion_hash_str = companion_hash_str_from_identity_key("55" * 32)
         assert companion_hash_str in daemon.companion_journals
         assert companion_hash_str not in daemon._rf_reception_journals
+        assert server_cls.call_args.kwargs["port"] == DEFAULT_COMPANION_TCP_PORT
+        assert (
+            server_cls.call_args.kwargs["client_idle_timeout_sec"]
+            == DEFAULT_COMPANION_TCP_TIMEOUT_SEC
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("setting_name", "setting_value"),
+        [
+            ("trim_contacts_on_overflow", "false"),
+            ("rf_reception_events", "true"),
+        ],
+    )
+    async def test_boot_rejects_string_policy_before_stateful_setup(
+        self,
+        setting_name,
+        setting_value,
+        caplog,
+    ):
+        sqlite = self._empty_sqlite()
+        daemon = self._daemon_with_companion(
+            sqlite,
+            settings={setting_name: setting_value},
+        )
+        daemon._build_push_notifier = MagicMock()
+
+        with (
+            patch("repeater.companion.RepeaterCompanionBridge") as bridge_cls,
+            patch("repeater.companion.CompanionFrameServer") as server_cls,
+            caplog.at_level(logging.ERROR),
+        ):
+            await daemon._load_companion_identities()
+
+        sqlite.companion_bind_namespace.assert_not_called()
+        daemon._build_push_notifier.assert_not_called()
+        bridge_cls.assert_not_called()
+        server_cls.assert_not_called()
+        assert daemon.companion_journals == {}
+        assert daemon._rf_reception_journals == {}
+        assert any(
+            setting_name in record.message and "must be a boolean" in record.message
+            for record in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("setting_name", "setting_value"),
+        [
+            ("trim_contacts_on_overflow", "false"),
+            ("rf_reception_events", "true"),
+        ],
+    )
+    async def test_hot_reload_rejects_string_policy_before_stateful_setup(
+        self,
+        setting_name,
+        setting_value,
+    ):
+        sqlite = self._empty_sqlite()
+        daemon = self._daemon_with_companion(sqlite, settings={})
+        daemon.identity_manager = IdentityManager({})
+        daemon._build_push_notifier = MagicMock()
+        comp_config = {
+            "name": "hot-invalid",
+            "identity_key": "77" * 32,
+            "settings": {
+                "tcp_port": 5001,
+                setting_name: setting_value,
+            },
+        }
+
+        with (
+            patch("repeater.companion.RepeaterCompanionBridge") as bridge_cls,
+            patch("repeater.companion.CompanionFrameServer") as server_cls,
+            pytest.raises(ValueError, match=setting_name),
+        ):
+            await daemon.add_companion_from_config(comp_config)
+
+        sqlite.companion_bind_namespace.assert_not_called()
+        daemon._build_push_notifier.assert_not_called()
+        bridge_cls.assert_not_called()
+        server_cls.assert_not_called()
+        assert daemon.companion_journals == {}
+        assert daemon._rf_reception_journals == {}
+
+    @pytest.mark.asyncio
+    async def test_hot_reload_frame_start_failure_stops_partial_runtime(self):
+        sqlite = self._empty_sqlite()
+        daemon = self._daemon_with_companion(sqlite, settings={})
+        daemon.identity_manager = IdentityManager({})
+        comp_config = {
+            "name": "hot-fail",
+            "identity_key": "66" * 32,
+            "settings": {"tcp_port": 5001},
+        }
+
+        with (
+            patch("repeater.companion.RepeaterCompanionBridge") as bridge_cls,
+            patch("repeater.companion.CompanionFrameServer") as server_cls,
+        ):
+            bridge = bridge_cls.return_value
+            bridge.message_queue.max_size = 100
+            bridge.start = AsyncMock()
+            bridge.stop = AsyncMock()
+            server = server_cls.return_value
+            server.start = AsyncMock(side_effect=OSError("bind failed"))
+            server.stop = AsyncMock()
+
+            with pytest.raises(
+                IdentityConfigurationError,
+                match=(
+                    r"Companion 'hot-fail' Frame listener failed to start "
+                    r"on 127\.0\.0\.1:5001: bind failed"
+                ),
+            ):
+                await daemon.add_companion_from_config(comp_config)
+
+        bridge.start.assert_awaited_once()
+        server.stop.assert_awaited_once()
+        bridge.stop.assert_awaited_once()
+        assert daemon.companion_bridges == {}
+        assert daemon.companion_frame_servers == []

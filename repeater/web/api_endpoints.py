@@ -1,8 +1,12 @@
+import asyncio
+import copy
+import html
 import json
 import logging
 import os
 import re
 import secrets
+import threading
 import time
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from datetime import datetime, timezone
@@ -14,23 +18,39 @@ from openhop_core.protocol import CryptoUtils
 
 from repeater import __version__
 from repeater.companion.identity_resolve import (
-    derive_companion_public_key_hex,
     find_companion_index,
     heal_companion_empty_names,
 )
 from repeater.companion.utils import (
     CompanionContactCapacityError,
+    DEFAULT_COMPANION_TCP_PORT,
+    DEFAULT_COMPANION_TCP_TIMEOUT_SEC,
     merge_companion_settings_update,
-    parse_companion_bridge_kwargs,
-    trim_companion_contacts_to_fit,
+    normalize_companion_identity_key,
+    select_companion_contacts_to_trim,
     validate_companion_config_capacity,
+    validate_companion_listener_config,
+    validate_companion_node_name,
+    validate_companion_registration_name,
 )
 from repeater.config import resolve_storage_dir
+from repeater.data_acquisition.sqlite_handler import (
+    CompanionNamespaceCollisionError,
+    CompanionStorageError,
+)
+from repeater.identity_manager import IdentityConfigurationError
 from repeater.policy_engine import PolicyEngine
 from repeater.service_utils import get_buildroot_image_info
 from repeater.utils_packet import create_scoped_advert_packet
 
+from .api_validation import read_json_object
+from .auth.cherrypy_tool import check_auth
+from .auth.jwt_handler import (
+    validate_jwt_expiry_minutes,
+    validate_jwt_signing_secret,
+)
 from .auth.middleware import require_auth
+from .auth.policy import is_admin_user, validate_new_admin_password
 from .auth_endpoints import AuthAPIEndpoints
 from .cad_calibration_engine import CADCalibrationEngine
 from .companion_endpoints import CompanionAPIEndpoints
@@ -38,6 +58,31 @@ from .mobile_endpoints import MobileAPIEndpoints
 from .update_endpoints import UpdateAPIEndpoints
 
 logger = logging.getLogger("HTTPServer")
+
+_TRACE_TAG_GENERATION_ATTEMPTS = 32
+_SETUP_JSON_BODY_BYTES = 64 * 1024
+_CONFIG_IMPORT_JSON_BODY_BYTES = 1024 * 1024
+_CONFIG_IMPORT_OBJECT_SECTIONS = frozenset(
+    {
+        "repeater",
+        "mesh",
+        "radio",
+        "sx1262",
+        "ch341",
+        "kiss",
+        "pymc_usb",
+        "pymc_tcp",
+        "mqtt_brokers",
+        "mqtt",
+        "identities",
+        "delays",
+        "http",
+        "web",
+        "letsmesh",
+        "glass",
+        "logging",
+    }
+)
 
 POLICY_GROUP_KINDS = {
     "channel_hash": "channel_hashes",
@@ -203,18 +248,31 @@ class APIEndpoints:
     ):
         self.stats_getter = stats_getter
         self.send_advert_func = send_advert_func
-        self.config = config or {}
+        self.config = config if config is not None else {}
         self.event_loop = event_loop
         self.daemon_instance = daemon_instance
         self._config_path = config_path or "/etc/openhop_repeater/config.yaml"
+        # Public setup and public config restore are one irreversible
+        # first-run boundary. Serialize their final persisted-config check
+        # through save so two requests cannot both claim it.
+        self._bootstrap_mutation_lock = threading.Lock()
         self.cad_calibration = CADCalibrationEngine(daemon_instance, event_loop)
 
         # Initialize ConfigManager for centralized config management
         from repeater.config_manager import ConfigManager
 
-        self.config_manager = ConfigManager(
-            config_path=self._config_path, config=self.config, daemon_instance=daemon_instance
-        )
+        daemon_config_manager = getattr(daemon_instance, "config_manager", None)
+        if (
+            isinstance(daemon_config_manager, ConfigManager)
+            and daemon_config_manager.config is self.config
+        ):
+            self.config_manager = daemon_config_manager
+        else:
+            self.config_manager = ConfigManager(
+                config_path=self._config_path,
+                config=self.config,
+                daemon_instance=daemon_instance,
+            )
 
         # Create nested auth object for /api/auth/* routes
         self.auth = AuthAPIEndpoints()
@@ -226,7 +284,10 @@ class APIEndpoints:
 
         # Create nested v1 object for /api/v1/* routes (Mobile Companion API)
         self.v1 = MobileAPIEndpoints(
-            daemon_instance=daemon_instance, config=self.config, event_loop=self.event_loop
+            daemon_instance=daemon_instance,
+            config=self.config,
+            event_loop=self.event_loop,
+            sse_admission=self.companion._sse_admission,
         )
 
         # Create nested update object for /api/update/* routes
@@ -237,12 +298,23 @@ class APIEndpoints:
 
     def _set_cors_headers(self):
         if self._is_cors_enabled():
-            cherrypy.response.headers["Access-Control-Allow-Origin"] = "*"
+            configured = self.config.get("web", {}).get("cors_origins", ())
+            if isinstance(configured, str):
+                configured = [configured]
+            request_headers = getattr(cherrypy.request, "headers", {})
+            origin = request_headers.get("Origin")
+            if not origin or origin not in configured:
+                return
+            cherrypy.response.headers["Access-Control-Allow-Origin"] = origin
+            cherrypy.response.headers["Vary"] = "Origin"
             cherrypy.response.headers["Access-Control-Allow-Methods"] = (
                 "GET, POST, PUT, DELETE, OPTIONS"
             )
             cherrypy.response.headers["Access-Control-Allow-Headers"] = (
-                "Content-Type, Authorization"
+                "Authorization, Content-Type, Idempotency-Key, Last-Event-ID, X-API-Key"
+            )
+            cherrypy.response.headers["Access-Control-Expose-Headers"] = (
+                "ETag, Idempotency-Replayed, Retry-After"
             )
 
     @cherrypy.expose
@@ -278,6 +350,190 @@ class APIEndpoints:
 
     def _error(self, error):
         return {"success": False, "error": str(error)}
+
+    def _bad_request(self, error):
+        cherrypy.response.status = 400
+        return self._error(error)
+
+    def _local_identity_name_conflict(
+        self,
+        name: str,
+        *,
+        exclude_companion: Optional[str] = None,
+        exclude_room_server: Optional[str] = None,
+    ) -> Optional[str]:
+        """Return the configured/runtime owner of a reserved local name."""
+        if name == "repeater":
+            return "repeater"
+        identities = self.config.get("identities", {}) or {}
+        for room in identities.get("room_servers") or []:
+            room_name = str(room.get("name") or "").strip()
+            if room_name == name and room_name != exclude_room_server:
+                return "room server"
+        for companion in identities.get("companions") or []:
+            companion_name = str(companion.get("name") or "").strip()
+            if companion_name == name and companion_name != exclude_companion:
+                return "companion"
+        manager = getattr(self.daemon_instance, "identity_manager", None)
+        get_by_name = getattr(manager, "get_identity_by_name", None)
+        registered = get_by_name(name) if callable(get_by_name) else None
+        if (
+            registered is not None
+            and name != exclude_companion
+            and name != exclude_room_server
+        ):
+            return str(registered[2])
+        return None
+
+    @staticmethod
+    def _public_identity_settings(settings: object) -> dict:
+        """Copy identity settings without returning stored credentials."""
+        public = copy.deepcopy(settings) if isinstance(settings, dict) else {}
+        for field in ("admin_password", "guest_password"):
+            if field in public:
+                public[f"{field}_configured"] = bool(public[field])
+                public.pop(field, None)
+        return public
+
+    @staticmethod
+    def _merge_room_server_settings(current: object, patch: object) -> dict:
+        """Merge a public settings round-trip without erasing credentials.
+
+        Password values are write-only.  An omitted or empty password keeps
+        the stored value; clearing one requires the matching explicit
+        ``clear_*`` flag.  Read-only ``*_configured`` markers are accepted so
+        a human UI or agent can safely GET, edit, and PUT the public object.
+        """
+        if not isinstance(patch, dict):
+            raise ValueError("settings must be an object")
+
+        merged = copy.deepcopy(current) if isinstance(current, dict) else {}
+        update = copy.deepcopy(patch)
+        missing = object()
+        for field in ("admin_password", "guest_password"):
+            update.pop(f"{field}_configured", None)
+            clear_field = f"clear_{field}"
+            clear_requested = update.pop(clear_field, False)
+            if type(clear_requested) is not bool:
+                raise ValueError(f"{clear_field} must be a boolean")
+
+            replacement = update.get(field, missing)
+            if replacement is not missing:
+                if not isinstance(replacement, str):
+                    raise ValueError(f"{field} must be a string")
+                if replacement == "":
+                    update.pop(field)
+
+            if clear_requested:
+                if replacement is not missing and replacement != "":
+                    raise ValueError(
+                        f"{clear_field} cannot be combined with a replacement "
+                        f"{field}"
+                    )
+                update[field] = ""
+
+        merged.update(update)
+        return merged
+
+    def _identity_to_public_wire(
+        self,
+        identity_config: dict,
+        identity_type: Optional[str] = None,
+        *,
+        identity_obj=None,
+        runtime_type: Optional[str] = None,
+        registered: bool = False,
+        include_runtime: bool = False,
+    ) -> dict:
+        """Serialize configured identity state without exposing private keys.
+
+        Top-level public fields always describe the persisted configuration.
+        A live runtime object is registration evidence only when both its type
+        and full public key match that configuration.  A stale same-type
+        runtime remains observable under ``runtime`` instead of replacing the
+        configured identity or making it look active.
+        """
+        kind = identity_type or identity_config.get("type") or "room_server"
+
+        configured_identity = None
+        raw_key = identity_config.get("identity_key")
+        try:
+            from openhop_core import LocalIdentity
+
+            if isinstance(raw_key, (bytes, bytearray)):
+                seed = bytes(raw_key)
+            else:
+                normalized = str(raw_key or "").strip()
+                if normalized.lower().startswith("0x"):
+                    normalized = normalized[2:].strip()
+                seed = bytes.fromhex(normalized)
+            if len(seed) in (32, 64):
+                configured_identity = LocalIdentity(seed=seed)
+        except Exception:
+            configured_identity = None
+
+        def public_fields(identity):
+            if identity is None:
+                return None, None, None
+            try:
+                public_key_bytes = bytes(identity.get_public_key())
+            except Exception:
+                return None, None, None
+            if not public_key_bytes:
+                return None, None, None
+            public_key = public_key_bytes.hex()
+            identity_hash = f"0x{public_key_bytes[0]:02x}"
+            try:
+                address = identity.get_address_bytes().hex()
+            except Exception:
+                address = None
+            return public_key, identity_hash, address
+
+        public_key, identity_hash, address = public_fields(configured_identity)
+        runtime_public_key, runtime_hash, runtime_address = public_fields(identity_obj)
+        runtime_matches = bool(
+            identity_obj is not None
+            and runtime_type == kind
+            and public_key is not None
+            and runtime_public_key is not None
+            and secrets.compare_digest(public_key, runtime_public_key)
+        )
+        is_registered = bool(registered and runtime_matches)
+
+        wire = {
+            "name": identity_config.get("name"),
+            "type": kind,
+            "settings": self._public_identity_settings(
+                identity_config.get("settings")
+            ),
+            "hash": identity_hash,
+            "public_key": public_key,
+            "address": address,
+            "registered": is_registered,
+        }
+        if identity_obj is not None and (include_runtime or not runtime_matches):
+            wire["runtime"] = {
+                "hash": runtime_hash,
+                "public_key": runtime_public_key,
+                "address": runtime_address,
+                "type": runtime_type,
+                "registered": True,
+                "matches_configuration": runtime_matches,
+            }
+        elif include_runtime:
+            wire["runtime"] = {"registered": False}
+        return wire
+
+    def _registered_identity(self, name: object, identity_type: str):
+        """Return the live identity tuple only when its registered type matches."""
+        manager = getattr(self.daemon_instance, "identity_manager", None)
+        get_by_name = getattr(manager, "get_identity_by_name", None)
+        if not callable(get_by_name):
+            return None
+        runtime = get_by_name(str(name or "").strip())
+        if runtime is None or len(runtime) < 3 or runtime[2] != identity_type:
+            return None
+        return runtime
 
     def _get_params(self, defaults):
         params = cherrypy.request.params
@@ -581,7 +837,7 @@ class APIEndpoints:
         return finalized
 
     def _setup_status_from_config(self, config: dict) -> tuple[bool, dict]:
-        """Return whether first-run setup should still be available."""
+        """Return whether the configuration still needs operator attention."""
         node_name = config.get("repeater", {}).get("node_name", "")
         has_default_name = node_name in ["mesh-repeater-01", ""]
 
@@ -598,6 +854,178 @@ class APIEndpoints:
             "radio_not_configured": radio_not_configured,
         }
         return has_default_name or has_default_password or radio_not_configured, reasons
+
+    @staticmethod
+    def _public_bootstrap_allowed(config: dict) -> bool:
+        """Return whether unauthenticated first-run mutation is still safe.
+
+        ``needs_setup`` is deliberately broader: an authenticated operator may
+        still need to choose a radio or rename a node.  Public mutation is a
+        separate security boundary and closes permanently after a successful
+        bootstrap, or immediately when a non-default administrator password is
+        already configured (the migration rule for older config files).
+        """
+
+        if not isinstance(config, dict):
+            return False
+        repeater_config = config.get("repeater")
+        if not isinstance(repeater_config, dict):
+            repeater_config = {}
+        if repeater_config.get("setup_complete") is True:
+            return False
+        security = repeater_config.get("security")
+        if not isinstance(security, dict):
+            security = {}
+        return security.get("admin_password") in (None, "", "admin123")
+
+    @staticmethod
+    def _require_admin_on_public_route() -> None:
+        """Authenticate an admin when routing must stay public for bootstrap."""
+
+        headers = getattr(cherrypy.request, "headers", {})
+        if not headers.get("Authorization") and not headers.get("X-API-Key"):
+            raise cherrypy.HTTPError(
+                403,
+                "Public bootstrap is closed; administrator authentication is required.",
+            )
+        check_auth()
+        if not is_admin_user(getattr(cherrypy.request, "user", None)):
+            raise cherrypy.HTTPError(403, "Administrator authentication is required.")
+
+    @staticmethod
+    def _config_has_bootstrap_admin_password(config: object) -> bool:
+        """Return whether a candidate can safely close public bootstrap."""
+
+        if not isinstance(config, dict):
+            return False
+        repeater_config = config.get("repeater")
+        if not isinstance(repeater_config, dict):
+            return False
+        security = repeater_config.get("security")
+        if not isinstance(security, dict):
+            return False
+        password = security.get("admin_password")
+        if not isinstance(password, str):
+            return False
+        visible_password = password.strip()
+        return len(visible_password) >= 8 and visible_password != "admin123"
+
+    @staticmethod
+    def _validate_config_import_shape(imported_config: dict) -> Optional[str]:
+        """Return a readable error for structurally unsafe import sections."""
+
+        for section, value in imported_config.items():
+            if section in _CONFIG_IMPORT_OBJECT_SECTIONS and not isinstance(value, dict):
+                return f"Configuration section '{section}' must be an object"
+            if section == "radio_type" and value is not None and not isinstance(value, str):
+                return "Configuration section 'radio_type' must be a string or null"
+
+        repeater_config = imported_config.get("repeater")
+        if isinstance(repeater_config, dict):
+            if (
+                "security" in repeater_config
+                and not isinstance(repeater_config["security"], dict)
+            ):
+                return "Configuration field 'repeater.security' must be an object"
+            security = repeater_config.get("security", {})
+            if (
+                isinstance(security, dict)
+                and "admin_password" in security
+                and security["admin_password"] != "*** REDACTED ***"
+            ):
+                password = security["admin_password"]
+                try:
+                    validate_new_admin_password(password)
+                except ValueError as exc:
+                    return (
+                        "Configuration field "
+                        f"'repeater.security.admin_password' is invalid: {exc}"
+                    )
+
+        identities = imported_config.get("identities")
+        if isinstance(identities, dict):
+            for collection in ("room_servers", "companions"):
+                entries = identities.get(collection)
+                if entries is None:
+                    continue
+                if not isinstance(entries, list):
+                    return f"Configuration field 'identities.{collection}' must be an array"
+                if any(not isinstance(entry, dict) for entry in entries):
+                    return (
+                        f"Every entry in 'identities.{collection}' must be an object"
+                    )
+        return None
+
+    @staticmethod
+    def _validate_auth_startup_config(config: dict) -> Optional[str]:
+        """Validate the auth values that the HTTP server will consume."""
+
+        repeater_config = config.get("repeater", {})
+        if not isinstance(repeater_config, dict):
+            return "Configuration section 'repeater' must be an object"
+        security = repeater_config.get("security", {})
+        if not isinstance(security, dict):
+            return "Configuration field 'repeater.security' must be an object"
+
+        try:
+            validate_jwt_expiry_minutes(
+                security.get("jwt_expiry_minutes", 60)
+            )
+            jwt_secret = security.get("jwt_secret")
+            # Null and empty string are the two historical auto-generation
+            # sentinels. Every explicit value must already be safe to start.
+            if jwt_secret not in (None, ""):
+                validate_jwt_signing_secret(jwt_secret)
+        except ValueError as exc:
+            return str(exc)
+        return None
+
+    @staticmethod
+    def _restart_sensitive_repeater_config(config: dict) -> tuple:
+        """Return repeater values captured by long-lived runtime objects."""
+
+        repeater_config = config.get("repeater", {})
+        if not isinstance(repeater_config, dict):
+            return (None, None, 60)
+        security = repeater_config.get("security", {})
+        if not isinstance(security, dict):
+            security = {}
+        return (
+            repeater_config.get("identity_key"),
+            security.get("jwt_secret"),
+            security.get("jwt_expiry_minutes", 60),
+        )
+
+    @staticmethod
+    def _restart_sensitive_http_config(config: dict) -> tuple:
+        """Return listener and CORS values captured when HTTP starts."""
+
+        http_config = config.get("http", {})
+        if not isinstance(http_config, dict):
+            http_config = {}
+        web_config = config.get("web", {})
+        if not isinstance(web_config, dict):
+            web_config = {}
+        cors_origins = web_config.get("cors_origins", ())
+        if isinstance(cors_origins, str):
+            cors_origins = (cors_origins,)
+        elif isinstance(cors_origins, (list, tuple)):
+            cors_origins = tuple(cors_origins)
+        else:
+            cors_origins = ()
+        return (
+            http_config.get("enabled", True),
+            http_config.get("host", "0.0.0.0"),
+            http_config.get("port", 8000),
+            web_config.get("cors_enabled", False),
+            cors_origins,
+        )
+
+    def _replace_live_config(self, config: dict) -> None:
+        """Replace the shared config object without invalidating its consumers."""
+
+        self.config.clear()
+        self.config.update(copy.deepcopy(config))
 
     def _default_policy_document(self) -> dict:
         return {
@@ -1245,10 +1673,15 @@ class APIEndpoints:
             return {
                 "needs_setup": needs_setup,
                 "reasons": reasons,
+                "public_bootstrap_allowed": self._public_bootstrap_allowed(config),
             }
         except Exception as e:
             logger.error(f"Error checking setup status: {e}")
-            return {"needs_setup": False, "error": str(e)}
+            return {
+                "needs_setup": False,
+                "public_bootstrap_allowed": False,
+                "error": str(e),
+            }
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
@@ -1380,12 +1813,11 @@ class APIEndpoints:
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
-    @cherrypy.tools.json_in()
     def setup_wizard(self):
         """Complete initial setup wizard configuration"""
+        bootstrap_lock_acquired = False
         try:
             self._require_post()
-            data = cherrypy.request.json
 
             # Setup wizard is first-run only. After setup, use /auth/change_password
             # and /api/update_radio_config for subsequent changes.
@@ -1395,13 +1827,20 @@ class APIEndpoints:
             except Exception:
                 current_config = self.config or {}
 
-            needs_setup, _ = self._setup_status_from_config(current_config)
-            if not needs_setup:
+            if not self._public_bootstrap_allowed(current_config):
                 cherrypy.response.status = 403
                 return {
                     "success": False,
-                    "error": "Setup is already complete. Use authenticated endpoints for configuration changes.",
+                    "error": (
+                        "Public setup is closed. Use authenticated endpoints "
+                        "for configuration changes."
+                    ),
                 }
+
+            data = read_json_object(
+                max_bytes=_SETUP_JSON_BODY_BYTES,
+                require_json_content_type=True,
+            )
 
             # Validate required fields
             node_name = data.get("node_name", "").strip()
@@ -1419,9 +1858,12 @@ class APIEndpoints:
             if not radio_preset:
                 return {"success": False, "error": "Radio preset selection is required"}
 
-            admin_password = data.get("admin_password", "").strip()
-            if not admin_password or len(admin_password) < 8:
-                return {"success": False, "error": "Admin password must be at least 8 characters"}
+            try:
+                admin_password = validate_new_admin_password(
+                    data.get("admin_password")
+                )
+            except ValueError as exc:
+                return self._error(exc)
 
             import json
 
@@ -1446,9 +1888,26 @@ class APIEndpoints:
             else:
                 hw_config = {}
 
-            # Read current config first so we can update it
+            # Validation and local file discovery above do not consume the
+            # one-time bootstrap. The authoritative check belongs beside the
+            # read-modify-write below, under the lock shared with config_import.
+            self._bootstrap_mutation_lock.acquire()
+            bootstrap_lock_acquired = True
+
+            # Re-read the persisted source after acquiring the lock. Another
+            # valid first-run request may have completed while this body was
+            # being parsed.
             with open(self._config_path, "r") as f:
-                config_yaml = yaml.safe_load(f)
+                config_yaml = yaml.safe_load(f) or {}
+            if not self._public_bootstrap_allowed(config_yaml):
+                cherrypy.response.status = 403
+                return {
+                    "success": False,
+                    "error": (
+                        "Public setup is closed. Use authenticated endpoints "
+                        "for configuration changes."
+                    ),
+                }
 
             # Update repeater settings
             if "repeater" not in config_yaml:
@@ -1458,6 +1917,7 @@ class APIEndpoints:
             if "security" not in config_yaml["repeater"]:
                 config_yaml["repeater"]["security"] = {}
             config_yaml["repeater"]["security"]["admin_password"] = admin_password
+            config_yaml["repeater"]["setup_complete"] = True
 
             # Update radio settings - convert MHz/kHz to Hz (used for both SX1262 and KISS modem)
             if "radio" not in config_yaml:
@@ -1609,17 +2069,34 @@ class APIEndpoints:
                     config_yaml["sx1262"]["use_gpiod_backend"] = hw_config.get(
                         "use_gpiod_backend", False
                     )
-            # Write updated config
-            with open(self._config_path, "w") as f:
-                yaml.dump(config_yaml, f, default_flow_style=False, sort_keys=False)
+            auth_config_error = self._validate_auth_startup_config(config_yaml)
+            if auth_config_error is not None:
+                return self._error(auth_config_error)
+
+            # Persist through the shared ConfigManager so setup gets the same
+            # atomic replacement semantics as every later configuration save.
+            # Update the existing dictionary in place because the auth and
+            # daemon components intentionally hold references to it.
+            previous_live_config = copy.deepcopy(self.config)
+            self._replace_live_config(config_yaml)
+            try:
+                saved = self.config_manager.save_to_file()
+            except Exception:
+                self._replace_live_config(previous_live_config)
+                raise
+            if saved is not True:
+                self._replace_live_config(previous_live_config)
+                cherrypy.response.status = 503
+                return {
+                    "success": False,
+                    "error": "Setup could not be persisted; no changes were applied",
+                }
 
             logger.info(
                 f"Setup wizard completed: node_name={node_name}, hardware={hardware_key}, freq={freq_mhz}MHz"
             )
 
             # Trigger service restart after setup
-            import threading
-
             def delayed_restart():
                 import time
 
@@ -1667,6 +2144,9 @@ class APIEndpoints:
         except Exception as e:
             logger.error(f"Error completing setup wizard: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
+        finally:
+            if bootstrap_lock_acquired:
+                self._bootstrap_mutation_lock.release()
 
     # ============================================================================
     # SYSTEM ENDPOINTS
@@ -4713,6 +5193,41 @@ class APIEndpoints:
         else:
             return self._error("Method not supported")
 
+    def _allocate_trace_tag(self, trace_helper) -> int:
+        """Return a tag unused by Repeater and Frame requests on this radio."""
+
+        pending = getattr(trace_helper, "pending_pings", {})
+        frame_has_owner = getattr(
+            self.daemon_instance,
+            "_frame_has_response_owner",
+            None,
+        )
+        for _ in range(_TRACE_TAG_GENERATION_ATTEMPTS):
+            tag = secrets.randbits(32)
+            if tag in pending:
+                continue
+            try:
+                conflict = bool(
+                    callable(frame_has_owner)
+                    and frame_has_owner("trace", tag)
+                )
+            except Exception as exc:
+                logger.error(
+                    "Could not verify trace response tag ownership: %s",
+                    exc,
+                    exc_info=True,
+                )
+                raise RuntimeError(
+                    "Could not verify trace response tag ownership"
+                ) from exc
+            if not conflict:
+                return tag
+        logger.error(
+            "Could not allocate a unique trace response tag after %d attempts",
+            _TRACE_TAG_GENERATION_ATTEMPTS,
+        )
+        raise RuntimeError("No unique trace response tag is available")
+
     @cherrypy.expose
     @cherrypy.tools.json_out()
     @cherrypy.tools.json_in()
@@ -4764,47 +5279,51 @@ class APIEndpoints:
 
             trace_helper = self.daemon_instance.trace_helper
 
-            # Generate unique tag for this ping
-            trace_tag = secrets.randbits(32)
-
-            # Create trace packet
-            from openhop_core.protocol import PacketBuilder
-
-            path_bytes = list(target_hash.to_bytes(byte_count, "big"))
-            packet = PacketBuilder.create_trace(
-                tag=trace_tag, auth_code=0x12345678, flags=trace_flags, path=path_bytes
-            )
-
             # Wait for response with timeout
             import asyncio
 
             async def send_and_wait():
-                """Async helper to send ping and wait for response"""
-                # Register ping with TraceHelper (must be done in async context)
+                """Reserve, send, and wait on the daemon's event loop."""
+                # Allocation and registration have no await between them. A
+                # Frame command tentatively reserves before checking Repeater
+                # ownership, so one side always observes a same-tag collision.
+                trace_tag = self._allocate_trace_tag(trace_helper)
                 event = trace_helper.register_ping(trace_tag, target_hash)
+                from openhop_core.protocol import PacketBuilder
 
-                # Send packet via router
-                await router.inject_packet(packet)
-                logger.info(
-                    f"Ping sent to 0x{target_hash:0{hex_chars}x} with tag {trace_tag} (path_hash_mode={path_hash_mode})"
+                packet = PacketBuilder.create_trace(
+                    tag=trace_tag,
+                    auth_code=0x12345678,
+                    flags=trace_flags,
+                    path=list(target_hash.to_bytes(byte_count, "big")),
                 )
-
                 try:
-                    await asyncio.wait_for(event.wait(), timeout=timeout)
-                    return True
-                except asyncio.TimeoutError:
-                    return False
+                    await router.inject_packet(packet)
+                    logger.info(
+                        f"Ping sent to 0x{target_hash:0{hex_chars}x} with tag "
+                        f"{trace_tag} (path_hash_mode={path_hash_mode})"
+                    )
+                    try:
+                        await asyncio.wait_for(event.wait(), timeout=timeout)
+                        return True, trace_tag
+                    except asyncio.TimeoutError:
+                        return False, trace_tag
+                except BaseException:
+                    trace_helper.pending_pings.pop(trace_tag, None)
+                    raise
 
             # Run the async send and wait in the daemon's event loop
+            future = None
             try:
                 if self.event_loop is None:
                     return self._error("Event loop not available")
 
                 future = asyncio.run_coroutine_threadsafe(send_and_wait(), self.event_loop)
-                response_received = future.result(timeout=timeout + 1)
+                response_received, trace_tag = future.result(timeout=timeout + 1)
             except Exception as e:
                 logger.error(f"Error waiting for ping response: {e}")
-                trace_helper.pending_pings.pop(trace_tag, None)
+                if future is not None:
+                    future.cancel()
                 return self._error(f"Error waiting for response: {str(e)}")
 
             if response_received:
@@ -4890,18 +5409,35 @@ class APIEndpoints:
             if not discovery_helper:
                 return self._error("Discovery helper not available")
 
-            discovery_helper.cleanup_sessions()
-            session = discovery_helper.create_session(
-                timeout=timeout,
-                filter_mask=filter_mask,
-                since=since,
-                prefix_only=prefix_only,
-                result_enricher=self._enrich_discovery_result,
-            )
+            async def allocate_and_start():
+                # No await is intentional: allocation, cross-surface tag
+                # ownership checks, and task creation are one daemon-loop
+                # critical section shared with Frame protocol commands.
+                discovery_helper.cleanup_sessions()
+                allocated = discovery_helper.create_session(
+                    timeout=timeout,
+                    filter_mask=filter_mask,
+                    since=since,
+                    prefix_only=prefix_only,
+                    result_enricher=self._enrich_discovery_result,
+                )
+                discovery_helper.start_session_task(allocated["session_id"])
+                return allocated
 
-            self.event_loop.call_soon_threadsafe(
-                discovery_helper.start_session_task, session["session_id"]
-            )
+            allocation = allocate_and_start()
+            try:
+                future = asyncio.run_coroutine_threadsafe(
+                    allocation,
+                    self.event_loop,
+                )
+            except Exception:
+                allocation.close()
+                raise
+            try:
+                session = future.result(timeout=5.0)
+            except FutureTimeoutError:
+                future.cancel()
+                raise RuntimeError("Timed out allocating discovery session") from None
 
             return self._success(
                 session,
@@ -5130,27 +5666,15 @@ class APIEndpoints:
             configured = []
             for room_config in room_servers:
                 name = room_config.get("name")
-                identity_key = room_config.get("identity_key", "")
-                settings = room_config.get("settings", {})
-
-                # Find matching registered identity for additional data
-                matching = next(
-                    (r for r in registered_identities if r["name"] == f"room_server:{name}"), None
-                )
-
+                runtime = self._registered_identity(name, "room_server")
                 configured.append(
-                    {
-                        "name": name,
-                        "type": "room_server",
-                        "identity_key": (
-                            identity_key[:16] + "..." if len(identity_key) > 16 else identity_key
-                        ),
-                        "identity_key_length": len(identity_key),
-                        "settings": settings,
-                        "hash": matching["hash"] if matching else None,
-                        "address": matching["address"] if matching else None,
-                        "registered": matching is not None,
-                    }
+                    self._identity_to_public_wire(
+                        room_config,
+                        "room_server",
+                        identity_obj=runtime[0] if runtime else None,
+                        runtime_type=runtime[2] if runtime else None,
+                        registered=runtime is not None,
+                    )
                 )
 
             # Configured companions (same pattern as room servers)
@@ -5158,35 +5682,15 @@ class APIEndpoints:
             configured_companions = []
             for comp_config in companions:
                 name = comp_config.get("name")
-                raw_ik = comp_config.get("identity_key", "")
-                if isinstance(raw_ik, bytes):
-                    ik_hex = raw_ik.hex()
-                else:
-                    ik_hex = str(raw_ik)
-                settings = comp_config.get("settings", {})
-
-                matching = next(
-                    (r for r in registered_identities if r["name"] == f"companion:{name}"),
-                    None,
-                )
-
-                pk_display = None
-                if matching:
-                    pk_display = matching.get("public_key")
-                else:
-                    pk_display = derive_companion_public_key_hex(comp_config.get("identity_key"))
-
+                runtime = self._registered_identity(name, "companion")
                 configured_companions.append(
-                    {
-                        "name": name,
-                        "type": "companion",
-                        "identity_key": (ik_hex[:16] + "..." if len(ik_hex) > 16 else ik_hex),
-                        "identity_key_length": len(ik_hex),
-                        "settings": settings,
-                        "hash": matching["hash"] if matching else None,
-                        "public_key": pk_display,
-                        "registered": matching is not None,
-                    }
+                    self._identity_to_public_wire(
+                        comp_config,
+                        "companion",
+                        identity_obj=runtime[0] if runtime else None,
+                        runtime_type=runtime[2] if runtime else None,
+                        registered=runtime is not None,
+                    )
                 )
 
             return self._success(
@@ -5226,29 +5730,26 @@ class APIEndpoints:
 
             # Find the identity in config (room servers first, then companions)
             identity_config = next((r for r in room_servers if r.get("name") == name), None)
+            identity_type = "room_server"
             if identity_config is None:
                 identity_config = next((c for c in companions if c.get("name") == name), None)
+                identity_type = "companion"
 
             if not identity_config:
                 return self._error(f"Identity '{name}' not found")
 
-            # Get runtime info if available (identity_manager uses name for both types)
-            if self.daemon_instance and hasattr(self.daemon_instance, "identity_manager"):
-                identity_manager = self.daemon_instance.identity_manager
-                runtime_info = identity_manager.get_identity_by_name(name)
+            runtime_info = self._registered_identity(name, identity_type)
 
-                if runtime_info:
-                    identity_obj, config, identity_type = runtime_info
-                    identity_config["runtime"] = {
-                        "hash": self._fmt_hash(identity_obj.get_public_key()),
-                        "address": identity_obj.get_address_bytes().hex(),
-                        "type": identity_type,
-                        "registered": True,
-                    }
-                else:
-                    identity_config["runtime"] = {"registered": False}
-
-            return self._success(identity_config)
+            return self._success(
+                self._identity_to_public_wire(
+                    identity_config,
+                    identity_type,
+                    identity_obj=runtime_info[0] if runtime_info else None,
+                    runtime_type=runtime_info[2] if runtime_info else None,
+                    registered=runtime_info is not None,
+                    include_runtime=True,
+                )
+            )
 
         except Exception as e:
             logger.error(f"Error getting identity: {e}")
@@ -5293,6 +5794,8 @@ class APIEndpoints:
 
             if not name:
                 return self._error("Missing required field: name")
+            if not isinstance(settings, dict):
+                return self._bad_request("settings must be an object")
 
             # Validate identity type
             if identity_type not in ["room_server", "companion"]:
@@ -5309,6 +5812,12 @@ class APIEndpoints:
 
             # Auto-generate identity key if not provided
             key_was_generated = False
+            if (
+                identity_type == "companion"
+                and identity_key is not None
+                and not isinstance(identity_key, str)
+            ):
+                return self._bad_request("Companion identity_key must be a hex string")
             if not identity_key:
                 try:
                     # Use MeshCore-compatible keygen and store 32-byte private scalar hex.
@@ -5317,54 +5826,88 @@ class APIEndpoints:
                     _, private_key = generate_meshcore_keypair()
                     identity_key = private_key[:32].hex()
                     key_was_generated = True
-                    logger.info(f"Auto-generated identity key for '{name}': {identity_key[:16]}...")
+                    logger.info("Auto-generated identity key for '%s'", name)
                 except Exception as gen_error:
                     logger.error(f"Failed to auto-generate identity key: {gen_error}")
                     return self._error(f"Failed to auto-generate identity key: {gen_error}")
 
             identities_config = self.config.get("identities", {})
-            if "identities" not in self.config:
-                self.config["identities"] = {}
 
             if identity_type == "companion":
                 # Companion: validate key length (32 or 64 bytes hex), normalize settings
+                try:
+                    name = validate_companion_registration_name(raw_name)
+                except ValueError as e:
+                    return self._bad_request(str(e))
                 if identity_key:
                     try:
+                        identity_key = normalize_companion_identity_key(identity_key)
+                        if (
+                            len(identity_key) not in (64, 128)
+                            or any(
+                                character not in "0123456789abcdefABCDEF"
+                                for character in identity_key
+                            )
+                        ):
+                            raise ValueError("identity_key is not exact hexadecimal")
                         key_bytes = bytes.fromhex(identity_key)
                         if len(key_bytes) not in (32, 64):
-                            return self._error(
+                            return self._bad_request(
                                 "Companion identity_key must be 32 or 64 bytes (64 or 128 hex chars)"
                             )
                     except ValueError:
-                        return self._error("Companion identity_key must be a valid hex string")
+                        return self._bad_request(
+                            "Companion identity_key must be a valid hex string"
+                        )
 
                 companions = identities_config.get("companions") or []
-                if any(str(c.get("name") or "").strip() == name for c in companions):
-                    return self._error(f"Companion with name '{name}' already exists")
+                original_collection = copy.deepcopy(companions)
+                collection_key = "companions"
+                conflict_owner = self._local_identity_name_conflict(name)
+                if conflict_owner is not None:
+                    return self._error(
+                        f"Companion name '{name}' conflicts with existing "
+                        f"{conflict_owner} identity"
+                    )
+
+                manager = getattr(self.daemon_instance, "identity_manager", None)
+                registration_error = getattr(manager, "registration_error", None)
+                if callable(registration_error):
+                    from openhop_core import LocalIdentity
+
+                    candidate = LocalIdentity(seed=key_bytes)
+                    conflict = registration_error(name, candidate)
+                    if conflict:
+                        return self._bad_request(conflict)
 
                 try:
-                    bridge_settings = parse_companion_bridge_kwargs(settings)
-                except ValueError as e:
-                    return self._error(str(e))
-
-                comp_settings = {
-                    "node_name": settings.get("node_name") or name,
-                    "tcp_port": settings.get("tcp_port", 5000),
-                    "bind_address": settings.get("bind_address", "0.0.0.0"),  # nosec B104
-                }
-                if "tcp_timeout" in settings:
-                    comp_settings["tcp_timeout"] = settings["tcp_timeout"]
-                if "trim_contacts_on_overflow" in settings:
-                    comp_settings["trim_contacts_on_overflow"] = bool(
-                        settings["trim_contacts_on_overflow"]
+                    comp_settings = merge_companion_settings_update(
+                        {
+                            "node_name": validate_companion_node_name(name[:31]),
+                            "frame_enabled": True,
+                            "tcp_port": DEFAULT_COMPANION_TCP_PORT,
+                            "bind_address": "127.0.0.1",
+                            "tcp_timeout": DEFAULT_COMPANION_TCP_TIMEOUT_SEC,
+                            "trim_contacts_on_overflow": False,
+                            "rf_reception_events": False,
+                        },
+                        settings,
                     )
-                comp_settings.update(bridge_settings)
+                except ValueError as e:
+                    return self._bad_request(str(e))
                 new_identity = {
                     "name": name,
                     "identity_key": identity_key,
                     "type": identity_type,
                     "settings": comp_settings,
                 }
+                try:
+                    validate_companion_listener_config(
+                        [*companions, new_identity],
+                        self.config.get("http", {}),
+                    )
+                except ValueError as e:
+                    return self._bad_request(str(e))
                 sqlite_handler = None
                 repeater_handler = (
                     getattr(self.daemon_instance, "repeater_handler", None)
@@ -5385,13 +5928,38 @@ class APIEndpoints:
                         return self._error(str(e))
                     except (ValueError, TypeError) as e:
                         return self._error(str(e))
-                companions.append(new_identity)
-                self.config["identities"]["companions"] = companions
             else:
                 # Room server
                 room_servers = identities_config.get("room_servers") or []
-                if any(str(r.get("name") or "").strip() == name for r in room_servers):
-                    return self._error(f"Identity with name '{name}' already exists")
+                original_collection = copy.deepcopy(room_servers)
+                collection_key = "room_servers"
+                conflict_owner = self._local_identity_name_conflict(name)
+                if conflict_owner is not None:
+                    return self._error(
+                        f"Identity name '{name}' conflicts with existing "
+                        f"{conflict_owner} identity"
+                    )
+                try:
+                    room_key_bytes = bytes.fromhex(str(identity_key))
+                except ValueError:
+                    return self._bad_request(
+                        "identity_key must be a valid hexadecimal string"
+                    )
+                if len(room_key_bytes) not in (32, 64):
+                    return self._bad_request(
+                        "identity_key must be 32 or 64 bytes"
+                    )
+                manager = getattr(self.daemon_instance, "identity_manager", None)
+                registration_error = getattr(manager, "registration_error", None)
+                if callable(registration_error):
+                    from openhop_core import LocalIdentity
+
+                    conflict = registration_error(
+                        name,
+                        LocalIdentity(seed=room_key_bytes),
+                    )
+                    if conflict:
+                        return self._bad_request(conflict)
 
                 new_identity = {
                     "name": name,
@@ -5399,13 +5967,28 @@ class APIEndpoints:
                     "type": identity_type,
                     "settings": settings,
                 }
-                room_servers.append(new_identity)
-                self.config["identities"]["room_servers"] = room_servers
-
-            # Save to file
-            saved = self.config_manager.save_to_file()
-            if not saved:
-                return self._error("Failed to save configuration to file")
+            # Commit only if the collection validated above is still current.
+            # Frame name changes share this same lock and therefore cannot be
+            # overwritten by a stale create snapshot.
+            with self.config_manager.mutation():
+                current_collection = (
+                    (self.config.get("identities") or {}).get(collection_key)
+                    or []
+                )
+                if current_collection != original_collection:
+                    cherrypy.response.status = 409
+                    return self._error(
+                        "Identity configuration changed during this request; "
+                        "retry with the current settings"
+                    )
+                committed_collection = [*current_collection, new_identity]
+                self.config.setdefault("identities", {})[
+                    collection_key
+                ] = committed_collection
+                saved = self.config_manager.save_to_file()
+                if not saved:
+                    self.config["identities"][collection_key] = current_collection
+                    return self._error("Failed to save configuration to file")
 
             logger.info(
                 f"Created new identity: {name} (type: {identity_type}){' with auto-generated key' if key_was_generated else ''}"
@@ -5413,6 +5996,7 @@ class APIEndpoints:
 
             # Hot reload - register identity immediately
             registration_success = False
+            activation_pending = False
             companion_activation_error = None
             if identity_type == "room_server" and self.daemon_instance:
                 try:
@@ -5458,11 +6042,15 @@ class APIEndpoints:
                     )
 
             elif identity_type == "companion" and self.daemon_instance and self.event_loop:
+                future = None
                 try:
                     import asyncio
 
                     future = asyncio.run_coroutine_threadsafe(
-                        self.daemon_instance.add_companion_from_config(new_identity),
+                        self.daemon_instance.add_companion_from_config(
+                            new_identity,
+                            require_current_config=True,
+                        ),
                         self.event_loop,
                     )
                     future.result(timeout=15)
@@ -5472,6 +6060,55 @@ class APIEndpoints:
                     # A restart won't fix a capacity overflow; report the real cause.
                     companion_activation_error = str(cap_error)
                     logger.warning(f"Hot reload companion '{name}' not activated: {cap_error}")
+                except CompanionNamespaceCollisionError as collision_error:
+                    # A restart cannot make a different full public key safe
+                    # to attach to this one-byte persisted namespace.
+                    companion_activation_error = str(collision_error)
+                    logger.warning(
+                        "Hot reload companion '%s' refused: %s",
+                        name,
+                        collision_error,
+                    )
+                except IdentityConfigurationError as activation_error:
+                    companion_activation_error = str(activation_error)
+                    logger.warning(
+                        "Hot reload companion '%s' refused: %s",
+                        name,
+                        activation_error,
+                    )
+                except FutureTimeoutError:
+                    # Activation owns startup and rollback for the bridge and
+                    # optional Frame listener. Let it converge instead of
+                    # cancelling a merely slow start after config was committed.
+                    activation_pending = True
+
+                    def _log_activation_completion(
+                        completed_future,
+                        companion_name=name,
+                    ):
+                        try:
+                            completed_future.result()
+                        except Exception as completion_exc:
+                            logger.warning(
+                                "Background activation for companion '%s' "
+                                "failed; restart required: %s",
+                                companion_name,
+                                completion_exc,
+                                exc_info=True,
+                            )
+                        else:
+                            logger.info(
+                                "Background activation for companion '%s' "
+                                "completed",
+                                companion_name,
+                            )
+
+                    future.add_done_callback(_log_activation_completion)
+                    logger.warning(
+                        "Hot reload companion '%s' timed out; activation is "
+                        "still running in the background",
+                        name,
+                    )
                 except Exception as comp_error:
                     logger.warning(
                         f"Hot reload companion '{name}' failed: {comp_error}. Restart required to activate.",
@@ -5486,6 +6123,12 @@ class APIEndpoints:
                         f"Companion '{name}' created, but not activated: "
                         f"{companion_activation_error}"
                     )
+                elif activation_pending:
+                    message = (
+                        f"Companion '{name}' created successfully. Live "
+                        "activation is still finishing; restart if it does "
+                        "not complete."
+                    )
                 else:
                     message = (
                         f"Companion '{name}' created successfully. Restart required to activate."
@@ -5499,7 +6142,17 @@ class APIEndpoints:
             if key_was_generated:
                 message += " Identity key was auto-generated."
 
-            return self._success(new_identity, message=message)
+            runtime = self._registered_identity(name, identity_type)
+            public_identity = self._identity_to_public_wire(
+                new_identity,
+                identity_type,
+                identity_obj=runtime[0] if runtime else None,
+                runtime_type=runtime[2] if runtime else None,
+                registered=runtime is not None,
+            )
+            if identity_type == "companion":
+                public_identity["activation_pending"] = activation_pending
+            return self._success(public_identity, message=message)
 
         except cherrypy.HTTPError:
             raise
@@ -5522,8 +6175,9 @@ class APIEndpoints:
                 "node_name": "Updated Room Name",
                 "latitude": 1.0,
                 "longitude": 2.0,
-                "admin_password": "newsecret",  # Optional - admin password
-                "guest_password": "newguest"    # Optional - guest password
+                "admin_password": "newsecret",  # Non-empty replaces; empty keeps
+                "guest_password": "newguest",   # Non-empty replaces; empty keeps
+                "clear_guest_password": true    # Explicit credential removal
             }
         }
         """
@@ -5566,42 +6220,58 @@ class APIEndpoints:
                     )
                 if err:
                     return self._error(err)
-                identity = companions[identity_index]
+                # Validate and build the update on a copy. A later invalid
+                # setting must not partially rename or re-key live config.
+                original_identity = copy.deepcopy(companions[identity_index])
+                identity = dict(original_identity)
                 resolved_name = str(identity.get("name") or "").strip()
 
+                if "identity_key" in data:
+                    return self._bad_request(
+                        "identity_key is immutable for companions; create a new "
+                        "companion identity instead"
+                    )
+
                 if "new_name" in data:
-                    new_name = data["new_name"]
-                    new_name = str(new_name).strip() if new_name is not None else ""
-                    if not new_name:
-                        return self._error("new_name cannot be empty")
-                    if any(
-                        str(c.get("name") or "").strip() == new_name
-                        for i, c in enumerate(companions)
-                        if i != identity_index
-                    ):
-                        return self._error(f"Companion with name '{new_name}' already exists")
+                    try:
+                        new_name = validate_companion_registration_name(
+                            data["new_name"]
+                        )
+                    except ValueError as e:
+                        return self._bad_request(str(e))
+                    conflict_owner = self._local_identity_name_conflict(
+                        new_name,
+                        exclude_companion=resolved_name,
+                    )
+                    if conflict_owner is not None:
+                        return self._error(
+                            f"Companion name '{new_name}' conflicts with "
+                            f"existing {conflict_owner} identity"
+                        )
                     identity["name"] = new_name
 
-                if "identity_key" in data and data["identity_key"]:
-                    new_key = data["identity_key"]
-                    if "..." not in new_key:
-                        try:
-                            key_bytes = bytes.fromhex(new_key)
-                            if len(key_bytes) in (32, 64):
-                                identity["identity_key"] = new_key
-                                logger.info(f"Updated identity_key for companion '{resolved_name}'")
-                        except ValueError:
-                            pass
-
-                trimmed_count = 0
-                if "settings" in data:
+                force_trim = data.get("force_trim", False)
+                if type(force_trim) is not bool:
+                    return self._bad_request("force_trim must be a boolean")
+                trim_scheduled_count = 0
+                if "settings" in data or force_trim:
+                    settings_patch = data.get("settings", {})
+                    if not isinstance(settings_patch, dict):
+                        return self._bad_request("settings must be an object")
+                    settings_patch = dict(settings_patch)
+                    if force_trim:
+                        # Compatibility spelling for an older immediate-trim
+                        # option. Trimming a live companion would race its
+                        # in-memory ContactStore, so persist the existing
+                        # startup policy and apply it before activation.
+                        settings_patch["trim_contacts_on_overflow"] = True
                     try:
                         merged_settings = merge_companion_settings_update(
                             identity.get("settings") or {},
-                            data["settings"],
+                            settings_patch,
                         )
                     except ValueError as e:
-                        return self._error(str(e))
+                        return self._bad_request(str(e))
 
                     sqlite_handler = None
                     repeater_handler = (
@@ -5620,47 +6290,106 @@ class APIEndpoints:
                                 settings=merged_settings,
                             )
                         except CompanionContactCapacityError as e:
-                            if not data.get("force_trim"):
+                            if not merged_settings.get(
+                                "trim_contacts_on_overflow",
+                                False,
+                            ):
                                 return self._error(str(e))
-                            # Power-user opt-in: trim persisted contacts down to the
-                            # new limit (favourite-aware) instead of rejecting.
-                            try:
-                                trimmed_count = trim_companion_contacts_to_fit(
-                                    sqlite_handler, e.companion_hash, e.max_contacts
+                            strict_load = getattr(
+                                type(sqlite_handler),
+                                "companion_load_contacts_strict",
+                                None,
+                            )
+                            if callable(strict_load):
+                                contacts = strict_load(
+                                    sqlite_handler,
+                                    e.companion_hash,
                                 )
-                            except ValueError as trim_err:
-                                return self._error(str(trim_err))
-                            except RuntimeError:
-                                return self._error("Failed to persist trimmed contacts")
+                            else:
+                                contacts = sqlite_handler.companion_load_contacts(
+                                    e.companion_hash
+                                )
+                                if contacts is None:
+                                    raise CompanionStorageError(
+                                        "Persisted contacts could not be loaded"
+                                    )
+                            _keep, removed = select_companion_contacts_to_trim(
+                                contacts,
+                                e.max_contacts,
+                            )
+                            trim_scheduled_count = len(removed)
                             logger.info(
-                                "Force-trimmed %d contact(s) for companion '%s' "
-                                "to fit max_contacts=%d",
-                                trimmed_count,
+                                "Scheduled favourite-aware trim of %d contact(s) "
+                                "for companion '%s' at restart (max_contacts=%d)",
+                                trim_scheduled_count,
                                 resolved_name,
                                 e.max_contacts,
                             )
-                        except (ValueError, TypeError) as e:
+                        except (CompanionStorageError, ValueError, TypeError) as e:
                             return self._error(str(e))
 
                     identity["settings"] = merged_settings
+                    prospective = [
+                        identity if i == identity_index else entry
+                        for i, entry in enumerate(companions)
+                    ]
+                    try:
+                        validate_companion_listener_config(
+                            prospective,
+                            self.config.get("http", {}),
+                        )
+                    except ValueError as e:
+                        return self._bad_request(str(e))
 
-                companions[identity_index] = identity
-                self.config["identities"]["companions"] = companions
-                saved = self.config_manager.save_to_file()
-                if not saved:
-                    return self._error("Failed to save configuration to file")
+                with self.config_manager.mutation():
+                    current_companions = (
+                        (self.config.get("identities") or {}).get("companions")
+                        or []
+                    )
+                    current_index, current_error = find_companion_index(
+                        current_companions,
+                        name=resolved_name,
+                    )
+                    if (
+                        current_error
+                        or current_companions[current_index] != original_identity
+                    ):
+                        cherrypy.response.status = 409
+                        return self._error(
+                            "Companion configuration changed during this request; "
+                            "retry with the current settings"
+                        )
+
+                    committed_companions = list(current_companions)
+                    committed_companions[current_index] = identity
+                    self.config["identities"]["companions"] = committed_companions
+                    saved = self.config_manager.save_to_file()
+                    if not saved:
+                        self.config["identities"]["companions"] = current_companions
+                        return self._error("Failed to save configuration to file")
                 logger.info(f"Updated companion: {resolved_name}")
                 message = (
                     f"Companion '{resolved_name}' updated successfully. "
                     "Restart required to apply changes."
                 )
-                if trimmed_count:
+                if trim_scheduled_count:
                     message = (
                         f"Companion '{resolved_name}' updated successfully; "
-                        f"trimmed {trimmed_count} contact(s) to fit the new limit. "
-                        "Restart required to apply changes."
+                        f"{trim_scheduled_count} oldest non-favourite contact(s) "
+                        "will be trimmed safely before activation on restart."
                     )
-                return self._success(identity, message=message)
+                runtime = self._registered_identity(identity.get("name"), "companion")
+                return self._success(
+                    self._identity_to_public_wire(
+                        identity,
+                        "companion",
+                        identity_obj=runtime[0] if runtime else None,
+                        runtime_type=runtime[2] if runtime else None,
+                        registered=runtime is not None,
+                    ),
+                    message=message,
+                    trim_scheduled_count=trim_scheduled_count,
+                )
 
             # Room server path
             if not name_s:
@@ -5679,43 +6408,50 @@ class APIEndpoints:
             if identity_index is None:
                 return self._error(f"Identity '{name_s}' not found")
 
-            # Update fields
-            identity = room_servers[identity_index]
+            # Validate on a copy so a rejected field or save cannot mutate the
+            # live configuration.
+            original_identity = room_servers[identity_index]
+            identity = copy.deepcopy(original_identity)
 
             if "new_name" in data:
                 new_name = data["new_name"]
                 new_name = str(new_name).strip() if new_name is not None else ""
                 if not new_name:
                     return self._error("new_name cannot be empty")
-                # Check if new name conflicts
-                if any(
-                    str(r.get("name") or "").strip() == new_name
-                    for i, r in enumerate(room_servers)
-                    if i != identity_index
-                ):
-                    return self._error(f"Identity with name '{new_name}' already exists")
+                conflict_owner = self._local_identity_name_conflict(
+                    new_name,
+                    exclude_room_server=name_s,
+                )
+                if conflict_owner is not None:
+                    return self._error(
+                        f"Identity name '{new_name}' conflicts with existing "
+                        f"{conflict_owner} identity"
+                    )
                 identity["name"] = new_name
 
-            # Only update identity_key if a valid full key is provided
-            # Silently reject truncated keys (containing "...") or invalid hex strings
             if "identity_key" in data and data["identity_key"]:
-                new_key = data["identity_key"]
-                # Check if it's a truncated key (contains "...") or not a valid 64-char hex string
-                if "..." not in new_key and len(new_key) == 64:
-                    try:
-                        # Validate it's proper hex
-                        bytes.fromhex(new_key)
-                        identity["identity_key"] = new_key
-                        logger.info(f"Updated identity_key for '{name_s}'")
-                    except ValueError:
-                        # Invalid hex, silently ignore
-                        pass
+                new_key = str(data["identity_key"]).strip()
+                try:
+                    key_bytes = bytes.fromhex(new_key)
+                except ValueError:
+                    return self._bad_request(
+                        "identity_key must be a valid hexadecimal string"
+                    )
+                if len(key_bytes) not in (32, 64):
+                    return self._bad_request(
+                        "identity_key must be 32 or 64 bytes"
+                    )
+                identity["identity_key"] = new_key
+                logger.info("Updated identity key for '%s'", name_s)
 
             if "settings" in data:
-                # Merge settings
-                if "settings" not in identity:
-                    identity["settings"] = {}
-                identity["settings"].update(data["settings"])
+                try:
+                    identity["settings"] = self._merge_room_server_settings(
+                        identity.get("settings"),
+                        data["settings"],
+                    )
+                except ValueError as e:
+                    return self._bad_request(str(e))
 
                 # Validate passwords are different if both are now set
                 admin_pw = identity["settings"].get("admin_password")
@@ -5729,6 +6465,8 @@ class APIEndpoints:
 
             saved = self.config_manager.save_to_file()
             if not saved:
+                room_servers[identity_index] = original_identity
+                self.config["identities"]["room_servers"] = room_servers
                 return self._error("Failed to save configuration to file")
 
             logger.info(f"Updated identity: {name_s}")
@@ -5799,7 +6537,17 @@ class APIEndpoints:
                     f"Identity '{name_s}' updated successfully (settings only, no reload needed)."
                 )
 
-            return self._success(identity, message=message)
+            runtime = self._registered_identity(identity.get("name"), "room_server")
+            return self._success(
+                self._identity_to_public_wire(
+                    identity,
+                    "room_server",
+                    identity_obj=runtime[0] if runtime else None,
+                    runtime_type=runtime[2] if runtime else None,
+                    registered=runtime is not None,
+                ),
+                message=message,
+            )
 
         except cherrypy.HTTPError:
             raise
@@ -5809,12 +6557,10 @@ class APIEndpoints:
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
-    def delete_identity(
-        self, name=None, type=None, lookup_identity_key=None, public_key_prefix=None
-    ):
+    def delete_identity(self, name=None, type=None, public_key_prefix=None):
         """
         DELETE /api/delete_identity?name=<name>&type=<room_server|companion> - Delete an identity
-        Companions may also be deleted with lookup_identity_key or public_key_prefix when name is empty.
+        Companions may also be deleted with public_key_prefix when name is empty.
         """
         # Enable CORS for this endpoint only if configured
         self._set_cors_headers()
@@ -5837,44 +6583,132 @@ class APIEndpoints:
             identities_config = self.config.get("identities", {})
 
             if identity_type == "companion":
-                if not name_s and not lookup_identity_key and not public_key_prefix:
-                    return self._error(
-                        "Missing name parameter or lookup_identity_key or public_key_prefix"
-                    )
+                if not name_s and not public_key_prefix:
+                    return self._error("Missing name parameter or public_key_prefix")
                 companions = identities_config.get("companions") or []
                 if name_s:
                     idx, err = find_companion_index(companions, name=name_s)
                 else:
                     idx, err = find_companion_index(
                         companions,
-                        identity_key=lookup_identity_key,
                         public_key_prefix=public_key_prefix,
                     )
                 if err:
                     return self._error(err)
-                resolved_name = str(companions[idx].get("name") or "").strip()
-                companions.pop(idx)
-                self.config["identities"]["companions"] = companions
-                saved = self.config_manager.save_to_file()
-                if not saved:
-                    return self._error("Failed to save configuration to file")
+                deleted_identity = copy.deepcopy(companions[idx])
+                resolved_name = str(deleted_identity.get("name") or "").strip()
+                deleted_identity_key = deleted_identity.get("identity_key")
+                original_companions = copy.deepcopy(companions)
+                with self.config_manager.mutation():
+                    current_companions = (
+                        (self.config.get("identities") or {}).get("companions")
+                        or []
+                    )
+                    if current_companions != original_companions:
+                        cherrypy.response.status = 409
+                        return self._error(
+                            "Companion configuration changed during this request; "
+                            "retry with the current settings"
+                        )
+                    committed_companions = list(current_companions)
+                    committed_companions.pop(idx)
+                    self.config["identities"]["companions"] = committed_companions
+                    saved = self.config_manager.save_to_file()
+                    if not saved:
+                        self.config["identities"][
+                            "companions"
+                        ] = current_companions
+                        return self._error("Failed to save configuration to file")
                 logger.info(f"Deleted companion: {resolved_name}")
                 unregister_success = False
-                if self.daemon_instance and hasattr(self.daemon_instance, "identity_manager"):
-                    identity_manager = self.daemon_instance.identity_manager
-                    if resolved_name and resolved_name in identity_manager.named_identities:
-                        del identity_manager.named_identities[resolved_name]
-                        logger.info(f"Removed companion {resolved_name} from named_identities")
-                        unregister_success = True
-                message = (
-                    f"Companion '{resolved_name}' deleted successfully and deactivated immediately!"
-                    if unregister_success
-                    else (
+                deactivation_pending = False
+                if (
+                    self.daemon_instance
+                    and self.event_loop
+                    and hasattr(self.daemon_instance, "remove_companion")
+                ):
+                    future = asyncio.run_coroutine_threadsafe(
+                        self.daemon_instance.remove_companion(
+                            resolved_name,
+                            identity_key=deleted_identity_key,
+                        ),
+                        self.event_loop,
+                    )
+                    try:
+                        unregister_success = bool(future.result(timeout=15))
+                    except FutureTimeoutError:
+                        # remove_companion detaches the runtime before draining
+                        # its private listener/bridge. Do not cancel that drain:
+                        # cancellation could strand a live listener after its
+                        # config and API lookup have already been removed.
+                        deactivation_pending = True
+
+                        def _log_deactivation_completion(
+                            completed_future,
+                            companion_name=resolved_name,
+                        ):
+                            try:
+                                completed = bool(completed_future.result())
+                            except Exception as completion_exc:
+                                logger.warning(
+                                    "Background deactivation for companion '%s' "
+                                    "failed; restart required: %s",
+                                    companion_name,
+                                    completion_exc,
+                                    exc_info=True,
+                                )
+                            else:
+                                log = logger.info if completed else logger.warning
+                                log(
+                                    "Background deactivation for companion '%s' "
+                                    "%s",
+                                    companion_name,
+                                    (
+                                        "completed"
+                                        if completed
+                                        else "did not fully complete; restart required"
+                                    ),
+                                )
+
+                        future.add_done_callback(_log_deactivation_completion)
+                        logger.warning(
+                            "Companion '%s' was removed from configuration; "
+                            "live deactivation is still running in the background",
+                            resolved_name,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "Companion '%s' was removed from configuration but "
+                            "live deactivation failed: %s",
+                            resolved_name,
+                            exc,
+                            exc_info=True,
+                        )
+                if unregister_success:
+                    message = (
+                        f"Companion '{resolved_name}' deleted successfully "
+                        "and deactivated immediately!"
+                    )
+                elif deactivation_pending:
+                    message = (
+                        f"Companion '{resolved_name}' deleted successfully. "
+                        "Live deactivation is still finishing; restart if it "
+                        "does not complete."
+                    )
+                else:
+                    message = (
                         f"Companion '{resolved_name}' deleted successfully. "
                         "Restart required to fully remove."
                     )
+                return self._success(
+                    {
+                        "name": resolved_name,
+                        "deactivated": unregister_success,
+                        "deactivation_pending": deactivation_pending,
+                        "restart_required": not unregister_success,
+                    },
+                    message=message,
                 )
-                return self._success({"name": resolved_name}, message=message)
 
             # Room server path
             if not name_s:
@@ -6779,8 +7613,8 @@ class APIEndpoints:
 
             if self.event_loop:
                 sender_timestamp = int(time.time())
-                # SECURITY: Server messages (using room server's key) go to ALL clients
-                # API is allowed to send these (TODO: Add authentication/authorization)
+                # Server-authored messages go to all room clients. This route
+                # is operator-only through the shared /api authorization gate.
                 future = asyncio.run_coroutine_threadsafe(
                     room_server.add_post(
                         client_pubkey=author_bytes,
@@ -7250,7 +8084,6 @@ class APIEndpoints:
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
-    @cherrypy.tools.json_in()
     def config_import(self):
         """Import a configuration JSON and apply it.
 
@@ -7271,40 +8104,104 @@ class APIEndpoints:
         self._set_cors_headers()
         if cherrypy.request.method == "OPTIONS":
             return ""
+        bootstrap_lock_acquired = False
+        admin_authenticated = False
         try:
             self._require_post()
 
             # Allow unauthenticated config restore only during first-run setup.
             # Authenticated users may import config at any time.
-            request_user = getattr(cherrypy.request, "user", None)
-            if not request_user:
+            request_headers = getattr(cherrypy.request, "headers", {})
+            has_credentials = bool(
+                request_headers.get("Authorization")
+                or request_headers.get("X-API-Key")
+            )
+            current_config = self.config
+            if self._config_path:
                 try:
-                    current_config = self.config
-                    if self._config_path:
-                        with open(self._config_path, "r", encoding="utf-8") as f:
-                            current_config = yaml.safe_load(f) or {}
+                    with open(self._config_path, "r", encoding="utf-8") as f:
+                        current_config = yaml.safe_load(f) or {}
                 except Exception as exc:
-                    logger.debug(
-                        f"config_import could not read persisted config {self._config_path}: {exc}"
+                    logger.warning(
+                        "config_import could not verify persisted bootstrap state "
+                        "%s: %s",
+                        self._config_path,
+                        exc,
                     )
+                    if not has_credentials:
+                        raise cherrypy.HTTPError(
+                            503,
+                            "Persisted bootstrap state is unavailable; "
+                            "administrator authentication is required",
+                        ) from exc
+                    self._require_admin_on_public_route()
+                    admin_authenticated = True
                     current_config = self.config
 
-                needs_setup, _ = self._setup_status_from_config(current_config or {})
-                if not needs_setup:
-                    cherrypy.response.status = 403
-                    return {
-                        "success": False,
-                        "error": (
-                            "Unauthorized restore. First-run setup is already complete; "
-                            "authenticate to import configuration."
-                        ),
-                    }
+            public_bootstrap = self._public_bootstrap_allowed(current_config or {})
+            if has_credentials and not admin_authenticated:
+                self._require_admin_on_public_route()
+                admin_authenticated = True
+            elif not public_bootstrap:
+                self._require_admin_on_public_route()
+                admin_authenticated = True
 
-            data = cherrypy.request.json
+            data = read_json_object(
+                max_bytes=_CONFIG_IMPORT_JSON_BODY_BYTES,
+                require_json_content_type=True,
+            )
             imported_config = data.get("config")
 
             if not imported_config or not isinstance(imported_config, dict):
                 return self._error("Missing or invalid 'config' object in request body")
+            shape_error = self._validate_config_import_shape(imported_config)
+            if shape_error is not None:
+                return self._error(shape_error)
+
+            # Parsing an invalid body must not consume the one-time bootstrap.
+            # Serialize only the authoritative persisted-config recheck and
+            # read-modify-write, sharing the same lock as setup_wizard.
+            self._bootstrap_mutation_lock.acquire()
+            bootstrap_lock_acquired = True
+            locked_config = self.config
+            if self._config_path:
+                try:
+                    with open(self._config_path, "r", encoding="utf-8") as f:
+                        locked_config = yaml.safe_load(f) or {}
+                except Exception as exc:
+                    logger.warning(
+                        "config_import could not authoritatively re-read persisted "
+                        "bootstrap state %s: %s",
+                        self._config_path,
+                        exc,
+                    )
+                    if not admin_authenticated:
+                        raise cherrypy.HTTPError(
+                            503,
+                            "Persisted bootstrap state changed or became unavailable; "
+                            "retry after restoring it or authenticate as administrator",
+                        ) from exc
+                    locked_config = self.config
+
+            if not isinstance(locked_config, dict):
+                raise cherrypy.HTTPError(
+                    503,
+                    "Persisted configuration root must be an object",
+                )
+            if (
+                not self._public_bootstrap_allowed(locked_config)
+                and not admin_authenticated
+            ):
+                self._require_admin_on_public_route()
+                admin_authenticated = True
+
+            working_config = copy.deepcopy(locked_config)
+            previous_restart_sensitive_config = (
+                self._restart_sensitive_repeater_config(working_config)
+            )
+            previous_restart_sensitive_http_config = (
+                self._restart_sensitive_http_config(working_config)
+            )
 
             # Sections we allow to be imported
             ALLOWED_SECTIONS = {
@@ -7320,6 +8217,7 @@ class APIEndpoints:
                 "mqtt",
                 "identities",
                 "delays",
+                "http",
                 "web",
                 "letsmesh",
                 "glass",
@@ -7330,19 +8228,30 @@ class APIEndpoints:
             updated_sections = []
             restart_required = False
 
-            for section, value in imported_config.items():
+            for section, imported_value in imported_config.items():
                 if section not in ALLOWED_SECTIONS:
                     logger.info(f"Config import: skipping unknown section '{section}'")
                     continue
+                value = copy.deepcopy(imported_value)
 
                 if section == "repeater" and isinstance(value, dict):
-                    # Preserve security secrets that are redacted
+                    # Security is a readable nested patch. Omitted and
+                    # redacted credentials preserve their current values, so
+                    # changing JWT expiry cannot silently erase the signing
+                    # secret, administrator password, or existing API tokens.
                     sec = value.get("security", {})
                     if isinstance(sec, dict):
-                        cur_sec = self.config.get("repeater", {}).get("security", {})
+                        cur_sec = working_config.get("repeater", {}).get("security", {})
+                        merged_sec = (
+                            copy.deepcopy(cur_sec)
+                            if isinstance(cur_sec, dict)
+                            else {}
+                        )
                         for field in ("admin_password", "guest_password", "jwt_secret"):
                             if sec.get(field) == "*** REDACTED ***":
-                                sec[field] = cur_sec.get(field, "")
+                                sec.pop(field)
+                        merged_sec.update(sec)
+                        value["security"] = merged_sec
                     # Restore identity_key only if a real (non-redacted) hex value is provided
                     ik = value.get("identity_key")
                     if ik and isinstance(ik, str) and ik != "*** REDACTED ***":
@@ -7359,7 +8268,10 @@ class APIEndpoints:
                     # Preserve identity keys that are redacted
                     for id_section in ("room_servers", "companions"):
                         entries = value.get(id_section, []) or []
-                        cur_entries = self.config.get("identities", {}).get(id_section, []) or []
+                        cur_entries = (
+                            working_config.get("identities", {}).get(id_section, [])
+                            or []
+                        )
                         cur_by_name = {e.get("name"): e for e in cur_entries}
                         for entry in entries:
                             if entry.get("identity_key") == "*** REDACTED ***":
@@ -7381,40 +8293,138 @@ class APIEndpoints:
                     "radio_type",
                     "mqtt_brokers",
                     "letsmesh",
+                    "identities",
                 }:
                     restart_required = True
 
                 if section == "radio_type":
                     # radio_type is a top-level scalar, not a dict
-                    self.config[section] = value
+                    working_config[section] = value
                 else:
-                    if section not in self.config:
-                        self.config[section] = {}
-                    if isinstance(value, dict) and isinstance(self.config[section], dict):
-                        self.config[section].update(value)
+                    if section not in working_config:
+                        working_config[section] = {}
+                    if isinstance(value, dict) and isinstance(
+                        working_config[section], dict
+                    ):
+                        working_config[section].update(value)
                     else:
-                        self.config[section] = value
+                        working_config[section] = value
 
                 updated_sections.append(section)
 
             if not updated_sections:
                 return self._error("No valid configuration sections found in import")
 
-            # Persist and live-reload
-            self.config_manager.update_and_save(
-                updates={},  # Already applied above
-                live_update=True,
-                live_update_sections=updated_sections,
-            )
+            repeater_config = working_config.get("repeater")
+            if repeater_config is None:
+                repeater_config = {}
+                working_config["repeater"] = repeater_config
+            elif not isinstance(repeater_config, dict):
+                return self._error("Configuration section 'repeater' must be an object")
+            if (
+                "security" in repeater_config
+                and not isinstance(repeater_config["security"], dict)
+            ):
+                return self._error(
+                    "Configuration field 'repeater.security' must be an object"
+                )
 
-            # Save to file (update_and_save with empty updates may not save)
-            saved = self.config_manager.save_to_file()
+            # A credentialless restore is another way to complete first-run
+            # setup, so it must establish the same usable security boundary as
+            # the wizard. Redacted, empty, and public-default passwords cannot
+            # permanently close bootstrap.
+            if (
+                not admin_authenticated
+                and not self._config_has_bootstrap_admin_password(working_config)
+            ):
+                return self._error(
+                    "Unauthenticated first-run import requires a non-default "
+                    "administrator password of at least 8 non-whitespace characters"
+                )
+
+            auth_config_error = self._validate_auth_startup_config(working_config)
+            if auth_config_error is not None:
+                return self._error(auth_config_error)
+            current_restart_sensitive_config = (
+                self._restart_sensitive_repeater_config(working_config)
+            )
+            if current_restart_sensitive_config != previous_restart_sensitive_config:
+                restart_required = True
+            current_restart_sensitive_http_config = (
+                self._restart_sensitive_http_config(working_config)
+            )
+            if (
+                current_restart_sensitive_http_config
+                != previous_restart_sensitive_http_config
+            ):
+                restart_required = True
+            if (
+                current_restart_sensitive_config[1]
+                != previous_restart_sensitive_config[1]
+            ):
+                logger.warning(
+                    "Config import changed the JWT signing secret; restart "
+                    "will invalidate current JWT sessions and stored API tokens"
+                )
+
+            # A restore is itself a completed bootstrap. Keep this marker
+            # monotonic so an old/default backup cannot reopen public mutation.
+            repeater_config["setup_complete"] = True
+
+            try:
+                validate_companion_listener_config(
+                    working_config.get("identities", {}).get("companions", [])
+                    or [],
+                    working_config.get("http", {}),
+                )
+            except (AttributeError, TypeError, ValueError) as exc:
+                return self._error(f"Invalid companion listener configuration: {exc}")
+
+            # Apply only after every imported section and cross-listener
+            # invariant has validated, so a rejected restore cannot partly
+            # alter the live configuration object.
+            previous_live_config = copy.deepcopy(self.config)
+            self._replace_live_config(working_config)
+
+            # Persist and live-reload
+            try:
+                live_update_sections = [
+                    section
+                    for section in updated_sections
+                    if section != "http"
+                ]
+                persistence = self.config_manager.update_and_save(
+                    updates={},  # Already applied above
+                    # Never stop or rebind the HTTP listener from the request
+                    # currently using it. Listener/CORS changes take effect on
+                    # the advertised restart; unrelated sections still update.
+                    live_update=bool(live_update_sections),
+                    live_update_sections=live_update_sections,
+                )
+                saved = (
+                    persistence.get("saved")
+                    if isinstance(persistence, dict)
+                    else None
+                )
+                # Compatibility for older/custom ConfigManager implementations
+                # that predate the structured ``saved`` result.
+                if saved is None:
+                    saved = self.config_manager.save_to_file()
+            except Exception:
+                self._replace_live_config(previous_live_config)
+                raise
+            if saved is not True:
+                self._replace_live_config(previous_live_config)
+                cherrypy.response.status = 503
+                return self._error(
+                    "Configuration could not be persisted; no changes were applied"
+                )
 
             return {
                 "success": True,
                 "message": f"Imported {len(updated_sections)} config section(s)",
                 "sections_updated": updated_sections,
-                "saved": saved,
+                "saved": True,
                 "restart_required": restart_required,
             }
 
@@ -7423,6 +8433,9 @@ class APIEndpoints:
         except Exception as e:
             logger.error(f"Config import error: {e}", exc_info=True)
             return self._error(str(e))
+        finally:
+            if bootstrap_lock_acquired:
+                self._bootstrap_mutation_lock.release()
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
@@ -7609,6 +8622,12 @@ class APIEndpoints:
                 "companion_messages",
                 "companion_prefs",
             ]
+            COMPANION_STATE_TABLES = {
+                "companion_contacts",
+                "companion_channels",
+                "companion_messages",
+                "companion_prefs",
+            }
 
             if tables_param == "all":
                 tables = ALL_PURGEABLE
@@ -7619,18 +8638,35 @@ class APIEndpoints:
 
             storage = self._get_storage()
             results = {}
+            companion_state_purged = False
             for table in tables:
                 try:
                     deleted = storage.sqlite_handler.purge_table(table)
                     results[table] = {"deleted": deleted}
+                    if table in COMPANION_STATE_TABLES and deleted > 0:
+                        companion_state_purged = True
                 except ValueError as ve:
                     results[table] = {"error": str(ve)}
 
-            return {
+            response = {
                 "success": True,
                 "data": results,
                 "message": f"Purged {len([r for r in results.values() if 'deleted' in r])} table(s)",
             }
+            if companion_state_purged:
+                # Each non-empty companion purge rotates the epoch in the same
+                # transaction as its delete. Report the durable winner; a
+                # second rotation here would add a crash window and needless
+                # client reset.
+                journal_epoch = (
+                    storage.sqlite_handler.companion_journal_epoch_strict()
+                )
+                response["journal_epoch"] = journal_epoch
+                logger.info(
+                    "Companion journal epoch after companion state purge: %s",
+                    journal_epoch,
+                )
+            return response
         except cherrypy.HTTPError:
             raise
         except Exception as e:
@@ -7694,43 +8730,88 @@ class APIEndpoints:
 
     @cherrypy.expose
     def docs(self):
-        """Serve Swagger UI for interactive API documentation."""
-        html = """<!DOCTYPE html>
+        """Serve dependency-free, same-origin API documentation.
+
+        The raw OpenAPI documents remain the machine-readable source of truth.
+        This small index deliberately runs no JavaScript: documentation is a
+        public route on the same origin as the authenticated admin UI, so a
+        third-party documentation bundle must never share that origin.
+        """
+        spec_path = os.path.join(os.path.dirname(__file__), "openapi.yaml")
+        try:
+            with open(spec_path, "r", encoding="utf-8") as spec_file:
+                spec = yaml.safe_load(spec_file) or {}
+            paths = spec.get("paths", {})
+            if not isinstance(paths, dict):
+                paths = {}
+        except (OSError, TypeError, ValueError, yaml.YAMLError):
+            logger.exception("Could not build the local OpenAPI documentation index")
+            paths = {}
+
+        operations = []
+        for path in sorted(paths):
+            path_item = paths[path]
+            if not isinstance(path_item, dict):
+                continue
+            for method in ("get", "post", "put", "patch", "delete", "options", "head"):
+                operation = path_item.get(method)
+                if not isinstance(operation, dict):
+                    continue
+                summary = operation.get("summary") or "No summary provided."
+                operations.append(
+                    "<tr>"
+                    f"<td><code>{html.escape(method.upper())}</code></td>"
+                    f"<td><code>{html.escape(str(path))}</code></td>"
+                    f"<td>{html.escape(str(summary))}</td>"
+                    "</tr>"
+                )
+        operations_html = "\n".join(operations) or (
+            '<tr><td colspan="3">The endpoint index is unavailable. '
+            "Use the raw OpenAPI links above.</td></tr>"
+        )
+
+        page = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>openHop Repeater API Documentation</title>
-    <link rel="stylesheet" type="text/css" href="https://unpkg.com/swagger-ui-dist@5.10.0/swagger-ui.css">
-    <style>
-        body {
-            margin: 0;
-            padding: 0;
-        }
-    </style>
 </head>
 <body>
-    <div id="swagger-ui"></div>
-    <script src="https://unpkg.com/swagger-ui-dist@5.10.0/swagger-ui-bundle.js"></script>
-    <script src="https://unpkg.com/swagger-ui-dist@5.10.0/swagger-ui-standalone-preset.js"></script>
-    <script>
-        window.onload = function() {
-            window.ui = SwaggerUIBundle({
-                url: '/api/openapi',
-                dom_id: '#swagger-ui',
-                deepLinking: true,
-                presets: [
-                    SwaggerUIBundle.presets.apis,
-                    SwaggerUIStandalonePreset
-                ],
-                plugins: [
-                    SwaggerUIBundle.plugins.DownloadUrl
-                ],
-                layout: "StandaloneLayout"
-            });
-        };
-    </script>
+    <main>
+        <h1>openHop Repeater API</h1>
+        <p>
+            The contract is available as
+            <a href="/api/openapi">OpenAPI YAML</a> or
+            <a href="/doc/openapi.json">OpenAPI JSON</a>.
+            Both are suitable for humans, generators, and coding agents.
+        </p>
+        <p>Authenticated operations use an <code>Authorization: Bearer …</code> header.</p>
+        <table>
+            <thead><tr><th>Method</th><th>Path</th><th>Summary</th></tr></thead>
+            <tbody>
+                {operations_html}
+            </tbody>
+        </table>
+    </main>
 </body>
 </html>"""
-        cherrypy.response.headers["Content-Type"] = "text/html"
-        return html.encode("utf-8")
+        cherrypy.response.headers.update(
+            {
+                "Content-Type": "text/html; charset=utf-8",
+                "Cache-Control": "no-store",
+                "Content-Security-Policy": (
+                    "default-src 'none'; "
+                    "script-src 'none'; "
+                    "style-src 'none'; "
+                    "img-src 'none'; "
+                    "connect-src 'none'; "
+                    "base-uri 'none'; "
+                    "form-action 'none'; "
+                    "frame-ancestors 'none'"
+                ),
+                "Referrer-Policy": "no-referrer",
+                "X-Content-Type-Options": "nosniff",
+            }
+        )
+        return page.encode("utf-8")

@@ -3,7 +3,7 @@ through the real journal and push notifier, to a captured relay POST.
 
 This is the path the handoff records as untested -- "the notifier->relay POST
 path itself is unit/integration-tested rather than live... triggering a live
-`message` journal event needs a companion frame client (TCP 15050), out of
+`message` journal event needs a companion frame client (TCP 5000), out of
 scope for a curl smoke". Everything here is real except the bridge (no radio)
 and the relay (a local capture listener).
 
@@ -40,12 +40,16 @@ def register_push_device(harness, listener, *, detail="none", mention_push=None,
     """Register a device the way POST /api/v1/devices/{id}/push would."""
     token_id = harness.handler.create_api_token("t", "hash-1", scope="companion:x")
     harness.handler.companion_device_create(
-        harness.companion_hash, "dev-1", "Phone", token_id, platform="ios"
+        harness.companion_hash,
+        "dev-1",
+        "Phone",
+        token_id,
+        platform="ios",
+        companion_identity=harness.bridge.get_public_key().hex(),
     )
     harness.handler.companion_device_set_push(
         "dev-1",
         TOKEN,
-        push_relay_url=listener.url,
         push_detail=detail,
         mention_push=mention_push,
         mention_keywords=keywords,
@@ -53,9 +57,19 @@ def register_push_device(harness, listener, *, detail="none", mention_push=None,
 
 
 def start_notifier(harness, **kwargs) -> CompanionPushNotifier:
-    notifier = CompanionPushNotifier(harness.handler, min_interval=kwargs.pop("min_interval", 0.2))
+    notifier = CompanionPushNotifier(
+        harness.handler,
+        min_interval=kwargs.pop("min_interval", 0.2),
+        allow_insecure_http=kwargs.pop("allow_insecure_http", True),
+        **kwargs,
+    )
     notifier.start()
-    harness.journal.register_listener(notifier.make_listener(harness.companion_hash))
+    harness.journal.register_listener(
+        notifier.make_listener(
+            harness.companion_hash,
+            harness.bridge.get_public_key().hex(),
+        )
+    )
     return notifier
 
 
@@ -70,7 +84,7 @@ def test_connect_returns_self_info(tmp_path):
             try:
                 info = client.self_info
                 assert info.node_name == "TestNode"
-                assert info.companion_hash == harness.companion_hash
+                assert info.companion_hash == harness.companion_hash.removeprefix("0x")
                 assert info.spreading_factor == 10
             finally:
                 await client.close()
@@ -228,7 +242,7 @@ def test_inbound_message_produces_a_wake_push(tmp_path):
         notifier = None
         try:
             register_push_device(harness, listener, detail="none")
-            notifier = start_notifier(harness)
+            notifier = start_notifier(harness, relay_url=listener.url)
             client = await connected_client(harness)
             try:
                 await harness.inject_inbound_message("wake me", "ph-wake")
@@ -257,7 +271,7 @@ def test_count_detail_carries_badge_hint(tmp_path):
         notifier = None
         try:
             register_push_device(harness, listener, detail="count")
-            notifier = start_notifier(harness)
+            notifier = start_notifier(harness, relay_url=listener.url)
             await harness.inject_inbound_message("one", "ph-1")
             assert listener.wait_for_push(1, timeout=6)
             push = listener.last()
@@ -281,7 +295,7 @@ def test_platform_field_is_forwarded(tmp_path):
         notifier = None
         try:
             register_push_device(harness, listener)
-            notifier = start_notifier(harness)
+            notifier = start_notifier(harness, relay_url=listener.url)
             await harness.inject_inbound_message("hi", "ph-p")
             assert listener.wait_for_push(1, timeout=6)
             assert listener.last().body["platform"] == "ios"
@@ -301,7 +315,7 @@ def test_mention_produces_a_content_free_alert(tmp_path):
         notifier = None
         try:
             register_push_device(harness, listener, mention_push=True, keywords=["adam"])
-            notifier = start_notifier(harness)
+            notifier = start_notifier(harness, relay_url=listener.url)
             await harness.inject_inbound_message("hey adam are you there", "ph-m")
             assert listener.wait_for_push(1, timeout=6)
             push = listener.last()
@@ -325,7 +339,7 @@ def test_non_matching_message_does_not_mention(tmp_path):
         notifier = None
         try:
             register_push_device(harness, listener, mention_push=True, keywords=["adam"])
-            notifier = start_notifier(harness)
+            notifier = start_notifier(harness, relay_url=listener.url)
             await harness.inject_inbound_message("nothing relevant here", "ph-nm")
             assert listener.wait_for_push(1, timeout=6)
             assert listener.last().shape != "mention"
@@ -355,7 +369,11 @@ def test_burst_fires_immediately_then_collapses_the_rest(tmp_path):
         notifier = None
         try:
             register_push_device(harness, listener, detail="count")
-            notifier = start_notifier(harness, min_interval=1.0)
+            notifier = start_notifier(
+                harness,
+                min_interval=1.0,
+                relay_url=listener.url,
+            )
             for i in range(5):
                 await harness.inject_inbound_message(f"burst-{i}", f"ph-b{i}")
 
@@ -385,7 +403,7 @@ def test_relay_410_clears_the_push_token(tmp_path):
         notifier = None
         try:
             register_push_device(harness, listener)
-            notifier = start_notifier(harness)
+            notifier = start_notifier(harness, relay_url=listener.url)
             await harness.inject_inbound_message("gone", "ph-410")
             assert listener.wait_for_push(1, timeout=6)
 
@@ -593,7 +611,7 @@ def test_no_op_set_journals_nothing(tmp_path):
         try:
             client = await connected_client(harness)
             try:
-                await client.set_channel(1, "#howltest", bytes(1) * 16)
+                await client.set_channel(1, "#howltest", bytes([1]) * 16)
                 assert channel_events(harness) == []
             finally:
                 await client.close()

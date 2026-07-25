@@ -16,9 +16,19 @@ its own companion/device names rather than a fresh server.
 
 from __future__ import annotations
 
+import hashlib
+import json
+import urllib.error
+import urllib.request
+
 import pytest
 
-from companion_client.rest import CompanionRestClient, NotModified, RestError
+from companion_client.rest import (
+    CompanionRestClient,
+    NotModified,
+    PairingIdentityMismatch,
+    RestError,
+)
 from companion_client.rest_simulator import start_rest_harness, stop_rest_harness
 
 
@@ -47,14 +57,26 @@ def paired(harness) -> CompanionRestClient:
     work within it rather than around it.
     """
     client = CompanionRestClient(harness.base_url)
-    code = client.pair_start(harness.companion_name, harness.admin_token())["code"]
+    started = client.pair_start(harness.companion_name, harness.admin_token())
     device_id = "dev-shared"
-    client.pair(code, device_id, "Test Phone", platform="ios")
+    client.pair(
+        started["code"],
+        device_id,
+        "Test Phone",
+        platform="ios",
+        expected_fingerprint=started["fingerprint"],
+    )
     client.device_id = device_id
     return client
 
 
 # --- unauthenticated surface ----------------------------------------------
+
+
+def test_real_http_harness_tracks_its_live_event_loop_thread(harness):
+    assert harness.event_loop_thread is not None
+    assert harness.event_loop_thread.is_alive()
+    assert harness.event_loop.is_running()
 
 
 def test_server_info_is_public(anon):
@@ -101,36 +123,84 @@ def test_pair_start_returns_a_short_lived_code(anon, harness):
     assert started["companion_name"] == harness.companion_name
     assert started["expires_in"] > 0
     assert started["code"]
+    assert len(started["companion_identity"]) == 64
+    assert (
+        started["fingerprint"]
+        == hashlib.sha256(bytes.fromhex(started["companion_identity"])).hexdigest()
+    )
 
 
 def test_pair_exchanges_code_for_a_device_token(anon, harness):
-    code = anon.pair_start(harness.companion_name, harness.admin_token())["code"]
-    result = anon.pair(code, "dev-exchange", "Phone", platform="ios")
+    started = anon.pair_start(harness.companion_name, harness.admin_token())
+    result = anon.pair(
+        started["code"],
+        "dev-exchange",
+        "Phone",
+        platform="ios",
+        expected_fingerprint=started["fingerprint"],
+    )
     assert result["token"]
     assert result["companion_name"] == harness.companion_name
+    assert result["companion_identity"] == started["companion_identity"]
+    assert result["fingerprint"] == started["fingerprint"]
     assert anon.token == result["token"]
 
 
+def test_pair_does_not_adopt_token_for_unexpected_identity(anon, harness):
+    started = anon.pair_start(harness.companion_name, harness.admin_token())
+    with pytest.raises(PairingIdentityMismatch):
+        anon.pair(
+            started["code"],
+            "dev-mismatch",
+            "Wrong repeater check",
+            expected_fingerprint="00" * 32,
+        )
+    assert anon.token is None
+
+
 def test_pairing_code_is_single_use(anon, harness):
-    code = anon.pair_start(harness.companion_name, harness.admin_token())["code"]
-    anon.pair(code, "dev-first", "First")
+    started = anon.pair_start(harness.companion_name, harness.admin_token())
+    code = started["code"]
+    anon.pair(
+        code,
+        "dev-first",
+        "First",
+        expected_fingerprint=started["fingerprint"],
+    )
     with pytest.raises(RestError) as excinfo:
-        CompanionRestClient(harness.base_url).pair(code, "dev-second", "Second")
+        CompanionRestClient(harness.base_url).pair(
+            code,
+            "dev-second",
+            "Second",
+            expected_fingerprint=started["fingerprint"],
+        )
     assert excinfo.value.status in (400, 404)
 
 
 def test_bad_pairing_code_rejected(anon):
     with pytest.raises(RestError) as excinfo:
-        anon.pair("0" * 32, "dev-bad", "Phone")
+        anon.pair(
+            "0" * 32,
+            "dev-bad",
+            "Phone",
+            expected_fingerprint="00" * 32,
+        )
     assert excinfo.value.status in (400, 404)
 
 
 def test_post_without_trailing_slash_still_works(anon, harness):
-    """CherryPy 301-redirects /pair to /pair/, and stock HTTP clients downgrade
-    POST to GET when following it -- yielding a misleading
-    '405 Method not allowed. Use POST.' The client preserves the method."""
-    code = anon.pair_start(harness.companion_name, harness.admin_token())["code"]
-    assert anon.pair(code, "dev-noslash", "Phone")["token"]
+    """The production mount dispatches the canonical bare path directly.
+
+    The reference client refuses redirects so it cannot forward a pairing
+    credential or later bearer token to another URL.
+    """
+    started = anon.pair_start(harness.companion_name, harness.admin_token())
+    assert anon.pair(
+        started["code"],
+        "dev-noslash",
+        "Phone",
+        expected_fingerprint=started["fingerprint"],
+    )["token"]
 
 
 # --- snapshot --------------------------------------------------------------
@@ -183,16 +253,28 @@ def test_sync_from_snapshot_cursor_is_empty_when_idle(paired, harness):
 def test_sync_delivers_new_events(paired, harness):
     data, _etag = paired.snapshot(harness.companion_name)
     harness.handler.companion_push_message(
-        harness.companion_hash, {"text": "hi", "timestamp": 1, "packet_hash": "rest-1"}
+        harness.companion_hash,
+        {
+            "text": "hi",
+            "timestamp": 1,
+            "packet_hash": "AABBCCDDEEFF0011",
+        },
     )
     from repeater.companion.journal import CompanionEventJournal
 
     journal = CompanionEventJournal(harness.handler, harness.companion_hash)
-    journal.record_message({"text": "hi", "timestamp": 1, "packet_hash": "rest-1"})
+    stored_message = harness.handler.companion_get_messages_strict(
+        harness.companion_hash,
+        limit=1,
+    )[0]
+    journal.record_message(stored_message)
 
     result = paired.sync(harness.companion_name, data["cursor"])
     assert [e["type"] for e in result.events if e.get("type")] or result.events
-    assert int(result.next_cursor) > int(data["cursor"])
+    before_epoch, before_seq = data["cursor"].rsplit(":", 1)
+    after_epoch, after_seq = result.next_cursor.rsplit(":", 1)
+    assert after_epoch == before_epoch
+    assert int(after_seq) > int(before_seq)
 
 
 def test_channel_event_reaches_a_syncing_client(paired, harness):
@@ -232,9 +314,8 @@ def test_synced_channel_event_carries_only_index_name_change(paired, harness):
 
 
 def test_bad_cursor_is_rejected(paired, harness):
-    with pytest.raises(RestError) as excinfo:
+    with pytest.raises(ValueError, match="cursor must be at most 128 ASCII bytes"):
         paired.sync(harness.companion_name, "not-a-number")
-    assert excinfo.value.status == 400
 
 
 # --- push registration -----------------------------------------------------
@@ -252,7 +333,6 @@ def test_register_and_unregister_push(paired, harness):
     result = paired.register_push(
         paired.device_id,
         push_token="a" * 64,
-        push_relay_url="https://relay.example/notify",
         push_detail="count",
     )
     assert result is not None
@@ -263,10 +343,62 @@ def test_register_and_unregister_push(paired, harness):
         return next(d for d in admin.devices() if d["device_id"] == paired.device_id)
 
     assert row()["push_detail"] == "count"
+    assert row()["push_registered"] is True
 
     paired.unregister_push(paired.device_id)
-    # DELETE clears the token but keeps detail/relay (documented behaviour).
-    assert not row().get("push_token")
+    # The admin listing exposes registration state, never the device token.
+    assert row()["push_registered"] is False
+
+
+def test_unauthenticated_options_cannot_mutate_push_registration(paired, harness):
+    paired.register_push(
+        paired.device_id,
+        push_token="c" * 64,
+        push_detail="count",
+    )
+    before = harness.handler.companion_device_get_strict(paired.device_id)
+
+    body = json.dumps(
+        {
+            "push_token": "d" * 64,
+            "push_detail": "preview",
+        }
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        f"{harness.base_url}/api/v1/devices/{paired.device_id}/push",
+        data=body,
+        method="OPTIONS",
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(request, timeout=5) as response:
+        assert response.status == 204
+        assert response.read() == b""
+
+    after = harness.handler.companion_device_get_strict(paired.device_id)
+    assert after["push_token"] == before["push_token"]
+    assert after["push_detail"] == "count"
+    paired.unregister_push(paired.device_id)
+
+
+def test_authenticated_v1_write_rejects_non_json_media_type(paired, harness):
+    before = harness.handler.companion_device_get_strict(paired.device_id)
+    body = json.dumps({"push_token": "e" * 64}).encode("utf-8")
+    request = urllib.request.Request(
+        f"{harness.base_url}/api/v1/devices/{paired.device_id}/push",
+        data=body,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {paired.token}",
+            "Content-Type": "text/plain",
+        },
+    )
+
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        urllib.request.urlopen(request, timeout=5)
+
+    with exc.value:
+        assert exc.value.code == 415
+    assert harness.handler.companion_device_get_strict(paired.device_id) == before
 
 
 def test_register_push_rejects_bad_detail(paired):
@@ -274,18 +406,21 @@ def test_register_push_rejects_bad_detail(paired):
         paired.register_push(
             paired.device_id,
             push_token="a" * 64,
-            push_relay_url="https://relay.example/notify",
             push_detail="not-a-mode",
         )
     assert excinfo.value.status == 400
 
 
-def test_register_push_rejects_non_http_relay(paired):
+def test_register_push_rejects_device_selected_relay(paired):
+    """Relay routing is operator configuration, never device input."""
     with pytest.raises(RestError) as excinfo:
-        paired.register_push(
-            paired.device_id,
-            push_token="a" * 64,
-            push_relay_url="ftp://relay.example/notify",
+        paired._data(
+            "POST",
+            f"/devices/{paired.device_id}/push",
+            body={
+                "push_token": "a" * 64,
+                "push_relay_url": "https://relay.example/notify",
+            },
         )
     assert excinfo.value.status == 400
 
@@ -296,7 +431,6 @@ def test_device_cannot_register_push_for_another_device(paired):
         paired.register_push(
             "somebody-elses-device",
             push_token="b" * 64,
-            push_relay_url="https://relay.example/notify",
         )
     assert excinfo.value.status in (403, 404)
 
@@ -306,9 +440,48 @@ def test_device_cannot_register_push_for_another_device(paired):
 
 def test_send_channel_message_reaches_the_bridge(paired, harness):
     before = len(harness.bridge.sent)
-    result = paired.send_message(harness.companion_name, "hello over REST", channel_idx=0)
+    result = paired.send_message(
+        harness.companion_name,
+        "hello over REST",
+        channel_idx=0,
+        idempotency_key=paired.new_idempotency_key(),
+    )
     assert result["sent"] is True
     assert harness.bridge.sent[before:] == [{"channel_idx": 0, "text": "hello over REST"}]
+
+
+def test_send_direct_message_reaches_the_bridge(paired, harness):
+    before = len(harness.bridge.sent)
+    result = paired.send_message(
+        harness.companion_name,
+        "direct over REST",
+        to="aa" * 32,
+        idempotency_key=paired.new_idempotency_key(),
+    )
+
+    assert result["sent"] is True
+    assert harness.bridge.sent[before:] == [{"to": "aa" * 32, "text": "direct over REST"}]
+
+
+def test_documented_contact_actions_work_over_real_http(paired, harness):
+    pubkey = "aa" * 32
+
+    assert paired.has_connection(harness.companion_name, pubkey) == {"connected": False}
+    assert paired.login(harness.companion_name, pubkey, "secret") == {"logged_in": True}
+    assert paired.has_connection(harness.companion_name, pubkey) == {"connected": True}
+    assert paired.status_request(harness.companion_name, pubkey) == {"status": "ok"}
+    telemetry = paired.telemetry_request(harness.companion_name, pubkey)
+    assert telemetry["base"] == {"battery_mv": 4200}
+    assert telemetry["location"] == {
+        "latitude": 47.6,
+        "longitude": -122.3,
+    }
+    assert telemetry["environment"] == {"temperature_c": 20.0}
+    assert paired.logout(harness.companion_name, pubkey) == {
+        "logged_out": True,
+        "sent": True,
+    }
+    assert paired.has_connection(harness.companion_name, pubkey) == {"connected": False}
 
 
 def test_send_requires_exactly_one_target(paired, harness):
@@ -331,6 +504,12 @@ def test_send_requires_idempotency_key(paired, harness):
     assert excinfo.value.status == 400
 
 
+def test_client_requires_visible_persistable_idempotency_key(paired, harness):
+    """The reference client must not hide a key needed after transport loss."""
+    with pytest.raises(ValueError, match="idempotency_key is required"):
+        paired.send_message(harness.companion_name, "no hidden key", channel_idx=0)
+
+
 def test_retry_with_same_key_replays_without_touching_the_radio(paired, harness):
     key = "replay-key-1"
     first = paired.send_message(harness.companion_name, "once", channel_idx=0, idempotency_key=key)
@@ -351,7 +530,12 @@ def test_same_key_different_body_is_409(paired, harness):
 
 def test_empty_text_is_rejected(paired, harness):
     with pytest.raises(RestError) as excinfo:
-        paired.send_message(harness.companion_name, "", channel_idx=0)
+        paired.send_message(
+            harness.companion_name,
+            "",
+            channel_idx=0,
+            idempotency_key=paired.new_idempotency_key(),
+        )
     assert excinfo.value.status == 400
 
 
@@ -413,7 +597,7 @@ def test_delete_contact_journals_a_removal(paired, harness):
 
     events = journal_events(harness, "contact")
     assert len(events) == before + 1
-    assert events[-1]["payload"]["change"] == "removed"
+    assert events[-1]["payload"]["change"] == "remove"
 
 
 def test_delete_unknown_contact_is_404(paired, harness):
@@ -496,7 +680,11 @@ def test_channel_event_from_join_carries_no_secret(paired, harness):
 @pytest.mark.parametrize("secret", [b"", bytes(8), bytes(20)])
 def test_bad_secret_length_is_400(paired, harness, secret):
     with pytest.raises(RestError) as excinfo:
-        paired.set_channel(harness.companion_name, 2, "#bad", secret)
+        paired._data(
+            "PUT",
+            f"/companions/{harness.companion_name}/channels/2",
+            body={"name": "#bad", "secret": secret.hex()},
+        )
     assert excinfo.value.status == 400
 
 
@@ -506,6 +694,16 @@ def test_non_hex_secret_is_400(paired, harness):
             "PUT",
             f"/companions/{harness.companion_name}/channels/2",
             body={"name": "#bad", "secret": "not-hex-at-all"},
+        )
+    assert excinfo.value.status == 400
+
+
+def test_hex_secret_with_whitespace_is_400(paired, harness):
+    with pytest.raises(RestError) as excinfo:
+        paired._data(
+            "PUT",
+            f"/companions/{harness.companion_name}/channels/2",
+            body={"name": "#bad", "secret": ("00 " * 15) + "00"},
         )
     assert excinfo.value.status == 400
 
@@ -524,6 +722,12 @@ def test_join_without_name_is_400(paired, harness):
 def test_channel_index_out_of_range_is_404(paired, harness):
     with pytest.raises(RestError) as excinfo:
         paired.set_channel(harness.companion_name, 999, "#nope", bytes(16))
+    assert excinfo.value.status == 404
+
+
+def test_clear_channel_index_out_of_range_is_404(paired, harness):
+    with pytest.raises(RestError) as excinfo:
+        paired.clear_channel(harness.companion_name, 999)
     assert excinfo.value.status == 404
 
 
@@ -582,9 +786,10 @@ def test_favorite_defaults_false(paired, harness):
 
 def test_setting_favorite_preserves_other_flag_bits(paired, harness):
     """Live contacts carry flags like 129 (0x81) and 145 (0x91). Favouriting
-    must not clobber the high bits."""
+    must not clobber server-managed high bits."""
     pubkey = "f3" * 32
-    paired.upsert_contact(harness.companion_name, pubkey, name="Flagged", flags=0x90)
+    paired.upsert_contact(harness.companion_name, pubkey, name="Flagged")
+    harness.bridge.contacts.get_by_key(bytes.fromhex(pubkey)).flags = 0x90
     result = paired.set_favorite(harness.companion_name, pubkey, True)
 
     assert result["contact"]["flags"] == 0x91
@@ -593,7 +798,8 @@ def test_setting_favorite_preserves_other_flag_bits(paired, harness):
 
 def test_unfavoriting_preserves_other_flag_bits(paired, harness):
     pubkey = "f4" * 32
-    paired.upsert_contact(harness.companion_name, pubkey, name="Flagged2", flags=0x91)
+    paired.upsert_contact(harness.companion_name, pubkey, name="Flagged2")
+    harness.bridge.contacts.get_by_key(bytes.fromhex(pubkey)).flags = 0x91
     result = paired.set_favorite(harness.companion_name, pubkey, False)
 
     assert result["contact"]["flags"] == 0x90
@@ -603,6 +809,7 @@ def test_unfavoriting_preserves_other_flag_bits(paired, harness):
 def test_favorite_survives_an_unrelated_update(paired, harness):
     """Renaming a favourite must not silently unfavourite it."""
     pubkey = "f5" * 32
+    paired.upsert_contact(harness.companion_name, pubkey, name="Original")
     paired.set_favorite(harness.companion_name, pubkey, True)
     result = paired.upsert_contact(harness.companion_name, pubkey, name="Renamed")
 
@@ -610,13 +817,15 @@ def test_favorite_survives_an_unrelated_update(paired, harness):
     assert result["contact"]["favorite"] is True
 
 
-def test_favorite_beats_raw_flags_when_both_sent(paired, harness):
-    """`favorite` is the more specific instruction, so it wins."""
-    pubkey = "f6" * 32
-    result = paired.upsert_contact(
-        harness.companion_name, pubkey, name="Both", flags=0x00, favorite=True
-    )
-    assert result["contact"]["favorite"] is True
+def test_raw_contact_flags_are_not_client_writable(paired, harness):
+    """Only the readable `favorite` projection is writable."""
+    with pytest.raises(RestError) as excinfo:
+        paired._data(
+            "POST",
+            f"/companions/{harness.companion_name}/contacts/{'f6' * 32}",
+            body={"name": "Raw flags", "flags": 0x90},
+        )
+    assert excinfo.value.status == 400
 
 
 def test_clear_does_not_leave_an_empty_named_channel(paired, harness):

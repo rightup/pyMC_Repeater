@@ -38,23 +38,6 @@ copy_or_die() {
     fi
 }
 
-use_runtime_merged_config() {
-    src="$1"
-    runtime_dir="$(mktemp -d /tmp/openhop-repeater-config.XXXXXX)"
-    runtime_config="${runtime_dir}/config.yaml"
-
-    if ! cp "${src}" "${runtime_config}"; then
-        echo "Failed to prepare temporary merged config at ${runtime_config}; keeping the existing config." >&2
-        return 1
-    fi
-
-    CONFIG_PATH="${runtime_config}"
-    echo "Using merged config from ${CONFIG_PATH} for this container start only." >&2
-    echo "Fix the bind-mounted config ownership so future upgrades can persist merged config changes." >&2
-    print_permission_help
-    return 0
-}
-
 merge_config_from_example() {
     config_path="$1"
 
@@ -96,7 +79,8 @@ merge_config_from_example() {
     if ! cmp -s "${config_path}" "${merged_config}"; then
         if ! cp "${merged_config}" "${config_path}"; then
             echo "Failed to update ${config_path} from merged config; the bind-mounted config is not writable." >&2
-            use_runtime_merged_config "${merged_config}" || true
+            echo "Keeping the durable config path; security credentials must never be generated in a temporary config." >&2
+            print_permission_help
         fi
     fi
 

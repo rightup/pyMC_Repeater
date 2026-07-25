@@ -216,6 +216,18 @@ def test_trace_helper_cleanup_stale_pings():
     assert 2 in helper.pending_pings
 
 
+def test_trace_helper_rejects_duplicate_pending_tag():
+    helper = TraceHelper(
+        local_hash=0x42,
+        local_identity=FakeIdentity(0x42),
+        repeater_handler=MagicMock(),
+    )
+    helper.register_ping(7, 0x42)
+
+    with pytest.raises(ValueError, match="already pending"):
+        helper.register_ping(7, 0x43)
+
+
 def test_discovery_request_filter_match_and_mismatch():
     helper = DiscoveryHelper(
         local_identity=FakeIdentity(0x42), packet_injector=AsyncMock(), node_type=2
@@ -242,6 +254,68 @@ def test_discovery_request_without_identity_does_not_send():
     )
 
     helper._send_discovery_response.assert_not_called()
+
+
+def test_discovery_session_tag_retries_active_and_frame_owned_values():
+    frame_conflict = MagicMock(side_effect=lambda tag: tag == 0x22)
+    helper = DiscoveryHelper(
+        local_identity=FakeIdentity(0x42),
+        packet_injector=AsyncMock(),
+        tag_conflict=frame_conflict,
+    )
+
+    with patch(
+        "repeater.handler_helpers.discovery.secrets.randbits",
+        return_value=0x11,
+    ):
+        first = helper.create_session(filter_mask=0x04)
+
+    with patch(
+        "repeater.handler_helpers.discovery.secrets.randbits",
+        side_effect=[0x11, 0x22, 0x33],
+    ):
+        second = helper.create_session(filter_mask=0x04)
+
+    assert first["tag"] == 0x11
+    assert second["tag"] == 0x33
+    assert helper.owns_response_tag(0x11)
+    assert helper.owns_response_tag(0x33)
+    frame_conflict.assert_any_call(0x22)
+
+
+def test_discovery_tag_exhaustion_fails_before_radio_injection():
+    injector = AsyncMock()
+    helper = DiscoveryHelper(
+        local_identity=FakeIdentity(0x42),
+        packet_injector=injector,
+        tag_conflict=lambda _tag: True,
+    )
+
+    with (
+        patch(
+            "repeater.handler_helpers.discovery.secrets.randbits",
+            return_value=0x44,
+        ),
+        pytest.raises(RuntimeError, match="No unique discovery response tag"),
+    ):
+        helper.create_session(filter_mask=0x04)
+
+    injector.assert_not_awaited()
+    assert helper._sessions == {}
+
+
+def test_discovery_cleanup_releases_stale_never_started_tag():
+    helper = DiscoveryHelper(
+        local_identity=FakeIdentity(0x42),
+        packet_injector=AsyncMock(),
+    )
+    session = helper.create_session(filter_mask=0x04)
+    helper._sessions[session["session_id"]]["created_at"] = time.time() - 121
+
+    helper.cleanup_sessions(max_age_seconds=120)
+
+    assert helper.get_session_snapshot(session["session_id"]) is None
+    assert not helper.owns_response_tag(session["tag"])
 
 
 @pytest.mark.asyncio

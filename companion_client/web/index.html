@@ -90,7 +90,9 @@
     background: var(--mention); border: 1px solid var(--mention-line);
     color: var(--text); font-size: 13px; padding: 8px 18px;
   }
-  #err { color: #e5534b; font-size: 13px; padding: 0 18px 8px; display: none; }
+  .status { font-size: 13px; padding: 7px 18px; display: none; }
+  #pendingStatus { background: var(--mention); border-bottom: 1px solid var(--mention-line); }
+  #connectionStatus, #err { color: #e5534b; }
   @media (max-width: 820px) {
     main { flex-direction: column; }
     .chat { border-right: none; border-bottom: 1px solid var(--line); }
@@ -105,7 +107,9 @@
   <span class="badge" id="node"></span>
   <span class="badge" id="transport" title="API surface in use"></span>
 </header>
-<div id="err"></div>
+<div class="status" id="pendingStatus" role="status"></div>
+<div class="status" id="connectionStatus" role="status"></div>
+<div class="status" id="err" role="alert"></div>
 <div class="warn" id="livewarn" style="display:none">
   <strong>Live mode.</strong> Messages you send are transmitted over the air to a
   real mesh. Check the selected channel before sending.
@@ -147,6 +151,8 @@
 <script>
 const $ = (id) => document.getElementById(id);
 const messagesEl = $("messages"), pushesEl = $("pushes"), errEl = $("err");
+const pendingStatusEl = $("pendingStatus");
+const connectionStatusEl = $("connectionStatus");
 
 function clearEmpty(el) {
   const empty = el.querySelector(".empty");
@@ -155,7 +161,69 @@ function clearEmpty(el) {
 function atBottom(el) { return el.scrollHeight - el.scrollTop - el.clientHeight < 40; }
 
 let currentChannel = 0;
+let currentCompanion = "";
+let currentCompanionIdentity = "";
+let currentApiBaseUrl = "";
+let currentDeviceId = "";
+let currentPairingGeneration = "";
 const allMessages = [];
+const PENDING_SEND_STORAGE_PREFIX = "openhop-companion-pending-send:";
+const MAX_RENDERED_MESSAGES = 1000;
+const MAX_RENDERED_PUSHES = 256;
+
+function trimMessages() {
+  if (allMessages.length > MAX_RENDERED_MESSAGES) {
+    allMessages.splice(0, allMessages.length - MAX_RENDERED_MESSAGES);
+  }
+}
+
+function pendingSendStorageKey() {
+  return PENDING_SEND_STORAGE_PREFIX +
+    encodeURIComponent(currentApiBaseUrl) + ":" + currentCompanionIdentity +
+    ":" + encodeURIComponent(currentDeviceId) +
+    ":" + encodeURIComponent(currentPairingGeneration);
+}
+
+function newIdempotencyKey() {
+  if (crypto.randomUUID) return crypto.randomUUID();
+  return Array.from(crypto.getRandomValues(new Uint8Array(16)))
+    .map((value) => value.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+function isVisibleAscii(value) {
+  return value.length <= 128 && [...value].every((character) => {
+    const code = character.codePointAt(0);
+    return code >= 0x21 && code <= 0x7e;
+  });
+}
+
+function loadPendingSend() {
+  try {
+    const pending = JSON.parse(localStorage.getItem(pendingSendStorageKey()));
+    if (
+      pending &&
+      pending.companion === currentCompanion &&
+      pending.companion_identity === currentCompanionIdentity &&
+      pending.api_base_url === currentApiBaseUrl &&
+      pending.device_id === currentDeviceId &&
+      pending.pairing_generation === currentPairingGeneration &&
+      typeof pending.idempotency_key === "string" &&
+      pending.idempotency_key &&
+      isVisibleAscii(pending.idempotency_key) &&
+      typeof pending.text === "string" &&
+      pending.text.trim() &&
+      Number.isInteger(pending.channel) &&
+      pending.channel >= 0
+    ) return pending;
+    localStorage.removeItem(pendingSendStorageKey());
+  } catch (error) {}
+  return null;
+}
+
+function savePendingSend(pending) {
+  localStorage.setItem(pendingSendStorageKey(), JSON.stringify(pending));
+}
 
 function renderAll() {
   messagesEl.innerHTML = "";
@@ -172,9 +240,32 @@ function renderAll() {
 }
 
 function addMessage(m) {
-  allMessages.push(m);
+  const existing = m.id == null ? null : allMessages.find((item) => item.id === m.id);
+  if (existing) Object.assign(existing, m);
+  else allMessages.push(m);
+  trimMessages();
   if (Number(m.channel) !== Number(currentChannel)) return;
-  renderMessage(m);
+  renderAll();
+}
+
+function reconcileState(state) {
+  if (state.companion) currentCompanion = state.companion;
+  if (state.companion_identity) currentCompanionIdentity = state.companion_identity;
+  if (state.api_base_url) currentApiBaseUrl = state.api_base_url;
+  if (state.device_id) currentDeviceId = state.device_id;
+  if (state.pairing_generation) currentPairingGeneration = state.pairing_generation;
+  $("node").textContent = state.node_name
+    ? state.node_name + " · 0x" + state.companion_hash
+    : "";
+  const byId = new Map();
+  const withoutId = [];
+  (state.messages || []).forEach((message) => {
+    if (message.id == null) withoutId.push(message);
+    else byId.set(message.id, message);
+  });
+  allMessages.splice(0, allMessages.length, ...withoutId, ...byId.values());
+  trimMessages();
+  refreshChannels(state.channels || []);
 }
 
 function renderMessage(m) {
@@ -191,7 +282,8 @@ function renderMessage(m) {
   meta.textContent = (m.direction === "out" ? "sent" : "received") +
     (m.channel_name ? " · " + m.channel_name : "") +
     (when ? " · " + when : "") +
-    (m.snr != null ? " · SNR " + m.snr : "");
+    (m.snr != null ? " · SNR " + m.snr : "") +
+    (m.state ? " · " + m.state : "");
   bubble.appendChild(meta);
   wrap.appendChild(bubble);
   messagesEl.appendChild(wrap);
@@ -217,12 +309,25 @@ function addPush(p) {
   pre.textContent = JSON.stringify(p.body, null, 2);
   box.append(shape, desc, pre);
   pushesEl.appendChild(box);
+  while (pushesEl.children.length > MAX_RENDERED_PUSHES) {
+    pushesEl.firstElementChild.remove();
+  }
   if (stick) pushesEl.scrollTop = pushesEl.scrollHeight;
 }
 
 function showError(msg) {
   errEl.textContent = msg;
   errEl.style.display = msg ? "block" : "none";
+}
+
+function showPendingStatus(msg) {
+  pendingStatusEl.textContent = msg;
+  pendingStatusEl.style.display = msg ? "block" : "none";
+}
+
+function showConnectionStatus(msg) {
+  connectionStatusEl.textContent = msg;
+  connectionStatusEl.style.display = msg ? "block" : "none";
 }
 
 async function post(url, body) {
@@ -233,14 +338,26 @@ async function post(url, body) {
   });
   if (!res.ok) {
     let detail = res.statusText;
-    try { detail = (await res.json()).error || detail; } catch (e) {}
-    throw new Error(detail);
+    let payload = {};
+    try {
+      payload = await res.json();
+      detail = payload.error || detail;
+    } catch (e) {}
+    const error = new Error(detail);
+    error.status = res.status;
+    error.details = payload;
+    throw error;
   }
   return res.json();
 }
 
 async function init() {
   const state = await (await fetch("/api/state")).json();
+  currentCompanion = state.companion;
+  currentCompanionIdentity = state.companion_identity;
+  currentApiBaseUrl = state.api_base_url;
+  currentDeviceId = state.device_id;
+  currentPairingGeneration = state.pairing_generation;
   const mode = $("mode");
   mode.textContent = state.mode === "sim" ? "simulator" : "live";
   mode.className = "badge mode-" + state.mode;
@@ -260,6 +377,24 @@ async function init() {
   }
   currentChannel = Number(sel.value || 0);
   sel.onchange = () => { currentChannel = Number(sel.value); renderAll(); };
+  const pending = loadPendingSend();
+  if (pending) {
+    let pendingOption = [...sel.options].find(
+      (option) => Number(option.value) === pending.channel
+    );
+    if (!pendingOption) {
+      pendingOption = document.createElement("option");
+      pendingOption.value = pending.channel;
+      pendingOption.textContent = "Pending channel (" + pending.channel + ")";
+      sel.appendChild(pendingOption);
+    }
+    sel.value = pendingOption.value;
+    currentChannel = pending.channel;
+    $("text").value = pending.text;
+    showPendingStatus(
+      "An unresolved send was restored. Retry it unchanged with the same key."
+    );
+  }
   if (state.mode === "live") $("livewarn").style.display = "block";
   (state.messages || []).forEach((m) => allMessages.push(m));
   renderAll();
@@ -271,13 +406,37 @@ async function init() {
 
   const stream = new EventSource("/api/events");
   stream.onmessage = (e) => {
-    const evt = JSON.parse(e.data);
-    if (evt.kind === "message") addMessage(evt.data);
+    let evt;
+    try {
+      evt = JSON.parse(e.data);
+    } catch (error) {
+      showConnectionStatus("Event stream sent invalid data; reconnecting is recommended.");
+      return;
+    }
+    if (evt.kind === "state") reconcileState(evt.data);
+    else if (evt.kind === "message") addMessage(evt.data);
+    else if (evt.kind === "message_state") {
+      const message = allMessages.find((item) => item.id === evt.data.message_id);
+      if (message) {
+        if ("state" in evt.data) message.state = evt.data.state;
+        if ("packet_hash" in evt.data) message.packet_hash = evt.data.packet_hash;
+        renderAll();
+      }
+    }
     else if (evt.kind === "push") addPush(evt.data);
     else if (evt.kind === "channels") refreshChannels(evt.data.channels);
-    else if (evt.kind === "resync") showError("Cursor expired — re-bootstrapped from snapshot.");
+    else if (evt.kind === "resync") {
+      fetch("/api/state")
+        .then((response) => response.json())
+        .then(reconcileState)
+        .then(() => showError("State was refreshed from a new snapshot."))
+        .catch((error) => showError("State refresh failed: " + error.message));
+    }
   };
-  stream.onerror = () => showError("Event stream disconnected — is the server still running?");
+  stream.onopen = () => showConnectionStatus("");
+  stream.onerror = () => showConnectionStatus(
+    "Event stream disconnected — is the server still running?"
+  );
 }
 
 function refreshChannels(channels) {
@@ -290,7 +449,24 @@ function refreshChannels(channels) {
     opt.textContent = c.name + "  (" + c.index + ")";
     sel.appendChild(opt);
   });
-  if ([...sel.options].some((o) => o.value === previous)) sel.value = previous;
+  const pending = loadPendingSend();
+  if (
+    pending &&
+    ![...sel.options].some((option) => Number(option.value) === pending.channel)
+  ) {
+    const pendingOption = document.createElement("option");
+    pendingOption.value = pending.channel;
+    pendingOption.textContent = "Pending channel (" + pending.channel + ")";
+    sel.appendChild(pendingOption);
+  }
+  if (!sel.options.length) {
+    const fallback = document.createElement("option");
+    fallback.value = 0;
+    fallback.textContent = "Public (0)";
+    sel.appendChild(fallback);
+  }
+  if (pending) sel.value = pending.channel;
+  else if ([...sel.options].some((o) => o.value === previous)) sel.value = previous;
   currentChannel = Number(sel.value || 0);
   renderAll();
 }
@@ -306,10 +482,51 @@ async function doRename() {
 async function doSend() {
   const input = $("text"), text = input.value.trim();
   if (!text) return;
-  input.value = "";
   showError("");
-  try { await post("/api/send", {text, channel: currentChannel}); }
-  catch (err) { showError("Send failed: " + err.message); }
+  let pending = loadPendingSend();
+  if (pending && (pending.text !== text || pending.channel !== currentChannel)) {
+    showPendingStatus(
+      "The previous send is unresolved. Retry the restored text and channel unchanged " +
+      "before starting another send."
+    );
+    return;
+  }
+  if (!pending) {
+    pending = {
+      companion: currentCompanion,
+      companion_identity: currentCompanionIdentity,
+      api_base_url: currentApiBaseUrl,
+      device_id: currentDeviceId,
+      pairing_generation: currentPairingGeneration,
+      text,
+      channel: currentChannel,
+      idempotency_key: newIdempotencyKey(),
+    };
+    try {
+      savePendingSend(pending);
+    } catch (err) {
+      showError("Cannot persist a safe retry key; the message was not sent.");
+      return;
+    }
+  }
+  try {
+    const entry = await post("/api/send", pending);
+    localStorage.removeItem(pendingSendStorageKey());
+    showPendingStatus("");
+    input.value = "";
+    addMessage(entry);
+  } catch (err) {
+    if (err.status === 400 || (err.details && err.details.safe_to_edit)) {
+      localStorage.removeItem(pendingSendStorageKey());
+      showPendingStatus("");
+      showError("Send was rejected before radio work. Edit the draft and try again.");
+      return;
+    }
+    input.value = pending.text;
+    showPendingStatus(
+      "Send unresolved; retry will reuse the same key. " + err.message
+    );
+  }
 }
 
 async function doInject() {

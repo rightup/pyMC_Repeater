@@ -14,6 +14,8 @@ import re
 import time
 from typing import Any, Dict, Optional
 
+from repeater.retention import storage_retention_days
+
 #: design doc §10.1 defaults
 DEFAULT_WINDOW_SECONDS = 24 * 3600
 #: a window smaller than this isn't a meaningful RF correlation window and
@@ -54,12 +56,6 @@ def parse_window_seconds(value: Optional[str]) -> int:
     return max(MIN_WINDOW_SECONDS, min(seconds, MAX_WINDOW_SECONDS))
 
 
-#: fallback packets retention when config is missing/malformed -- matches
-#: the ``storage.retention.sqlite_cleanup_days`` default in config.yaml and
-#: ``engine.py``'s periodic cleanup call.
-_DEFAULT_PACKETS_RETENTION_DAYS = 31
-
-
 def packets_retention_days(config: Optional[Dict[str, Any]]) -> int:
     """Return the configured ``packets`` table retention window, in days.
 
@@ -69,12 +65,7 @@ def packets_retention_days(config: Optional[Dict[str, Any]]) -> int:
     always matches the retention that's actually enforced, not a
     separately-maintained constant.
     """
-    cfg = config or {}
-    retention_cfg = cfg.get("storage", {}).get("retention", {}) if isinstance(cfg, dict) else {}
-    try:
-        return int(retention_cfg.get("sqlite_cleanup_days", _DEFAULT_PACKETS_RETENTION_DAYS))
-    except (TypeError, ValueError):
-        return _DEFAULT_PACKETS_RETENTION_DAYS
+    return storage_retention_days({} if config is None else config)[0]
 
 
 def observations_pruned(window_start: float, config: Optional[Dict[str, Any]]) -> bool:

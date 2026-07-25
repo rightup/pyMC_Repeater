@@ -319,7 +319,11 @@ class _BrokerConnection:
         signature_hex = binascii.hexlify(signature).decode()
         token = f"{header_b64}.{payload_b64}.{signature_hex}"
 
-        logger.debug(f"JWT token generated for {self.broker['name']}: {token[:50]}...")
+        logger.debug(
+            "JWT token generated for %s (expires=%s)",
+            self.broker["name"],
+            payload["exp"],
+        )
 
         return token
 

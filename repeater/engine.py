@@ -35,6 +35,7 @@ from repeater.airtime import AirtimeManager
 from repeater.data_acquisition import StorageCollector
 from repeater.neighbour_links import NeighbourLinkTracker
 from repeater.policy_engine import PolicyDecision, PolicyEngine
+from repeater.retention import storage_retention_days
 
 logger = logging.getLogger("RepeaterHandler")
 
@@ -123,6 +124,10 @@ class RepeaterHandler(BaseHandler):
     ):
 
         self.config = config
+        (
+            self.sqlite_cleanup_days,
+            self.companion_events_days,
+        ) = storage_retention_days(config)
         self.dispatcher = dispatcher
         self.local_hash = local_hash
         self.local_hash_bytes = local_hash_bytes or bytes([local_hash])
@@ -1736,18 +1741,14 @@ class RepeaterHandler(BaseHandler):
                 if current_time - self.last_db_cleanup >= 21600:
                     if self.storage:
                         try:
-                            retention_cfg = self.config.get("storage", {}).get(
-                                "retention", {}
-                            )
-                            retention_days = retention_cfg.get("sqlite_cleanup_days", 31)
-                            companion_events_days = retention_cfg.get(
-                                "companion_events_days", 31
-                            )
                             self.storage.cleanup_old_data(
-                                days=retention_days,
-                                companion_events_days=companion_events_days,
+                                days=self.sqlite_cleanup_days,
+                                companion_events_days=self.companion_events_days,
                             )
-                            logger.info("Cleaned up SQLite data older than %d days", retention_days)
+                            logger.info(
+                                "Cleaned up SQLite data older than %d days",
+                                self.sqlite_cleanup_days,
+                            )
                         except Exception as e:
                             logger.warning(f"SQLite cleanup failed: {e}")
                     self.last_db_cleanup = current_time

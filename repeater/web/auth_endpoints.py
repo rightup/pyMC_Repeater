@@ -2,18 +2,81 @@
 Authentication endpoints for login and token management
 """
 
+import json
 import logging
 import math
+import secrets
 import threading
 import time
 
 import cherrypy
 
-from .auth.middleware import require_auth
+from repeater.data_acquisition.sqlite_handler import CompanionStorageError
+
+from .api_validation import (
+    positive_sqlite_row_id,
+    read_json_object,
+    reject_control_characters,
+    reject_unknown_fields,
+    text_field,
+)
+from .auth.middleware import require_admin
+from .auth.policy import (
+    api_token_scope,
+    bearer_token_from_header,
+    is_admin_scope,
+    is_valid_bearer_token,
+    validate_new_admin_password,
+)
 
 logger = logging.getLogger(__name__)
 
 _MIN_ADMIN_PASSWORD_LEN = 8
+
+
+def _validation_error(exc: cherrypy.HTTPError) -> dict:
+    """Preserve the established JSON auth contract for validation failures."""
+
+    cherrypy.response.status = exc.status
+    message = getattr(exc, "_message", None)
+    if not message:
+        message = exc.args[1] if len(exc.args) > 1 else "Invalid request"
+    return {"success": False, "error": str(message)}
+
+
+def _validation_error_bytes(exc: cherrypy.HTTPError) -> bytes:
+    return json.dumps(_validation_error(exc)).encode("utf-8")
+
+
+def _auth_storage_unavailable_response(
+    operation: str,
+    exc: CompanionStorageError,
+) -> dict:
+    """Map token-store failures to an observable response without leaking details."""
+
+    logger.error("Authentication storage unavailable during %s: %s", operation, exc)
+    cherrypy.response.status = 503
+    return {"success": False, "error": "Authentication storage unavailable"}
+
+
+def _auth_storage_unavailable(operation: str, exc: CompanionStorageError) -> bytes:
+    return json.dumps(_auth_storage_unavailable_response(operation, exc)).encode(
+        "utf-8"
+    )
+
+
+def _api_token_candidates(
+    bearer_api_token: str,
+    raw_api_key: str,
+) -> tuple[str, ...]:
+    """Return distinct API credentials in the same order as the auth middleware."""
+
+    api_key = raw_api_key if is_valid_bearer_token(raw_api_key) else ""
+    return tuple(
+        dict.fromkeys(
+            token for token in (bearer_api_token, api_key) if token
+        )
+    )
 
 
 class _LoginThrottle:
@@ -46,6 +109,18 @@ class _LoginThrottle:
             bucket[key] = {"failures": 0, "last_failure": 0.0, "blocked_until": 0.0}
         return bucket[key]
 
+    def _prune_locked(self, now: float) -> None:
+        """Drop inactive attacker-controlled keys while holding the lock."""
+
+        for bucket in (self._ip_states, self._user_states):
+            stale = [
+                key
+                for key, state in bucket.items()
+                if now - float(state.get("last_failure", 0.0)) > self.window_sec
+            ]
+            for key in stale:
+                bucket.pop(key, None)
+
     def _maybe_decay(self, state: dict, now: float) -> None:
         last = state.get("last_failure", 0.0)
         if last and (now - last) > self.window_sec:
@@ -73,8 +148,14 @@ class _LoginThrottle:
         user_key = (username or "").strip().lower() or "<unknown>"
         ip_key = client_ip or "<unknown>"
         with self._lock:
-            ip_retry = self._retry_after(self._state(self._ip_states, ip_key), now)
-            user_retry = self._retry_after(self._state(self._user_states, user_key), now)
+            self._prune_locked(now)
+            # Read-only admission checks must not allocate attacker-controlled
+            # keys. Only a recorded authentication failure creates state.
+            ip_retry = self._retry_after(self._ip_states.get(ip_key, {}), now)
+            user_retry = self._retry_after(
+                self._user_states.get(user_key, {}),
+                now,
+            )
             global_retry = self._retry_after(self._global_state, now)
             return max(ip_retry, user_retry, global_retry)
 
@@ -83,6 +164,7 @@ class _LoginThrottle:
         user_key = (username or "").strip().lower() or "<unknown>"
         ip_key = client_ip or "<unknown>"
         with self._lock:
+            self._prune_locked(now)
             self._record_failure(self._state(self._ip_states, ip_key), self.per_ip_threshold, now)
             self._record_failure(
                 self._state(self._user_states, user_key), self.per_user_threshold, now
@@ -117,8 +199,10 @@ class TokensAPIEndpoint:
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
-    @require_auth
+    @require_admin
     def index(self):
+        cherrypy.response.headers["Cache-Control"] = "no-store"
+
         # Handle CORS preflight
         if cherrypy.request.method == "OPTIONS":
             return {}
@@ -133,6 +217,8 @@ class TokensAPIEndpoint:
             try:
                 tokens = token_manager.list_tokens()
                 return {"success": True, "tokens": tokens}
+            except CompanionStorageError as exc:
+                return _auth_storage_unavailable_response("token listing", exc)
             except Exception as e:
                 logger.error(f"Token list error: {e}")
                 cherrypy.response.status = 500
@@ -140,15 +226,23 @@ class TokensAPIEndpoint:
 
         elif cherrypy.request.method == "POST":
             try:
-                import json
-
-                body = cherrypy.request.body.read().decode("utf-8")
-                data = json.loads(body) if body else {}
-                name = data.get("name", "").strip()
-
+                data = read_json_object(
+                    max_bytes=4096,
+                    require_json_content_type=True,
+                )
+                reject_unknown_fields(data, {"name"})
+                name = text_field(
+                    data,
+                    "name",
+                    required=True,
+                    max_bytes=128,
+                )
+                if name is None:  # Defensive: required=True normally rejects this.
+                    raise cherrypy.HTTPError(400, "name required")
+                reject_control_characters(name, "name")
+                name = name.strip()
                 if not name:
-                    cherrypy.response.status = 400
-                    return {"success": False, "error": "Token name is required"}
+                    raise cherrypy.HTTPError(400, "name required")
 
                 # Create the token
                 token_id, plaintext_token = token_manager.create_token(name)
@@ -165,6 +259,10 @@ class TokensAPIEndpoint:
                     "warning": "Save this token securely - it will not be shown again",
                 }
 
+            except cherrypy.HTTPError as exc:
+                return _validation_error(exc)
+            except CompanionStorageError as exc:
+                return _auth_storage_unavailable_response("token creation", exc)
             except Exception as e:
                 logger.error(f"Token generation error: {e}")
                 cherrypy.response.status = 500
@@ -174,8 +272,10 @@ class TokensAPIEndpoint:
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
-    @require_auth
+    @require_admin
     def default(self, token_id=None):
+        cherrypy.response.headers["Cache-Control"] = "no-store"
+
         # Handle CORS preflight
         if cherrypy.request.method == "OPTIONS":
             return {}
@@ -194,10 +294,9 @@ class TokensAPIEndpoint:
 
                 # Convert to int
                 try:
-                    token_id_int = int(token_id)
-                except ValueError:
-                    cherrypy.response.status = 400
-                    return {"success": False, "error": "Invalid token ID"}
+                    token_id_int = positive_sqlite_row_id(token_id, "token_id")
+                except cherrypy.HTTPError as exc:
+                    return _validation_error(exc)
 
                 # Revoke the token
                 success = token_manager.revoke_token(token_id_int)
@@ -211,6 +310,8 @@ class TokensAPIEndpoint:
                     cherrypy.response.status = 404
                     return {"success": False, "error": "Token not found"}
 
+            except CompanionStorageError as exc:
+                return _auth_storage_unavailable_response("token revocation", exc)
             except Exception as e:
                 logger.error(f"Token revocation error: {e}")
                 cherrypy.response.status = 500
@@ -237,12 +338,9 @@ class AuthEndpoints:
     @staticmethod
     def _get_request_ip() -> str:
         """Extract client IP for login throttling/auditing."""
-        xff = cherrypy.request.headers.get("X-Forwarded-For", "")
-        if xff:
-            first = xff.split(",", 1)[0].strip()
-            if first:
-                return first
-
+        # Forwarding headers are attacker-controlled unless the server has an
+        # explicit trusted-proxy policy.  This service currently has none, so
+        # throttle on the actual peer address.
         remote = getattr(cherrypy.request, "remote", None)
         if remote and getattr(remote, "ip", None):
             return str(remote.ip)
@@ -253,6 +351,7 @@ class AuthEndpoints:
     def login(self, **kwargs):
 
         cherrypy.response.headers["Content-Type"] = "application/json"
+        cherrypy.response.headers["Cache-Control"] = "no-store"
 
         # Handle CORS preflight
         if cherrypy.request.method == "OPTIONS":
@@ -266,24 +365,25 @@ class AuthEndpoints:
             raise cherrypy.HTTPError(405, "Method not allowed")
 
         try:
-            # Parse JSON body manually since we can't use json_in decorator with OPTIONS
-            import json
-
-            body = cherrypy.request.body.read().decode("utf-8")
-            data = json.loads(body) if body else {}
-
-            username = data.get("username", "").strip()
-            password = data.get("password", "")
-            client_id = data.get("client_id", "").strip()
+            # Parse JSON manually since json_in cannot be combined with this
+            # endpoint's explicit OPTIONS handling.
+            data = read_json_object(
+                max_bytes=4096,
+                require_json_content_type=True,
+            )
+            reject_unknown_fields(data, {"username", "password", "client_id"})
+            username = text_field(
+                data, "username", required=True, max_bytes=64, strip=True
+            )
+            password = text_field(
+                data, "password", required=True, max_bytes=1024
+            )
+            client_id = text_field(
+                data, "client_id", required=True, max_bytes=128, strip=True
+            )
+            reject_control_characters(username, "username")
+            reject_control_characters(client_id, "client_id")
             client_ip = self._get_request_ip()
-
-            if not username or not password or not client_id:
-                return json.dumps(
-                    {
-                        "success": False,
-                        "error": "Missing required fields: username, password, client_id",
-                    }
-                ).encode("utf-8")
 
             retry_after = self._login_throttle.get_retry_after(client_ip, username)
             if retry_after > 0:
@@ -309,9 +409,15 @@ class AuthEndpoints:
             security_config = repeater_config.get("security", {})
             config_password = security_config.get("admin_password", "")
 
-            # Don't allow login with empty or unconfigured password
-            if not config_password:
+            # The historical default is a setup sentinel, not a credential.
+            # Issuing an administrator JWT for it would bypass the public
+            # bootstrap boundary that deliberately remains open.
+            if (
+                not isinstance(config_password, str)
+                or config_password in ("", "admin123")
+            ):
                 logger.warning("Login attempt rejected - password not configured")
+                cherrypy.response.status = 409
                 return json.dumps(
                     {
                         "success": False,
@@ -325,7 +431,7 @@ class AuthEndpoints:
                     len(config_password),
                 )
 
-            if username == "admin" and password == config_password:
+            if username == "admin" and secrets.compare_digest(password, config_password):
                 self._login_throttle.register_success(client_ip, username)
                 # Create JWT token
                 token = self.jwt_handler.create_jwt(username, client_id)
@@ -372,14 +478,18 @@ class AuthEndpoints:
                     {"success": False, "error": "Invalid username or password"}
                 ).encode("utf-8")
 
+        except cherrypy.HTTPError as exc:
+            return _validation_error_bytes(exc)
         except Exception as e:
             logger.error(f"Login error: {e}")
+            cherrypy.response.status = 500
             return json.dumps({"success": False, "error": "Internal server error"}).encode("utf-8")
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
-    @require_auth
+    @require_admin
     def verify(self):
+        cherrypy.response.headers["Cache-Control"] = "no-store"
         if cherrypy.request.method != "GET":
             raise cherrypy.HTTPError(405, "Method not allowed")
 
@@ -389,6 +499,7 @@ class AuthEndpoints:
     def refresh(self, **kwargs):
 
         cherrypy.response.headers["Content-Type"] = "application/json"
+        cherrypy.response.headers["Cache-Control"] = "no-store"
 
         # Handle CORS preflight
         if cherrypy.request.method == "OPTIONS":
@@ -402,20 +513,26 @@ class AuthEndpoints:
             raise cherrypy.HTTPError(405, "Method not allowed")
 
         try:
-            import json
-
             # Manual authentication check (can't use @require_auth since we need to handle OPTIONS)
             auth_header = cherrypy.request.headers.get("Authorization", "")
-            api_key = cherrypy.request.headers.get("X-API-Key", "")
+            raw_api_key = cherrypy.request.headers.get("X-API-Key", "")
 
             jwt_handler = cherrypy.config.get("jwt_handler")
             token_manager = cherrypy.config.get("token_manager")
 
+            if not jwt_handler or not token_manager:
+                logger.error("Auth handlers not configured")
+                cherrypy.response.status = 500
+                return json.dumps(
+                    {"success": False, "error": "Authentication not configured"}
+                ).encode("utf-8")
+
             user_info = None
+            bearer_api_token = ""
 
             # Check JWT first
-            if auth_header.startswith("Bearer "):
-                token = auth_header[7:]
+            token = bearer_token_from_header(auth_header)
+            if token is not None:
                 payload = jwt_handler.verify_jwt(token)
                 if payload:
                     user_info = {
@@ -423,29 +540,64 @@ class AuthEndpoints:
                         "client_id": payload.get("client_id"),
                         "auth_method": "jwt",
                     }
+                else:
+                    bearer_api_token = token
 
             # Check API token
-            if not user_info and api_key:
-                token_data = token_manager.verify_token(api_key)
-                if token_data:
+            if not user_info:
+                for presented_api_token in _api_token_candidates(
+                    bearer_api_token,
+                    raw_api_key,
+                ):
+                    try:
+                        token_data = token_manager.verify_token(
+                            presented_api_token
+                        )
+                    except CompanionStorageError as exc:
+                        return _auth_storage_unavailable("token refresh", exc)
+                    if not token_data:
+                        continue
+                    scope = api_token_scope(token_data)
+                    if not is_admin_scope(scope):
+                        logger.warning(
+                            "Denied JWT refresh for API token %r with scope %r",
+                            token_data.get("id"),
+                            scope,
+                        )
+                        cherrypy.response.status = 403
+                        return json.dumps(
+                            {"success": False, "error": "Forbidden - Admin scope required"}
+                        ).encode("utf-8")
                     user_info = {
                         "username": "admin",
                         "token_id": token_data["id"],
                         "auth_method": "api_token",
                     }
+                    break
 
             if not user_info:
+                cherrypy.response.status = 401
                 return json.dumps(
                     {"success": False, "error": "Unauthorized - Valid JWT or API token required"}
                 ).encode("utf-8")
 
-            # Parse request body
-            body = cherrypy.request.body.read().decode("utf-8")
-            data = json.loads(body) if body else {}
-
-            client_id = data.get("client_id", user_info.get("client_id", "")).strip()
+            data = read_json_object(
+                max_bytes=4096,
+                require_json_content_type=True,
+            )
+            reject_unknown_fields(data, {"client_id"})
+            client_id = text_field(
+                data,
+                "client_id",
+                default=user_info.get("client_id", ""),
+                required=True,
+                max_bytes=128,
+                strip=True,
+            )
+            reject_control_characters(client_id, "client_id")
 
             if not client_id:
+                cherrypy.response.status = 400
                 return json.dumps({"success": False, "error": "Client ID is required"}).encode(
                     "utf-8"
                 )
@@ -466,8 +618,11 @@ class AuthEndpoints:
                 }
             ).encode("utf-8")
 
+        except cherrypy.HTTPError as exc:
+            return _validation_error_bytes(exc)
         except Exception as e:
             logger.error(f"Token refresh error: {e}")
+            cherrypy.response.status = 500
             return json.dumps({"success": False, "error": "Failed to refresh token"}).encode(
                 "utf-8"
             )
@@ -475,9 +630,8 @@ class AuthEndpoints:
     @cherrypy.expose
     def change_password(self):
 
-        import json
-
         cherrypy.response.headers["Content-Type"] = "application/json"
+        cherrypy.response.headers["Cache-Control"] = "no-store"
 
         # Handle CORS preflight
         if cherrypy.request.method == "OPTIONS":
@@ -502,9 +656,10 @@ class AuthEndpoints:
         # Try JWT authentication first
         auth_header = cherrypy.request.headers.get("Authorization", "")
         user = None
+        bearer_api_token = ""
 
-        if auth_header.startswith("Bearer "):
-            token = auth_header[7:]  # Remove 'Bearer ' prefix
+        token = bearer_token_from_header(auth_header)
+        if token is not None:
             payload = jwt_handler.verify_jwt(token)
 
             if payload:
@@ -513,20 +668,41 @@ class AuthEndpoints:
                     "client_id": payload["client_id"],
                     "auth_type": "jwt",
                 }
+            else:
+                bearer_api_token = token
 
         # Try API token authentication if JWT failed
         if not user:
-            api_key = cherrypy.request.headers.get("X-API-Key", "")
-            if api_key:
-                token_info = token_manager.verify_token(api_key)
+            raw_api_key = cherrypy.request.headers.get("X-API-Key", "")
+            for api_key in _api_token_candidates(
+                bearer_api_token,
+                raw_api_key,
+            ):
+                try:
+                    token_info = token_manager.verify_token(api_key)
+                except CompanionStorageError as exc:
+                    return _auth_storage_unavailable("password change", exc)
 
-                if token_info:
-                    user = {
-                        "username": "api_token",
-                        "token_name": token_info["name"],
-                        "token_id": token_info["id"],
-                        "auth_type": "api_token",
-                    }
+                if not token_info:
+                    continue
+                scope = api_token_scope(token_info)
+                if not is_admin_scope(scope):
+                    logger.warning(
+                        "Denied password change for API token %r with scope %r",
+                        token_info.get("id"),
+                        scope,
+                    )
+                    cherrypy.response.status = 403
+                    return json.dumps(
+                        {"success": False, "error": "Forbidden - Admin scope required"}
+                    ).encode("utf-8")
+                user = {
+                    "username": "api_token",
+                    "token_name": token_info["name"],
+                    "token_id": token_info["id"],
+                    "auth_type": "api_token",
+                }
+                break
 
         if not user:
             cherrypy.response.status = 401
@@ -535,27 +711,30 @@ class AuthEndpoints:
             ).encode("utf-8")
 
         try:
-            # Parse JSON body manually
-            body = cherrypy.request.body.read().decode("utf-8")
-            data = json.loads(body) if body else {}
+            data = read_json_object(
+                max_bytes=4096,
+                require_json_content_type=True,
+            )
+            reject_unknown_fields(data, {"current_password", "new_password"})
+            current_password = text_field(
+                data,
+                "current_password",
+                required=True,
+                max_bytes=1024,
+            )
+            new_password = text_field(
+                data,
+                "new_password",
+                required=True,
+                max_bytes=1024,
+            )
 
-            current_password = data.get("current_password", "")
-            new_password = data.get("new_password", "")
-
-            if not current_password or not new_password:
+            try:
+                validate_new_admin_password(new_password)
+            except ValueError as exc:
                 cherrypy.response.status = 400
                 return json.dumps(
-                    {
-                        "success": False,
-                        "error": "Both current_password and new_password are required",
-                    }
-                ).encode("utf-8")
-
-            # Validate new password strength
-            if len(new_password) < 8:
-                cherrypy.response.status = 400
-                return json.dumps(
-                    {"success": False, "error": "New password must be at least 8 characters long"}
+                    {"success": False, "error": str(exc)}
                 ).encode("utf-8")
 
             # Verify current password
@@ -569,41 +748,43 @@ class AuthEndpoints:
                     "utf-8"
                 )
 
-            if current_password != config_password:
+            if not secrets.compare_digest(current_password, config_password):
                 cherrypy.response.status = 401
                 return json.dumps(
                     {"success": False, "error": "Current password is incorrect"}
                 ).encode("utf-8")
 
-            # Update password in config
-            if "repeater" not in self.config:
-                self.config["repeater"] = {}
-            if "security" not in self.config["repeater"]:
-                self.config["repeater"]["security"] = {}
-
-            self.config["repeater"]["security"]["admin_password"] = new_password
-
             # Save to config file using ConfigManager
-            if self.config_manager:
-                if self.config_manager.save_to_file():
-                    logger.info(f"Admin password changed successfully by user {user['username']}")
-                    return json.dumps(
-                        {
-                            "success": True,
-                            "message": "Password changed successfully. Please log in again with your new password.",
-                        }
-                    ).encode("utf-8")
-                else:
-                    cherrypy.response.status = 500
-                    return json.dumps(
-                        {"success": False, "error": "Failed to save password to config file"}
-                    ).encode("utf-8")
-            else:
+            if not self.config_manager:
                 cherrypy.response.status = 500
                 return json.dumps(
                     {"success": False, "error": "Config manager not available"}
                 ).encode("utf-8")
 
+            previous_password = config_password
+            security_config["admin_password"] = new_password
+            try:
+                saved = self.config_manager.save_to_file()
+            except Exception:
+                security_config["admin_password"] = previous_password
+                raise
+            if saved:
+                logger.info(f"Admin password changed successfully by user {user['username']}")
+                return json.dumps(
+                    {
+                        "success": True,
+                        "message": "Password changed successfully. Please log in again with your new password.",
+                    }
+                ).encode("utf-8")
+
+            security_config["admin_password"] = previous_password
+            cherrypy.response.status = 500
+            return json.dumps(
+                {"success": False, "error": "Failed to save password to config file"}
+            ).encode("utf-8")
+
+        except cherrypy.HTTPError as exc:
+            return _validation_error_bytes(exc)
         except Exception as e:
             logger.error(f"Password change error: {e}")
             cherrypy.response.status = 500

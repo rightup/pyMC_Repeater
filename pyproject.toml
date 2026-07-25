@@ -11,14 +11,13 @@ authors = [
 description = "PyMC Repeater Daemon"
 readme = "README.md"
 license = {text = "MIT"}
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
@@ -29,12 +28,11 @@ keywords = ["mesh", "networking", "lora", "repeater", "daemon", "iot"]
 
 
 dependencies = [
-    "openhop_core[hardware] @ git+https://github.com/openhop-dev/openhop_core.git@fix/all-the-things-core ; sys_platform == 'linux'",
-    "openhop_core @ git+https://github.com/openhop-dev/openhop_core.git@fix/all-the-things-core ; sys_platform != 'linux'",
+    "openhop_core[hardware] @ git+https://github.com/openhop-dev/openhop_core.git@3cfce4e10febfaab464e8f6a267588ea63e2cd3c ; sys_platform == 'linux'",
+    "openhop_core @ git+https://github.com/openhop-dev/openhop_core.git@3cfce4e10febfaab464e8f6a267588ea63e2cd3c ; sys_platform != 'linux'",
     "pyyaml>=6.0.0",
     "cherrypy>=18.0.0",
     "paho-mqtt>=1.6.0",
-    "cherrypy-cors==1.7.0",
     "psutil>=5.9.0",
     "pyserial>=3.5",
     "pyjwt>=2.8.0",
@@ -46,11 +44,14 @@ dependencies = [
 [project.optional-dependencies]
 # SX1262/SPI support (Linux only; required for Raspberry Pi HATs)
 hardware = [
-    "openhop_core[hardware] @ git+https://github.com/openhop-dev/openhop_core.git@fix/all-the-things-core",
+    "openhop_core[hardware] @ git+https://github.com/openhop-dev/openhop_core.git@3cfce4e10febfaab464e8f6a267588ea63e2cd3c",
 ]
 # RRD metrics (Performance Metrics chart); system librrd required (e.g. apt install rrdtool)
 rrd = [
     "rrdtool",
+]
+companion-web = [
+    "aiohttp>=3.9.0",
 ]
 dev = [
     "pytest>=7.4.0",
@@ -65,7 +66,7 @@ pymc-cli = "repeater.local_cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["repeater*"]
+include = ["repeater*", "companion_client*"]
 
 [tool.setuptools.package-data]
 repeater = [
@@ -76,10 +77,14 @@ repeater = [
     "web/*.html",
     "presets/*.yaml",
 ]
+companion_client = [
+    "README.md",
+    "web/*.html",
+]
 
 [tool.ruff]
 line-length = 100
-target-version = "py39"
+target-version = "py310"
 
 [tool.ruff.lint]
 extend-ignore = ["E701"]

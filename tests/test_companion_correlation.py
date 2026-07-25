@@ -14,17 +14,28 @@ docs/architecture/mobile-companion-api.md §9, §10.2-§10.4.
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import cherrypy
 import pytest
+from openhop_core.companion.models import Contact
 from openhop_core.protocol import LocalIdentity, Packet
 from openhop_core.protocol.constants import PH_TYPE_SHIFT, ROUTE_TYPE_FLOOD
 
-from repeater.companion.bridge import RepeaterCompanionBridge
-from repeater.companion.correlation import CompanionCorrelationTracker, outbound_send_capture
+from repeater.companion.bridge import (
+    OutboundMessageEvent,
+    RepeaterCompanionBridge,
+    outbound_message_id,
+    outbound_message_source,
+)
+from repeater.companion.correlation import (
+    CompanionCorrelationTracker,
+    injected_tx_outcome,
+    outbound_send_capture,
+)
 from repeater.companion.frame_server import CompanionFrameServer
 from repeater.companion.journal import CompanionEventJournal
 from repeater.data_acquisition.sqlite_handler import SQLiteHandler
@@ -103,6 +114,19 @@ class TestTrackerMiss:
 
 
 class TestTrackerInboundCorrelation:
+    def test_same_packet_is_correlated_for_every_companion(self):
+        tracker = CompanionCorrelationTracker(ttl_seconds=300)
+        packet_hash = "ABCDEF0123456789"
+        tracker.register_inbound(packet_hash, "0x01", message_id=11)
+        tracker.register_inbound(packet_hash, "0x02", message_id=22)
+
+        hits = tracker.observe_duplicate(_record(packet_hash=packet_hash))
+
+        assert [
+            (hit["companion_hash"], hit["message_id"])
+            for hit in hits
+        ] == [("0x01", 11), ("0x02", 22)]
+
     def test_running_counts_across_repeated_observations(self):
         tracker = CompanionCorrelationTracker(ttl_seconds=300)
         h = "ABCDEF0123456789"
@@ -141,7 +165,7 @@ class TestTrackerOutboundCorrelation:
     def test_heard_repeat_count_vs_unique_repeater_count(self):
         tracker = CompanionCorrelationTracker(ttl_seconds=300)
         h = "1234567890ABCDEF"
-        tracker.register_outbound(h, _HASH)
+        tracker.register_outbound(h, _HASH, message_id=1)
 
         # Same terminal repeater heard twice: heard_repeat_count counts both,
         # unique_repeater_count counts the repeater once.
@@ -160,19 +184,104 @@ class TestTrackerOutboundCorrelation:
         assert hit3["heard_repeat_count"] == 3
         assert hit3["unique_repeater_count"] == 2
 
-    def test_outbound_message_id_is_always_none(self):
+    def test_transient_outbound_hit_is_buffered_until_promotion(self):
         tracker = CompanionCorrelationTracker(ttl_seconds=300)
         h = "1234567890ABCDEF"
         tracker.register_outbound(h, _HASH)
-        hit = tracker.observe_duplicate(_record(packet_hash=h, original_path=["11"]))[0]
-        assert hit["message_id"] is None
+        assert tracker.observe_duplicate(
+            _record(packet_hash=h, original_path=["11"])
+        ) == []
+        assert tracker.observe_duplicate(
+            _record(packet_hash=h, original_path=["22"])
+        ) == []
+
+        buffered = tracker.promote_outbound(h, _HASH, message_id=42)
+
+        assert len(buffered) == 1
+        assert buffered[0]["message_id"] == 42
+        assert buffered[0]["path"] == ["22"]
+        assert buffered[0]["heard_repeat_count"] == 2
+        assert buffered[0]["unique_repeater_count"] == 2
+
+    def test_promotion_preserves_counts_ttl_and_one_tracker_entry(self):
+        tracker = CompanionCorrelationTracker(ttl_seconds=300)
+        h = "1234567890ABCDEF"
+        clock = [100.0]
+
+        with patch(
+            "repeater.companion.correlation.time.time",
+            side_effect=lambda: clock[0],
+        ):
+            tracker.register_outbound(h, _HASH)
+            clock[0] = 101.0
+            assert tracker.observe_duplicate(
+                _record(
+                    packet_hash=h,
+                    original_path=["11"],
+                    ts=clock[0],
+                )
+            ) == []
+
+            clock[0] = 102.0
+            buffered = tracker.promote_outbound(h, _HASH, message_id=42)
+            assert buffered[0]["heard_repeat_count"] == 1
+            assert len(tracker) == 1
+
+            clock[0] = 103.0
+            promoted = tracker.observe_duplicate(
+                _record(
+                    packet_hash=h,
+                    original_path=["22"],
+                    ts=clock[0],
+                )
+            )
+            assert len(promoted) == 1
+            assert promoted[0]["message_id"] == 42
+            assert promoted[0]["heard_repeat_count"] == 2
+            assert promoted[0]["unique_repeater_count"] == 2
+
+            # Promotion must not restart the original registration's TTL.
+            clock[0] = 401.0
+            assert tracker.observe_duplicate(
+                _record(packet_hash=h, ts=clock[0])
+            ) == []
 
     def test_empty_path_has_no_terminal_hash(self):
         tracker = CompanionCorrelationTracker(ttl_seconds=300)
         h = "1234567890ABCDEF"
-        tracker.register_outbound(h, _HASH)
+        tracker.register_outbound(h, _HASH, message_id=1)
         hit = tracker.observe_duplicate(_record(packet_hash=h, original_path=[]))[0]
         assert hit["terminal_hash"] is None
+
+    def test_same_companion_hash_ambiguity_fails_closed(self, caplog):
+        tracker = CompanionCorrelationTracker(ttl_seconds=300)
+        h = "9999999999999999"
+        tracker.register_outbound(h, _HASH, message_id=1)
+        tracker.register_outbound(h, _HASH, message_id=2)
+
+        assert tracker.observe_duplicate(_record(packet_hash=h)) == []
+        assert "Ambiguous companion RF correlation suppressed" in caplog.text
+
+    def test_same_hash_still_fans_out_across_companions(self):
+        tracker = CompanionCorrelationTracker(ttl_seconds=300)
+        h = "8888888888888888"
+        tracker.register_outbound(h, "0x01", message_id=1)
+        tracker.register_outbound(h, "0x02", message_id=2)
+
+        hits = tracker.observe_duplicate(_record(packet_hash=h))
+
+        assert {
+            (hit["companion_hash"], hit["message_id"])
+            for hit in hits
+        } == {("0x01", 1), ("0x02", 2)}
+
+    def test_same_companion_mixed_direction_hash_fails_closed(self):
+        tracker = CompanionCorrelationTracker(ttl_seconds=300)
+        h = "7777777777777777"
+        tracker.register_inbound(h, _HASH, message_id=1)
+        tracker.register_outbound(h, _HASH, message_id=2)
+
+        assert tracker.observe_duplicate(_record(packet_hash=h)) == []
 
 
 class TestTrackerTTLAndEviction:
@@ -205,10 +314,16 @@ class TestJournalMessageReception:
     def test_record_message_reception_shapes_event(self, tmp_path):
         handler = _handler(tmp_path)
         journal = CompanionEventJournal(handler, _HASH)
+        packet_hash = "ABCDEF0123456789"
+        assert handler.companion_push_message(
+            _HASH,
+            {"packet_hash": packet_hash, "text": "stored"},
+        )
+        message_id = handler.companion_get_message_id(_HASH, packet_hash)
 
         correlation = {
-            "message_id": 7,
-            "packet_hash": "ABCDEF0123456789",
+            "message_id": message_id,
+            "packet_hash": packet_hash,
             "path": ["11", "22"],
             "rssi": -80,
             "snr": 2.5,
@@ -225,7 +340,7 @@ class TestJournalMessageReception:
         assert events[0]["packet_hash"] == "ABCDEF0123456789"
         data = events[0]["payload"]
         assert data == {
-            "message_id": 7,
+            "message_id": message_id,
             "packet_hash": "ABCDEF0123456789",
             "path": ["11", "22"],
             "rssi": -80,
@@ -273,12 +388,30 @@ class TestJournalRfReception:
 
 
 class TestJournalSendState:
-    def test_record_send_state_shapes_event(self, tmp_path):
+    def test_null_message_id_is_rejected_without_an_event(self, tmp_path):
         handler = _handler(tmp_path)
         journal = CompanionEventJournal(handler, _HASH)
 
+        with pytest.raises(ValueError, match="durable message_id"):
+            journal.record_send_state({"message_id": None})
+
+        assert handler.companion_get_events(_HASH, 0) == []
+
+    def test_record_send_state_shapes_event(self, tmp_path):
+        handler = _handler(tmp_path)
+        journal = CompanionEventJournal(handler, _HASH)
+        stored = journal.store_outbound_message(
+            {
+                "packet_hash": "1234567890ABCDEF",
+                "recipient_key": b"\x22" * 32,
+                "text": "stored",
+            },
+            "frame",
+            "transmitted",
+        )
+
         correlation = {
-            "message_id": None,
+            "message_id": stored["message_id"],
             "packet_hash": "1234567890ABCDEF",
             "path": ["33"],
             "terminal_hash": "33",
@@ -291,15 +424,92 @@ class TestJournalSendState:
         seq = journal.record_send_state(correlation)
         assert seq is not None
 
-        events = handler.companion_get_events(_HASH, 0)
+        events = [
+            event
+            for event in handler.companion_get_events(_HASH, 0)
+            if event["event_type"] == "message_send_state"
+        ]
         assert len(events) == 1
         assert events[0]["event_type"] == "message_send_state"
         data = events[0]["payload"]
         assert data["state"] == "heard_repeated"
-        assert data["message_id"] is None
+        assert data["message_id"] == stored["message_id"]
         assert data["terminal_repeater_hash"] == "33"
         assert data["heard_repeat_count"] == 2
         assert data["unique_repeater_count"] == 1
+
+    def test_durable_heard_repeat_advances_row_and_journals_rf_detail(self, tmp_path):
+        handler = _handler(tmp_path)
+        journal = CompanionEventJournal(handler, _HASH)
+        stored = journal.store_outbound_message(
+            {
+                "packet_hash": "1234567890ABCDEF" + "00" * 24,
+                "recipient_key": b"\x22" * 32,
+                "text": "hello",
+            },
+            "frame",
+            "transmitted",
+        )
+        correlation = {
+            "message_id": stored["message_id"],
+            "packet_hash": "1234567890ABCDEF",
+            "path": ["11", "22"],
+            "terminal_hash": "22",
+            "rssi": -71,
+            "snr": 2.5,
+            "observed_at": 789.0,
+            "heard_repeat_count": 1,
+            "unique_repeater_count": 1,
+        }
+
+        result = journal.record_outbound_heard_repeat(correlation)
+
+        assert result["message"]["state"] == "heard_repeated"
+        # The 16-char observation key must not truncate durable send history.
+        assert result["message"]["packet_hash"] == "1234567890ABCDEF" + "00" * 24
+        events = handler.companion_get_events(_HASH, 0)
+        send_events = [
+            event
+            for event in events
+            if event["event_type"] == "message_send_state"
+        ]
+        assert len(send_events) == 1
+        assert send_events[0]["payload"] == {
+            "message_id": stored["message_id"],
+            "state": "heard_repeated",
+            "packet_hash": "1234567890ABCDEF",
+            "path": ["11", "22"],
+            "terminal_repeater_hash": "22",
+            "rssi": -71,
+            "snr": 2.5,
+            "observed_at": 789.0,
+            "heard_repeat_count": 1,
+            "unique_repeater_count": 1,
+        }
+
+    def test_heard_repeat_does_not_regress_confirmed_row(self, tmp_path):
+        handler = _handler(tmp_path)
+        journal = CompanionEventJournal(handler, _HASH)
+        stored = journal.store_outbound_message(
+            {"packet_hash": "1234567890ABCDEF", "text": "hello"},
+            "rest",
+            "transmitted",
+        )
+        journal.update_outbound_state(stored["message_id"], "confirmed")
+
+        result = journal.record_outbound_heard_repeat(
+            {
+                "message_id": stored["message_id"],
+                "packet_hash": "1234567890ABCDEF",
+                "path": [],
+                "heard_repeat_count": 1,
+                "unique_repeater_count": 0,
+            }
+        )
+
+        assert result["message"]["state"] == "confirmed"
+        assert result["event"]["payload"]["state"] == "confirmed"
+        assert result["event"]["payload"]["heard_repeat_count"] == 1
 
 
 # ===================================================================
@@ -462,6 +672,398 @@ def _daemon_with_observer_state(tmp_path, rf_reception_hashes=()):
     return daemon, sqlite_handler, journal
 
 
+@pytest.mark.asyncio
+async def test_frame_history_promotion_yields_one_durable_heard_repeat(tmp_path):
+    daemon, sqlite_handler, journal = _daemon_with_observer_state(tmp_path)
+
+    async def _inject(_packet, **_kwargs):
+        return True
+
+    bridge = RepeaterCompanionBridge(
+        LocalIdentity(),
+        _inject,
+        companion_hash=_HASH,
+        tracker=daemon.correlation_tracker,
+    )
+    RepeaterDaemon._wire_companion_history_observers(bridge, journal)
+    event = OutboundMessageEvent(
+        companion_hash=_HASH,
+        packet_hash="AB" * 32,
+        text="from frame",
+        timestamp=10,
+        is_channel=False,
+        recipient_key=b"\x02" * 32,
+        channel_idx=None,
+        txt_type=0,
+        expected_ack=None,
+        source="frame",
+        message_id=None,
+        result=True,
+    )
+
+    await bridge._record_outbound_message(event)
+
+    stored = sqlite_handler.companion_outbound_message_get_by_hash(
+        _HASH,
+        event.packet_hash,
+    )
+    assert stored is not None
+    assert len(daemon.correlation_tracker) == 1
+
+    daemon._companion_duplicate_observer(
+        _record(
+            packet_hash=event.packet_hash[:16],
+            original_path=["AA", "BB"],
+            rssi=-77,
+            snr=4.0,
+            ts=1234.0,
+        )
+    )
+
+    durable = sqlite_handler.companion_message_get_by_id(
+        _HASH,
+        stored["id"],
+    )
+    assert durable["state"] == "heard_repeated"
+    events = sqlite_handler.companion_get_events(_HASH, 0)
+    send_events = [
+        item for item in events if item["event_type"] == "message_send_state"
+    ]
+    assert len(send_events) == 1
+    assert send_events[0]["payload"] == {
+        "message_id": stored["id"],
+        "state": "heard_repeated",
+        "packet_hash": event.packet_hash[:16],
+        "path": ["AA", "BB"],
+        "terminal_repeater_hash": "BB",
+        "rssi": -77,
+        "snr": 4.0,
+        "observed_at": 1234.0,
+        "heard_repeat_count": 1,
+        "unique_repeater_count": 1,
+    }
+
+
+@pytest.mark.asyncio
+async def test_frame_operator_and_v1_sends_share_bridge_without_history_cross_attribution(
+    tmp_path,
+):
+    """All three clients can interleave on one bridge/radio without aliasing."""
+
+    daemon, sqlite_handler, journal = _daemon_with_observer_state(tmp_path)
+    injected_hashes = []
+
+    async def _inject(packet, **_kwargs):
+        # Yield inside the one shared radio boundary so the three caller
+        # contexts overlap instead of merely running one after another.
+        injected_hashes.append(packet.calculate_packet_hash().hex().upper())
+        await asyncio.sleep(0)
+        return True
+
+    bridge = RepeaterCompanionBridge(
+        LocalIdentity(),
+        _inject,
+        companion_hash=_HASH,
+        tracker=daemon.correlation_tracker,
+    )
+    assert bridge.set_channel(1, "shared", bytes(32))
+    RepeaterDaemon._wire_companion_history_observers(bridge, journal)
+
+    # v1 owns its durable row before RF; Frame and the legacy operator route
+    # are persisted by the bridge observer after RF acceptance.
+    v1_row = journal.store_outbound_message(
+        {
+            "text": "v1",
+            "timestamp": 303,
+            "is_channel": True,
+            "channel_idx": 1,
+        },
+        "rest",
+        "pending",
+    )
+
+    async def _send(source, text, timestamp, message_id=None):
+        capture = {}
+        source_context = outbound_message_source.set(source)
+        row_context = outbound_message_id.set(message_id)
+        capture_context = outbound_send_capture.set(capture)
+        try:
+            assert await bridge.send_channel_message(
+                1,
+                text,
+                timestamp=timestamp,
+            )
+            return capture["hash"]
+        finally:
+            outbound_send_capture.reset(capture_context)
+            outbound_message_id.reset(row_context)
+            outbound_message_source.reset(source_context)
+
+    frame_hash, operator_hash, v1_hash = await asyncio.gather(
+        _send("frame", "frame", 101),
+        _send("operator", "operator", 202),
+        _send("rest", "v1", 303, v1_row["message_id"]),
+    )
+    assert len(injected_hashes) == 3
+    assert len({frame_hash, operator_hash, v1_hash}) == 3
+
+    journal.update_outbound_state(
+        v1_row["message_id"],
+        "transmitted",
+        v1_hash,
+    )
+    messages = {
+        message["text"]: message
+        for message in sqlite_handler.companion_get_messages(_HASH)
+    }
+    assert {
+        text: (messages[text]["source"], messages[text]["packet_hash"])
+        for text in ("frame", "operator", "v1")
+    } == {
+        "frame": ("frame", frame_hash),
+        "operator": ("operator", operator_hash),
+        "v1": ("rest", v1_hash),
+    }
+
+    for terminal, (text, packet_hash) in enumerate(
+        (
+            ("frame", frame_hash),
+            ("operator", operator_hash),
+            ("v1", v1_hash),
+        ),
+        start=1,
+    ):
+        daemon._companion_duplicate_observer(
+            _record(
+                packet_hash=packet_hash[:16],
+                original_path=[f"{terminal:02X}"],
+                ts=1000.0 + terminal,
+            )
+        )
+        messages[text] = sqlite_handler.companion_message_get_by_id(
+            _HASH,
+            messages[text]["id"],
+        )
+
+    assert {
+        text: messages[text]["state"]
+        for text in ("frame", "operator", "v1")
+    } == {
+        "frame": "heard_repeated",
+        "operator": "heard_repeated",
+        "v1": "heard_repeated",
+    }
+    heard_events = [
+        event
+        for event in sqlite_handler.companion_get_events(_HASH, 0)
+        if event["event_type"] == "message_send_state"
+        and event["payload"]["state"] == "heard_repeated"
+    ]
+    assert {
+        event["payload"]["message_id"] for event in heard_events
+    } == {
+        messages["frame"]["id"],
+        messages["operator"]["id"],
+        messages["v1"]["id"],
+    }
+
+
+@pytest.mark.asyncio
+async def test_outbound_repeat_during_blocked_store_drains_with_durable_id(
+    tmp_path,
+):
+    daemon, sqlite_handler, journal = _daemon_with_observer_state(tmp_path)
+
+    async def _inject(_packet, **_kwargs):
+        return True
+
+    bridge = RepeaterCompanionBridge(
+        LocalIdentity(),
+        _inject,
+        companion_hash=_HASH,
+        tracker=daemon.correlation_tracker,
+    )
+    store_started = threading.Event()
+    release_store = threading.Event()
+    real_store = journal.store_outbound_message
+
+    def _blocked_store(*args):
+        store_started.set()
+        assert release_store.wait(timeout=2)
+        return real_store(*args)
+
+    journal.store_outbound_message = _blocked_store
+    RepeaterDaemon._wire_companion_history_observers(bridge, journal)
+    event = OutboundMessageEvent(
+        companion_hash=_HASH,
+        packet_hash="BC" * 32,
+        text="racing frame send",
+        timestamp=10,
+        is_channel=False,
+        recipient_key=b"\x03" * 32,
+        channel_idx=None,
+        txt_type=0,
+        expected_ack=None,
+        source="frame",
+        message_id=None,
+        result=True,
+    )
+
+    send_task = asyncio.create_task(bridge._record_outbound_message(event))
+    try:
+        assert await asyncio.to_thread(store_started.wait, 2)
+        daemon._companion_duplicate_observer(
+            _record(
+                packet_hash=event.packet_hash[:16],
+                original_path=["AA"],
+                ts=321.0,
+            )
+        )
+        daemon._companion_duplicate_observer(
+            _record(
+                packet_hash=event.packet_hash[:16],
+                original_path=["BB"],
+                ts=322.0,
+            )
+        )
+        assert sqlite_handler.companion_get_events(_HASH, 0) == []
+    finally:
+        release_store.set()
+    await send_task
+
+    stored = sqlite_handler.companion_outbound_message_get_by_hash(
+        _HASH,
+        event.packet_hash,
+    )
+    assert stored["state"] == "heard_repeated"
+    events = sqlite_handler.companion_get_events(_HASH, 0)
+    assert [item["event_type"] for item in events] == [
+        "message",
+        "message_send_state",
+    ]
+    assert events[1]["payload"]["message_id"] == stored["id"]
+    assert events[1]["payload"]["message_id"] is not None
+    assert events[1]["payload"]["heard_repeat_count"] == 2
+    assert events[1]["payload"]["unique_repeater_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_cancelled_outbound_history_waits_for_commit_and_promotes_tracker(
+    tmp_path,
+):
+    daemon, sqlite_handler, journal = _daemon_with_observer_state(tmp_path)
+
+    async def _inject(_packet, **_kwargs):
+        return True
+
+    bridge = RepeaterCompanionBridge(
+        LocalIdentity(),
+        _inject,
+        companion_hash=_HASH,
+        tracker=daemon.correlation_tracker,
+    )
+    store_started = threading.Event()
+    release_store = threading.Event()
+    real_store = journal.store_outbound_message
+
+    def _blocked_store(*args):
+        store_started.set()
+        assert release_store.wait(timeout=2)
+        return real_store(*args)
+
+    journal.store_outbound_message = _blocked_store
+    RepeaterDaemon._wire_companion_history_observers(bridge, journal)
+    token = daemon.correlation_tracker.new_registration_token()
+    packet_hash = "D1" * 32
+    daemon.correlation_tracker.register_outbound(
+        packet_hash,
+        _HASH,
+        registration_token=token,
+    )
+    event = OutboundMessageEvent(
+        companion_hash=_HASH,
+        packet_hash=packet_hash,
+        text="cancel after RF",
+        timestamp=10,
+        is_channel=True,
+        recipient_key=None,
+        channel_idx=1,
+        txt_type=0,
+        expected_ack=None,
+        source="frame",
+        message_id=None,
+        result=True,
+        correlation_token=token,
+    )
+
+    task = asyncio.create_task(bridge._record_outbound_message(event))
+    assert await asyncio.to_thread(store_started.wait, 2)
+    task.cancel()
+    await asyncio.sleep(0)
+    assert not task.done()
+    release_store.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    stored = sqlite_handler.companion_outbound_message_get_by_hash(
+        _HASH,
+        packet_hash,
+    )
+    assert stored is not None
+    hit = daemon.correlation_tracker.observe_duplicate(
+        _record(packet_hash=packet_hash[:16], original_path=["AA"])
+    )
+    assert len(hit) == 1
+    assert hit[0]["message_id"] == stored["id"]
+
+
+@pytest.mark.asyncio
+async def test_operator_ack_timeout_retains_transmitted_history_and_correlation(
+    tmp_path,
+):
+    daemon, sqlite_handler, journal = _daemon_with_observer_state(tmp_path)
+
+    async def _accepted_then_timed_out(_packet, **_kwargs):
+        injected_tx_outcome.get()["accepted"] = True
+        return False
+
+    bridge = RepeaterCompanionBridge(
+        LocalIdentity(),
+        _accepted_then_timed_out,
+        companion_hash=_HASH,
+        tracker=daemon.correlation_tracker,
+    )
+    peer_key = LocalIdentity().get_public_key()
+    assert bridge.contacts.add(
+        Contact(public_key=peer_key, name="peer", adv_type=1)
+    )
+    RepeaterDaemon._wire_companion_history_observers(bridge, journal)
+
+    source_context = outbound_message_source.set("operator")
+    try:
+        result = await bridge.send_text_message(
+            peer_key,
+            "ACK timed out",
+            wait_for_ack=True,
+        )
+    finally:
+        outbound_message_source.reset(source_context)
+
+    assert result.success is False
+    messages = sqlite_handler.companion_get_messages(_HASH)
+    assert len(messages) == 1
+    assert messages[0]["source"] == "operator"
+    assert messages[0]["state"] == "transmitted"
+    hit = daemon.correlation_tracker.observe_duplicate(
+        _record(
+            packet_hash=messages[0]["packet_hash"][:16],
+            original_path=["AA"],
+        )
+    )
+    assert len(hit) == 1
+    assert hit[0]["message_id"] == messages[0]["id"]
+
+
 class TestRfReceptionWriteGate:
     def test_flag_off_by_default_no_rf_reception_journaled(self, tmp_path):
         daemon, sqlite_handler, journal = _daemon_with_observer_state(tmp_path)
@@ -473,12 +1075,88 @@ class TestRfReceptionWriteGate:
     def test_flag_off_correlation_hits_still_work(self, tmp_path):
         daemon, sqlite_handler, journal = _daemon_with_observer_state(tmp_path)
         h = "2222222222222222"
-        daemon.correlation_tracker.register_inbound(h, _HASH, message_id=9)
+        assert sqlite_handler.companion_push_message(
+            _HASH,
+            {"packet_hash": h, "text": "stored"},
+        )
+        message_id = sqlite_handler.companion_get_message_id(_HASH, h)
+        daemon.correlation_tracker.register_inbound(
+            h,
+            _HASH,
+            message_id=message_id,
+        )
 
         daemon._companion_duplicate_observer(_record(packet_hash=h, original_path=["11"]))
 
         events = sqlite_handler.companion_get_events(_HASH, 0)
         assert [e["event_type"] for e in events] == ["message_reception"]
+
+    def test_failed_correlation_commit_is_retried_before_pending_is_cleared(
+        self,
+        tmp_path,
+    ):
+        daemon, sqlite_handler, journal = _daemon_with_observer_state(tmp_path)
+        stored = journal.store_inbound_message(
+            {
+                "packet_hash": "2323232323232323",
+                "text": "retry evidence",
+            },
+            10,
+        )
+        daemon.correlation_tracker.register_inbound(
+            "2323232323232323",
+            _HASH,
+            message_id=stored["message_id"],
+        )
+        real_record = journal.record_inbound_reception
+        attempts = 0
+
+        def _fail_once(hit):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("temporary storage failure")
+            return real_record(hit)
+
+        journal.record_inbound_reception = _fail_once
+        daemon._companion_duplicate_observer(
+            _record(
+                packet_hash="2323232323232323",
+                original_path=["11"],
+            )
+        )
+        daemon._companion_duplicate_observer(
+            _record(
+                packet_hash="2323232323232323",
+                original_path=["22"],
+            )
+        )
+
+        message = sqlite_handler.companion_message_get_by_id(
+            _HASH,
+            stored["message_id"],
+        )
+        assert attempts == 2
+        assert message["observation_count"] == 3
+        reception_events = [
+            event
+            for event in sqlite_handler.companion_get_events(_HASH, 0)
+            if event["event_type"] == "message_reception"
+        ]
+        assert len(reception_events) == 1
+        assert reception_events[0]["payload"]["observation_count"] == 3
+
+    def test_transient_outbound_hit_does_not_emit_null_id_event(self, tmp_path):
+        daemon, sqlite_handler, journal = _daemon_with_observer_state(tmp_path)
+        h = "2121212121212121"
+        daemon.correlation_tracker.register_outbound(h, _HASH)
+
+        daemon._companion_duplicate_observer(
+            _record(packet_hash=h, original_path=["11"])
+        )
+
+        events = sqlite_handler.companion_get_events(_HASH, 0)
+        assert events == []
 
     def test_flag_on_uncorrelated_duplicate_journals_rf_reception(self, tmp_path):
         daemon, sqlite_handler, journal = _daemon_with_observer_state(
@@ -499,7 +1177,16 @@ class TestRfReceptionWriteGate:
             tmp_path, rf_reception_hashes=(_HASH,)
         )
         h = "4444444444444444"
-        daemon.correlation_tracker.register_inbound(h, _HASH, message_id=3)
+        assert sqlite_handler.companion_push_message(
+            _HASH,
+            {"packet_hash": h, "text": "stored"},
+        )
+        message_id = sqlite_handler.companion_get_message_id(_HASH, h)
+        daemon.correlation_tracker.register_inbound(
+            h,
+            _HASH,
+            message_id=message_id,
+        )
 
         daemon._companion_duplicate_observer(_record(packet_hash=h, original_path=["cc"]))
 
@@ -531,10 +1218,11 @@ def _frame_server_with_tracker(handler, journal, tracker):
     class _FakeMessageQueue:
         def __init__(self):
             self.max_size = 10
-            self.popped = 0
+            self.removed = []
 
-        def pop_last(self):
-            self.popped += 1
+        def remove(self, entry):
+            self.removed.append(entry)
+            return True
 
     class _FakeBridge:
         def __init__(self):
@@ -551,7 +1239,7 @@ class TestFrameServerInboundRegistration:
         fs = _frame_server_with_tracker(handler, journal=None, tracker=tracker)
 
         msg = {"text": "hi", "packet_hash": "AB" * 8 + "00" * 24, "timestamp": 1}
-        asyncio.run(fs._persist_companion_message(msg))
+        asyncio.run(fs._persist_companion_message(msg, object()))
 
         message_id = handler.companion_get_message_id(_HASH, msg["packet_hash"])
         assert message_id is not None
@@ -560,12 +1248,225 @@ class TestFrameServerInboundRegistration:
         assert len(hits) == 1
         assert hits[0]["message_id"] == message_id
 
+    @pytest.mark.asyncio
+    async def test_duplicate_during_blocked_store_drains_with_durable_id(
+        self,
+        tmp_path,
+    ):
+        handler = _handler(tmp_path)
+        tracker = CompanionCorrelationTracker(ttl_seconds=300)
+        journal = CompanionEventJournal(handler, _HASH)
+        fs = _frame_server_with_tracker(handler, journal, tracker)
+        daemon = RepeaterDaemon(
+            {"repeater": {"node_name": "n"}, "logging": {}},
+            radio=object(),
+        )
+        daemon.repeater_handler = SimpleNamespace(
+            storage=SimpleNamespace(sqlite_handler=handler)
+        )
+        daemon.correlation_tracker = tracker
+        daemon.companion_journals[_HASH] = journal
+
+        store_started = threading.Event()
+        release_store = threading.Event()
+        real_store = journal.store_inbound_message
+
+        def _blocked_store(*args):
+            store_started.set()
+            assert release_store.wait(timeout=2)
+            return real_store(*args)
+
+        journal.store_inbound_message = _blocked_store
+        msg = {
+            "text": "racing receive",
+            "packet_hash": "CD" * 8 + "00" * 24,
+            "timestamp": 1,
+        }
+        persist_task = asyncio.create_task(
+            fs._persist_companion_message(msg, object())
+        )
+        try:
+            assert await asyncio.to_thread(store_started.wait, 2)
+            daemon._companion_duplicate_observer(
+                _record(
+                    packet_hash=msg["packet_hash"][:16],
+                    original_path=["11", "22"],
+                    ts=654.0,
+                )
+            )
+            daemon._companion_duplicate_observer(
+                _record(
+                    packet_hash=msg["packet_hash"][:16],
+                    original_path=["33"],
+                    ts=655.0,
+                )
+            )
+            assert handler.companion_get_events(_HASH, 0) == []
+        finally:
+            release_store.set()
+        await persist_task
+
+        message_id = handler.companion_get_message_id(
+            _HASH,
+            msg["packet_hash"],
+        )
+        message = handler.companion_message_get_by_id(_HASH, message_id)
+        assert message["observation_count"] == 3
+        assert message["unique_path_count"] == 3
+        events = handler.companion_get_events(_HASH, 0)
+        assert [event["event_type"] for event in events] == [
+            "message",
+            "message_reception",
+        ]
+        assert events[1]["payload"]["message_id"] == message_id
+        assert events[1]["payload"]["message_id"] is not None
+        assert events[1]["payload"]["observation_count"] == 3
+        assert events[1]["payload"]["unique_path_count"] == 3
+
+    @pytest.mark.asyncio
+    async def test_cancelled_inbound_store_finishes_commit_and_reconciliation(
+        self,
+        tmp_path,
+    ):
+        handler = _handler(tmp_path)
+        tracker = CompanionCorrelationTracker(ttl_seconds=300)
+        journal = CompanionEventJournal(handler, _HASH)
+        fs = _frame_server_with_tracker(handler, journal, tracker)
+        store_started = threading.Event()
+        release_store = threading.Event()
+        real_store = journal.store_inbound_message
+
+        def _blocked_store(*args):
+            store_started.set()
+            assert release_store.wait(timeout=2)
+            return real_store(*args)
+
+        journal.store_inbound_message = _blocked_store
+        msg = {
+            "text": "cancelled caller",
+            "packet_hash": "CE" * 8,
+            "timestamp": 1,
+        }
+        queue_entry = object()
+        task = asyncio.create_task(
+            fs._persist_companion_message(msg, queue_entry)
+        )
+        assert await asyncio.to_thread(store_started.wait, 2)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        release_store.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        message_id = handler.companion_get_message_id(
+            _HASH,
+            msg["packet_hash"],
+        )
+        assert message_id is not None
+        assert fs.bridge.message_queue.removed == [queue_entry]
+        hit = tracker.observe_duplicate(
+            _record(packet_hash=msg["packet_hash"], original_path=["AA"])
+        )
+        assert len(hit) == 1
+        assert hit[0]["message_id"] == message_id
+
+    def test_storage_failure_discards_provisional_registration(self, tmp_path):
+        handler = _handler(tmp_path)
+        tracker = CompanionCorrelationTracker(ttl_seconds=300)
+        journal = MagicMock()
+        journal.store_inbound_message.side_effect = RuntimeError("disk failed")
+        fs = _frame_server_with_tracker(handler, journal, tracker)
+
+        with pytest.raises(RuntimeError, match="disk failed"):
+            asyncio.run(
+                fs._persist_companion_message(
+                    {
+                        "text": "not stored",
+                        "packet_hash": "DE" * 8,
+                        "timestamp": 1,
+                    },
+                    object(),
+                )
+            )
+
+        assert len(tracker) == 0
+
+    def test_dedup_non_insert_rebinds_one_durable_entry_and_counts_reception(
+        self,
+        tmp_path,
+    ):
+        handler = _handler(tmp_path)
+        tracker = CompanionCorrelationTracker(ttl_seconds=300)
+        journal = CompanionEventJournal(handler, _HASH)
+        fs = _frame_server_with_tracker(handler, journal, tracker)
+        msg = {
+            "text": "one durable row",
+            "packet_hash": "EF" * 8,
+            "timestamp": 1,
+        }
+
+        asyncio.run(fs._persist_companion_message(msg, object()))
+        assert len(tracker) == 1
+        asyncio.run(fs._persist_companion_message(msg, object()))
+
+        assert len(tracker) == 1
+        messages = handler.companion_get_messages(_HASH)
+        assert len(messages) == 1
+        assert messages[0]["observation_count"] == 2
+        hit = tracker.observe_duplicate(
+            _record(packet_hash=msg["packet_hash"], original_path=["AA"])
+        )
+        assert len(hit) == 1
+        assert hit[0]["message_id"] == messages[0]["id"]
+        assert hit[0]["observation_count"] == 3
+
+    def test_cold_dedup_rebind_seeds_counts_from_durable_history(self, tmp_path):
+        handler = _handler(tmp_path)
+        journal = CompanionEventJournal(handler, _HASH)
+        msg = {
+            "text": "survives restart",
+            "packet_hash": "F1" * 8,
+            "timestamp": 1,
+        }
+        stored = journal.store_inbound_message(msg, 10)
+        handler.companion_record_inbound_reception(
+            _HASH,
+            stored["message_id"],
+            {
+                "packet_hash": msg["packet_hash"],
+                "path": ["11"],
+                "observation_count": 4,
+                "unique_path_count": 3,
+            },
+        )
+
+        # A new process has no hot tracker entry, but SQLite still deduplicates
+        # the first post-restart reception to the existing logical row.
+        tracker = CompanionCorrelationTracker(ttl_seconds=300)
+        fs = _frame_server_with_tracker(handler, journal, tracker)
+        asyncio.run(fs._persist_companion_message(msg, object()))
+
+        message = handler.companion_message_get_by_id(
+            _HASH,
+            stored["message_id"],
+        )
+        assert message["observation_count"] == 5
+        assert message["unique_path_count"] == 3
+        assert len(tracker) == 1
+        next_hit = tracker.observe_duplicate(
+            _record(packet_hash=msg["packet_hash"], original_path=["22"])
+        )
+        assert len(next_hit) == 1
+        assert next_hit[0]["message_id"] == stored["message_id"]
+        assert next_hit[0]["observation_count"] == 6
+
     def test_missing_packet_hash_skips_registration(self, tmp_path):
         handler = _handler(tmp_path)
         tracker = CompanionCorrelationTracker(ttl_seconds=300)
         fs = _frame_server_with_tracker(handler, journal=None, tracker=tracker)
 
-        asyncio.run(fs._persist_companion_message({"text": "hi", "timestamp": 1}))
+        asyncio.run(fs._persist_companion_message({"text": "hi", "timestamp": 1}, object()))
         assert len(tracker) == 0
 
     def test_no_tracker_configured_does_not_error(self, tmp_path):
@@ -578,13 +1479,15 @@ class TestFrameServerInboundRegistration:
         class _FakeMessageQueue:
             max_size = 10
 
-            def pop_last(self):
-                pass
+            def remove(self, _entry):
+                return True
 
         fs.bridge = type("B", (), {"message_queue": _FakeMessageQueue()})()
 
         asyncio.run(
-            fs._persist_companion_message({"text": "hi", "packet_hash": "ph-x", "timestamp": 1})
+            fs._persist_companion_message(
+                {"text": "hi", "packet_hash": "ph-x", "timestamp": 1}, object()
+            )
         )
 
 
@@ -603,7 +1506,7 @@ async def _fail_injector(pkt, wait_for_ack=False, expected_crc=None):
 
 class TestBridgeOutboundRegistration:
     @pytest.mark.asyncio
-    async def test_send_packet_registers_outbound_with_tracker(self):
+    async def test_non_message_packet_is_not_registered_as_chat(self):
         tracker = CompanionCorrelationTracker(ttl_seconds=300)
         bridge = RepeaterCompanionBridge(
             LocalIdentity(), _ok_injector, tracker=tracker, companion_hash=_HASH
@@ -615,8 +1518,35 @@ class TestBridgeOutboundRegistration:
         assert sent is True
 
         hits = tracker.observe_duplicate(_record(packet_hash=expected_hash))
+        assert hits == []
+
+    @pytest.mark.asyncio
+    async def test_semantic_message_event_registers_outbound_with_tracker(self):
+        tracker = CompanionCorrelationTracker(ttl_seconds=300)
+        bridge = RepeaterCompanionBridge(
+            LocalIdentity(), _ok_injector, tracker=tracker, companion_hash=_HASH
+        )
+        event = OutboundMessageEvent(
+            companion_hash=_HASH,
+            packet_hash="AB" * 32,
+            text="hello",
+            timestamp=1,
+            is_channel=True,
+            recipient_key=None,
+            channel_idx=1,
+            txt_type=0,
+            expected_ack=None,
+            source="frame",
+            message_id=41,
+            result=True,
+        )
+
+        await bridge._record_outbound_message(event)
+
+        hits = tracker.observe_duplicate(_record(packet_hash=event.packet_hash[:16]))
         assert len(hits) == 1
         assert hits[0]["direction"] == "out"
+        assert hits[0]["message_id"] == 41
 
     @pytest.mark.asyncio
     async def test_failed_send_does_not_register(self):
@@ -707,7 +1637,11 @@ class TestSendMessageSurfacesPacketHash:
         cherrypy.serving.request.method = "POST"
         cherrypy.serving.request.headers = {"Idempotency-Key": "idem-corr-1"}
         cherrypy.serving.request.params = {}
-        cherrypy.serving.request.user = {"username": "adam", "auth_type": "jwt"}
+        cherrypy.serving.request.user = {
+            "username": "adam",
+            "auth_type": "jwt",
+            "scope": "admin",
+        }
         cherrypy.serving.response.headers = {}
         cherrypy.serving.response.status = None
         yield
@@ -716,6 +1650,7 @@ class TestSendMessageSurfacesPacketHash:
     def test_successful_send_response_includes_truncated_packet_hash(self, tmp_path):
         from types import SimpleNamespace
 
+        from repeater.companion.journal import CompanionEventJournal
         from repeater.web.mobile_endpoints import CompanionsV1
 
         handler = _handler(tmp_path)
@@ -729,7 +1664,13 @@ class TestSendMessageSurfacesPacketHash:
             def get_public_key(self):
                 return bytes([0x01]) + b"\x22" * 31
 
-            async def send_text_message(self, pub_key, text, txt_type=0):
+            async def send_text_message(
+                self,
+                pub_key,
+                text,
+                txt_type=0,
+                wait_for_ack=False,
+            ):
                 from openhop_core.companion.models import SentResult
 
                 # Simulate what RepeaterCompanionBridge._send_packet does:
@@ -747,6 +1688,7 @@ class TestSendMessageSurfacesPacketHash:
         daemon = SimpleNamespace(
             identity_manager=identity_manager,
             companion_bridges={0x01: _FakeBridge()},
+            companion_journals={"0x01": CompanionEventJournal(handler, "0x01")},
             repeater_handler=SimpleNamespace(storage=SimpleNamespace(sqlite_handler=handler)),
         )
         endpoints = CompanionsV1(daemon_instance=daemon, config={}, event_loop=object())

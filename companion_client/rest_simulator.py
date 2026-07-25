@@ -25,8 +25,11 @@ from types import SimpleNamespace
 from typing import Optional
 
 import cherrypy
+from openhop_core.companion.models import SentResult
 
+from repeater.companion.journal import CompanionEventJournal
 from repeater.data_acquisition.sqlite_handler import SQLiteHandler
+from repeater.web.http_server import _json_error_page_v1
 from repeater.web.mobile_endpoints import MobileAPIEndpoints
 
 logger = logging.getLogger("companion_client.rest_simulator")
@@ -87,7 +90,23 @@ class RestFakeBridge:
     def __init__(self, hash_byte: int = DEFAULT_HASH_BYTE) -> None:
         self._pubkey = bytes([hash_byte]) + b"\x22" * 31
         self.prefs = SimpleNamespace(
-            node_name="TestNode", adv_type=1, latitude=47.6, longitude=-122.3
+            node_name="TestNode",
+            adv_type=1,
+            latitude=47.6,
+            longitude=-122.3,
+            autoadd_config=0,
+            autoadd_max_hops=0,
+            path_hash_mode=0,
+            rx_delay_base=0.0,
+            airtime_factor=1.0,
+            client_repeat=0,
+            manual_add_contacts=0,
+            telemetry_mode_base=0,
+            telemetry_mode_location=0,
+            telemetry_mode_environment=0,
+            advert_loc_policy=0,
+            multi_acks=0,
+            default_scope_name="",
         )
         self._channel_map = {
             0: SimpleNamespace(name="Public", secret=b"\x00" * 16),
@@ -95,6 +114,7 @@ class RestFakeBridge:
         }
         self.channels = _FakeChannels(self._channel_map)
         self.sent: list = []
+        self._login_connections: set[bytes] = set()
         self.contacts = _FakeContactStore(
             [
                 SimpleNamespace(
@@ -164,9 +184,63 @@ class RestFakeBridge:
         self.sent.append({"channel_idx": channel_idx, "text": text})
         return True
 
-    async def send_text(self, pub_key, text: str, **kwargs):
+    async def send_text_message(self, pub_key, text: str, **kwargs):
         self.sent.append({"to": bytes(pub_key).hex(), "text": text})
+        return SentResult(success=True, is_flood=True)
+
+    async def send_text(self, pub_key, text: str, **kwargs):
+        """Compatibility alias for older client-harness callers."""
+
+        return await self.send_text_message(pub_key, text, **kwargs)
+
+    async def send_login(self, pub_key, password: str):
+        key = bytes(pub_key)
+        self._login_connections.add(key)
+        self.sent.append({"login": key.hex(), "password": password})
+        return {"logged_in": True}
+
+    def has_login_connection(self, pub_key) -> bool:
+        return bytes(pub_key) in self._login_connections
+
+    async def send_logout(self, pub_key):
+        key = bytes(pub_key)
+        self._login_connections.discard(key)
+        self.sent.append({"logout": key.hex()})
         return True
+
+    async def send_status_request(self, pub_key, *, timeout: float):
+        key = bytes(pub_key)
+        self.sent.append({"status_request": key.hex(), "timeout": timeout})
+        return {"status": "ok"}
+
+    async def send_telemetry_request(
+        self,
+        pub_key,
+        *,
+        want_base: bool,
+        want_location: bool,
+        want_environment: bool,
+        timeout: float,
+    ):
+        key = bytes(pub_key)
+        self.sent.append(
+            {
+                "telemetry_request": key.hex(),
+                "want_base": want_base,
+                "want_location": want_location,
+                "want_environment": want_environment,
+                "timeout": timeout,
+            }
+        )
+        return {
+            "base": {"battery_mv": 4200} if want_base else None,
+            "location": {"latitude": 47.6, "longitude": -122.3}
+            if want_location
+            else None,
+            "environment": {"temperature_c": 20.0}
+            if want_environment
+            else None,
+        }
 
     def set_channel_entry(self, idx: int, name: Optional[str]) -> None:
         """Mutate the channel table the snapshot reads, for drift tests."""
@@ -192,6 +266,7 @@ class RestHarness:
     token_manager: object
     jwt_handler: object
     event_loop: object = None
+    event_loop_thread: Optional[threading.Thread] = None
 
     def admin_token(self, name: str = "admin-token") -> str:
         """Mint an admin-scope API token, standing in for an operator's JWT.
@@ -203,7 +278,7 @@ class RestHarness:
         return plaintext
 
 
-def start_rest_harness(
+def _start_rest_harness(
     tmp_path,
     *,
     companion_name: str = DEFAULT_COMPANION_NAME,
@@ -216,6 +291,7 @@ def start_rest_harness(
     handler = SQLiteHandler(tmp_path)
     bridge = RestFakeBridge(hash_byte)
     companion_hash = f"0x{hash_byte:02x}"
+    journal = CompanionEventJournal(handler, companion_hash)
 
     identity_manager = SimpleNamespace(
         get_identities_by_type=lambda t: (
@@ -225,11 +301,12 @@ def start_rest_harness(
     daemon = SimpleNamespace(
         identity_manager=identity_manager,
         companion_bridges={hash_byte: bridge},
+        companion_journals={companion_hash: journal},
         repeater_handler=SimpleNamespace(storage=SimpleNamespace(sqlite_handler=handler)),
     )
 
     token_manager = APITokenManager(handler, secret_key="test-secret-not-for-production")
-    jwt_handler = JWTHandler(secret="test-secret-not-for-production")
+    jwt_handler = JWTHandler(secret="test-secret-not-for-production-only")
 
     port = _free_port()
     cherrypy.config.update(
@@ -257,12 +334,38 @@ def start_rest_harness(
     thread = threading.Thread(target=loop.run_forever, daemon=True, name="rest-harness-loop")
     thread.start()
 
-    root = SimpleNamespace()
-    root.api = SimpleNamespace()
-    root.api.v1 = MobileAPIEndpoints(daemon_instance=daemon, config={}, event_loop=loop)
-
-    cherrypy.tree.mount(root, "/", {"/": {"request.dispatch": cherrypy.dispatch.Dispatcher()}})
-    cherrypy.engine.start()
+    try:
+        root = SimpleNamespace()
+        root.api = SimpleNamespace()
+        root.api.v1 = MobileAPIEndpoints(
+            daemon_instance=daemon,
+            config={
+                "mobile_api": {
+                    "rf_burst": 1_000,
+                    "rf_per_minute": 1_000,
+                    "rf_global_burst": 1_000,
+                    "rf_global_per_minute": 1_000,
+                }
+            },
+            event_loop=loop,
+        )
+        cherrypy.tree.mount(
+            root,
+            "/",
+            {
+                "/": {"request.dispatch": cherrypy.dispatch.Dispatcher()},
+                "/api/v1": {"error_page.default": _json_error_page_v1},
+            },
+        )
+        cherrypy.engine.start()
+    except Exception:
+        cherrypy.engine.exit()
+        cherrypy.tree.apps.clear()
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=5)
+        if not thread.is_alive():
+            loop.close()
+        raise
 
     return RestHarness(
         base_url=f"http://127.0.0.1:{port}",
@@ -273,14 +376,79 @@ def start_rest_harness(
         token_manager=token_manager,
         jwt_handler=jwt_handler,
         event_loop=loop,
+        event_loop_thread=thread,
     )
 
 
+_HARNESS_STARTING = object()
+_harness_lock = threading.Lock()
+_active_harness: object = None
+
+
+def start_rest_harness(
+    tmp_path,
+    *,
+    companion_name: str = DEFAULT_COMPANION_NAME,
+    hash_byte: int = DEFAULT_HASH_BYTE,
+) -> RestHarness:
+    """Start the one process-global CherryPy harness allowed at a time."""
+
+    global _active_harness
+    with _harness_lock:
+        if _active_harness is not None:
+            raise RuntimeError("a REST simulator harness is already active")
+        _active_harness = _HARNESS_STARTING
+    try:
+        harness = _start_rest_harness(
+            tmp_path,
+            companion_name=companion_name,
+            hash_byte=hash_byte,
+        )
+    except Exception:
+        with _harness_lock:
+            _active_harness = None
+        raise
+    with _harness_lock:
+        _active_harness = harness
+    return harness
+
+
 def stop_rest_harness(harness: Optional[RestHarness] = None) -> None:
+    """Stop CherryPy and fully join/close the harness event loop."""
+
+    global _active_harness
+    with _harness_lock:
+        active = _active_harness
+        if harness is not None:
+            if active is None and (
+                harness.event_loop is None or harness.event_loop.is_closed()
+            ):
+                return
+            if harness is not active:
+                raise ValueError(
+                    "the supplied REST simulator harness is not active"
+                )
+            target = harness
+        elif isinstance(active, RestHarness):
+            target = active
+        elif active is _HARNESS_STARTING:
+            raise RuntimeError("the REST simulator harness is still starting")
+        else:
+            return
+
     cherrypy.engine.exit()
     cherrypy.tree.apps.clear()
-    if harness is not None and harness.event_loop is not None:
-        harness.event_loop.call_soon_threadsafe(harness.event_loop.stop)
-
-
-_lock = threading.Lock()
+    if target is not None and target.event_loop is not None:
+        loop = target.event_loop
+        thread = target.event_loop_thread
+        if loop.is_running():
+            loop.call_soon_threadsafe(loop.stop)
+        if thread is not None:
+            thread.join(timeout=5)
+            if thread.is_alive():
+                raise RuntimeError("REST simulator event loop did not stop")
+        if not loop.is_closed():
+            loop.close()
+    with _harness_lock:
+        if target is _active_harness:
+            _active_harness = None

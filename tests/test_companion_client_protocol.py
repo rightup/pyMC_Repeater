@@ -6,6 +6,7 @@ frame server imports, so a change on either side shows up here.
 
 from __future__ import annotations
 
+import asyncio
 import struct
 
 import pytest
@@ -20,10 +21,27 @@ from openhop_core.companion.constants import (
 )
 
 from companion_client import protocol
+from companion_client.client import (
+    CompanionClient,
+    CompanionClientError,
+    DEFAULT_PORT,
+)
 
 
 def outbound(payload: bytes) -> bytes:
     return bytes([FRAME_OUTBOUND_PREFIX]) + struct.pack("<H", len(payload)) + payload
+
+
+def test_client_default_port_matches_frame_server():
+    assert DEFAULT_PORT == 5000
+    assert CompanionClient("127.0.0.1").port == 5000
+
+
+def test_reader_loop_rejects_disconnected_state_explicitly():
+    client = CompanionClient("127.0.0.1")
+
+    with pytest.raises(CompanionClientError, match="while disconnected"):
+        asyncio.run(client._read_loop())
 
 
 # --- framing --------------------------------------------------------------
@@ -111,6 +129,16 @@ def test_direct_text_layout():
 def test_short_pubkey_prefix_is_padded():
     data = protocol.cmd_send_text(b"\x01\x02", "x", 1)[1:]
     assert data[6:12] == b"\x01\x02\x00\x00\x00\x00"
+
+
+def test_set_channel_uses_unambiguous_32_byte_hex_secret():
+    payload = protocol.cmd_set_channel(1, "#test", b"\x01" * 16)
+    data = payload[1:]
+
+    assert len(data) == 1 + 32 + 64
+    assert bytes.fromhex(data[33:97].decode("ascii")) == (
+        b"\x01" * 16 + b"\x00" * 16
+    )
 
 
 # --- response parsing -----------------------------------------------------

@@ -135,6 +135,16 @@ class TestListeners:
 
         assert received[0]["packet_hash"] is None
 
+    def test_registering_the_same_listener_twice_notifies_it_once(self, tmp_path):
+        journal = _journal(tmp_path)
+        received = []
+        journal.register_listener(received.append)
+        journal.register_listener(received.append)
+
+        journal.record_message({"text": "once"})
+
+        assert len(received) == 1
+
     def test_unregister_listener_stops_future_notifications(self, tmp_path):
         journal = _journal(tmp_path)
         received = []
@@ -211,10 +221,11 @@ def _frame_server(handler, journal):
     class _FakeMessageQueue:
         def __init__(self):
             self.max_size = 10
-            self.popped = 0
+            self.removed = []
 
-        def pop_last(self):
-            self.popped += 1
+        def remove(self, entry):
+            self.removed.append(entry)
+            return True
 
     class _FakeBridge:
         def __init__(self):
@@ -231,13 +242,14 @@ class TestFrameServerMessageJournaling:
         fs = _frame_server(handler, journal)
 
         msg = {"text": "hello", "packet_hash": "ph-1", "timestamp": 1}
-        asyncio.run(fs._persist_companion_message(msg))
+        queue_entry = object()
+        asyncio.run(fs._persist_companion_message(msg, queue_entry))
 
         events = handler.companion_get_events(_HASH, 0)
         assert len(events) == 1
         assert events[0]["event_type"] == "message"
         assert events[0]["packet_hash"] == "ph-1"
-        assert fs.bridge.message_queue.popped == 1
+        assert fs.bridge.message_queue.removed == [queue_entry]
 
     def test_duplicate_push_does_not_journal_a_second_event(self, tmp_path):
         handler = _handler(tmp_path)
@@ -245,23 +257,31 @@ class TestFrameServerMessageJournaling:
         fs = _frame_server(handler, journal)
 
         msg = {"text": "hello", "packet_hash": "dup-hash", "timestamp": 1}
-        asyncio.run(fs._persist_companion_message(msg))
-        # Same packet_hash: companion_push_message dedups (INSERT OR IGNORE),
-        # returns False, so the message must not be journaled again.
-        asyncio.run(fs._persist_companion_message(msg))
+        first_entry = object()
+        second_entry = object()
+        asyncio.run(fs._persist_companion_message(msg, first_entry))
+        # Same packet_hash: atomic storage deduplicates it, so the message must
+        # not be journaled again.
+        asyncio.run(fs._persist_companion_message(msg, second_entry))
 
         events = handler.companion_get_events(_HASH, 0)
         assert len(events) == 1
-        # First call pops (persisted); second call does not (rejected as dup).
-        assert fs.bridge.message_queue.popped == 1
+        # Both in-memory copies are removed: the second is already durable and
+        # must not be delivered to the frame client twice.
+        assert fs.bridge.message_queue.removed == [first_entry, second_entry]
 
     def test_no_journal_configured_does_not_error(self, tmp_path):
         handler = _handler(tmp_path)
         fs = _frame_server(handler, journal=None)
 
-        asyncio.run(fs._persist_companion_message({"text": "hello", "packet_hash": "ph-2"}))
+        queue_entry = object()
+        asyncio.run(
+            fs._persist_companion_message(
+                {"text": "hello", "packet_hash": "ph-2"}, queue_entry
+            )
+        )
 
-        assert fs.bridge.message_queue.popped == 1
+        assert fs.bridge.message_queue.removed == [queue_entry]
 
 
 class TestFrameServerContactJournaling:

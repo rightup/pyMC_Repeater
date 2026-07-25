@@ -1,29 +1,35 @@
 """A stand-in relay that captures what the push notifier sends.
 
-The client registers this listener's URL as its ``push_relay_url``, so the
-notifier POSTs here instead of to a real relay. That makes the whole chain
-assertable without APNs, a signing key, or a device:
+Configure the notifier with this listener's URL, then register a device push
+token. The notifier POSTs here instead of to a real relay, which makes the
+whole chain assertable without APNs, a signing key, or a device:
 
     inbound message -> journal append -> notifier debounce -> POST -> here
 
-Point ``push_relay_url`` at a real relay instead and the same client covers
-relay routing and APNs payload mapping too; this is the isolated-notifier end
-of that spectrum.
+Configure ``companion.push.relay_url`` with a real relay in production. Relay
+selection is operator-owned; paired devices cannot make the repeater request
+an arbitrary URL.
 """
 
 from __future__ import annotations
 
-import json
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
+
+from companion_client.rest import strict_json_loads
+
+MAX_PUSH_BODY_BYTES = 16 * 1024
+MAX_CAPTURED_PUSHES = 256
 
 
 @dataclass
 class CapturedPush:
     body: dict
+    sequence: int
     received_at: float = field(default_factory=time.time)
 
     @property
@@ -48,24 +54,53 @@ class PushListener:
 
     def __init__(self, host: str = "127.0.0.1", port: int = 0, status: int = 200) -> None:
         self.status = status
-        self.pushes: list[CapturedPush] = []
+        self.pushes: deque[CapturedPush] = deque(maxlen=MAX_CAPTURED_PUSHES)
+        self._push_sequence = 0
         self._lock = threading.Lock()
         self._condition = threading.Condition(self._lock)
 
         listener = self
 
         class _Handler(BaseHTTPRequestHandler):
-            def do_POST(self):  # noqa: N802 - stdlib naming
-                length = int(self.headers.get("Content-Length") or 0)
-                raw = self.rfile.read(length) if length else b""
-                try:
-                    body = json.loads(raw.decode("utf-8"))
-                except Exception:
-                    body = {"_unparseable": raw.decode("utf-8", errors="replace")}
-                listener._record(body)
-                self.send_response(listener.status)
+            def _send_empty(self, status: int) -> None:
+                self.send_response(status)
                 self.send_header("Content-Length", "0")
                 self.end_headers()
+
+            def do_POST(self):
+                raw_length = self.headers.get("Content-Length")
+                if raw_length is None:
+                    self.close_connection = True
+                    self._send_empty(411)
+                    return
+                try:
+                    if not raw_length.isdecimal():
+                        raise ValueError
+                    length = int(raw_length)
+                except (TypeError, ValueError, OverflowError):
+                    self.close_connection = True
+                    self._send_empty(400)
+                    return
+                if length > MAX_PUSH_BODY_BYTES:
+                    self.close_connection = True
+                    self._send_empty(413)
+                    return
+
+                raw = self.rfile.read(length)
+                if len(raw) != length:
+                    self.close_connection = True
+                    self._send_empty(400)
+                    return
+                try:
+                    body = strict_json_loads(raw)
+                except (UnicodeDecodeError, ValueError, RecursionError):
+                    self._send_empty(400)
+                    return
+                if not isinstance(body, dict):
+                    self._send_empty(400)
+                    return
+                listener._record(body)
+                self._send_empty(listener.status)
 
             def log_message(self, *args):
                 pass  # keep pytest output clean
@@ -77,8 +112,18 @@ class PushListener:
 
     def _record(self, body: dict) -> None:
         with self._condition:
-            self.pushes.append(CapturedPush(body))
+            self._push_sequence += 1
+            self.pushes.append(CapturedPush(body, self._push_sequence))
             self._condition.notify_all()
+
+    def captured_after(self, sequence: int) -> tuple[int, list[CapturedPush]]:
+        """Return retained pushes newer than one monotonic capture sequence."""
+
+        with self._lock:
+            return (
+                self._push_sequence,
+                [push for push in self.pushes if push.sequence > sequence],
+            )
 
     def start(self) -> PushListener:
         self._thread.start()
@@ -99,6 +144,10 @@ class PushListener:
 
     def wait_for_push(self, count: int = 1, timeout: float = 5.0) -> bool:
         """Block until at least ``count`` pushes have arrived."""
+        if type(count) is not int or not 1 <= count <= MAX_CAPTURED_PUSHES:
+            raise ValueError(
+                f"count must be an integer between 1 and {MAX_CAPTURED_PUSHES}"
+            )
         deadline = time.monotonic() + timeout
         with self._condition:
             while len(self.pushes) < count:

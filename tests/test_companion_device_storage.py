@@ -14,9 +14,15 @@ import json
 import sqlite3
 import time
 
-from repeater.data_acquisition.sqlite_handler import SQLiteHandler
+import pytest
+
+from repeater.data_acquisition.sqlite_handler import (
+    CompanionStorageError,
+    SQLiteHandler,
+)
 
 _HASH = "0x01"
+_IDENTITY = "01" * 32
 _MIGRATION = "add_companion_devices_and_idempotency"
 
 
@@ -254,6 +260,32 @@ def test_device_get_by_token(tmp_path):
     assert h.companion_device_get_by_token(999999) is None
 
 
+def test_strict_device_lookup_rejects_duplicate_token_rows(tmp_path):
+    h = _handler(tmp_path)
+    token_id = h.create_api_token("t", "hash-duplicate-token")
+    h.companion_device_create(
+        _HASH,
+        "device-a",
+        "Phone A",
+        token_id,
+        companion_identity=_IDENTITY,
+    )
+    with h._connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO companion_devices
+                (companion_hash, companion_identity, device_id, name,
+                 token_id, created_at)
+            VALUES (?, ?, 'device-b', 'Phone B', ?, ?)
+            """,
+            (_HASH, _IDENTITY, token_id, time.time()),
+        )
+        conn.commit()
+
+    with pytest.raises(CompanionStorageError, match="multiple paired-device bindings"):
+        h.companion_device_get_by_token_strict(token_id)
+
+
 def test_device_list_all_and_filtered_by_companion_hash(tmp_path):
     h = _handler(tmp_path)
     t1 = h.create_api_token("t1", "hash-4")
@@ -407,7 +439,14 @@ _PUSH_MIGRATION = "add_companion_device_push_detail"
 
 def _device_with_token(h, device_id="push-dev", token_hash="hash-push"):
     token_id = h.create_api_token("t", token_hash)
-    h.companion_device_create(_HASH, device_id, "Phone", token_id, platform="ios")
+    h.companion_device_create(
+        _HASH,
+        device_id,
+        "Phone",
+        token_id,
+        platform="ios",
+        companion_identity=_IDENTITY,
+    )
     return device_id
 
 
@@ -457,7 +496,7 @@ def test_set_push_token_refresh_leaves_relay_and_detail(tmp_path):
     assert device["push_detail"] == "count"
 
 
-def test_clear_push_nulls_token_but_keeps_relay(tmp_path):
+def test_clear_push_nulls_token_and_legacy_relay(tmp_path):
     h = _handler(tmp_path)
     device_id = _device_with_token(h)
     h.companion_device_set_push(
@@ -467,8 +506,44 @@ def test_clear_push_nulls_token_but_keeps_relay(tmp_path):
     assert h.companion_device_clear_push(device_id) is True
     device = h.companion_device_get(device_id)
     assert device["push_token"] is None
-    assert device["push_relay_url"] == "https://relay.example/notify"
+    assert device["push_relay_url"] is None
     assert device["push_detail"] == "count"
+
+
+def test_conditional_clear_push_only_clears_the_token_it_was_given(tmp_path):
+    h = _handler(tmp_path)
+    device_id = _device_with_token(h)
+    h.companion_device_set_push(
+        device_id,
+        "tok-new",
+        push_relay_url="https://relay.example/notify",
+    )
+
+    assert (
+        h.companion_device_clear_push_if_token_strict(
+            device_id,
+            "tok-old",
+            _HASH,
+            _IDENTITY,
+        )
+        is False
+    )
+    device = h.companion_device_get(device_id)
+    assert device["push_token"] == "tok-new"
+    assert device["push_relay_url"] == "https://relay.example/notify"
+
+    assert (
+        h.companion_device_clear_push_if_token_strict(
+            device_id,
+            "tok-new",
+            _HASH,
+            _IDENTITY,
+        )
+        is True
+    )
+    device = h.companion_device_get(device_id)
+    assert device["push_token"] is None
+    assert device["push_relay_url"] is None
 
 
 def test_devices_with_push_only_returns_registered(tmp_path):
@@ -477,7 +552,7 @@ def test_devices_with_push_only_returns_registered(tmp_path):
     _device_with_token(h, "dev-nopush", "hash-b")  # never registers a token
     h.companion_device_set_push(with_push, "tok", push_relay_url="https://r.example")
 
-    rows = h.companion_devices_with_push(_HASH)
+    rows = h.companion_devices_with_push(_HASH, _IDENTITY)
     assert [d["device_id"] for d in rows] == [with_push]
 
 
@@ -486,7 +561,7 @@ def test_devices_with_push_scoped_to_companion(tmp_path):
     device_id = _device_with_token(h, "dev-other-companion", "hash-c")
     h.companion_device_set_push(device_id, "tok", push_relay_url="https://r.example")
     # A different companion hash sees nothing.
-    assert h.companion_devices_with_push("0x99") == []
+    assert h.companion_devices_with_push("0x99", "99" * 32) == []
 
 
 def test_set_push_missing_device_returns_false(tmp_path):

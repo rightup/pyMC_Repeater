@@ -42,6 +42,7 @@ from openhop_core.protocol.constants import (
 )
 from openhop_core.protocol import LocalIdentity, Packet, PacketBuilder
 
+from repeater.companion.correlation import injected_tx_outcome
 from repeater.packet_router import (
     PacketRouter,
     _companion_dedup_key,
@@ -564,6 +565,125 @@ class TestPacketRouterRoutingBranches(unittest.IsolatedAsyncioTestCase):
             router._companion_delivered[f"K{i}"] = time.time() + 60.0
         self.assertTrue(router._should_deliver_path_to_companions(pkt))
 
+    async def test_concurrent_companion_response_duplicates_deliver_once(self):
+        router = PacketRouter(_make_daemon())
+        pkt = _make_packet(ProtocolResponseHandler.payload_type())
+        bridge = _make_bridge()
+        delivery_started = asyncio.Event()
+        release_delivery = asyncio.Event()
+        calls = 0
+
+        async def deliver(_packet):
+            nonlocal calls
+            calls += 1
+            delivery_started.set()
+            await release_delivery.wait()
+            return HandlerResult(authenticated=True)
+
+        bridge.process_received_packet = deliver
+        first = asyncio.create_task(
+            router._fan_out_to_bridges_once(
+                pkt,
+                {1: bridge},
+                context="RESPONSE",
+            )
+        )
+        await delivery_started.wait()
+        duplicate = asyncio.create_task(
+            router._fan_out_to_bridges_once(
+                pkt,
+                {1: bridge},
+                context="RESPONSE",
+            )
+        )
+        await asyncio.sleep(0)
+        self.assertEqual(calls, 1)
+
+        release_delivery.set()
+        self.assertEqual(await asyncio.gather(first, duplicate), [True, None])
+        self.assertEqual(calls, 1)
+
+    async def test_waiting_companion_duplicate_retries_failed_authentication(self):
+        router = PacketRouter(_make_daemon())
+        pkt = _make_packet(PathHandler.payload_type())
+        bridge = _make_bridge()
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+        calls = 0
+
+        async def deliver(_packet):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                first_started.set()
+                await release_first.wait()
+                return HandlerResult(authenticated=False)
+            return HandlerResult(authenticated=True)
+
+        bridge.process_received_packet = deliver
+        first = asyncio.create_task(
+            router._fan_out_to_bridges_once(
+                pkt,
+                {1: bridge},
+                context="PATH",
+            )
+        )
+        await first_started.wait()
+        duplicate = asyncio.create_task(
+            router._fan_out_to_bridges_once(
+                pkt,
+                {1: bridge},
+                context="PATH",
+            )
+        )
+        release_first.set()
+
+        self.assertEqual(await asyncio.gather(first, duplicate), [False, True])
+        self.assertEqual(calls, 2)
+
+    async def test_concurrent_authenticated_path_copies_are_consumed_once(self):
+        for destination in (0x01, 0xFE):
+            with self.subTest(
+                delivery=(
+                    "targeted"
+                    if destination == 0x01
+                    else "anonymous-path-response"
+                )
+            ):
+                daemon = _make_daemon()
+                router = PacketRouter(daemon)
+                bridge = _make_bridge()
+                delivery_started = asyncio.Event()
+                release_delivery = asyncio.Event()
+                calls = 0
+
+                async def deliver(_packet):
+                    nonlocal calls
+                    calls += 1
+                    delivery_started.set()
+                    await release_delivery.wait()
+                    return HandlerResult.consumed()
+
+                bridge.process_received_packet = deliver
+                daemon.companion_bridges = {0x01: bridge}
+                first_packet = _make_packet(PathHandler.payload_type())
+                duplicate_packet = _make_packet(PathHandler.payload_type())
+                first_packet.payload = bytes([destination, 0xAA])
+                duplicate_packet.payload = bytes([destination, 0xAA])
+
+                first = asyncio.create_task(router._route_packet(first_packet))
+                await delivery_started.wait()
+                duplicate = asyncio.create_task(
+                    router._route_packet(duplicate_packet)
+                )
+                await asyncio.sleep(0)
+                self.assertEqual(calls, 1)
+
+                release_delivery.set()
+                await asyncio.gather(first, duplicate)
+                self.assertEqual(calls, 1)
+                daemon.repeater_handler.assert_not_awaited()
+
     async def test_enqueue_drops_oldest_when_queue_full(self):
         router = PacketRouter(_make_daemon())
         router.queue = asyncio.Queue(maxsize=1)
@@ -580,6 +700,90 @@ class TestPacketRouterRoutingBranches(unittest.IsolatedAsyncioTestCase):
         router = PacketRouter(daemon)
         ok = await router.inject_packet(_make_packet())
         self.assertFalse(ok)
+
+    async def test_inject_cancellation_after_tx_attempt_is_indeterminate(self):
+        daemon = _make_daemon()
+        started = asyncio.Event()
+
+        async def pending_transmission(*_args, **_kwargs):
+            started.set()
+            await asyncio.Future()
+
+        daemon.repeater_handler = pending_transmission
+        router = PacketRouter(daemon)
+        outcome = {}
+        context = injected_tx_outcome.set(outcome)
+        try:
+            task = asyncio.create_task(router.inject_packet(_make_packet()))
+        finally:
+            injected_tx_outcome.reset(context)
+
+        await asyncio.wait_for(started.wait(), timeout=1.0)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+        self.assertIs(outcome["attempted"], True)
+        self.assertIs(outcome["accepted"], False)
+        self.assertIs(outcome["uncertain"], True)
+
+    async def test_inject_order_includes_echo_and_enqueue_before_next_radio_tx(
+        self,
+    ):
+        daemon = _make_daemon()
+        router = PacketRouter(daemon)
+        first = _make_packet()
+        second = _make_packet()
+        first.write_to.return_value = b"first"
+        second.write_to.return_value = b"second"
+        events = []
+        first_echo_started = asyncio.Event()
+        release_first_echo = asyncio.Event()
+
+        async def radio(packet, _metadata, local_transmission):
+            self.assertTrue(local_transmission)
+            events.append(("radio", packet))
+            return True
+
+        async def echo(raw, _rssi, _snr, exclude_hash=None):
+            events.append(("echo", raw))
+            if raw == b"first":
+                first_echo_started.set()
+                await release_first_echo.wait()
+
+        async def enqueue(packet):
+            events.append(("queue", packet))
+
+        daemon.repeater_handler = radio
+        daemon._on_raw_rx_for_companions = echo
+        daemon.companion_frame_servers = []
+        router.enqueue = enqueue
+
+        first_task = asyncio.create_task(router.inject_packet(first))
+        await first_echo_started.wait()
+        second_task = asyncio.create_task(router.inject_packet(second))
+        await asyncio.sleep(0)
+        self.assertEqual(
+            events,
+            [("radio", first), ("echo", b"first")],
+        )
+
+        release_first_echo.set()
+        self.assertEqual(
+            await asyncio.gather(first_task, second_task),
+            [True, True],
+        )
+        self.assertEqual(
+            events,
+            [
+                ("radio", first),
+                ("echo", b"first"),
+                ("queue", first),
+                ("radio", second),
+                ("echo", b"second"),
+                ("queue", second),
+            ],
+        )
 
     async def test_on_route_done_handles_task_exception(self):
         router = PacketRouter(_make_daemon())
@@ -896,6 +1100,9 @@ class TestPacketRouterRoutingBranches(unittest.IsolatedAsyncioTestCase):
     async def test_route_path_dedupes_companion_delivery(self):
         daemon = _make_daemon()
         bridge = _make_bridge()
+        bridge.process_received_packet = AsyncMock(
+            return_value=HandlerResult.consumed()
+        )
         daemon.companion_bridges = {0x01: bridge}
         router = PacketRouter(daemon)
         pkt = _make_packet(PathHandler.payload_type())
@@ -903,7 +1110,27 @@ class TestPacketRouterRoutingBranches(unittest.IsolatedAsyncioTestCase):
         await router._route_packet(pkt)
         await router._route_packet(pkt)
         bridge.process_received_packet.assert_awaited_once()
-        self.assertEqual(daemon.repeater_handler.await_count, 2)
+        daemon.repeater_handler.assert_not_awaited()
+
+    async def test_route_path_retries_after_unauthenticated_delivery(self):
+        daemon = _make_daemon()
+        bridge = _make_bridge()
+        bridge.process_received_packet = AsyncMock(
+            side_effect=(
+                HandlerResult.not_for_us(),
+                HandlerResult.consumed(),
+            )
+        )
+        daemon.companion_bridges = {0x01: bridge}
+        router = PacketRouter(daemon)
+        pkt = _make_packet(PathHandler.payload_type())
+        pkt.payload = bytes([0x01, 0xAA])
+
+        await router._route_packet(pkt)
+        await router._route_packet(pkt)
+        await router._route_packet(pkt)
+
+        self.assertEqual(bridge.process_received_packet.await_count, 2)
 
     async def test_route_login_response_final_hop_skips_engine(self):
         daemon = _make_daemon()
@@ -964,6 +1191,27 @@ class TestPacketRouterRoutingBranches(unittest.IsolatedAsyncioTestCase):
             await router._route_packet(pkt)
         self.assertGreaterEqual(b1.process_received_packet.await_count, 1)
         daemon.repeater_handler.assert_not_awaited()
+
+    async def test_route_protocol_response_retries_until_a_bridge_authenticates(self):
+        daemon = _make_daemon()
+        bridge = _make_bridge()
+        bridge.process_received_packet = AsyncMock(
+            side_effect=(
+                HandlerResult.not_for_us(),
+                HandlerResult.consumed(),
+            )
+        )
+        daemon.companion_bridges = {0x01: bridge}
+        router = PacketRouter(daemon)
+        pkt = _make_packet(ProtocolResponseHandler.payload_type())
+        pkt.header = 0
+
+        with patch("repeater.packet_router.PathHandler.payload_type", return_value=0x55):
+            await router._route_packet(pkt)
+            await router._route_packet(pkt)
+            await router._route_packet(pkt)
+
+        self.assertEqual(bridge.process_received_packet.await_count, 2)
 
     async def test_route_protocol_request_final_hop_skips_engine(self):
         daemon = _make_daemon()

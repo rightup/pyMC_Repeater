@@ -158,7 +158,11 @@ def cmd_set_channel(channel_idx: int, name: str, secret: bytes = b"") -> bytes:
     the form the firmware-compatible clients send.
     """
     padded = name.encode("utf-8")[:CHANNEL_NAME_SIZE].ljust(CHANNEL_NAME_SIZE, b"\x00")
-    secret_hex = (secret or bytes(32)).hex().encode("ascii")
+    # Always send the unambiguous 64-character form. A 16-byte value encoded
+    # directly would be 32 ASCII bytes, which the server correctly interprets
+    # as a raw 32-byte secret rather than hex.
+    normalized_secret = bytes(secret or b"")[:32].ljust(32, b"\x00")
+    secret_hex = normalized_secret.hex().encode("ascii")
     return bytes([CMD_SET_CHANNEL, channel_idx]) + padded + secret_hex
 
 

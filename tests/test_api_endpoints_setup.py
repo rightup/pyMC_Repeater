@@ -23,6 +23,7 @@ def test_needs_setup_triggers_when_radio_type_missing():
     assert result["reasons"]["radio_not_configured"] is True
     assert result["reasons"]["default_name"] is False
     assert result["reasons"]["default_password"] is False
+    assert result["public_bootstrap_allowed"] is False
 
 
 def test_needs_setup_does_not_trigger_for_configured_radio():
@@ -40,3 +41,24 @@ def test_needs_setup_does_not_trigger_for_configured_radio():
 
     assert result["needs_setup"] is False
     assert result["reasons"]["radio_not_configured"] is False
+    assert result["public_bootstrap_allowed"] is False
+
+
+def test_default_password_allows_public_bootstrap_until_completion():
+    api = _make_api(
+        {
+            "radio_type": "sx1262",
+            "repeater": {
+                "node_name": "mesh-node-01",
+                "security": {"admin_password": "admin123"},
+            },
+        }
+    )
+
+    result = api.needs_setup()
+
+    assert result["needs_setup"] is True
+    assert result["public_bootstrap_allowed"] is True
+
+    api.config["repeater"]["setup_complete"] = True
+    assert api.needs_setup()["public_bootstrap_allowed"] is False

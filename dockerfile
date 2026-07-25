@@ -10,8 +10,15 @@ ARG GPIO_GID=986
 ARG SPI_GID=989
 ARG TARGETARCH
 ARG YQ_VERSION=v4.40.5
+ARG YQ_SHA256_AMD64
+ARG YQ_SHA256_ARM64
+ARG YQ_SHA256_ARM
 ARG PYMC_CONSOLE_REPO=Treehouse-00/pymc_console-dist
-ARG PYMC_CONSOLE_VERSION=latest
+ARG PYMC_CONSOLE_VERSION
+ARG PYMC_CONSOLE_SHA256_AMD64
+ARG PYMC_CONSOLE_SHA256_ARM64
+ARG PYMC_CONSOLE_SHA256_ARM
+ARG PYMC_CONSOLE_ALLOW_LATEST=0
 ARG PYMC_CONSOLE_CACHE_BUST=default
 
 ENV INSTALL_DIR=/opt/openhop_repeater \
@@ -42,30 +49,66 @@ RUN DEBIAN_FRONTEND=noninteractive apt-get update && apt-get install -y \
     python3-dev \
     && rm -rf /var/lib/apt/lists/*
 
-RUN arch="${TARGETARCH:-}" \
-    && if [ -z "${arch}" ]; then arch="$(uname -m)"; fi \
-    && case "${arch}" in \
-        amd64|x86_64) YQ_BINARY="yq_linux_amd64" ;; \
-        arm64|aarch64) YQ_BINARY="yq_linux_arm64" ;; \
-        arm|armv7|armv7l) YQ_BINARY="yq_linux_arm" ;; \
+RUN set -eux; \
+    arch="${TARGETARCH:-}"; \
+    if [ -z "${arch}" ]; then arch="$(uname -m)"; fi; \
+    case "${arch}" in \
+        amd64|x86_64) YQ_BINARY="yq_linux_amd64"; YQ_SHA256="${YQ_SHA256_AMD64:-}" ;; \
+        arm64|aarch64) YQ_BINARY="yq_linux_arm64"; YQ_SHA256="${YQ_SHA256_ARM64:-}" ;; \
+        arm|armv7|armv7l) YQ_BINARY="yq_linux_arm"; YQ_SHA256="${YQ_SHA256_ARM:-}" ;; \
         *) echo "Unsupported architecture for yq: ${arch}" >&2; exit 1 ;; \
-    esac \
-    && wget -qO /usr/local/bin/yq "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/${YQ_BINARY}" \
-    && chmod +x /usr/local/bin/yq
+    esac; \
+    if [ -z "${YQ_VERSION}" ] || [ "${YQ_VERSION}" = "latest" ]; then \
+        echo "YQ_VERSION must be an exact release tag." >&2; \
+        exit 1; \
+    fi; \
+    if [ "${#YQ_SHA256}" -ne 64 ]; then \
+        echo "Missing 64-character YQ_SHA256 value for ${arch}; release builds must supply the verified digest." >&2; \
+        exit 1; \
+    fi; \
+    case "${YQ_SHA256}" in *[!0-9a-fA-F]*) echo "Invalid yq SHA-256 for ${arch}." >&2; exit 1 ;; esac; \
+    wget -qO /tmp/yq "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/${YQ_BINARY}"; \
+    printf '%s  %s\n' "${YQ_SHA256}" /tmp/yq | sha256sum -c -; \
+    install -m 0755 /tmp/yq /usr/local/bin/yq; \
+    rm /tmp/yq
 
 # Bundle the optional PyMC Console frontend so the web UI can select it without
-# requiring a host bind mount. Use PYMC_CONSOLE_VERSION=latest to pull the
-# newest release at image build time, or pin a tag such as v0.9.329.
+# requiring a host bind mount. Release builds must pin a tag and verified
+# digest. "latest" is accepted only as an explicit, checksum-pinned dev opt-in.
 RUN set -eux; \
     echo "Bundling PyMC Console cache key: ${PYMC_CONSOLE_CACHE_BUST}"; \
+    arch="${TARGETARCH:-}"; \
+    console_version="${PYMC_CONSOLE_VERSION:-}"; \
+    allow_latest="${PYMC_CONSOLE_ALLOW_LATEST:-0}"; \
+    if [ -z "${arch}" ]; then arch="$(uname -m)"; fi; \
+    case "${arch}" in \
+        amd64|x86_64) CONSOLE_SHA256="${PYMC_CONSOLE_SHA256_AMD64:-}" ;; \
+        arm64|aarch64) CONSOLE_SHA256="${PYMC_CONSOLE_SHA256_ARM64:-}" ;; \
+        arm|armv7|armv7l) CONSOLE_SHA256="${PYMC_CONSOLE_SHA256_ARM:-}" ;; \
+        *) echo "Unsupported architecture for PyMC Console: ${arch}" >&2; exit 1 ;; \
+    esac; \
+    if [ -z "${console_version}" ]; then \
+        echo "PYMC_CONSOLE_VERSION must be an exact release tag." >&2; \
+        exit 1; \
+    fi; \
+    if [ "${console_version}" = "latest" ] && [ "${allow_latest}" != "1" ]; then \
+        echo "PYMC_CONSOLE_VERSION=latest is dev-only; set PYMC_CONSOLE_ALLOW_LATEST=1 explicitly." >&2; \
+        exit 1; \
+    fi; \
+    if [ "${#CONSOLE_SHA256}" -ne 64 ]; then \
+        echo "Missing 64-character PyMC Console SHA-256 for ${arch}; release builds must supply the verified digest." >&2; \
+        exit 1; \
+    fi; \
+    case "${CONSOLE_SHA256}" in *[!0-9a-fA-F]*) echo "Invalid PyMC Console SHA-256 for ${arch}." >&2; exit 1 ;; esac; \
     mkdir -p "${PYMC_CONSOLE_WEB_DIR}"; \
-    if [ "${PYMC_CONSOLE_VERSION}" = "latest" ]; then \
+    if [ "${console_version}" = "latest" ]; then \
         console_url="https://github.com/${PYMC_CONSOLE_REPO}/releases/latest/download/pymc-ui-latest.tar.gz"; \
     else \
-        console_url="https://github.com/${PYMC_CONSOLE_REPO}/releases/download/${PYMC_CONSOLE_VERSION}/pymc-ui-${PYMC_CONSOLE_VERSION}.tar.gz"; \
+        console_url="https://github.com/${PYMC_CONSOLE_REPO}/releases/download/${console_version}/pymc-ui-${console_version}.tar.gz"; \
     fi; \
     wget -qO /tmp/pymc-console.tar.gz "${console_url}"; \
-    tar -xzf /tmp/pymc-console.tar.gz -C "${PYMC_CONSOLE_WEB_DIR}"; \
+    printf '%s  %s\n' "${CONSOLE_SHA256}" /tmp/pymc-console.tar.gz | sha256sum -c -; \
+    tar --no-same-owner --no-same-permissions -xzf /tmp/pymc-console.tar.gz -C "${PYMC_CONSOLE_WEB_DIR}"; \
     rm /tmp/pymc-console.tar.gz; \
     test -f "${PYMC_CONSOLE_WEB_DIR}/index.html"
 
@@ -85,7 +128,10 @@ WORKDIR ${INSTALL_DIR}
 
 # Copy source
 COPY repeater ./repeater
+COPY companion_client ./companion_client
 COPY pyproject.toml .
+COPY README.md .
+COPY LICENSE .
 COPY config.yaml.example .
 COPY radio-presets.json .
 COPY radio-settings.json .
@@ -103,6 +149,6 @@ RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
 USER ${USER}
 
-EXPOSE 8000
+EXPOSE 8000 5000
 
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]

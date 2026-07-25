@@ -1,7 +1,7 @@
 """Async companion frame client.
 
 A reference client for the repeater's companion TCP interface (default port
-15050). It is deliberately free of any ``repeater.*`` import: it speaks the
+5000). It is deliberately free of any ``repeater.*`` import: it speaks the
 wire protocol and nothing else, so it exercises the server the way a real
 phone app would rather than reaching inside it.
 
@@ -38,7 +38,7 @@ logger = logging.getLogger("companion_client")
 PushHandler = Callable[[int, bytes], Optional[Awaitable[None]]]
 MessageHandler = Callable[[ReceivedMessage], Optional[Awaitable[None]]]
 
-DEFAULT_PORT = 15050
+DEFAULT_PORT = 5000
 
 
 class CompanionClientError(Exception):
@@ -248,10 +248,12 @@ class CompanionClient:
     # -- reader ------------------------------------------------------------
 
     async def _read_loop(self) -> None:
-        assert self._reader is not None
+        reader = self._reader
+        if reader is None:
+            raise CompanionClientError("cannot start reader loop while disconnected")
         try:
             while True:
-                data = await self._reader.read(4096)
+                data = await reader.read(4096)
                 if not data:
                     if not self._closing:
                         logger.warning("companion connection closed by server")

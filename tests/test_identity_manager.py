@@ -39,6 +39,18 @@ def test_identity_manager_rejects_duplicate_names_without_mutating_state():
     assert mgr.get_identity_by_hash(0x22) is None
 
 
+def test_identity_manager_unregister_removes_every_index():
+    mgr = IdentityManager(config={})
+    identity = _FakeIdentity(bytes([0x11]) + b"A" * 31)
+    assert mgr.register_identity("phone", identity, {}, "companion") is True
+
+    assert mgr.unregister_identity("phone") is True
+    assert mgr.get_identity_by_name("phone") is None
+    assert mgr.get_identity_by_hash(0x11) is None
+    assert 0x11 not in mgr.registered_hashes
+    assert mgr.unregister_identity("phone") is False
+
+
 def test_identity_manager_list_and_type_filtering():
     mgr = IdentityManager(config={})
     id_a = _FakeIdentity(bytes([0x22]) + b"A" * 31)

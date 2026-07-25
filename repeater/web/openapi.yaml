@@ -20,16 +20,6 @@ info:
 servers:
   - url: /api
     description: Current server (relative URLs with /api prefix)
-  - url: /
-    description: Current server root (for /auth endpoints)
-  - url: http://localhost:8080/api
-    description: Local development server
-  - url: http://{host}:8080/api
-    description: Custom host
-    variables:
-      host:
-        default: localhost
-        description: Repeater IP address or hostname
 
 tags:
   - name: Authentication
@@ -64,15 +54,18 @@ tags:
       clients (`repeater/web/mobile_endpoints.py`), per
       `docs/architecture/mobile-companion-api.md`. Distinct from the legacy
       `/api/companion/*` surface used by the web UI (`companion_endpoints.py`),
-      which remains unchanged and unversioned.
+      which remains shape-compatible, operator-only, and unversioned. New chat
+      clients must use `/api/v1`; legacy sends do not have its idempotency
+      ledger.
 
       **Not a mirror of the TCP frame protocol.** The two surfaces differ in
-      coverage *and* trust level: the frame protocol (port 15050) hands out
+      coverage *and* trust level: the frame protocol (port 5000 by default)
+      is unauthenticated, hands out
       channel PSK secrets and can export the node's private key; this one
       deliberately exposes neither. Most omissions are intentional. See
       `docs/architecture/companion-frame-vs-rest.md` for the full inventory.
 
-      Gaps a client should know about before designing around them:
+      Deliberate boundaries a client should know before designing around them:
 
       - **Contact import/export is absent.** Add and remove exist
         (`POST`/`DELETE .../contacts/{pubkey}`), but there is no equivalent of
@@ -88,44 +81,48 @@ tags:
         a device token is network-reachable, and these would turn a leaked one
         into an identity compromise or an arbitrary-transmit primitive.
 
-      **Envelope:** every JSON response is either
-      `{"success": true, "data": {…}}` or (any error status) `{"success":
-      false, "error": "…", "status": <code>}`.
+      **Envelope:** successful JSON responses are
+      `{"success": true, "data": …}`. JSON errors are
+      `{"success": false, "error": "…"}` and may also include integer
+      `status` and structured `data`.
 
-      **Error rendering:** every error status raised anywhere under
-      `/api/v1` — `400`, `401`, `403`, `404`, `409`, `429`, `500`, `503`,
-      `504` — renders as that same JSON envelope. `401` is produced two
-      ways: the request-authentication step happening entirely inside
-      `require_auth` before the handler runs
-      (`repeater/web/auth/middleware.py`), which returns the JSON body
-      directly, or the globally-registered `error_page.401` handler
-      (`repeater/web/http_server.py:_json_error_handler`) that runs for the
-      tool-level auth gate applied to the whole `/api` tree. Every other
-      status raised from inside a v1 handler as plain `cherrypy.HTTPError`
-      is caught by the `error_page.default` handler
-      (`repeater/web/http_server.py:_json_error_page_v1`) registered on the
-      `/api/v1` config path — CherryPy prefers a status-specific
-      `error_page.<code>` over `error_page.default` when both apply
-      (`cherrypy._cperror.get_error_page`), so `401`s still go through the
-      global handler above, but both render identical JSON. See
-      `ErrorResponseV1`. The one notable in-code path:
-      `CompanionsV1._run_async` (used by every action/send endpoint) catches
-      a bridge-coroutine timeout or exception itself and re-raises it as
-      `cherrypy.HTTPError(504` or `500)`, which is likewise JSON-rendered by
-      the `/api/v1` default error page.
+      **Request media type:** every non-empty v1 request body requires
+      `Content-Type: application/json`; other media types return `415`.
+      Actions with no fields may omit the body or send an empty `{}` JSON
+      object.
+
+      **Caching and browser observability:** authenticated JSON success
+      responses use `Cache-Control: no-store`. Snapshot 200/304 responses use
+      `private, no-store, no-cache, no-transform` with `ETag`; credentialed SSE uses
+      `no-store, no-cache, no-transform`. Allowed CORS origins can read `ETag`,
+      `Idempotency-Replayed`, and `Retry-After`.
+
+      **Common errors:** authenticated operations can return `401`; scope
+      checks can return `403`/folded `404`; unavailable daemon, journal, or
+      SQLite state returns `503`; and unexpected bridge/runtime failures
+      return `500` or an action timeout `504`. These use `ErrorResponseV1`
+      even when an operation below lists only its input- or resource-specific
+      statuses. `304` snapshot and `204` preflight responses have no JSON
+      body.
 
       **Auth:** `Bearer` — either a JWT (web UI / `admin` scope) or a scoped
       device API token minted by `POST /api/v1/pair` — or `X-API-Key` with
       that same device token (`ApiKeyAuth`). Bearer values are tried as a
       JWT first; if that fails, the same value is looked up as a device
       token before the request is rejected, so either credential works via
-      either transport. See the security scheme below for scope semantics.
-      `GET .../events` (SSE) additionally accepts the JWT as `?token=` since
-      `EventSource` cannot set custom headers; the token is stripped from
-      `request.params` once consumed. `GET /api/v1/server_info` and `POST
-      /api/v1/pair` (and, by config-path cascade, `POST /api/v1/pair/start`)
-      are exempt from the tree-wide auth gate; `pair/start` re-imposes its
-      own `admin`-scope check in-handler instead.
+      either transport. Device tokens are rejected outside `/api/v1`.
+      `GET .../events` additionally accepts a short-lived operator JWT as
+      `?token=` for browser `EventSource`; device tokens are never accepted
+      in a URL. Each v1 request must present exactly one of these credential
+      transports; multiple transports return `400` rather than applying
+      credential precedence. Prefer `Authorization` with streaming `fetch`. Open SSE
+      sessions close at JWT expiry. API-token sessions revalidate revocation,
+      scope, and any exact device/identity binding at most every 15 seconds;
+      authorization-storage uncertainty also closes the stream. Resume with a
+      current credential and the last durably applied cursor.
+
+      `GET /api/v1/server_info` and `POST /api/v1/pair` are public.
+      `POST /api/v1/pair/start` performs its own authenticated admin check.
 
 paths:
   # ============================================================================
@@ -133,9 +130,15 @@ paths:
   # ============================================================================
   /auth/login:
     post:
+      servers:
+        - url: /
       tags: [Authentication]
       summary: User login
-      description: Authenticate with username/password and receive JWT token
+      description: |
+        Authenticate with username/password and receive a JWT token. If the
+        administrator password is missing or still the historical `admin123`
+        setup sentinel, the server returns 409; complete `/api/setup_wizard`
+        instead.
       requestBody:
         required: true
         content:
@@ -143,6 +146,7 @@ paths:
             schema:
               type: object
               required: [username, password, client_id]
+              additionalProperties: false
               properties:
                 username:
                   type: string
@@ -150,7 +154,7 @@ paths:
                 password:
                   type: string
                   format: password
-                  example: admin123
+                  example: replace-with-operator-password
                 client_id:
                   type: string
                   description: Unique client identifier
@@ -158,6 +162,11 @@ paths:
       responses:
         '200':
           description: Login successful
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+                example: no-store
           content:
             application/json:
               schema:
@@ -175,9 +184,19 @@ paths:
                     type: string
         '401':
           description: Invalid credentials
+        '409':
+          description: Initial setup has not established an administrator password.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '415':
+          description: Request body must use the application/json media type.
 
   /auth/refresh:
     post:
+      servers:
+        - url: /
       tags: [Authentication]
       summary: Refresh JWT token
       description: Extend session by refreshing JWT token
@@ -196,6 +215,11 @@ paths:
       responses:
         '200':
           description: Token refreshed
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+                example: no-store
           content:
             application/json:
               schema:
@@ -209,9 +233,13 @@ paths:
                     type: integer
                   username:
                     type: string
+        '415':
+          description: Request body must use the application/json media type.
 
   /auth/verify:
     get:
+      servers:
+        - url: /
       tags: [Authentication]
       summary: Verify authentication
       description: Check if current authentication is valid
@@ -235,6 +263,8 @@ paths:
 
   /auth/change_password:
     post:
+      servers:
+        - url: /
       tags: [Authentication]
       summary: Change admin password
       description: Change the admin password (requires authentication)
@@ -256,6 +286,11 @@ paths:
                   type: string
                   format: password
                   minLength: 8
+                  description: |
+                    New administrator password. After trimming surrounding
+                    whitespace for policy checks it must contain at least
+                    eight characters and cannot be the historical `admin123`
+                    default.
       responses:
         '200':
           description: Password changed successfully
@@ -263,6 +298,8 @@ paths:
           description: Current password incorrect
         '400':
           description: Invalid password format
+        '415':
+          description: Request body must use the application/json media type.
 
   /auth/tokens:
     get:
@@ -286,17 +323,46 @@ paths:
                     type: array
                     items:
                       type: object
+                      required: [id, name, created_at, last_used, scope]
                       properties:
                         id:
                           type: integer
                         name:
                           type: string
+                          description: |
+                            Human-readable token name. Legacy stored
+                            non-printing characters are returned as visible
+                            `\uXXXX` or `\UXXXXXXXX` escapes.
                         created_at:
-                          type: string
-                          format: date-time
+                          type: number
+                          format: double
+                          description: Unix epoch seconds.
                         last_used:
+                          type: number
+                          format: double
+                          nullable: true
+                          description: Unix epoch seconds, or null before first use.
+                        scope:
                           type: string
-                          format: date-time
+                          description: Effective authorization scope; legacy null scopes render as admin.
+        '401':
+          description: Missing or invalid JWT/API token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: The authenticated API token does not have admin scope.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: API-token storage is unavailable.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
     post:
       tags: [Authentication]
       summary: Create API token
@@ -311,14 +377,26 @@ paths:
             schema:
               type: object
               required: [name]
+              additionalProperties: false
               properties:
                 name:
                   type: string
-                  description: Friendly name for the token
+                  minLength: 1
+                  maxLength: 128
+                  description: |
+                    Friendly human-readable name for the token. The server
+                    trims surrounding whitespace, rejects blank or
+                    non-printing/control characters, and limits the input to
+                    128 UTF-8 bytes.
                   example: "My API Token"
       responses:
         '200':
           description: Token created
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+                example: no-store
           content:
             application/json:
               schema:
@@ -335,6 +413,32 @@ paths:
                     type: string
                   warning:
                     type: string
+        '400':
+          description: Invalid JSON body or token name.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Missing or invalid JWT/API token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: The authenticated API token does not have admin scope.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: API-token storage is unavailable.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '415':
+          description: Request body must use the application/json media type.
 
   /auth/tokens/{token_id}:
     delete:
@@ -350,11 +454,37 @@ paths:
           required: true
           schema:
             type: integer
+            minimum: 1
+            maximum: 9223372036854775807
       responses:
         '200':
           description: Token revoked
         '404':
           description: Token not found
+        '400':
+          description: Token ID is outside the positive SQLite row-ID range.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Missing or invalid JWT/API token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: The authenticated API token does not have admin scope.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: API-token storage is unavailable; revocation was not confirmed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
 
   # ============================================================================
   # System Endpoints
@@ -2385,7 +2515,8 @@ paths:
       summary: Create new identity
       description: |
         Create a new companion or room server identity.
-        `name` must be non-empty after trimming leading/trailing whitespace (whitespace-only values are rejected).
+        A companion `name` is its stable URL/configuration slug; put the
+        human-facing name in `settings.node_name`.
       requestBody:
         required: true
         content:
@@ -2398,11 +2529,13 @@ paths:
                   type: string
                   minLength: 1
                   maxLength: 64
-                  pattern: '^[a-zA-Z0-9_\-\s]+$'
                   description: |
-                    Identity registration name (alphanumeric, spaces, hyphens, underscores).
-                    Trimmed; must not be empty or whitespace-only.
-                  example: "General Chat"
+                    Identity registration name. For `companion`, this must
+                    match `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`; it is the
+                    stable slug used in configuration, URLs, and scopes.
+                    `room_server` retains the upstream human-readable naming
+                    rules (alphanumeric, spaces, hyphens, and underscores).
+                  example: "my-companion"
                 identity_key:
                   type: string
                   pattern: '^(?:[0-9a-fA-F]{64}|[0-9a-fA-F]{128})$'
@@ -2423,12 +2556,12 @@ paths:
                       type: string
                       minLength: 4
                       description: Admin authentication password (room_server only)
-                      example: "admin123"
+                      example: "replace-with-room-admin-password"
                     guest_password:
                       type: string
                       minLength: 4
                       description: Guest authentication password (room_server only)
-                      example: "guest123"
+                      example: "replace-with-room-guest-password"
                     max_posts:
                       type: integer
                       minimum: 1
@@ -2438,8 +2571,18 @@ paths:
                       example: 32
                     node_name:
                       type: string
-                      description: Advertised node name (companion only; defaults to identity name)
+                      description: |
+                        Human-facing advertised name (companion only; defaults
+                        to the registration slug). Maximum 31 bytes of UTF-8;
+                        CR, LF, and NUL are rejected.
                       example: "My Companion"
+                    frame_enabled:
+                      type: boolean
+                      default: true
+                      description: |
+                        Whether to start the upstream-compatible TCP frame
+                        listener (companion only). Set false for a REST/SSE-only
+                        companion; the bridge and shared radio path remain active.
                     tcp_port:
                       type: integer
                       minimum: 1
@@ -2447,29 +2590,95 @@ paths:
                       default: 5000
                       description: TCP listener port (companion only)
                       example: 5000
+                    tcp_timeout:
+                      type: integer
+                      minimum: 0
+                      maximum: 2147483647
+                      default: 28800
+                      description: |
+                        Frame-client idle timeout in seconds (companion only).
+                        `0` disables the idle timeout.
+                      example: 28800
                     bind_address:
                       type: string
-                      default: "0.0.0.0"
-                      description: TCP listener bind address (companion only)
-                      example: "0.0.0.0"
+                      default: "127.0.0.1"
+                      description: |
+                        TCP listener bind address (companion only). The frame
+                        protocol is unauthenticated and can expose identity and
+                        channel secrets; keep loopback unless the network is
+                        explicitly trusted.
+                      example: "127.0.0.1"
+                    adopt_legacy_namespace:
+                      type: boolean
+                      default: false
+                      description: |
+                        One-time companion recovery setting. Set true only
+                        after verifying that unbound rows from an older build
+                        belong to this full public identity. It can create a
+                        missing binding but never replace an existing one.
+                    max_contacts:
+                      type: integer
+                      minimum: 1
+                      maximum: 2000
+                      default: 1000
+                      description: Maximum durable contacts for this companion.
+                    offline_queue_size:
+                      type: integer
+                      minimum: 0
+                      maximum: 4096
+                      default: 512
+                      description: |
+                        Bounded pending queue for frame delivery. `0` disables
+                        offline frame queuing; REST history remains durable.
+                    trim_contacts_on_overflow:
+                      type: boolean
+                      default: false
+                      description: |
+                        On startup, remove the oldest non-favourite contacts
+                        when persisted contacts exceed `max_contacts`.
+                    rf_reception_events:
+                      type: boolean
+                      default: false
+                      description: |
+                        Include high-volume uncorrelated RF reception events in
+                        this companion's journal. Leave off for normal chat.
+              oneOf:
+                - title: Companion identity
+                  properties:
+                    type:
+                      type: string
+                      enum: [companion]
+                    name:
+                      $ref: '#/components/schemas/CompanionRegistrationName'
+                - title: Room server identity
+                  properties:
+                    type:
+                      type: string
+                      enum: [room_server]
+                    name:
+                      type: string
+                      minLength: 1
+                      maxLength: 64
+                      pattern: '^[a-zA-Z0-9_\-\s]+$'
             examples:
               room_server:
                 value:
                   name: "General Chat"
                   type: room_server
                   settings:
-                    admin_password: "admin123"
-                    guest_password: "guest123"
+                    admin_password: "replace-with-room-admin-password"
+                    guest_password: "replace-with-room-guest-password"
                     max_posts: 32
               companion:
                 value:
-                  name: "My Companion"
+                  name: "my-companion"
                   type: companion
                   identity_key: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                   settings:
                     node_name: "My Companion"
+                    frame_enabled: true
                     tcp_port: 5000
-                    bind_address: "0.0.0.0"
+                    bind_address: "127.0.0.1"
       responses:
         '200':
           description: Identity created
@@ -2491,6 +2700,14 @@ paths:
                         type: string
                       public_key:
                         type: string
+                      activation_pending:
+                        type: boolean
+                        description: |
+                          Companion only. True when the initial live activation
+                          exceeded the request wait but is still completing in
+                          the background. Poll `GET /identity?name=...` for
+                          `registered: true`; restart only if it does not
+                          complete.
               examples:
                 success:
                   value:
@@ -2521,17 +2738,44 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  success:
-                    type: boolean
-                  data:
-                    type: object
+                allOf:
+                  - $ref: '#/components/schemas/SuccessResponse'
+                  - type: object
                     properties:
-                      identities:
-                        type: array
-                        items:
-                          $ref: '#/components/schemas/Identity'
+                      data:
+                        type: object
+                        required:
+                          - registered
+                          - configured
+                          - configured_companions
+                          - total_registered
+                          - total_configured
+                          - total_configured_companions
+                        properties:
+                          registered:
+                            type: array
+                            description: Live identities currently registered with the identity manager.
+                            items:
+                              $ref: '#/components/schemas/RegisteredIdentity'
+                          configured:
+                            type: array
+                            description: Configured room-server identities.
+                            items:
+                              $ref: '#/components/schemas/Identity'
+                          configured_companions:
+                            type: array
+                            description: Configured companion identities.
+                            items:
+                              $ref: '#/components/schemas/Identity'
+                          total_registered:
+                            type: integer
+                            minimum: 0
+                          total_configured:
+                            type: integer
+                            minimum: 0
+                          total_configured_companions:
+                            type: integer
+                            minimum: 0
 
   /identity:
     get:
@@ -2567,6 +2811,8 @@ paths:
         For `room_server`, `name` is required to locate the identity.
         For `companion`, provide `name` OR `lookup_identity_key` OR `public_key_prefix`
         (at least 8 hex characters for prefix lookups) when the registration name is unknown.
+        `lookup_identity_key` is retained only for compatibility; prefer the
+        non-secret `public_key_prefix`.
       security:
         - BearerAuth: []
         - ApiKeyAuth: []
@@ -2583,25 +2829,173 @@ paths:
                   default: room_server
                 name:
                   type: string
-                  description: Current identity registration name (required for room_server; optional for companion if lookup fields are set)
+                  maxLength: 64
+                  description: |
+                    Current identity registration name (required for
+                    `room_server`; optional for `companion` if lookup fields
+                    are set). A companion name is the stable ASCII slug
+                    `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`.
                 lookup_identity_key:
                   type: string
+                  deprecated: true
                   description: |
-                    Companion only: hex private identity key (full or unique prefix, min 8 hex chars)
-                    to locate the companion when `name` is omitted.
+                    Legacy companion lookup using private identity-key material.
+                    Avoid transmitting identity secrets; use the non-secret
+                    `public_key_prefix` when `name` is omitted.
                 public_key_prefix:
                   type: string
                   description: |
                     Companion only: ed25519 public key hex prefix (min 8 hex chars) to locate the companion when `name` is omitted.
                 new_name:
                   type: string
-                  description: New identity name (optional; must be non-empty if provided)
+                  maxLength: 64
+                  description: |
+                    New identity registration name. For `companion`, this must
+                    match `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`; change
+                    `settings.node_name` instead when only the displayed name
+                    should change.
                 identity_key:
                   type: string
-                  description: New identity key (optional)
+                  description: |
+                    New identity key for a room server. Companion identity keys
+                    are immutable because their durable state and paired
+                    devices are identity-bound; create a new companion instead.
+                force_trim:
+                  type: boolean
+                  default: false
+                  description: |
+                    Companion-only compatibility alias for setting
+                    `trim_contacts_on_overflow: true`. It never deletes from a
+                    live bridge. The response reports `trim_scheduled_count`;
+                    favourite-safe removals run durably before activation on
+                    restart.
                 settings:
                   type: object
-                  description: Updated settings
+                  description: |
+                    Updated settings. Room-server passwords are write-only:
+                    omit them or send an empty string to keep the stored value,
+                    and use the matching explicit `clear_*` boolean to remove
+                    one. Public `*_configured` markers from an identity GET
+                    may be round-tripped; the server ignores and never stores
+                    them.
+                  properties:
+                    admin_password:
+                      type: string
+                      writeOnly: true
+                      description: |
+                        Room server only. A non-empty value replaces the stored
+                        admin password; an omitted or empty value leaves it
+                        unchanged.
+                    guest_password:
+                      type: string
+                      writeOnly: true
+                      description: |
+                        Room server only. A non-empty value replaces the stored
+                        guest password; an omitted or empty value leaves it
+                        unchanged.
+                    clear_admin_password:
+                      type: boolean
+                      writeOnly: true
+                      default: false
+                      description: |
+                        Room server only. Explicitly remove the stored admin
+                        password. Do not combine `true` with a non-empty
+                        `admin_password`.
+                    clear_guest_password:
+                      type: boolean
+                      writeOnly: true
+                      default: false
+                      description: |
+                        Room server only. Explicitly remove the stored guest
+                        password. Do not combine `true` with a non-empty
+                        `guest_password`.
+                    node_name:
+                      type: string
+                      description: Human-facing companion name; maximum 31 bytes of UTF-8.
+                    frame_enabled:
+                      type: boolean
+                      default: true
+                      description: |
+                        Start the companion TCP frame listener. Set false for a
+                        REST/SSE-only companion; no frame port is reserved.
+                    tcp_port:
+                      type: integer
+                      minimum: 1
+                      maximum: 65535
+                      default: 5000
+                    tcp_timeout:
+                      type: integer
+                      minimum: 0
+                      maximum: 2147483647
+                      default: 28800
+                      description: Frame-client idle timeout in seconds; `0` disables it.
+                    bind_address:
+                      type: string
+                      default: "127.0.0.1"
+                      description: |
+                        Frame listener bind. Loopback is the safe default
+                        because this protocol has no application authentication.
+                    adopt_legacy_namespace:
+                      type: boolean
+                      default: false
+                      description: |
+                        One-time companion recovery setting. Claims verified
+                        unbound legacy rows for this full public identity; it
+                        never replaces an existing namespace binding.
+                    max_contacts:
+                      type: integer
+                      minimum: 1
+                      maximum: 2000
+                      default: 1000
+                      description: Maximum durable contacts for this companion.
+                    offline_queue_size:
+                      type: integer
+                      minimum: 0
+                      maximum: 4096
+                      default: 512
+                      description: |
+                        Bounded pending queue for frame delivery. `0` disables
+                        offline frame queuing; REST history remains durable.
+                    trim_contacts_on_overflow:
+                      type: boolean
+                      default: false
+                      description: |
+                        Trim oldest non-favourite contacts on startup when the
+                        persisted count exceeds `max_contacts`.
+                    rf_reception_events:
+                      type: boolean
+                      default: false
+                      description: |
+                        Include high-volume uncorrelated RF reception events in
+                        this companion's journal.
+              oneOf:
+                - title: Companion identity update
+                  required: [type]
+                  not:
+                    required: [identity_key]
+                  properties:
+                    type:
+                      type: string
+                      enum: [companion]
+                    name:
+                      $ref: '#/components/schemas/CompanionRegistrationName'
+                    new_name:
+                      $ref: '#/components/schemas/CompanionRegistrationName'
+                - title: Room server identity update
+                  properties:
+                    type:
+                      type: string
+                      enum: [room_server]
+                    name:
+                      type: string
+                      minLength: 1
+                      maxLength: 64
+                      pattern: '^[a-zA-Z0-9_\-\s]+$'
+                    new_name:
+                      type: string
+                      minLength: 1
+                      maxLength: 64
+                      pattern: '^[a-zA-Z0-9_\-\s]+$'
       responses:
         '200':
           description: Identity updated
@@ -2617,8 +3011,8 @@ paths:
       description: |
         Remove an identity from the system.
         For `room_server`, `name` is required.
-        For `companion`, provide `name` OR `lookup_identity_key` OR `public_key_prefix`
-        (at least 8 hex characters for prefix lookups).
+        For `companion`, provide `name` OR `public_key_prefix` (at least 8
+        hex characters).
       security:
         - BearerAuth: []
         - ApiKeyAuth: []
@@ -2636,13 +3030,6 @@ paths:
             type: string
             enum: [room_server, companion]
           description: Identity kind (default room_server)
-        - name: lookup_identity_key
-          in: query
-          required: false
-          schema:
-            type: string
-          description: |
-            Companion only: hex identity key (full or unique prefix, min 8 hex chars) when `name` is omitted.
         - name: public_key_prefix
           in: query
           required: false
@@ -3375,6 +3762,18 @@ paths:
     get:
       tags: [System]
       summary: Check setup wizard status
+      description: |
+        Public, read-only first-run discovery. `needs_setup` describes whether
+        the node name, administrator password, or radio still needs operator
+        attention. It is intentionally independent of
+        `public_bootstrap_allowed`, which is the authoritative permission for
+        unauthenticated setup/import mutation.
+
+        Public bootstrap closes when `repeater.setup_complete` is true or a
+        non-empty, non-default administrator password is already configured.
+        Successful setup and configuration import set `setup_complete: true`;
+        imports cannot clear that marker.
+      security: []
       responses:
         '200':
           description: Setup status
@@ -3382,6 +3781,31 @@ paths:
             application/json:
               schema:
                 type: object
+                required: [needs_setup, public_bootstrap_allowed]
+                additionalProperties: false
+                properties:
+                  needs_setup:
+                    type: boolean
+                  public_bootstrap_allowed:
+                    type: boolean
+                    description: |
+                      Whether unauthenticated `POST /setup_wizard` and
+                      `POST /config_import` mutation is currently allowed.
+                  reasons:
+                    type: object
+                    required:
+                      [default_name, default_password, radio_not_configured]
+                    additionalProperties: false
+                    properties:
+                      default_name:
+                        type: boolean
+                      default_password:
+                        type: boolean
+                      radio_not_configured:
+                        type: boolean
+                  error:
+                    type: string
+                    description: Present only when status inspection failed.
 
   /site_info:
     get:
@@ -3435,19 +3859,108 @@ paths:
     post:
       tags: [System]
       summary: Submit setup wizard payload
+      description: |
+        Unauthenticated first-run mutation, accepted only while
+        `public_bootstrap_allowed` from `/needs_setup` is true. A successful
+        setup writes a non-default administrator password, sets the monotonic
+        `repeater.setup_complete` marker, and schedules a service restart.
+        Later changes use authenticated configuration endpoints.
+
+        The JSON body is limited to **65,536 bytes**, duplicate keys and more
+        than 64 nesting levels are rejected, and the top-level value must be
+        an object.
+      security: []
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
+              required: [node_name, hardware_key, radio_preset, admin_password]
+              properties:
+                node_name:
+                  type: string
+                  minLength: 1
+                  description: Non-blank; maximum 31 UTF-8 bytes.
+                hardware_key:
+                  type: string
+                  minLength: 1
+                radio_preset:
+                  type: object
+                  required: [frequency, bandwidth]
+                  properties:
+                    frequency:
+                      type: number
+                      description: MHz.
+                    bandwidth:
+                      type: number
+                      description: kHz.
+                    spreading_factor:
+                      type: integer
+                      default: 7
+                    coding_rate:
+                      type: integer
+                      default: 5
+                    tx_power:
+                      type: integer
+                      minimum: -9
+                      maximum: 22
+                admin_password:
+                  type: string
+                  format: password
+                  writeOnly: true
+                  minLength: 8
+                  description: Must not be the public bootstrap default.
+                  example: replace-with-a-unique-password
+                kiss_port:
+                  type: string
+                kiss_baud_rate:
+                  type: integer
+                pymc_usb_port:
+                  type: string
+                pymc_usb_baudrate:
+                  type: integer
+                pymc_tcp_host:
+                  type: string
+                pymc_tcp_port:
+                  type: integer
+                pymc_tcp_token:
+                  type: string
+                  writeOnly: true
       responses:
         '200':
-          description: Setup applied
+          description: |
+            Setup applied, or a semantic validation error represented by
+            `{success:false,error}`.
           content:
             application/json:
               schema:
-                type: object
+                oneOf:
+                  - type: object
+                    required: [success, message, config]
+                    properties:
+                      success:
+                        type: boolean
+                        enum: [true]
+                      message:
+                        type: string
+                      config:
+                        type: object
+                  - $ref: '#/components/schemas/ErrorResponse'
+        '400':
+          description: Invalid Content-Length or malformed/unsafe JSON object.
+        '403':
+          description: Public bootstrap is closed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '405':
+          description: Method not allowed (POST only).
+        '413':
+          description: JSON body exceeds 65,536 bytes.
+        '415':
+          description: Request body must use the application/json media type.
 
   /check_pymc_console:
     get:
@@ -3803,19 +4316,110 @@ paths:
     post:
       tags: [System]
       summary: Import configuration
+      description: |
+        Restore allowed configuration sections from an export. Before first
+        setup this may be called without credentials only while
+        `/needs_setup` reports `public_bootstrap_allowed: true`. After that
+        boundary closes, an authenticated administrator is required; a
+        device-scoped or non-admin credential is not sufficient.
+
+        A credentialless first-run restore must include a non-default
+        `repeater.security.admin_password` of at least eight non-whitespace
+        characters. A redacted, missing, empty, or `admin123` password is
+        rejected so an import cannot close bootstrap with unusable or public
+        credentials.
+
+        A successful import sets `repeater.setup_complete: true` and cannot
+        reopen public bootstrap, even when restoring an older/default config.
+        Omitted or redacted nested security credentials are preserved. An
+        explicit JWT secret must contain at least 32 UTF-8 bytes; null and
+        empty legacy sentinels retain auto-generation. JWT expiry must be an
+        integer from 1 through 10,080 minutes. An explicitly imported
+        administrator password follows the login wire limit (1,024 UTF-8
+        bytes), must pass the eight-character policy, and cannot be
+        `admin123`. Invalid auth values are rejected before live state or disk
+        is changed. Changing JWT secret/expiry or the repeater identity key
+        returns `restart_required: true`; current sessions continue using the
+        old runtime values until restart. JWT secret rotation also changes
+        API-token hashing, so all current JWTs and stored API tokens become
+        invalid after that restart. HTTP listener changes and CORS policy
+        changes also return `restart_required: true`; the running request
+        listener is never stopped or rebound from inside this operation.
+        Other `web` values such as `site_name` remain live. Unknown top-level
+        config sections are skipped. The JSON body is limited to **1,048,576 bytes**;
+        duplicate keys, non-object bodies, and more than 64 nesting levels are
+        rejected.
+      security:
+        - {}
+        - BearerAuth: []
+        - ApiKeyAuth: []
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
+              required: [config]
+              properties:
+                config:
+                  type: object
+                  minProperties: 1
+                  description: |
+                    Exported configuration. Accepted sections are `repeater`,
+                    `mesh`, `radio`, `sx1262`, `ch341`, `kiss`, `pymc_usb`,
+                    `pymc_tcp`, `mqtt_brokers` (or legacy `mqtt`),
+                    `identities`, `delays`, `http`, `web`, `letsmesh`, `glass`,
+                    `logging`, and `radio_type`.
       responses:
         '200':
-          description: Import result
+          description: |
+            Import result. Semantic validation failures use the same HTTP
+            status with `{success:false,error}`.
           content:
             application/json:
               schema:
-                type: object
+                oneOf:
+                  - type: object
+                    required:
+                      - success
+                      - message
+                      - sections_updated
+                      - saved
+                      - restart_required
+                    properties:
+                      success:
+                        type: boolean
+                        enum: [true]
+                      message:
+                        type: string
+                      sections_updated:
+                        type: array
+                        items:
+                          type: string
+                      saved:
+                        type: boolean
+                      restart_required:
+                        type: boolean
+                  - $ref: '#/components/schemas/ErrorResponse'
+        '400':
+          description: Invalid Content-Length or malformed/unsafe JSON object.
+        '401':
+          description: Supplied administrator credential is invalid.
+        '403':
+          description: |
+            Public bootstrap is closed and administrator authentication was
+            omitted, or the authenticated principal is not an administrator.
+        '405':
+          description: Method not allowed (POST only).
+        '413':
+          description: JSON body exceeds 1,048,576 bytes.
+        '415':
+          description: Request body must use the application/json media type.
+        '503':
+          description: |
+            Persisted bootstrap state could not be authoritatively read, or the
+            completed candidate could not be saved. No live configuration
+            change is retained when persistence fails.
 
   /identity_export:
     get:
@@ -4004,52 +4608,6 @@ paths:
         '200':
           description: HTML docs page
 
-  /api/auth/tokens:
-    get:
-      tags: [Authentication]
-      summary: List API tokens (alias path)
-      responses:
-        '200':
-          description: Token list
-          content:
-            application/json:
-              schema:
-                type: object
-    post:
-      tags: [Authentication]
-      summary: Create API token (alias path)
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-      responses:
-        '200':
-          description: Token created
-          content:
-            application/json:
-              schema:
-                type: object
-
-  /api/auth/tokens/{token_id}:
-    delete:
-      tags: [Authentication]
-      summary: Revoke API token (alias path)
-      parameters:
-        - name: token_id
-          in: path
-          required: true
-          schema:
-            type: integer
-      responses:
-        '200':
-          description: Token revoked
-          content:
-            application/json:
-              schema:
-                type: object
-
   /companion:
     get:
       tags: [System]
@@ -4066,6 +4624,9 @@ paths:
     get:
       tags: [System]
       summary: Get local companion identity info
+      parameters:
+        - $ref: '#/components/parameters/LegacyCompanionNameQuery'
+        - $ref: '#/components/parameters/LegacyCompanionHashQuery'
       responses:
         '200':
           description: Companion identity
@@ -4078,6 +4639,9 @@ paths:
     get:
       tags: [System]
       summary: List companion contacts
+      parameters:
+        - $ref: '#/components/parameters/LegacyCompanionNameQuery'
+        - $ref: '#/components/parameters/LegacyCompanionHashQuery'
       responses:
         '200':
           description: Contacts
@@ -4095,7 +4659,9 @@ paths:
           in: query
           required: true
           schema:
-            type: string
+            $ref: '#/components/schemas/LegacyPublicKey'
+        - $ref: '#/components/parameters/LegacyCompanionNameQuery'
+        - $ref: '#/components/parameters/LegacyCompanionHashQuery'
       responses:
         '200':
           description: Contact detail
@@ -4108,24 +4674,82 @@ paths:
     post:
       tags: [System]
       summary: Import repeater adverts into companion contacts
+      description: |
+        One-time, bounded seed from valid repeater advert rows. Malformed
+        stored adverts are skipped independently. `companion_name` is
+        required on this compatibility route.
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
+              required: [companion_name]
+              additionalProperties: false
+              properties:
+                companion_name:
+                  $ref: '#/components/schemas/CompanionRegistrationName'
+                companion_hash:
+                  $ref: '#/components/schemas/LegacyCompanionHash'
+                contact_types:
+                  type: array
+                  uniqueItems: true
+                  items:
+                    type: string
+                    enum: [companion, repeater, room_server, sensor]
+                  description: Empty or omitted means all supported advert types.
+                hours:
+                  type: integer
+                  minimum: 1
+                  maximum: 876000
+                  description: Only import adverts heard within this many hours.
+                limit:
+                  type: integer
+                  minimum: 1
+                  maximum: 1000000
+                  description: Candidate cap; the companion contact capacity still applies.
       responses:
         '200':
           description: Import result
           content:
             application/json:
               schema:
-                type: object
+                allOf:
+                  - $ref: '#/components/schemas/SuccessResponse'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        required: [imported, added, updated, retained, removed]
+                        properties:
+                          imported:
+                            type: integer
+                            minimum: 0
+                            description: Filtered repeater adverts considered by this import.
+                          added:
+                            type: integer
+                            minimum: 0
+                            description: New durable companion contacts added.
+                          updated:
+                            type: integer
+                            minimum: 0
+                            description: Existing contacts whose advert-owned fields changed.
+                          retained:
+                            type: integer
+                            minimum: 0
+                            description: Existing contacts already matching the imported advert.
+                          removed:
+                            type: integer
+                            minimum: 0
+                            description: Non-favourite rows excluded by the companion contact limit.
 
   /companion/channels:
     get:
       tags: [System]
       summary: List companion channels
+      parameters:
+        - $ref: '#/components/parameters/LegacyCompanionNameQuery'
+        - $ref: '#/components/parameters/LegacyCompanionHashQuery'
       responses:
         '200':
           description: Channels
@@ -4138,6 +4762,16 @@ paths:
     get:
       tags: [System]
       summary: Get companion stats
+      parameters:
+        - $ref: '#/components/parameters/LegacyCompanionNameQuery'
+        - $ref: '#/components/parameters/LegacyCompanionHashQuery'
+        - name: type
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [core, radio, packets]
+            default: packets
       responses:
         '200':
           description: Companion stats
@@ -4149,13 +4783,41 @@ paths:
   /companion/send_text:
     post:
       tags: [System]
-      summary: Send direct text message via companion
+      summary: Send direct text message via legacy operator API
+      description: |
+        Compatibility route for existing Repeater API callers. It preserves
+        the upstream `wait_for_ack=true` behavior. `sent: false` after RF
+        injection may therefore mean ACK timeout, not proof that nothing went
+        on air. It has no idempotency key and must not be used by retrying
+        chat clients. Use `/api/v1/companions/{name}/messages`.
+      deprecated: true
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
+              required: [pub_key, text]
+              additionalProperties: false
+              properties:
+                companion_name:
+                  $ref: '#/components/schemas/CompanionRegistrationName'
+                companion_hash:
+                  $ref: '#/components/schemas/LegacyCompanionHash'
+                pub_key:
+                  $ref: '#/components/schemas/LegacyPublicKey'
+                text:
+                  type: string
+                  minLength: 1
+                  maxLength: 160
+                  description: |
+                    Maximum 160 UTF-8 bytes. NUL is rejected because MeshCore
+                    text is NUL-terminated.
+                txt_type:
+                  type: integer
+                  minimum: 0
+                  maximum: 1
+                  default: 0
       responses:
         '200':
           description: Send result
@@ -4167,13 +4829,39 @@ paths:
   /companion/send_channel_message:
     post:
       tags: [System]
-      summary: Send channel message via companion
+      summary: Send channel message via legacy operator API
+      description: |
+        Compatibility route for existing Repeater API callers. It preserves
+        the historic request and response shape but has no idempotency ledger.
+        Retrying chat clients must use
+        `/api/v1/companions/{name}/messages`.
+      deprecated: true
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
+              required: [channel_idx, text]
+              additionalProperties: false
+              properties:
+                companion_name:
+                  $ref: '#/components/schemas/CompanionRegistrationName'
+                companion_hash:
+                  $ref: '#/components/schemas/LegacyCompanionHash'
+                channel_idx:
+                  type: integer
+                  minimum: 0
+                  maximum: 255
+                  description: Must also be below this companion's configured channel capacity.
+                text:
+                  type: string
+                  minLength: 1
+                  maxLength: 160
+                  description: |
+                    Maximum 160 UTF-8 bytes before the companion node-name
+                    prefix; the effective per-companion budget may be smaller.
+                    NUL is rejected because MeshCore text is NUL-terminated.
       responses:
         '200':
           description: Send result
@@ -4192,6 +4880,22 @@ paths:
           application/json:
             schema:
               type: object
+              required: [pub_key]
+              additionalProperties: false
+              properties:
+                companion_name:
+                  $ref: '#/components/schemas/CompanionRegistrationName'
+                companion_hash:
+                  $ref: '#/components/schemas/LegacyCompanionHash'
+                pub_key:
+                  $ref: '#/components/schemas/LegacyPublicKey'
+                password:
+                  type: string
+                  maxLength: 15
+                  default: ""
+                  description: |
+                    Maximum 15 UTF-8 bytes. NUL is rejected because MeshCore
+                    credentials are NUL-terminated.
       responses:
         '200':
           description: Login result
@@ -4204,6 +4908,23 @@ paths:
     post:
       tags: [System]
       summary: Request companion status frame
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [pub_key]
+              additionalProperties: false
+              properties:
+                companion_name:
+                  $ref: '#/components/schemas/CompanionRegistrationName'
+                companion_hash:
+                  $ref: '#/components/schemas/LegacyCompanionHash'
+                pub_key:
+                  $ref: '#/components/schemas/LegacyPublicKey'
+                timeout:
+                  $ref: '#/components/schemas/LegacyTimeout'
       responses:
         '200':
           description: Request accepted
@@ -4216,6 +4937,32 @@ paths:
     post:
       tags: [System]
       summary: Request companion telemetry frame
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [pub_key]
+              additionalProperties: false
+              properties:
+                companion_name:
+                  $ref: '#/components/schemas/CompanionRegistrationName'
+                companion_hash:
+                  $ref: '#/components/schemas/LegacyCompanionHash'
+                pub_key:
+                  $ref: '#/components/schemas/LegacyPublicKey'
+                want_base:
+                  type: boolean
+                  default: true
+                want_location:
+                  type: boolean
+                  default: true
+                want_environment:
+                  type: boolean
+                  default: true
+                timeout:
+                  $ref: '#/components/schemas/LegacyTimeout'
       responses:
         '200':
           description: Request accepted
@@ -4234,6 +4981,26 @@ paths:
           application/json:
             schema:
               type: object
+              required: [pub_key, command]
+              additionalProperties: false
+              properties:
+                companion_name:
+                  $ref: '#/components/schemas/CompanionRegistrationName'
+                companion_hash:
+                  $ref: '#/components/schemas/LegacyCompanionHash'
+                pub_key:
+                  $ref: '#/components/schemas/LegacyPublicKey'
+                command:
+                  type: string
+                  minLength: 1
+                  maxLength: 160
+                  description: UTF-8 command text; must not contain NUL.
+                parameters:
+                  type: string
+                  maxLength: 160
+                  description: >-
+                    UTF-8 parameters; must not contain NUL. Command plus one
+                    separating space plus parameters must fit 160 UTF-8 bytes.
       responses:
         '200':
           description: Command result
@@ -4246,6 +5013,21 @@ paths:
     post:
       tags: [System]
       summary: Reset companion route/path state
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [pub_key]
+              additionalProperties: false
+              properties:
+                companion_name:
+                  $ref: '#/components/schemas/CompanionRegistrationName'
+                companion_hash:
+                  $ref: '#/components/schemas/LegacyCompanionHash'
+                pub_key:
+                  $ref: '#/components/schemas/LegacyPublicKey'
       responses:
         '200':
           description: Path reset
@@ -4264,6 +5046,26 @@ paths:
           application/json:
             schema:
               type: object
+              additionalProperties: false
+              anyOf:
+                - required: [advert_name]
+                - required: [name]
+              properties:
+                companion_name:
+                  $ref: '#/components/schemas/CompanionRegistrationName'
+                companion_hash:
+                  $ref: '#/components/schemas/LegacyCompanionHash'
+                advert_name:
+                  type: string
+                  minLength: 1
+                  maxLength: 31
+                  description: Preferred field; maximum 31 UTF-8 bytes and no ASCII controls.
+                name:
+                  type: string
+                  minLength: 1
+                  maxLength: 31
+                  deprecated: true
+                  description: Upstream compatibility alias for `advert_name`.
       responses:
         '200':
           description: Name updated
@@ -4282,6 +5084,21 @@ paths:
           application/json:
             schema:
               type: object
+              required: [latitude, longitude]
+              additionalProperties: false
+              properties:
+                companion_name:
+                  $ref: '#/components/schemas/CompanionRegistrationName'
+                companion_hash:
+                  $ref: '#/components/schemas/LegacyCompanionHash'
+                latitude:
+                  type: number
+                  minimum: -90
+                  maximum: 90
+                longitude:
+                  type: number
+                  minimum: -180
+                  maximum: 180
       responses:
         '200':
           description: Location updated
@@ -4294,9 +5111,52 @@ paths:
     get:
       tags: [System]
       summary: Stream companion events (SSE)
+      description: |
+        Legacy operator event stream. Prefer `Authorization: Bearer`; browser
+        `EventSource` may use an exact `?token=` query parameter containing a
+        short-lived operator JWT. Device/API tokens are never accepted in the
+        query string. This route and `/v1/.../events` share one process-wide
+        `mobile_api.sse_max_connections` budget and one-stream-per-principal/
+        companion rule. Two HTTP workers are always reserved for ordinary
+        APIs. The configured connection cap may not exceed 256. The queue is
+        clamped to at least 32 and capped at 4096; keepalive is clamped to at
+        least 5 seconds and capped at 60 seconds. The
+        stream closes at JWT expiry or within 15 seconds of API-token
+        revocation/scope change; authorization-storage uncertainty also
+        closes it.
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/LegacyCompanionNameQuery'
+        - $ref: '#/components/parameters/LegacyCompanionHashQuery'
+        - name: token
+          in: query
+          required: false
+          schema:
+            type: string
+          description: |
+            Operator JWT only, for browser `EventSource`. Prefer
+            `Authorization`; never put a device token in a URL.
       responses:
         '200':
           description: Event stream
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+                example: no-store, no-cache, no-transform
+          content:
+            text/event-stream:
+              schema:
+                type: string
+        '429':
+          description: Shared SSE connection budget or duplicate stream limit reached.
+          headers:
+            Retry-After:
+              schema:
+                type: integer
+                example: 5
 
   /update/status:
     get:
@@ -4456,6 +5316,7 @@ paths:
                     properties:
                       data:
                         type: object
+                        required: [site_name, api_versions, auth_modes, transport, server]
                         properties:
                           site_name:
                             type: string
@@ -4469,8 +5330,21 @@ paths:
                             items:
                               type: string
                             example: ["jwt", "api_token"]
+                          transport:
+                            type: object
+                            required: [scheme, secure, trusted_network_required]
+                            properties:
+                              scheme:
+                                type: string
+                                enum: [http, https]
+                              secure:
+                                type: boolean
+                              trusted_network_required:
+                                type: boolean
+                                description: True for plaintext HTTP.
                           server:
                             type: object
+                            required: [version, time]
                             properties:
                               version:
                                 type: string
@@ -4485,6 +5359,10 @@ paths:
                       site_name: "Everett North Repeater"
                       api_versions: ["v1"]
                       auth_modes: ["jwt", "api_token"]
+                      transport:
+                        scheme: https
+                        secure: true
+                        trusted_network_required: false
                       server: { version: "1.4.0", time: 1789012345.6 }
         '405':
           description: |
@@ -4501,7 +5379,7 @@ paths:
       summary: Generate a pairing code (admin)
       description: |
         Admin-scope-only. Generates a single-use, 5-minute-TTL pairing code
-        for a companion identity (design doc §11.2 step 1). Exempt from the
+        for a companion identity (architecture §9, pairing step 1). Exempt from the
         tree-wide `/api` auth gate by config path (it shares the `/api/v1/
         pair` exemption via CherryPy config-path cascade), so this handler
         re-checks `admin` scope itself.
@@ -4515,9 +5393,10 @@ paths:
             schema:
               type: object
               required: [companion_name]
+              additionalProperties: false
               properties:
                 companion_name:
-                  type: string
+                  $ref: '#/components/schemas/CompanionRegistrationName'
       responses:
         '200':
           description: Pairing code generated
@@ -4530,6 +5409,7 @@ paths:
                     properties:
                       data:
                         type: object
+                        required: [code, expires_in, companion_name, companion_identity, fingerprint]
                         properties:
                           code:
                             type: string
@@ -4538,10 +5418,20 @@ paths:
                             type: integer
                             example: 300
                           companion_name:
+                            $ref: '#/components/schemas/CompanionRegistrationName'
+                          companion_identity:
                             type: string
+                            pattern: '^[0-9a-f]{64}$'
+                            description: Immutable 32-byte companion public key, lowercase hex.
                           fingerprint:
                             type: string
-                            description: sha256 hexdigest of the companion identity's public key (TOFU pin, §11.3).
+                            pattern: '^[0-9a-f]{64}$'
+                            description: |
+                              Lowercase SHA-256 hex of `companion_identity`.
+                              Transfer this through the trusted pairing channel
+                              and compare it with `/pair`. It detects an
+                              unexpected identity; it does not authenticate a
+                              plaintext HTTP server.
         '400':
           description: |
             `companion_name required`. Rendered as the v1 JSON error envelope (see tag description).
@@ -4570,18 +5460,22 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponseV1'
+        '415':
+          description: Request body must use the application/json media type.
+        '503':
+          $ref: '#/components/responses/ServiceUnavailableV1'
 
   /v1/pair:
     post:
       tags: [Mobile Companion API v1]
       summary: Exchange a pairing code for a device token
       description: |
-        No auth — the pairing code itself is the credential (design doc
-        §11.2 steps 2-3). Exempt from the tree-wide `/api` auth gate. The
+        No auth — the pairing code itself is the credential (architecture §9,
+        steps 2-3). Exempt from the tree-wide `/api` auth gate. The
         code is consumed atomically (single use); unknown and expired codes
         both 404 with the same message so a caller can't distinguish "wrong
-        code" from "code expired". Rate-limited to 10 attempts/60s globally
-        across all callers, checked before code lookup.
+        code" from "code expired". Attempts are rate-limited per remote
+        address before code lookup.
       requestBody:
         required: true
         content:
@@ -4589,18 +5483,35 @@ paths:
             schema:
               type: object
               required: [code, device_id, name]
+              additionalProperties: false
               properties:
                 code:
                   type: string
+                  minLength: 32
+                  maxLength: 32
+                  pattern: '^[0-9a-fA-F]{32}$'
+                  description: Single-use 128-bit pairing code, hex encoded.
                 device_id:
                   type: string
-                  description: Client-generated stable device identifier. Unique per companion_devices row.
+                  minLength: 1
+                  maxLength: 128
+                  description: |
+                    Client-generated stable device identifier, globally unique
+                    on this repeater; maximum 128 UTF-8 bytes. Leading/trailing
+                    whitespace, ASCII controls, `/`, `\`, `.` and `..` are
+                    rejected rather than normalized.
                 name:
                   type: string
-                  description: Human-readable device name (e.g. "Adam's iPhone").
+                  minLength: 1
+                  maxLength: 96
+                  description: |
+                    Human-readable device name, trimmed and limited to 96
+                    UTF-8 bytes (for example, "Adam's iPhone").
                 platform:
                   type: string
                   nullable: true
+                  maxLength: 32
+                  description: Optional platform label, trimmed; maximum 32 UTF-8 bytes.
                   example: ios
       responses:
         '200':
@@ -4614,14 +5525,30 @@ paths:
                     properties:
                       data:
                         type: object
+                        required: [token, device_id, companion_name, companion_identity, fingerprint, scope]
                         properties:
                           token:
                             type: string
-                            description: Plaintext device API token — shown once, store in Keychain. Send as `X-API-Key` on all subsequent v1 requests.
+                            description: |
+                              Plaintext device API token — shown once, store in
+                              Keychain. Send on subsequent v1 requests as
+                              `Authorization: Bearer <token>` or
+                              `X-API-Key: <token>`.
                           device_id:
                             type: string
                           companion_name:
+                            $ref: '#/components/schemas/CompanionRegistrationName'
+                          companion_identity:
                             type: string
+                            pattern: '^[0-9a-f]{64}$'
+                            description: Immutable 32-byte companion public key, lowercase hex.
+                          fingerprint:
+                            type: string
+                            pattern: '^[0-9a-f]{64}$'
+                            description: |
+                              Lowercase SHA-256 hex of `companion_identity`;
+                              compare with the value received through the
+                              trusted pairing channel before storing the token.
                           scope:
                             type: string
                             example: "companion:field-radio-1"
@@ -4641,16 +5568,18 @@ paths:
                 $ref: '#/components/schemas/ErrorResponseV1'
         '409':
           description: |
-            `device_id already registered` — the just-minted token is
-            revoked server-side before this response. Rendered as the v1 JSON error envelope (see tag description).
+            `device_id already registered`. Device and token creation is one
+            transaction, so no token survives this conflict.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponseV1'
+        '415':
+          description: Request body must use the application/json media type.
         '429':
           description: |
-            `Too many pairing attempts, try again later` (fixed 60s window,
-            max 10 attempts, process-global). Rendered as the v1 JSON error envelope (see tag description).
+            `Too many pairing attempts, try again later`. Includes
+            `Retry-After`.
           content:
             application/json:
               schema:
@@ -4659,6 +5588,12 @@ paths:
           description: |
             `Authentication not configured` (no token manager wired up).
             Rendered as the v1 JSON error envelope (see tag description).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponseV1'
+        '503':
+          description: Pairing storage is unavailable. A still-live code remains reusable.
           content:
             application/json:
               schema:
@@ -4672,7 +5607,8 @@ paths:
         All companions' paired devices. `last_seen` is backfilled from the
         linked api_token's `last_used` timestamp when that is newer than the
         device row's own `last_seen` — presence is derived from token use,
-        not written per-request.
+        not written per-request. Token ids, push tokens, relay configuration,
+        and mention keywords are intentionally redacted.
       security:
         - BearerAuth: []
         - ApiKeyAuth: []
@@ -4690,45 +5626,45 @@ paths:
                         type: array
                         items:
                           type: object
+                          required:
+                            - device_id
+                            - name
+                            - platform
+                            - companion_hash
+                            - companion_identity
+                            - created_at
+                            - last_seen
+                            - push_registered
+                            - push_detail
+                            - mention_push
                           properties:
-                            id:
-                              type: integer
                             companion_hash:
                               type: string
                               pattern: '^0x[0-9a-f]{2}$'
+                            companion_identity:
+                              type: string
+                              nullable: true
+                              description: Full immutable companion public key, lowercase hex.
                             device_id:
                               type: string
                             name:
                               type: string
-                            token_id:
-                              type: integer
                             platform:
                               type: string
                               nullable: true
-                            push_token:
-                              type: string
-                              nullable: true
-                            push_relay_url:
-                              type: string
-                              nullable: true
+                            push_registered:
+                              type: boolean
                             push_detail:
                               type: string
                               enum: [none, count, preview]
-                              description: Per-device push content level (design doc §12.2). Defaults to `none`.
+                              description: Per-device push content level (architecture §11). Defaults to `none`.
                             mention_push:
                               type: boolean
-                              description: Whether the content-free mention alert class is enabled for this device (design doc §12.2).
-                            mention_keywords:
-                              type: string
-                              nullable: true
-                              description: JSON array of trigger strings, or null to fall back to the companion node_name.
+                              description: Whether the content-free mention alert class is enabled for this device (architecture §11).
                             created_at:
                               type: number
                             last_seen:
                               type: number
-                              nullable: true
-                            last_synced_seq:
-                              type: integer
                               nullable: true
         '403':
           description: |
@@ -4738,14 +5674,18 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponseV1'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailableV1'
 
   /v1/devices/{device_id}:
     delete:
       tags: [Mobile Companion API v1]
-      summary: Revoke a paired device (admin)
+      summary: Revoke a paired device
       description: |
         Deletes the device's `api_tokens` row (its next request 401s
-        naturally) and its `companion_devices` row.
+        naturally) and its `companion_devices` row. A paired device token may
+        revoke its own `device_id`; an admin may revoke any device. A device
+        probing another id receives the same `404` as an unknown id.
       security:
         - BearerAuth: []
         - ApiKeyAuth: []
@@ -4755,6 +5695,11 @@ paths:
           required: true
           schema:
             type: string
+            minLength: 1
+            maxLength: 128
+          description: |
+            Stable device identifier; maximum 128 UTF-8 bytes. No edge
+            whitespace, ASCII controls, slash/backslash, `.` or `..`.
       responses:
         '200':
           description: Device revoked
@@ -4767,16 +5712,15 @@ paths:
                     properties:
                       data:
                         type: object
+                        required: [revoked, device_id]
                         properties:
                           revoked:
                             type: boolean
                             example: true
                           device_id:
                             type: string
-        '403':
-          description: |
-            `Admin scope required`. Rendered as the v1 JSON error envelope (see tag
-            description).
+        '401':
+          description: Missing/invalid JWT or API token.
           content:
             application/json:
               schema:
@@ -4788,22 +5732,23 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponseV1'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailableV1'
 
   /v1/devices/{device_id}/push:
     post:
       tags: [Mobile Companion API v1]
       summary: Register a device's push credentials
       description: |
-        Register (or refresh) the APNs/FCM token, relay URL, and content
-        level for a paired device (design doc §12.2). The repeater's notifier
-        POSTs a wake to `push_relay_url` (as-is — the client registers the
-        full notify endpoint) when the companion journals a new `message`,
-        debounced per device (default 30s collapse window).
+        Register (or refresh) an APNs/FCM token and content preference for a
+        paired device. When `companion.push.relay_url` is configured, the
+        repeater POSTs message wakes to that single operator-owned endpoint.
+        Devices cannot select a URL.
 
         **Payload-free by default.** `push_detail: none` sends only a wake;
         `count` adds a `badge_hint`; `preview` adds a short `alert` string —
         opting `preview` in is the only way message text reaches the relay,
-        which is why it defaults off (§11.4).
+        which is why it defaults off (architecture §11).
 
         **Mentions.** `mention_push: true` enables a separate, content-free
         mention alert: when a new message's text matches one of the device's
@@ -4812,17 +5757,19 @@ paths:
         (`{mention: true, alert: "You were mentioned"}`, never the message
         text) instead of a silent wake. It takes precedence over `push_detail`
         for that push and is what makes a mention prompt without leaking
-        content (design doc §12.2).
+        content (architecture §11).
 
-        The **relay service itself is a separate deliverable** (phase 4): until
-        one is deployed, registration succeeds and the notifier's POSTs simply
-        have no recipient; the app falls back to background-refresh sync.
+        Registration still succeeds when no relay is configured; in that
+        case the notifier is inactive and the app uses sync/SSE.
+
+        Only inbound durable message events produce wakes. Outbound sends
+        from REST or the parallel frame client do not trigger push.
 
         Auth: the device's **own** token (the token paired to `device_id`), or
         `admin`. A scoped device token registering for a *different* device
         gets `404` (same not-found-folding as the rest of /api/v1 — no
-        cross-device existence leak). A token refresh may omit `push_relay_url`
-        and `push_detail`; the stored values are kept.
+        cross-device existence leak). Optional preference fields retain their
+        stored values when omitted.
       security:
         - BearerAuth: []
         - ApiKeyAuth: []
@@ -4832,6 +5779,11 @@ paths:
           required: true
           schema:
             type: string
+            minLength: 1
+            maxLength: 128
+          description: |
+            Stable device identifier; maximum 128 UTF-8 bytes. No edge
+            whitespace, ASCII controls, slash/backslash, `.` or `..`.
       requestBody:
         required: true
         content:
@@ -4839,13 +5791,15 @@ paths:
             schema:
               type: object
               required: [push_token]
+              additionalProperties: false
               properties:
                 push_token:
                   type: string
-                  description: APNs/FCM device token.
-                push_relay_url:
-                  type: string
-                  description: Absolute http(s) URL the notifier POSTs wakes to. Private/LAN targets allowed (self-hosted relays).
+                  minLength: 1
+                  maxLength: 4096
+                  description: |
+                    APNs/FCM device token; maximum 4096 UTF-8 bytes. Leading/
+                    trailing whitespace and ASCII controls are rejected.
                 push_detail:
                   type: string
                   enum: [none, count, preview]
@@ -4855,9 +5809,15 @@ paths:
                   description: Enable the content-free mention alert class. Omitted → stored value (default false).
                 mention_keywords:
                   type: array
+                  maxItems: 32
                   items:
                     type: string
-                  description: Trigger strings for mentions. Omitted → stored value; `[]` → fall back to the companion node_name.
+                    maxLength: 64
+                    description: Maximum 64 UTF-8 bytes; blank values are discarded.
+                  description: |
+                    Trigger strings for mentions. Omitted → stored value;
+                    `[]` → fall back to the companion node_name. At most 32;
+                    trimmed duplicates collapse to one stored value.
       responses:
         '200':
           description: Push registered
@@ -4870,6 +5830,7 @@ paths:
                     properties:
                       data:
                         type: object
+                        required: [device_id, push_detail, mention_push, registered]
                         properties:
                           device_id:
                             type: string
@@ -4883,11 +5844,9 @@ paths:
                             example: true
         '400':
           description: |
-            `push_token is required`, an invalid `push_detail`, a
-            `push_relay_url` that isn't an absolute http(s) URL, a non-boolean
-            `mention_push`, or a `mention_keywords` that isn't an array of
-            strings. Rendered as the v1 JSON error envelope (see tag
-            description).
+            Missing/oversized `push_token`, invalid `push_detail`, non-boolean
+            `mention_push`, invalid/oversized `mention_keywords`, or any
+            unknown field (including `push_relay_url`).
           content:
             application/json:
               schema:
@@ -4907,14 +5866,17 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponseV1'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaTypeV1'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailableV1'
     delete:
       tags: [Mobile Companion API v1]
       summary: Clear a device's push registration
       description: |
         Nulls the device's `push_token` (a complete push opt-out — the
-        notifier skips any device without a token). `push_relay_url` and
-        `push_detail` are left in place so a later re-register need only
-        supply a fresh token. Same auth as the POST.
+        notifier skips any device without a token). Preferences remain, so a
+        later re-register need only supply a fresh token. Same auth as POST.
       security:
         - BearerAuth: []
         - ApiKeyAuth: []
@@ -4924,6 +5886,11 @@ paths:
           required: true
           schema:
             type: string
+            minLength: 1
+            maxLength: 128
+          description: |
+            Stable device identifier; maximum 128 UTF-8 bytes. No edge
+            whitespace, ASCII controls, slash/backslash, `.` or `..`.
       responses:
         '200':
           description: Push unregistered
@@ -4936,6 +5903,7 @@ paths:
                     properties:
                       data:
                         type: object
+                        required: [unregistered, device_id]
                         properties:
                           unregistered:
                             type: boolean
@@ -4956,16 +5924,19 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponseV1'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailableV1'
 
   /v1/companions:
     get:
       tags: [Mobile Companion API v1]
       summary: List companion identities
       description: |
-        Scope-filtered (design doc §11.1): a `companion:{name}` device token
+        Scope-filtered (architecture §9): a `companion:{name}` device token
         sees only its own companion (name + public key of the others are
         withheld, not just their action endpoints); `admin`/`companion:*`
-        (and legacy scope-less callers) see all.
+        callers see all. Authentication always supplies an explicit normalized
+        scope; an incomplete auth context fails closed.
       security:
         - BearerAuth: []
         - ApiKeyAuth: []
@@ -4989,6 +5960,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponseV1'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailableV1'
 
   /v1/companions/{name}/snapshot:
     get:
@@ -4996,14 +5969,15 @@ paths:
       summary: Bootstrap document (state + journal cursor)
       description: |
         Full state snapshot plus the journal cursor it corresponds to
-        (design doc §7.4): self info, contacts, channels (no PSK secrets),
+        (architecture §4.2): self info, contacts, channels (no PSK secrets),
         and the most recent messages. Journal head is read *before* the
         state queries, so any event with `seq >` the returned `cursor` may
         duplicate snapshot content — clients dedupe by message id.
 
-        Supports conditional requests: `ETag` = `"{journal_epoch}:{head_seq}"`;
-        send it back as `If-None-Match` to get `304 Not Modified` with no
-        body when nothing has changed.
+        Supports conditional requests. The opaque `ETag` includes companion,
+        journal epoch/head, and `messages_limit`; send it back as
+        `If-None-Match` to get `304 Not Modified` when that exact snapshot
+        request is unchanged.
       security:
         - BearerAuth: []
         - ApiKeyAuth: []
@@ -5012,8 +5986,8 @@ paths:
           in: path
           required: true
           schema:
-            type: string
-          description: Companion identity name.
+            $ref: '#/components/schemas/CompanionRegistrationName'
+          description: Companion registration slug.
         - name: messages_limit
           in: query
           required: false
@@ -5035,7 +6009,11 @@ paths:
             ETag:
               schema:
                 type: string
-              description: '`"{journal_epoch}:{head_seq}"`'
+              description: Opaque validator for this companion and `messages_limit`.
+            Cache-Control:
+              schema:
+                type: string
+                example: private, no-store, no-cache, no-transform
           content:
             application/json:
               schema:
@@ -5051,6 +6029,10 @@ paths:
             ETag:
               schema:
                 type: string
+            Cache-Control:
+              schema:
+                type: string
+                example: private, no-store, no-cache, no-transform
         '401':
           description: Missing/invalid JWT or API token.
           content:
@@ -5068,6 +6050,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponseV1'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailableV1'
 
   /v1/companions/{name}/sync:
     get:
@@ -5075,14 +6059,16 @@ paths:
       summary: Journal delta since a cursor
       description: |
         One indexed range scan (`idx_companion_events_sync`) bounded by
-        `limit` (design doc §7.5). A `cursor` older than the journal's prune
-        floor returns `200` with empty `events` and `"snapshot_required":
-        true` rather than a silently incomplete delta — the client must
-        re-fetch `snapshot` and resume from its `cursor`. `has_more: true`
+        `limit`. Cursors use the human-readable opaque form `epoch:seq`.
+        A legacy bare sequence, an epoch mismatch, a future sequence, or a
+        sequence below the companion's prune floor returns `200` with empty
+        `events`, `"snapshot_required": true`, and a stable `reset_reason`.
+        Re-fetch `snapshot` and resume from its `cursor`. `has_more: true`
         means immediately re-request with `next_cursor`.
 
-        Supports `ETag`/`If-None-Match` the same way as `snapshot`
-        (`"{journal_epoch}:{head_seq}"`) for cheap poll-and-check.
+        This endpoint intentionally has no `ETag`: the cursor already
+        expresses the caller's position and every page is one coherent
+        validate-and-read transaction.
       security:
         - BearerAuth: []
         - ApiKeyAuth: []
@@ -5091,13 +6077,22 @@ paths:
           in: path
           required: true
           schema:
-            type: string
+            $ref: '#/components/schemas/CompanionRegistrationName'
         - name: cursor
           in: query
           required: true
           schema:
-            type: string
-            description: Opaque journal seq, as returned by `snapshot.cursor` or a prior `sync.next_cursor`. Non-negative integer string.
+            oneOf:
+              - type: string
+                maxLength: 128
+                pattern: '^[0-9a-f]+:[0-9]+$'
+                description: Opaque `epoch:seq` returned by this API.
+              - type: string
+                maxLength: 128
+                pattern: '^[0-9]+$'
+                description: |
+                  Legacy bare sequence accepted only as a compatibility reset
+                  input; the response requires a fresh snapshot.
         - name: limit
           in: query
           required: false
@@ -5111,27 +6106,22 @@ paths:
           required: false
           schema:
             type: string
+            maxLength: 128
+            pattern: '^rf_receptions(?:\s*,\s*rf_receptions)*$'
           description: |
             Comma-separated opt-in list of otherwise-excluded event types.
             The only recognized token is `rf_receptions` — without it, the
-            `rf_reception` firehose events (§9, off by default) are filtered
+            `rf_reception` firehose events (architecture §6, off by default) are filtered
             out of `events` even for a companion that has the
             `rf_reception_events` setting enabled. Filtered rows still advance
             `next_cursor`/`has_more` (the scan, not the returned list, drives
-            paging), so a client that opts in late never sees a gap. Unknown
-            tokens are ignored.
-        - name: If-None-Match
-          in: header
-          required: false
-          schema:
-            type: string
+            paging). Late opt-in is therefore prospective from the supplied
+            cursor; use an older still-retained cursor to replay earlier RF
+            rows. Empty and unknown tokens return `400`; repeating the known
+            token is harmless.
       responses:
         '200':
           description: Delta (possibly empty)
-          headers:
-            ETag:
-              schema:
-                type: string
           content:
             application/json:
               schema:
@@ -5140,37 +6130,20 @@ paths:
                   - type: object
                     properties:
                       data:
-                        type: object
-                        properties:
-                          journal_epoch:
-                            type: string
-                          events:
-                            type: array
-                            items:
-                              $ref: '#/components/schemas/MobileJournalEvent'
-                          next_cursor:
-                            type: string
-                          has_more:
-                            type: boolean
-                          snapshot_required:
-                            type: boolean
+                        oneOf:
+                          - $ref: '#/components/schemas/MobileSyncDelta'
+                          - $ref: '#/components/schemas/MobileSyncReset'
               examples:
                 delta:
                   value:
                     success: true
                     data:
-                      journal_epoch: "b3f1c2"
+                      journal_epoch: "b3f1c2d4e5f60708"
                       events:
                         - { seq: 184224, type: message, ts: 1789012345.0, packet_hash: null, data: {} }
-                      next_cursor: "184224"
+                      next_cursor: "b3f1c2d4e5f60708:184224"
                       has_more: false
                       snapshot_required: false
-        '304':
-          description: Not modified.
-          headers:
-            ETag:
-              schema:
-                type: string
         '400':
           description: |
             `cursor required` or `Invalid cursor`. Rendered as the v1 JSON error envelope (see tag description).
@@ -5194,6 +6167,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponseV1'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailableV1'
 
   /v1/companions/{name}/messages:
     get:
@@ -5210,12 +6185,15 @@ paths:
           in: path
           required: true
           schema:
-            type: string
+            $ref: '#/components/schemas/CompanionRegistrationName'
         - name: before_id
           in: query
           required: false
           schema:
             type: integer
+            format: int64
+            minimum: 1
+            maximum: 9223372036854775807
           description: Exclusive upper bound on message `id` (rowid) — page backward in time.
         - name: limit
           in: query
@@ -5237,6 +6215,7 @@ paths:
                     properties:
                       data:
                         type: object
+                        required: [messages, next_before_id]
                         properties:
                           messages:
                             type: array
@@ -5244,6 +6223,9 @@ paths:
                               $ref: '#/components/schemas/MobileMessage'
                           next_before_id:
                             type: integer
+                            format: int64
+                            minimum: 1
+                            maximum: 9223372036854775807
                             nullable: true
                             description: Pass as `before_id` to fetch the next (older) page; `null` when this page was empty.
         '400':
@@ -5270,25 +6252,42 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponseV1'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailableV1'
 
     post:
       tags: [Mobile Companion API v1]
       summary: Send a DM or channel message
       description: |
-        Sends RF, so retries must be idempotent (design doc §6): the
-        `Idempotency-Key` header is **required**. A retry with the same key
-        and the same request body (companion name + JSON body, hashed)
-        replays the stored response without touching the radio again; the
-        same key against a different body, or a different companion, is a
-        `409`. Only a *successful* send claims the key — a failed send
-        leaves it unclaimed so a retry reaches the radio.
+        Sends RF, so `Idempotency-Key` is required and durably reserved before
+        message persistence or radio work. The same principal, key, companion
+        identity, and body replay the recorded result without transmitting
+        again. Reusing the key for another request returns `409`.
+        A paired-device principal is its full companion identity plus stable
+        `device_id`, not its token or database row. Token rotation/re-pairing
+        therefore cannot make an unresolved key dispatch again; do not switch
+        device IDs to bypass an unknown result.
 
-        Unlike the design doc's example response, the actual response has
-        **no** `message_id`/`packet_hash` fields (code wins over doc): a DM
-        send returns `{sent, is_flood, expected_ack}`; a channel send
-        returns `{sent}`. Delivery/heard-repeat progress arrives only via
-        `sync`/`events`, correlated by the client on `text`+timing, not by an
-        id returned here.
+        Every accepted attempt first creates one outbound history row and
+        returns its `message_id`. Its initial journal event has `state:
+        pending`; later `message_send_state` events make `transmitted`,
+        `confirmed`, `heard_repeated`, `failed`, or `indeterminate`
+        observable to every client. `packet_hash` is included when the radio
+        backend provides it.
+
+        If HTTP fails after RF may have started, retry only with the same key.
+        An `indeterminate` result explicitly means a new key could duplicate
+        an over-the-air send. If storage is temporarily unavailable during
+        that transition, the running server still remembers the key as
+        indeterminate, blocks redispatch, and repairs durable state on a
+        later same-key request; startup recovery covers a server restart.
+
+        Completed/failed replay records are retained for at least 48 hours
+        from first reservation (maintenance may retain them longer). Reconcile
+        a lost result within that window. After it, inspect durable history
+        and require an explicit decision; do not assume the old key still
+        suppresses RF. Indeterminate records are retained rather than made
+        reusable.
       security:
         - BearerAuth: []
         - ApiKeyAuth: []
@@ -5297,13 +6296,19 @@ paths:
           in: path
           required: true
           schema:
-            type: string
+            $ref: '#/components/schemas/CompanionRegistrationName'
         - name: Idempotency-Key
           in: header
           required: true
           schema:
             type: string
-          description: Caller-generated opaque retry key, scoped per authenticated device (or `user:{username}` for JWT callers with no paired device row).
+            minLength: 1
+            maxLength: 128
+            pattern: '^[!-~]+$'
+          description: |
+            Non-blank caller-generated opaque retry key, scoped to the
+            authenticated principal. Use 1–128 visible ASCII characters
+            (`!` through `~`) with no whitespace; UUIDs are recommended.
       requestBody:
         required: true
         content:
@@ -5311,27 +6316,46 @@ paths:
             schema:
               type: object
               required: [text]
+              additionalProperties: false
               description: Exactly one of `to` or `channel_idx` is required (validated as a strict XOR).
               properties:
                 to:
                   type: string
+                  pattern: '^[0-9a-fA-F]{64}$'
                   description: Recipient's 32-byte public key, hex-encoded. Required for a DM; omit for a channel send.
                 channel_idx:
                   type: integer
+                  minimum: 0
                   description: Channel index (0 is valid). Required for a channel send; omit for a DM.
                 text:
                   type: string
                   minLength: 1
+                  maxLength: 160
+                  description: |
+                    Maximum 160 UTF-8 bytes. For a channel send, the
+                    companion's `node_name + ": "` prefix also occupies that
+                    wire budget, so the accepted text limit may be smaller.
+                    NUL is rejected because MeshCore text payloads are
+                    NUL-terminated.
                 txt_type:
                   type: integer
+                  enum: [0]
                   default: 0
-                  description: DM only; ignored for channel sends.
+                  description: DM only. Supplying it for a channel send is invalid.
       responses:
         '200':
           description: |
             Send attempted (`sent: false` is still a `200` — the radio/queue
             rejected it — not an error status), or a replayed response for a
-            reused `Idempotency-Key` with an identical body.
+            reused `Idempotency-Key` with an identical body. A safe
+            pre-dispatch failure is also terminal and replayable without RF.
+            Every `failed` result includes a human-readable `reason`.
+          headers:
+            Idempotency-Replayed:
+              schema:
+                type: string
+                enum: ["true"]
+              description: Present only when this is a stored replay.
           content:
             application/json:
               schema:
@@ -5340,35 +6364,59 @@ paths:
                   - type: object
                     properties:
                       data:
-                        oneOf:
-                          - type: object
-                            description: DM send result.
-                            properties:
-                              sent:
-                                type: boolean
-                              is_flood:
-                                type: boolean
-                              expected_ack:
-                                type: boolean
-                          - type: object
-                            description: Channel send result.
-                            properties:
-                              sent:
-                                type: boolean
+                        type: object
+                        required: [message_id, sent, state]
+                        properties:
+                          message_id:
+                            type: integer
+                            minimum: 1
+                            maximum: 9223372036854775807
+                          sent:
+                            type: boolean
+                          state:
+                            type: string
+                            enum: [transmitted, failed]
+                          reason:
+                            type: string
+                            minLength: 1
+                            description: Present when `state` is `failed`.
+                          packet_hash:
+                            type: string
+                            nullable: true
+                            pattern: '^[0-9A-F]{16}$'
+                          is_flood:
+                            type: boolean
+                            description: Direct messages only.
+                          expected_ack:
+                            type: integer
+                            nullable: true
+                            minimum: 0
+                            maximum: 4294967295
+                            description: Direct-message ACK correlation value.
               examples:
                 dm_sent:
                   value:
                     success: true
-                    data: { sent: true, is_flood: false, expected_ack: true }
+                    data:
+                      message_id: 42
+                      sent: true
+                      state: transmitted
+                      packet_hash: AABBCCDDEEFF0011
+                      is_flood: false
+                      expected_ack: 305419896
                 channel_sent:
                   value:
                     success: true
-                    data: { sent: true }
+                    data:
+                      message_id: 43
+                      sent: true
+                      state: transmitted
+                      packet_hash: 1122334455667788
         '400':
           description: |
-            Missing `Idempotency-Key` header, invalid JSON body, neither/both
-            of `to`/`channel_idx` set, missing `text`, or an invalid `to` hex
-            key. Rendered as the v1 JSON error envelope (see tag description).
+            Missing/oversized `Idempotency-Key`, invalid or oversized JSON,
+            unknown fields, neither/both targets, invalid target/index/text,
+            or `txt_type` on a channel send.
           content:
             application/json:
               schema:
@@ -5391,18 +6439,27 @@ paths:
                 $ref: '#/components/schemas/ErrorResponseV1'
         '409':
           description: |
-            `Idempotency-Key reuse with different request` — same key,
-            different companion or body. Rendered as the v1 JSON error envelope (see tag
-            description).
+            The key conflicts with another request, the original send is
+            still in progress (`Retry-After: 1`), or its outcome is
+            indeterminate. Indeterminate responses include known
+            `message_id`, `packet_hash`, and `expected_ack`.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponseV1'
-        '504':
+        '429':
+          description: RF admission limit exceeded. Includes `Retry-After`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponseV1'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaTypeV1'
+        '503':
           description: |
-            `Timed out waiting for radio response` — the bridge coroutine
-            (default 30s) did not complete; the idempotency key is left
-            unclaimed so a retry reaches the radio. Rendered as the v1 JSON error envelope (see tag description).
+            Durable storage is unavailable before RF, or RF may have happened
+            but its final state could not be persisted. The latter response
+            carries `state: indeterminate`; retry only with the same key.
           content:
             application/json:
               schema:
@@ -5413,29 +6470,35 @@ paths:
       tags: [Mobile Companion API v1]
       summary: Resumable live event stream (SSE)
       description: |
-        `text/event-stream`. Each frame: `id:` = `seq`, `event:` = event
-        `type`, `data:` = the same JSON object `sync` returns for that row
-        (design doc §8) — one schema, two transports.
+        `text/event-stream`. Each frame uses `id: epoch:seq`, `event:` equal
+        to the journal event type, and `data:` equal to the same JSON object
+        returned by `sync`.
 
         **Resume point:** the standard `Last-Event-ID` header if present,
         else `?cursor=`, else the current journal head (a bare connection
         gets a live tail only, no replay). On connect the server drains the
         backlog from that point (paged, reusing the sync query) before
-        switching to a live tail; a cursor older than the prune floor gets
-        one `event: snapshot_required` frame and the stream closes — the
-        client must `snapshot` and reconnect with a fresh cursor.
+        switching to a live tail. Any reset-invalid cursor (missing/mismatched
+        epoch, future seq, or pruned seq) gets one
+        `event: snapshot_required` frame and closes.
 
         Keepalive: a `: ka` comment frame every `http.sse_keepalive_sec`
-        (default 15s) while idle. A slow client whose queue overflows is
-        disconnected outright (no unbounded buffering) — it reconnects with
-        `Last-Event-ID` and replays what it missed.
+        (default 15s) while idle. Listener notifications are a coalescing wake
+        signal only; the stream always reads ordered rows from SQLite, so a
+        burst cannot reorder or drop journal events.
 
-        This endpoint does **not** carry the `@require_auth` decorator the
-        other companion handlers do — auth still applies (the tree-wide
-        CherryPy tool-level gate on `/api`, which also accepts `?token=` for
-        `EventSource` and consumes it from the query string before the
-        handler runs); stacking the decorator on top would re-check and
-        401 a request whose token was already stripped.
+        One stream is allowed per authenticated principal and companion. This
+        route and legacy `/companion/events` share one process-wide default
+        cap of 8 (`mobile_api.sse_max_connections`, maximum 256); it must
+        leave two HTTP workers for ordinary APIs. Queue size is clamped to
+        32..4096 and keepalive to 5..60 seconds.
+        Use `Authorization` from a streaming client. `?token=` accepts only a
+        short-lived operator JWT for browser `EventSource`, never a device
+        token. The stream closes at JWT expiry. API tokens are revalidated at
+        most every 15 seconds, including exact paired-device/full-identity
+        ownership; revocation, scope/binding change, or authorization-storage
+        uncertainty closes the connection. Resume with a current credential
+        and the last durably applied cursor.
       security:
         - BearerAuth: []
         - ApiKeyAuth: []
@@ -5444,35 +6507,52 @@ paths:
           in: path
           required: true
           schema:
-            type: string
+            $ref: '#/components/schemas/CompanionRegistrationName'
         - name: cursor
           in: query
           required: false
           schema:
-            type: string
-          description: Resume point if `Last-Event-ID` is absent. Defaults to current journal head.
+            oneOf:
+              - type: string
+                maxLength: 128
+                pattern: '^[0-9a-f]+:[0-9]+$'
+              - type: string
+                maxLength: 128
+                pattern: '^[0-9]+$'
+                description: Legacy reset input; never emitted.
+          description: "`epoch:seq` resume point if `Last-Event-ID` is absent. Defaults to current journal head."
         - name: Last-Event-ID
           in: header
           required: false
           schema:
-            type: string
+            oneOf:
+              - type: string
+                maxLength: 128
+                pattern: '^[0-9a-f]+:[0-9]+$'
+              - type: string
+                maxLength: 128
+                pattern: '^[0-9]+$'
+                description: Legacy reset input; never emitted.
           description: Standard SSE resume header; takes priority over `?cursor=`.
         - name: token
           in: query
           required: false
           schema:
             type: string
-          description: JWT, for `EventSource` clients that cannot set an `Authorization` header. Consumed (stripped from params) before the handler runs.
+          description: Operator JWT only, for `EventSource`. Prefer `Authorization`; never put a device token in a URL.
         - name: include
           in: query
           required: false
           schema:
             type: string
+            maxLength: 128
+            pattern: '^rf_receptions(?:\s*,\s*rf_receptions)*$'
           description: |
             Same semantics as on `sync`: a comma-separated opt-in list whose
             only recognized token is `rf_receptions`. Applies to both the
             backlog replay and the live tail — without it, `rf_reception`
-            firehose frames are suppressed. Unknown tokens are ignored.
+            firehose frames are suppressed. Empty and unknown tokens return
+            `400`; repeating the known token is harmless.
       responses:
         '200':
           description: Event stream established
@@ -5484,7 +6564,7 @@ paths:
             Cache-Control:
               schema:
                 type: string
-                example: no-cache
+                example: no-store, no-cache, no-transform
             X-Accel-Buffering:
               schema:
                 type: string
@@ -5494,11 +6574,12 @@ paths:
               schema:
                 type: string
                 description: |
-                  Stream of `id: {seq}\nevent: {type}\ndata: {json}\n\n` frames,
+                  Stream of `id: {epoch}:{seq}\nevent: {type}\ndata: {json}\n\n` frames,
                   `: ka\n\n` keepalive comments, and — only when `cursor`/
-                  `Last-Event-ID` is below the prune floor — a single
+                  `Last-Event-ID` requires reset — a single
                   `event: snapshot_required\ndata: {"journal_epoch":…,
-                  "snapshot_required":true}\n\n` frame before the stream ends.
+                  "cursor":…,"snapshot_required":true,
+                  "reset_reason":…}\n\n` frame before the stream ends.
         '400':
           description: |
             `Invalid cursor`. Rendered as the v1 JSON error envelope (see tag
@@ -5523,6 +6604,14 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponseV1'
+        '429':
+          description: |
+            The principal already has this companion stream, or the global
+            stream cap is full. Includes `Retry-After: 5`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponseV1'
         '503':
           description: |
             `Companion event journal not available`. Rendered as the v1 JSON error envelope (see tag description).
@@ -5537,8 +6626,9 @@ paths:
       summary: Add or update a contact
       description: |
         Upsert the contact identified by `{pubkey}`. The body carries only
-        mutable fields; omitted ones keep their current value on an update and
-        take model defaults on an insert. Learned routing state (`out_path`,
+        mutable fields. `name` is required on an insert, where `adv_type`
+        defaults to the chat type (`1`). Omitted fields keep their current
+        value on an update. Learned routing state (`out_path`,
         advert timestamps) is preserved across an update — a client renaming a
         contact must not erase what the mesh taught the node.
 
@@ -5556,46 +6646,52 @@ paths:
           in: path
           required: true
           schema:
-            type: string
+            $ref: '#/components/schemas/CompanionRegistrationName'
         - name: pubkey
           in: path
           required: true
           schema:
             type: string
-          description: Contact public key, hex.
+            pattern: '^[0-9a-fA-F]{64}$'
+          description: Contact's 32-byte public key, hex encoded.
       requestBody:
         required: false
         content:
           application/json:
             schema:
               type: object
+              additionalProperties: false
               properties:
                 name:
                   type: string
+                  minLength: 1
+                  maxLength: 32
+                  description: |
+                    Contact name; maximum 32 UTF-8 bytes. Required when the
+                    public key is not already a contact.
                 adv_type:
                   type: integer
-                flags:
-                  type: integer
+                  minimum: 1
+                  maximum: 255
+                  default: 1
                   description: |
-                    Raw contact flag bitfield. **Bit 0 (`0x01`) marks a
-                    favourite**, which protects the contact from forced-trim
-                    eviction when the store fills. Other bits are in active use
-                    on real deployments (values like `129` and `145` occur), so
-                    prefer the `favorite` boolean below over writing this
-                    directly — the server does a read-modify-write that
-                    preserves the bits you did not mean to touch.
+                    Contact advert type. Core reserves `0` for the transient
+                    non-contact type, so writable values are `1..255`.
+                    Defaults to chat (`1`) on insert; unchanged on update.
                 favorite:
                   type: boolean
                   description: |
                     Convenience over `flags` bit 0. Derived on read, and on
-                    write sets/clears just that bit. If both `flags` and
-                    `favorite` are supplied, `favorite` wins.
-                out_path_len:
-                  type: integer
+                    write sets/clears just that bit while preserving every
+                    server-managed flag.
                 gps_lat:
                   type: number
+                  minimum: -90
+                  maximum: 90
                 gps_lon:
                   type: number
+                  minimum: -180
+                  maximum: 180
       responses:
         '200':
           description: Contact upserted.
@@ -5608,9 +6704,18 @@ paths:
                     properties:
                       data:
                         type: object
+                        required: [contact]
                         properties:
                           contact:
-                            type: object
+                            $ref: '#/components/schemas/MobileContact'
+        '400':
+          description: |
+            New contact without `name`, invalid field value, malformed JSON,
+            or unknown field.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponseV1'
         '401':
           description: Missing/invalid token.
           content:
@@ -5631,12 +6736,16 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponseV1'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaTypeV1'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailableV1'
     delete:
       tags: [Mobile Companion API v1]
       summary: Remove a contact
       description: |
         Delete the contact and its stored row. Emits a `contact` journal event
-        with `change: removed`, so other synced devices drop it too.
+        with `change: remove`, so other synced devices drop it too.
       security:
         - BearerAuth: []
         - ApiKeyAuth: []
@@ -5645,12 +6754,13 @@ paths:
           in: path
           required: true
           schema:
-            type: string
+            $ref: '#/components/schemas/CompanionRegistrationName'
         - name: pubkey
           in: path
           required: true
           schema:
             type: string
+            pattern: '^[0-9a-fA-F]{64}$'
       responses:
         '200':
           description: Removed.
@@ -5663,6 +6773,7 @@ paths:
                     properties:
                       data:
                         type: object
+                        required: [removed]
                         properties:
                           removed:
                             type: boolean
@@ -5672,6 +6783,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponseV1'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailableV1'
 
   /v1/companions/{name}/channels/{index}:
     put:
@@ -5682,7 +6795,7 @@ paths:
 
         **`secret` is write-only.** It is accepted here but never returned by
         any v1 endpoint — `snapshot.channels` exposes `{index, name}` only, and
-        the `channel` journal event carries no secret either (§11.4). Clients
+        the `channel` journal event carries no secret either (architecture §8). Clients
         learn the PSK out of band (QR code, invite link), exactly as MeshCore
         clients do.
 
@@ -5701,12 +6814,13 @@ paths:
           in: path
           required: true
           schema:
-            type: string
+            $ref: '#/components/schemas/CompanionRegistrationName'
         - name: index
           in: path
           required: true
           schema:
             type: integer
+            minimum: 0
       requestBody:
         required: true
         content:
@@ -5714,11 +6828,16 @@ paths:
             schema:
               type: object
               required: [name, secret]
+              additionalProperties: false
               properties:
                 name:
                   type: string
+                  minLength: 1
+                  maxLength: 32
+                  description: Non-blank channel name; maximum 32 UTF-8 bytes.
                 secret:
                   type: string
+                  pattern: '^(?:[0-9a-fA-F]{32}|[0-9a-fA-F]{64})$'
                   description: |
                     Channel PSK as hex — 32 or 64 characters (16 or 32 bytes).
                     Write-only; never returned.
@@ -5736,9 +6855,11 @@ paths:
                     properties:
                       data:
                         type: object
+                        required: [channel]
                         properties:
                           channel:
                             type: object
+                            required: [index, name]
                             properties:
                               index:
                                 type: integer
@@ -5758,6 +6879,10 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponseV1'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaTypeV1'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailableV1'
     delete:
       tags: [Mobile Companion API v1]
       summary: Clear a channel slot
@@ -5772,44 +6897,54 @@ paths:
           in: path
           required: true
           schema:
-            type: string
+            $ref: '#/components/schemas/CompanionRegistrationName'
         - name: index
           in: path
           required: true
           schema:
             type: integer
+            minimum: 0
       responses:
         '200':
           description: Cleared.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/SuccessResponse'
+                allOf:
+                  - $ref: '#/components/schemas/SuccessResponse'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        required: [removed]
+                        properties:
+                          removed:
+                            type: boolean
         '404':
           description: Channel not configured, or companion not found.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponseV1'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailableV1'
 
   /v1/companions/{name}/contacts/{pubkey}/login:
     post:
       tags: [Mobile Companion API v1]
       summary: Room/repeater login for a contact
       description: |
-        Mirrors the legacy `/api/companion/login` bridge call. No
-        idempotency requirement (only message sends transmit a duplicable
-        payload, design doc §6). 15s bridge timeout.
+        Mirrors the legacy `/api/companion/login` bridge call. This is an RF
+        action and shares the Mobile API's per-principal/global RF admission
+        budget. It has no idempotency key; do not blindly retry a timeout.
+        The bridge timeout is 15 seconds.
 
         **Synchronous by design.** This blocks on the mesh round trip and
-        returns the result inline, rather than acknowledging and reporting the
-        outcome later via the journal. A multi-hop round trip can exceed the
-        timeout, and when it does the caller gets a timeout error and the
-        response is **dropped** — the frame protocol would still deliver its
-        `PUSH_CODE_*_RESPONSE` whenever it arrived. The design doc §9 lists
-        `login_result` / `status_response` / `telemetry_response` journal
-        events that would fix this; they are **not implemented**. Clients
-        should treat a timeout as "unknown", not "failed".
+        returns the bridge result inline. It is deliberately not a queued
+        command and does not create a later result event. A multi-hop round
+        trip can exceed the request guard; HTTP 504 then means the remote
+        outcome is unknown. Do not blindly retry. This small synchronous
+        contract is the complete v1 behavior for login/status/telemetry.
 
       security:
         - BearerAuth: []
@@ -5819,7 +6954,7 @@ paths:
           in: path
           required: true
           schema:
-            type: string
+            $ref: '#/components/schemas/CompanionRegistrationName'
         - name: pubkey
           in: path
           required: true
@@ -5833,10 +6968,15 @@ paths:
           application/json:
             schema:
               type: object
+              additionalProperties: false
               properties:
                 password:
                   type: string
                   default: ""
+                  maxLength: 15
+                  description: |
+                    Maximum 15 UTF-8 bytes. NUL is rejected because MeshCore
+                    login credentials are NUL-terminated.
       responses:
         '200':
           description: Login attempted
@@ -5879,10 +7019,207 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponseV1'
+        '429':
+          description: RF admission limit exceeded. Includes `Retry-After`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponseV1'
         '504':
           description: |
             Bridge coroutine timed out. Rendered as the v1 JSON error envelope (see tag
             description).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponseV1'
+        '500':
+          $ref: '#/components/responses/OperationFailedV1'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaTypeV1'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailableV1'
+
+  /v1/companions/{name}/contacts/{pubkey}/connection:
+    get:
+      tags: [Mobile Companion API v1]
+      summary: Read a contact's remote login-session state
+      description: |
+        Reports whether this companion currently tracks a non-expired login
+        session with the contact. This mirrors Frame `HAS_CONNECTION`: it is
+        remote mesh-session state, not the state of an HTTP, WebSocket, SSE,
+        or Frame client connection.
+
+        This is a local read and does not transmit RF or consume the RF
+        admission budget. The response is transient and uses
+        `Cache-Control: no-store`.
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/CompanionRegistrationName'
+        - name: pubkey
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: '^[0-9a-fA-F]{64}$'
+          description: Contact's 32-byte public key, hex-encoded.
+      responses:
+        '200':
+          description: Current remote login-session state.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessResponse'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        required: [connected]
+                        additionalProperties: false
+                        properties:
+                          connected:
+                            type: boolean
+        '400':
+          description: Invalid public key.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponseV1'
+        '401':
+          description: Missing/invalid JWT or API token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponseV1'
+        '404':
+          description: |
+            Companion not found — also returned for companions outside the
+            caller's token scope.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponseV1'
+        '405':
+          description: Method not allowed (GET only).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponseV1'
+        '500':
+          $ref: '#/components/responses/OperationFailedV1'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailableV1'
+        '504':
+          description: Timed out waiting for the companion event loop.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponseV1'
+
+  /v1/companions/{name}/contacts/{pubkey}/logout:
+    post:
+      tags: [Mobile Companion API v1]
+      summary: End a contact's remote login session
+      description: |
+        Mirrors Frame `LOGOUT`. The server first orders this operation after
+        any in-flight login for the same destination, clears its local login
+        session, and then makes one best-effort RF logout send. `logged_out`
+        therefore means the local session is closed; `sent` separately says
+        whether the RF packet was queued.
+
+        This action consumes the shared per-principal/global RF admission
+        budget. It deliberately has no idempotency key: each call is one
+        explicit best-effort logout send.
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/CompanionRegistrationName'
+        - name: pubkey
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: '^[0-9a-fA-F]{64}$'
+          description: Contact's 32-byte public key, hex-encoded.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+      responses:
+        '200':
+          description: Local session ended and the RF send was attempted.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessResponse'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        required: [logged_out, sent]
+                        additionalProperties: false
+                        properties:
+                          logged_out:
+                            type: boolean
+                            enum: [true]
+                          sent:
+                            type: boolean
+        '400':
+          description: Invalid public key, JSON body, or unexpected body field.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponseV1'
+        '401':
+          description: Missing/invalid JWT or API token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponseV1'
+        '404':
+          description: |
+            Companion not found — also returned for companions outside the
+            caller's token scope.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponseV1'
+        '405':
+          description: Method not allowed (POST only).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponseV1'
+        '429':
+          description: RF admission limit exceeded. Includes `Retry-After`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponseV1'
+        '500':
+          $ref: '#/components/responses/OperationFailedV1'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaTypeV1'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailableV1'
+        '504':
+          description: Timed out waiting for the companion event loop.
           content:
             application/json:
               schema:
@@ -5894,12 +7231,15 @@ paths:
       summary: Request a contact's status
       description: |
         Mirrors the legacy `/api/companion/request_status` bridge call.
-        Empty body. Bridge timeout 15s (handler waits up to 20s total).
+        No fields; omit the body or send `{}`. Bridge timeout 15s (handler
+        waits up to 20s total).
+        This shares the same RF admission budget as sends and login.
 
         Synchronous like `/login`: it blocks on the mesh round trip and
-        returns inline, so a timeout means "unknown", not "failed". See the
-        `/login` description and design doc §9 for the unimplemented
-        journal-event alternative.
+        returns the bridge result inline. A bridge-level timeout may be an
+        ordinary result object; expiration of the outer guard is HTTP 504.
+        Either case means the remote outcome is unknown, not failed. No later
+        result event is promised; do not blindly retry.
 
       security:
         - BearerAuth: []
@@ -5909,13 +7249,20 @@ paths:
           in: path
           required: true
           schema:
-            type: string
+            $ref: '#/components/schemas/CompanionRegistrationName'
         - name: pubkey
           in: path
           required: true
           schema:
             type: string
             pattern: '^[0-9a-fA-F]{64}$'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
       responses:
         '200':
           description: Status request completed (or timed out inside the bridge call and returned a failure result)
@@ -5959,6 +7306,18 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponseV1'
+        '429':
+          description: RF admission limit exceeded. Includes `Retry-After`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponseV1'
+        '500':
+          $ref: '#/components/responses/OperationFailedV1'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaTypeV1'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailableV1'
 
   /v1/companions/{name}/contacts/{pubkey}/telemetry_request:
     post:
@@ -5966,13 +7325,16 @@ paths:
       summary: Request a contact's telemetry
       description: |
         Mirrors the legacy `/api/companion/request_telemetry` bridge call,
-        always requesting base + location + environment. Empty body. Bridge
+        always requesting base + location + environment. There are no fields;
+        omit the body or send `{}`. Bridge
         timeout 20s (handler waits up to 25s total).
+        This shares the same RF admission budget as sends and login.
 
         Synchronous like `/login`: it blocks on the mesh round trip and
-        returns inline, so a timeout means "unknown", not "failed". See the
-        `/login` description and design doc §9 for the unimplemented
-        journal-event alternative.
+        returns the bridge result inline. A bridge-level timeout may be an
+        ordinary result object; expiration of the outer guard is HTTP 504.
+        Either case means the remote outcome is unknown, not failed. No later
+        result event is promised; do not blindly retry.
 
       security:
         - BearerAuth: []
@@ -5982,13 +7344,20 @@ paths:
           in: path
           required: true
           schema:
-            type: string
+            $ref: '#/components/schemas/CompanionRegistrationName'
         - name: pubkey
           in: path
           required: true
           schema:
             type: string
             pattern: '^[0-9a-fA-F]{64}$'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
       responses:
         '200':
           description: Telemetry request completed
@@ -6032,15 +7401,27 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponseV1'
+        '429':
+          description: RF admission limit exceeded. Includes `Retry-After`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponseV1'
+        '500':
+          $ref: '#/components/responses/OperationFailedV1'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaTypeV1'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailableV1'
 
   /v1/companions/{name}/contacts/{pubkey}/reset_path:
     post:
       tags: [Mobile Companion API v1]
       summary: Reset a contact's outbound routing path
       description: |
-        Mirrors the legacy `/api/companion/reset_path` bridge call. Empty
-        body, synchronous (not routed through `_run_async` — no bridge
-        timeout applies).
+        Resets the contact's learned outbound path on the shared companion
+        event loop, then atomically persists the contact and journals a
+        `contact` event with `change: path`. This is local state, not RF.
       security:
         - BearerAuth: []
         - ApiKeyAuth: []
@@ -6049,13 +7430,20 @@ paths:
           in: path
           required: true
           schema:
-            type: string
+            $ref: '#/components/schemas/CompanionRegistrationName'
         - name: pubkey
           in: path
           required: true
           schema:
             type: string
             pattern: '^[0-9a-fA-F]{64}$'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
       responses:
         '200':
           description: Path reset
@@ -6068,6 +7456,7 @@ paths:
                     properties:
                       data:
                         type: object
+                        required: [reset]
                         properties:
                           reset:
                             type: boolean
@@ -6095,25 +7484,29 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponseV1'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaTypeV1'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailableV1'
 
   /v1/companions/{name}/messages/{id}/receptions:
     get:
       tags: [Mobile Companion API v1]
-      summary: Every RF reception of a message's packet_hash
+      summary: Bounded RF receptions of a message's packet_hash
       description: |
-        RF observation surface (design doc §10). Returns every reception of
-        the message's `packet_hash` within the window — per-copy RSSI/SNR,
-        the incoming path (each element resolved against the companion's
-        contacts, §10.5), arrival time, and whether we retransmitted it.
-        Answers "how did this message reach me, and how well".
+        RF observation surface (architecture §12). Returns up to 500
+        receptions of the message's `packet_hash` within the window —
+        per-copy RSSI/SNR, the incoming path (each element resolved against
+        the companion's contacts), arrival time, and whether we retransmitted
+        it. `truncated` says more matched.
 
         The window is measured back from *now*, not anchored on the message's
         own timestamp — a message can be heard again well after it first
         arrived — so a copy that predates the message but falls inside the
         window is included. The query resolves through `idx_packets_hash`
-        with the bounded window (§10.1); `observation_count`/
-        `unique_path_count` are the exact counts from this query, not the
-        approximate running counters on the message row (§10.4). A message
+        with the bounded window; `observation_count`/`unique_path_count`
+        describe the returned rows (the full result only when `truncated` is
+        false), not the approximate running counters on the message row. A message
         with no `packet_hash` (predates correlation) returns an empty
         `receptions` list rather than a 404.
       security:
@@ -6124,12 +7517,15 @@ paths:
           in: path
           required: true
           schema:
-            type: string
+            $ref: '#/components/schemas/CompanionRegistrationName'
         - name: id
           in: path
           required: true
           schema:
             type: integer
+            format: int64
+            minimum: 1
+            maximum: 9223372036854775807
           description: The `companion_messages` row id.
         - name: window
           in: query
@@ -6141,7 +7537,7 @@ paths:
             Look-back window, back from now. Bare integer seconds or an
             integer with an `s`/`m`/`h`/`d` suffix (e.g. `30m`, `24h`, `7d`).
             Clamped to `[60s, 7d]` (default `24h`); a malformed string is a
-            `400` (§10.1).
+            `400`.
       responses:
         '200':
           description: Receptions (possibly empty)
@@ -6154,6 +7550,15 @@ paths:
                     properties:
                       data:
                         type: object
+                        required:
+                          - message_id
+                          - packet_hash
+                          - window
+                          - receptions
+                          - observation_count
+                          - unique_path_count
+                          - truncated
+                          - observations_pruned
                         properties:
                           message_id:
                             type: integer
@@ -6172,9 +7577,12 @@ paths:
                             type: integer
                           unique_path_count:
                             type: integer
+                          truncated:
+                            type: boolean
+                            description: True when more than 500 receptions matched; counts describe returned rows.
                           observations_pruned:
                             type: boolean
-                            description: True when the window reaches past the packets retention floor (§10.6).
+                            description: True when the window reaches past the packets retention floor.
         '400':
           description: |
             `Invalid message id` or `Invalid window`. Rendered as the v1 JSON error envelope (see tag description).
@@ -6197,13 +7605,15 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponseV1'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailableV1'
 
   /v1/companions/{name}/contacts/{pubkey}/paths:
     get:
       tags: [Mobile Companion API v1]
       summary: Incoming path aggregation for a contact
       description: |
-        RF observation surface (design doc §10). Aggregates distinct incoming
+        RF observation surface (architecture §12). Aggregates distinct incoming
         paths seen on a contact's traffic within the window, each with a copy
         count, first/last-seen timestamps, and RSSI/SNR min/max/avg — a
         "route diversity" view. Paths are ordered most-observed first.
@@ -6213,8 +7623,8 @@ paths:
         recent `packet_hash`es are resolved first (bounded to
         `message_limit` messages, reported as `messages_scanned`), then a
         hash-keyed `idx_packets_hash` lookup per packet — never a scan of
-        `packets` on a non-indexed column (§10.1). Each path element is
-        resolved against the companion's contacts (§10.5).
+        `packets` on a non-indexed column. Observation rows are capped at 500;
+        each path element is resolved against the companion's contacts.
       security:
         - BearerAuth: []
         - ApiKeyAuth: []
@@ -6223,7 +7633,7 @@ paths:
           in: path
           required: true
           schema:
-            type: string
+            $ref: '#/components/schemas/CompanionRegistrationName'
         - name: pubkey
           in: path
           required: true
@@ -6238,7 +7648,7 @@ paths:
             default: 24h
           description: |
             Look-back window, back from now. Same format/clamps as the
-            receptions endpoint (`[60s, 7d]`, default `24h`, §10.1).
+            receptions endpoint (`[60s, 7d]`, default `24h`).
       responses:
         '200':
           description: Path aggregation (possibly empty)
@@ -6251,6 +7661,16 @@ paths:
                     properties:
                       data:
                         type: object
+                        required:
+                          - contact_pubkey
+                          - window
+                          - paths
+                          - total_observations
+                          - messages_scanned
+                          - message_limit
+                          - observation_limit
+                          - truncated
+                          - observations_pruned
                         properties:
                           contact_pubkey:
                             type: string
@@ -6269,6 +7689,12 @@ paths:
                           message_limit:
                             type: integer
                             description: The cap on `messages_scanned` (200).
+                          observation_limit:
+                            type: integer
+                            description: The cap on packet observations (500).
+                          truncated:
+                            type: boolean
+                            description: True when either the message or observation cap omitted matching rows; counts describe returned rows.
                           observations_pruned:
                             type: boolean
         '400':
@@ -6293,26 +7719,32 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponseV1'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailableV1'
 
   /v1/companions/{name}/transmissions/{packet_hash}/repeats:
     get:
       tags: [Mobile Companion API v1]
       summary: Heard repeats of our own transmission
       description: |
-        RF observation surface (design doc §10). Given a `packet_hash` we
-        transmitted, returns the receptions of that same hash arriving
+        RF observation surface. The hash must first resolve to a durable
+        outbound message owned by this companion; global packet rows alone
+        do not establish authorization. It then returns receptions of that
+        same hash arriving
         *after* our transmit — neighbors repeating us. The strongest
         available signal that a send actually propagated.
 
-        Predicate is exactly §10.3: `is_duplicate=1 AND transmitted=0 AND
+        Predicate is exactly `is_duplicate=1 AND transmitted=0 AND
         timestamp > tx.timestamp` (local echo and the transmit row itself are
-        excluded). Two counts are exposed and neither is collapsed into the
+        excluded). At most 500 matching rows are returned. Two counts are
+        exposed and neither is collapsed into the
         other: `heard_repeat_count` (every matching OTA copy — a repeater
         heard twice counts twice) and `unique_repeater_count` (distinct
-        terminal path hashes, i.e. the last hop each copy took). Both are a
-        lower bound (hash-changing rebroadcast variants are out of scope,
-        §10.3). `packet_hash` accepts either the full or already-truncated
-        16-char form.
+        terminal path hashes, i.e. the last hop each copy took). When
+        `truncated` is true, both describe only the returned rows. They are
+        always a lower bound because hash-changing rebroadcast variants are
+        out of scope. `packet_hash` accepts exactly 16 or 64 hexadecimal characters,
+        with an optional `0x` prefix.
       security:
         - BearerAuth: []
         - ApiKeyAuth: []
@@ -6321,13 +7753,14 @@ paths:
           in: path
           required: true
           schema:
-            type: string
+            $ref: '#/components/schemas/CompanionRegistrationName'
         - name: packet_hash
           in: path
           required: true
           schema:
             type: string
-          description: The transmission's correlation key (full or 16-char hex).
+            pattern: '^(0x)?([0-9A-Fa-f]{16}|[0-9A-Fa-f]{64})$'
+          description: The companion-owned transmission correlation key.
         - name: window
           in: query
           required: false
@@ -6337,7 +7770,7 @@ paths:
           description: |
             Look-back window for locating the transmit row, back from now.
             Same format/clamps as the receptions endpoint (`[60s, 7d]`,
-            default `24h`, §10.1). Repeats are then searched from the
+            default `24h`). Repeats are then searched from the
             transmit time forward.
       responses:
         '200':
@@ -6351,6 +7784,15 @@ paths:
                     properties:
                       data:
                         type: object
+                        required:
+                          - packet_hash
+                          - transmitted_at
+                          - window
+                          - repeats
+                          - heard_repeat_count
+                          - unique_repeater_count
+                          - truncated
+                          - observations_pruned
                         properties:
                           packet_hash:
                             type: string
@@ -6368,6 +7810,9 @@ paths:
                             type: integer
                           unique_repeater_count:
                             type: integer
+                          truncated:
+                            type: boolean
+                            description: True when more than 500 heard repeats matched; counts describe returned rows.
                           observations_pruned:
                             type: boolean
         '400':
@@ -6393,21 +7838,57 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponseV1'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailableV1'
 
 components:
   schemas:
+    LegacyCompanionHash:
+      description: |
+        Optional legacy companion selector. Prefer `companion_name`; this
+        hash form exists for upstream Repeater API compatibility.
+      oneOf:
+        - type: integer
+          minimum: 0
+          maximum: 255
+        - type: string
+          pattern: '^(?:0[xX][0-9A-Fa-f]{1,2}|(?:0|[1-9][0-9]{0,2}))$'
+
+    LegacyPublicKey:
+      type: string
+      pattern: '^[0-9A-Fa-f]{64}$'
+      description: Exactly one 32-byte public key encoded as 64 hexadecimal characters.
+
+    LegacyTimeout:
+      type: number
+      minimum: 1
+      maximum: 60
+      description: Request timeout in seconds. Use a JSON number; numeric strings remain compatibility-only.
+
+    CompanionRegistrationName:
+      type: string
+      minLength: 1
+      maxLength: 64
+      pattern: '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$'
+      description: |
+        Stable companion registration slug used in configuration, URL path
+        segments, pairing, and authorization scopes. Human-facing text belongs
+        in `node_name`.
+      example: "my-companion"
+
     SuccessResponse:
       type: object
+      required: [success, data]
       properties:
         success:
           type: boolean
           example: true
         data:
-          type: object
           description: Response data (varies by endpoint)
 
     ErrorResponse:
       type: object
+      required: [success, error]
       properties:
         success:
           type: boolean
@@ -6419,7 +7900,7 @@ components:
     ErrorResponseV1:
       description: |
         Error envelope for the Mobile Companion API v1 tree (`/api/v1/*`).
-        Every non-2xx response under `/v1/*` — auth failures (401), scope
+        Every 4xx/5xx error under `/v1/*` — auth failures (401), scope
         rejections (403), not-found (404), validation errors (400/422), and
         uncaught exceptions (500) alike — renders this same JSON shape
         instead of CherryPy's default HTML error page
@@ -6431,7 +7912,7 @@ components:
           properties:
             status:
               type: integer
-              description: HTTP status code, echoed in the body for convenience.
+              description: HTTP status code, included by error paths that echo it.
               example: 401
 
     NeighborLinkSnapshot:
@@ -7016,48 +8497,87 @@ components:
           description: Client is currently active (synced within timeout period)
           example: true
 
+    RegisteredIdentity:
+      type: object
+      description: One live identity-manager registration.
+      required: [name, type, hash, public_key, address]
+      properties:
+        name:
+          type: string
+          description: Runtime registration name, including its type prefix.
+          example: "companion:my-companion"
+        type:
+          type: string
+          enum: [repeater, room_server, companion]
+        hash:
+          type: string
+          pattern: '^0x[0-9a-fA-F]{2}$'
+        public_key:
+          type: string
+          nullable: true
+          pattern: '^[0-9a-fA-F]{64}$'
+        address:
+          type: string
+          description: Runtime address hex, or `N/A` for an unavailable identity object.
+
     Identity:
       type: object
-      required: [name, type, hash, public_key]
+      description: |
+        One configured room-server or companion identity. Top-level identity
+        fields always describe configuration, never an unrelated live object.
+        Derived fields are null when a malformed legacy identity key cannot be
+        decoded.
+      required: [name, type, settings, hash, public_key, address, registered]
       properties:
         name:
           type: string
           minLength: 1
           maxLength: 64
-          pattern: '^[a-zA-Z0-9_\-\s]+$'
-          description: Identity name (alphanumeric, spaces, hyphens, underscores)
+          description: |
+            Identity registration name. Companion values are the stricter
+            stable slug `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`; human-facing
+            companion text is in `settings.node_name`.
           example: "General Chat"
         type:
           type: string
-          enum: [repeater, room_server]
+          enum: [repeater, room_server, companion]
           description: |
             - repeater: Repeater identity (only one allowed per system)
             - room_server: Room server for group chat
+            - companion: Frame/REST companion identity sharing the repeater radio
           example: room_server
         hash:
           type: string
+          nullable: true
           pattern: '^0x[0-9a-fA-F]{2}$'
-          description: 1-byte identity hash (used in radio packets)
+          description: 1-byte configured identity hash (used in radio packets).
           example: "0x42"
         public_key:
           type: string
+          nullable: true
           pattern: '^[0-9a-fA-F]{64}$'
-          description: Ed25519 public key (64 hex chars)
-          example: "abc123def456..."
+          description: Configured Ed25519 public key (64 hex chars).
+          example: "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+        address:
+          type: string
+          nullable: true
+          pattern: '^[0-9a-fA-F]+$'
+          description: Address derived from the configured identity.
+        registered:
+          type: boolean
+          description: |
+            True only when a live identity has the configured type and exact
+            full public key.
         settings:
           type: object
           description: Type-specific settings
           properties:
-            admin_password:
-              type: string
-              minLength: 4
-              description: Admin password (room_server only)
-              example: "admin123"
-            guest_password:
-              type: string
-              minLength: 4
-              description: Guest password (room_server only)
-              example: "guest123"
+            admin_password_configured:
+              type: boolean
+              description: Whether an admin password is stored (room_server only).
+            guest_password_configured:
+              type: boolean
+              description: Whether a guest password is stored (room_server only).
             max_posts:
               type: integer
               minimum: 1
@@ -7065,6 +8585,95 @@ components:
               default: 32
               description: Maximum messages to keep (room_server only, hard limit 32)
               example: 32
+            node_name:
+              type: string
+              description: Human-facing companion name; maximum 31 bytes of UTF-8.
+            frame_enabled:
+              type: boolean
+              default: true
+              description: |
+                Whether the upstream-compatible companion TCP frame listener is
+                enabled. REST/SSE and the shared bridge remain active when false.
+            tcp_port:
+              type: integer
+              minimum: 1
+              maximum: 65535
+              default: 5000
+              description: Companion frame-listener port.
+            tcp_timeout:
+              type: integer
+              minimum: 0
+              maximum: 2147483647
+              default: 28800
+              description: Companion frame-client idle seconds; `0` disables the timeout.
+            bind_address:
+              type: string
+              default: "127.0.0.1"
+              description: |
+                Companion frame-listener bind. Loopback is the safe default
+                because the frame protocol is unauthenticated.
+            adopt_legacy_namespace:
+              type: boolean
+              default: false
+              description: |
+                One-time companion recovery setting. Claims verified unbound
+                legacy rows for this full public identity; it never replaces
+                an existing namespace binding.
+            max_contacts:
+              type: integer
+              minimum: 1
+              maximum: 2000
+              default: 1000
+              description: Maximum durable contacts for this companion.
+            offline_queue_size:
+              type: integer
+              minimum: 0
+              maximum: 4096
+              default: 512
+              description: |
+                Bounded pending queue for frame delivery. `0` disables offline
+                frame queuing; REST history remains durable.
+            trim_contacts_on_overflow:
+              type: boolean
+              default: false
+              description: |
+                Trim oldest non-favourite contacts on startup when persisted
+                contacts exceed `max_contacts`.
+            rf_reception_events:
+              type: boolean
+              default: false
+              description: |
+                Include high-volume uncorrelated RF reception events in this
+                companion's journal.
+        runtime:
+          type: object
+          description: |
+            Optional live-runtime observation. An absent registration is
+            represented as `{registered: false}`. When a live identity is
+            present, all remaining fields are included; a mismatched runtime
+            stays here and never replaces the configured top-level fields.
+          required: [registered]
+          properties:
+            hash:
+              type: string
+              nullable: true
+              pattern: '^0x[0-9a-fA-F]{2}$'
+            public_key:
+              type: string
+              nullable: true
+              pattern: '^[0-9a-fA-F]{64}$'
+            address:
+              type: string
+              nullable: true
+              pattern: '^[0-9a-fA-F]+$'
+            type:
+              type: string
+              nullable: true
+              enum: [repeater, room_server, companion]
+            registered:
+              type: boolean
+            matches_configuration:
+              type: boolean
 
     ACLClient:
       type: object
@@ -7122,35 +8731,125 @@ components:
     MobileCompanionSummary:
       type: object
       description: One entry from `GET /api/v1/companions` (scope-filtered).
+      required: [name, companion_hash, node_name, public_key]
       properties:
         name:
-          type: string
-          example: "field-radio-1"
+          $ref: '#/components/schemas/CompanionRegistrationName'
         companion_hash:
           type: string
           pattern: '^0x[0-9a-f]{2}$'
           example: "0xa4"
         node_name:
           type: string
+          description: Human-facing advertised name; at most 31 bytes of UTF-8.
         public_key:
           type: string
           description: Full ed25519 public key, hex-encoded (64 chars).
 
+    MobileContact:
+      type: object
+      description: |
+        One mobile contact. Snapshot entries, contact-mutation responses, and
+        `contact` journal-event data use this same public shape. Raw path,
+        advert packet, and storage-only fields are intentionally omitted. All
+        listed fields are present; clients should reject missing or unexpected
+        fields for this known shape.
+      required:
+        - public_key
+        - name
+        - adv_type
+        - flags
+        - favorite
+        - out_path_len
+        - last_advert_timestamp
+        - lastmod
+        - gps_lat
+        - gps_lon
+      properties:
+        public_key:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+          description: Full contact public key, lowercase hex.
+        name:
+          type: string
+        adv_type:
+          type: integer
+        flags:
+          type: integer
+          description: |
+            Raw flag bitfield; bit 0 (`0x01`) marks a favourite. Other bits
+            are server-managed.
+        favorite:
+          type: boolean
+          description: Derived from `flags` bit 0.
+        out_path_len:
+          type: integer
+        last_advert_timestamp:
+          type: integer
+        lastmod:
+          type: integer
+        gps_lat:
+          type: number
+          nullable: true
+        gps_lon:
+          type: number
+          nullable: true
+
+    MobileContactEvent:
+      allOf:
+        - $ref: '#/components/schemas/MobileContact'
+        - type: object
+          required: [change]
+          properties:
+            change:
+              type: string
+              enum: [new, update, remove, path]
+
     MobileSnapshot:
       type: object
       description: Bootstrap document returned by `GET .../snapshot`.
+      required: [journal_epoch, cursor, self, contacts, channels, messages, server]
       properties:
         journal_epoch:
           type: string
+          maxLength: 128
+          pattern: '^[0-9a-f]+$'
           description: Opaque epoch id; changes if the journal is ever reset (e.g. DB restore).
         cursor:
           type: string
-          description: Journal head `seq` at snapshot time, as a string. Feed this to `sync` as `cursor`.
+          maxLength: 128
+          pattern: '^[0-9a-f]+:[0-9]+$'
+          description: Reset-safe journal head in `epoch:seq` form. Store and echo it unchanged.
         self:
           type: object
+          additionalProperties: false
+          description: |
+            Full public companion preference state. This is the reset-safe
+            baseline for the same fields carried by later `prefs` journal
+            events; radio tuning and secret scope material are excluded.
+          required:
+            - public_key
+            - node_name
+            - adv_type
+            - latitude
+            - longitude
+            - autoadd_config
+            - autoadd_max_hops
+            - path_hash_mode
+            - rx_delay_base
+            - airtime_factor
+            - client_repeat
+            - manual_add_contacts
+            - telemetry_mode_base
+            - telemetry_mode_location
+            - telemetry_mode_environment
+            - advert_loc_policy
+            - multi_acks
+            - default_scope_name
           properties:
             public_key:
               type: string
+              pattern: '^[0-9a-f]{64}$'
             node_name:
               type: string
             adv_type:
@@ -7159,39 +8858,42 @@ components:
               type: number
             longitude:
               type: number
+            autoadd_config:
+              type: integer
+            autoadd_max_hops:
+              type: integer
+            path_hash_mode:
+              type: integer
+            rx_delay_base:
+              type: number
+            airtime_factor:
+              type: number
+            client_repeat:
+              type: integer
+            manual_add_contacts:
+              type: integer
+            telemetry_mode_base:
+              type: integer
+            telemetry_mode_location:
+              type: integer
+            telemetry_mode_environment:
+              type: integer
+            advert_loc_policy:
+              type: integer
+            multi_acks:
+              type: integer
+            default_scope_name:
+              type: string
         contacts:
           type: array
           items:
-            type: object
-            properties:
-              public_key:
-                type: string
-              name:
-                type: string
-              adv_type:
-                type: integer
-              flags:
-                type: integer
-                description: |
-                  Raw flag bitfield; **bit 0 (`0x01`) marks a favourite**
-                  (protected from forced-trim eviction). Other bits are in use.
-              favorite:
-                type: boolean
-                description: Derived from `flags` bit 0.
-              out_path_len:
-                type: integer
-              last_advert_timestamp:
-                type: integer
-              lastmod:
-                type: integer
-              gps_lat:
-                type: number
-              gps_lon:
-                type: number
+            $ref: '#/components/schemas/MobileContact'
         channels:
           type: array
           items:
             type: object
+            additionalProperties: false
+            required: [index, name]
             properties:
               index:
                 type: integer
@@ -7200,33 +8902,68 @@ components:
           description: PSK secrets are never exposed on this surface.
         messages:
           type: array
-          description: Most recent messages (default/max 200 via `messages_limit`), oldest-first.
+          description: Most recent messages (default 100, max 200), oldest-first.
           items:
             $ref: '#/components/schemas/MobileMessage'
         server:
           type: object
+          required: [version]
           properties:
-            time:
-              type: number
             version:
               type: string
               nullable: true
 
     MobileMessage:
       type: object
+      additionalProperties: false
       description: |
         A `companion_messages` row. `sender_key` and `channel_data_payload`
-        are hex-encoded byte strings; `is_channel` distinguishes a channel
-        post (`channel_idx` set) from a DM (`sender_key`/`sender_prefix` set).
+        are hex-encoded byte strings. Both inbound and outbound messages are
+        durable; use `direction`, `state`, and `source` instead of inferring
+        lifecycle from text or timestamps. Frame-delivery-only
+        `pending_for_frame`/`consumed_at` markers are deliberately omitted:
+        REST clients do not own the frame queue, and frame pops must not
+        invalidate an otherwise unchanged REST snapshot.
+      required:
+        - id
+        - companion_hash
+        - sender_key
+        - recipient_key
+        - sender_prefix
+        - txt_type
+        - timestamp
+        - text
+        - is_channel
+        - channel_idx
+        - path_len
+        - snr
+        - rssi
+        - channel_data_type
+        - channel_data_payload
+        - packet_hash
+        - created_at
+        - observation_count
+        - unique_path_count
+        - direction
+        - state
+        - expected_ack
+        - source
       properties:
         id:
           type: integer
         companion_hash:
           type: string
+          pattern: '^0x[0-9a-f]{2}$'
         sender_key:
           type: string
+          pattern: '^(?:|[0-9a-f]{64})$'
+        recipient_key:
+          type: string
+          pattern: '^(?:|[0-9a-f]{64})$'
+          description: DM recipient public key; empty for inbound/channel messages.
         sender_prefix:
           type: string
+          pattern: '^[0-9a-f]*$'
         txt_type:
           type: integer
         timestamp:
@@ -7237,7 +8974,6 @@ components:
           type: boolean
         channel_idx:
           type: integer
-          nullable: true
         path_len:
           type: integer
         snr:
@@ -7248,30 +8984,53 @@ components:
           type: integer
         channel_data_payload:
           type: string
+          pattern: '^[0-9a-f]*$'
         packet_hash:
           type: string
           nullable: true
+          pattern: '^[0-9A-F]{16}$'
+          description: Canonical 16-hex-character uppercase correlation hash.
         created_at:
           type: number
-        consumed_at:
-          type: number
+        observation_count:
+          type: integer
+        unique_path_count:
+          type: integer
+        direction:
+          type: string
+          enum: [in, out]
+        state:
+          type: string
+          enum: [received, pending, transmitted, heard_repeated, confirmed, failed, indeterminate]
+        expected_ack:
+          type: integer
           nullable: true
-
+          minimum: 0
+          maximum: 4294967295
+        source:
+          type: string
+          nullable: true
+          enum: [radio, rest, frame, operator]
     MobileJournalEvent:
       type: object
       description: |
         One event, identical shape whether delivered via `sync`'s `events`
-        array or one SSE frame's `data:` line (design doc §9). `data` is
+        array or one SSE frame's `data:` line (architecture §6). `data` is
         type-specific per `type` — clients must ignore unrecognized types.
+        This server preserves a safe unrecognized type and envelope so clients
+        can advance their cursor, but emits its unreviewed `data` as `{}`.
+        `snapshot_required` is reserved for the non-journal SSE reset control
+        event and is never a durable journal `type`.
 
         Known `type` values and their `data` shapes:
         - `message` — a persisted inbound/outbound message (`data` mirrors a
           `companion_messages` row).
-        - `contact` — a contact upsert.
+        - `contact` — a contact mutation; `change` is `new`, `update`,
+          `remove`, or `path`.
         - `channel` — a channel slot was added, renamed or cleared:
           `{index, name, change: "update"|"remove"}`. `name` is `null` when
           `change` is `"remove"`. The PSK secret is **never** included —
-          the snapshot withholds it (§11.4) and a secret journaled here would
+          the snapshot withholds it (architecture §8) and a secret journaled here would
           reach every synced device *and* persist in the journal table.
           Emitted on a real change only: a rejected or no-op `SET_CHANNEL`
           produces nothing, and the bulk save at shutdown is not journaled
@@ -7280,51 +9039,135 @@ components:
           but not settable** over `/api/v1`: the event reports changes made on
           any surface, but no v1 endpoint causes one.
         - `message_reception` — another RF copy of a known inbound message
-          (§10.4): `{message_id, packet_hash, path[], rssi, snr, observed_at,
+          (architecture §12): `{message_id, packet_hash, path[], rssi, snr, observed_at,
           observation_count, unique_path_count}`.
-        - `message_send_state` — a heard-repeat of one of our sends (§10.3):
-          `{message_id (null — outbound sends aren't persisted), state:
-          "heard_repeated", packet_hash, path[], terminal_repeater_hash,
-          rssi, snr, observed_at, heard_repeat_count, unique_repeater_count}`.
-        - `rf_reception` — the opt-in firehose (§9): every OTA duplicate the
+        - `message_send_state` — an outbound lifecycle transition. Send-path
+          transitions carry `{message_id, state, packet_hash, expected_ack}`.
+          Heard-repeat transitions additionally carry path/signal and repeat
+          counters.
+        - `rf_reception` — the opt-in firehose (architecture §6): every OTA duplicate the
           repeater hears, regardless of companion relevance. **Off by
           default** — suppressed from `sync`/`events` output unless the caller
           passes `?include=rf_receptions` *and* the companion has the
           `rf_reception_events` setting enabled. `{packet_hash, rssi, snr,
           path[], observed_at}`. `path` here is raw hashes (not resolved).
+      required: [seq, type, ts, packet_hash, data]
       properties:
         seq:
           type: integer
+          minimum: 1
+          maximum: 9223372036854775807
         type:
           type: string
-          enum: [message, contact, channel, prefs, message_reception, message_send_state, rf_reception]
+          minLength: 1
+          maxLength: 64
+          pattern: '^[A-Za-z0-9_.-]+$'
           example: message
+          description: |
+            Event type. Known values are listed above; clients must ignore
+            unrecognized future values rather than reject the page/stream.
         ts:
           type: number
         packet_hash:
           type: string
           nullable: true
+          pattern: '^[0-9A-F]{16}$'
+          description: |
+            Correlation hash for the event. For `message`,
+            `message_reception`, `message_send_state`, and `rf_reception`,
+            this exactly matches `data.packet_hash` (including both being
+            null where the event schema permits null).
         data:
-          type: object
+          anyOf:
+            - $ref: '#/components/schemas/MobileMessage'
+            - $ref: '#/components/schemas/MobileContactEvent'
+            - type: object
+              description: |
+                Payload for another known or forward-compatible event type;
+                use `type` and ignore unrecognized future values.
+
+    MobileSyncDelta:
+      type: object
+      description: A valid journal page; continue from `next_cursor`.
+      required:
+        - journal_epoch
+        - events
+        - next_cursor
+        - has_more
+        - snapshot_required
+      properties:
+        journal_epoch:
+          type: string
+          maxLength: 128
+          pattern: '^[0-9a-f]+$'
+        events:
+          type: array
+          items:
+            $ref: '#/components/schemas/MobileJournalEvent'
+        next_cursor:
+          type: string
+          maxLength: 128
+          pattern: '^[0-9a-f]+:[0-9]+$'
+        has_more:
+          type: boolean
+        snapshot_required:
+          type: boolean
+          enum: [false]
+
+    MobileSyncReset:
+      type: object
+      description: |
+        The supplied cursor cannot produce a complete delta. Fetch a fresh
+        snapshot and resume from that snapshot's cursor.
+      required:
+        - journal_epoch
+        - events
+        - next_cursor
+        - has_more
+        - snapshot_required
+        - reset_reason
+      properties:
+        journal_epoch:
+          type: string
+          maxLength: 128
+          pattern: '^[0-9a-f]+$'
+        events:
+          type: array
+          maxItems: 0
+          items:
+            $ref: '#/components/schemas/MobileJournalEvent'
+        next_cursor:
+          type: string
+          maxLength: 128
+          pattern: '^[0-9a-f]+:[0-9]+$'
+        has_more:
+          type: boolean
+          enum: [false]
+        snapshot_required:
+          type: boolean
+          enum: [true]
+        reset_reason:
+          type: string
+          enum: [missing_epoch, epoch_mismatch, future_cursor, pruned_cursor]
 
     MobileActionResult:
       type: object
       description: |
-        `data` for the contact-action endpoints (login/status_request/
-        telemetry_request). This is the underlying `CompanionBridge` call's
-        result object passed through `companion_endpoints._to_json_safe`
-        (dataclass/enum -> plain JSON), so its exact fields depend on the
-        companion bridge library version; treat it as an open object.
+        Open JSON-safe `data` returned by the synchronous contact-action
+        endpoints (login/status_request/telemetry_request). Exact fields
+        depend on the companion bridge library version; no later result-event
+        schema is promised.
 
     ResolvedPathElement:
       type: object
       description: |
-        One hop of an RF path (design doc §10.5). Path entries are abbreviated
+        One hop of an RF path (architecture §12). Path entries are abbreviated
         hashes (commonly one byte) that genuinely collide, so every rendered
         element carries both the raw value and its interpretation against the
         companion's current contacts. Clients display `raw_hash` unless
         `resolution` is `unique`. Resolution is computed at read time, so it
         can improve as contacts are learned.
+      required: [raw_hash, resolution, candidates]
       properties:
         raw_hash:
           description: The raw path element as stored (opaque; usually a short hex string).
@@ -7339,6 +9182,7 @@ components:
           description: Prefix-matching contacts, capped at 5.
           items:
             type: object
+            required: [pubkey, name]
             properties:
               pubkey:
                 type: string
@@ -7351,7 +9195,8 @@ components:
 
     RfReception:
       type: object
-      description: One RF copy of a message's `packet_hash` (design doc §10).
+      description: One RF copy of a message's `packet_hash` (architecture §12).
+      required: [observed_at, rssi, snr, path, is_duplicate, transmitted]
       properties:
         observed_at:
           type: number
@@ -7364,7 +9209,7 @@ components:
           nullable: true
         path:
           type: array
-          description: Incoming path, each hop resolved (§10.5).
+          description: Incoming path, each hop resolved (architecture §12).
           items:
             $ref: '#/components/schemas/ResolvedPathElement'
         is_duplicate:
@@ -7375,7 +9220,20 @@ components:
 
     RfPathAggregate:
       type: object
-      description: One distinct incoming path for a contact, with signal stats (§10).
+      description: One distinct incoming path for a contact, with signal stats (architecture §12).
+      required:
+        - path
+        - count
+        - first_seen
+        - last_seen
+        - rssi_min
+        - rssi_max
+        - rssi_avg
+        - snr_min
+        - snr_max
+        - snr_avg
+        - first_hop
+        - last_hop
       properties:
         path:
           type: array
@@ -7419,7 +9277,8 @@ components:
 
     RfHeardRepeat:
       type: object
-      description: One heard repeat of our transmission (design doc §10.3).
+      description: One heard repeat of our transmission (architecture §12).
+      required: [observed_at, rssi, snr, path, terminal_repeater]
       properties:
         observed_at:
           type: number
@@ -7439,7 +9298,44 @@ components:
           nullable: true
           description: |
             The last path hop — the repeater that forwarded this copy to us
-            (§10.3). Null for an empty path.
+            (architecture §12). Null for an empty path.
+
+  responses:
+    UnsupportedMediaTypeV1:
+      description: |
+        A non-empty request body must use `Content-Type: application/json`.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponseV1'
+    ServiceUnavailableV1:
+      description: Required daemon, event-loop, journal, or durable storage state is unavailable.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponseV1'
+    OperationFailedV1:
+      description: The companion bridge or runtime operation failed unexpectedly.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponseV1'
+
+  parameters:
+    LegacyCompanionNameQuery:
+      name: companion_name
+      in: query
+      required: false
+      schema:
+        $ref: '#/components/schemas/CompanionRegistrationName'
+      description: Preferred legacy selector. Omit only when exactly one companion exists.
+    LegacyCompanionHashQuery:
+      name: companion_hash
+      in: query
+      required: false
+      schema:
+        $ref: '#/components/schemas/LegacyCompanionHash'
+      description: Compatibility selector used only when `companion_name` is absent.
 
   securitySchemes:
     BearerAuth:
@@ -7454,24 +9350,21 @@ components:
         cherrypy_tool.py`) tries the Bearer value as a JWT first, and falls
         back to a device-token lookup only if JWT verification fails, so a
         device token works equally well as `Authorization: Bearer <token>`
-        or `X-API-Key: <token>` (see `ApiKeyAuth`).
+        or `X-API-Key: <token>` (see `ApiKeyAuth`). Companion-scoped device
+        tokens are authorized only under `/api/v1`; they cannot enter auth,
+        operator, legacy Repeater API, or WebSocket surfaces.
     ApiKeyAuth:
       type: apiKey
       in: header
       name: X-API-Key
       description: |
-        API key authentication for machine-to-machine access, and the
-        original transport for Mobile Companion API v1 (`/api/v1/*`) device
-        tokens minted by `POST /api/v1/pair`. `Authorization: Bearer` now
-        also accepts these tokens (see `BearerAuth`), matching
-        `docs/architecture/mobile-companion-api.md`. Each token carries a
-        `scope` recorded at mint time and enforced by
-        `CompanionsV1._check_scope`: `admin` (full access, implied for all
-        pre-scope-migration tokens), `companion:*` (all companion
-        identities), or `companion:{name}` (exactly the one companion
-        identity the token was paired to). A `scope`-less `request.user`
-        (legacy caller) is treated as `admin`.
+        API key header used by operator tokens and Mobile Companion device
+        tokens. `Authorization: Bearer` accepts the same API-token values.
+        Explicit scopes are `admin`, `companion:*`, or `companion:{name}`;
+        unknown scopes fail closed. Pre-scope stored tokens with a NULL scope
+        retain their legacy admin access. Paired devices are also bound to the
+        companion's full public identity, so a configured name change does
+        not silently retarget a device token.
 
-# Future security - currently open
-# security:
-#   - ApiKeyAuth: []
+# Security is declared per operation so the small public bootstrap/pairing
+# surface remains explicit while every protected route names its auth modes.

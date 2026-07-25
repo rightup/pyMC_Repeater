@@ -1,911 +1,693 @@
-# Mobile Companion API
+# Mobile Companion API v1
 
-**Status:** Draft for review
-**Scope:** openhop_repeater HTTP API for first-party companion mobile clients (iOS first)
-**Audience:** repeater contributors and mobile client implementers
+**Status:** Implemented
+**Base path:** `/api/v1`
+**Primary contract:** `repeater/web/openapi.yaml`
+**Reference client:** `companion_client/rest.py`
 
----
+This is the authenticated, durable chat API for clients that run alongside a
+standard MeshCore frame client. It is additive: the TCP frame protocol remains
+available, and both surfaces share the same companion identity, bridge, packet
+injector, and radio.
 
-## 1. Summary
+## 1. Invariants
 
-openhop_repeater already exposes a companion identity through the MeshCore
-companion frame protocol (binary frames over TCP, `repeater/companion/`), and a
-browser-oriented REST/SSE proxy on top of it (`repeater/web/companion_endpoints.py`).
-Neither surface is suitable as the primary protocol for a mobile app:
+These rules are the shortest useful description of the design:
 
-- The frame protocol supports **one TCP client per companion at a time** and
-  uses **destructive pop** message sync (`CMD_SYNC_NEXT_MESSAGE` →
-  `companion_pop_message`), so a phone, the web UI, and a desktop client cannot
-  coexist against the same companion identity.
-- The existing SSE stream is fire-and-forget: in-memory per-client queues, no
-  event IDs, no replay. A mobile client that loses connectivity (which is the
-  normal case, not the exception) silently misses events.
-- There is no way for a backgrounded or terminated app to catch up cheaply, and
-  no push-notification path at all.
-- Per-message RF context (every reception of a packet, heard repeats of our own
-  transmissions, incoming path diversity) exists in the `packets` table but is
-  not correlated with companion messages anywhere in the API.
+1. The daemon is the only radio owner. REST and frame clients never open
+   competing radio paths.
+2. Every chat message is durable history before it is exposed as a journal
+   event.
+3. Frame delivery is a bounded pending queue; consuming a frame message clears
+   its pending flag but does not delete REST history.
+4. Every sync cursor is `epoch:seq`. A cursor that cannot prove continuity
+   requires a snapshot instead of risking a silent gap.
+5. An HTTP send reserves its idempotency key before RF. A terminal result is
+   replayed; an ambiguous result stays visibly `indeterminate`.
+6. Companion device tokens can enter `/api/v1` only. They cannot use the
+   operator API, auth-management endpoints, legacy companion API, or
+   WebSockets.
+7. A paired device chooses its push token and privacy preference. The operator
+   chooses the one relay URL.
+8. Channel secrets are write-only. Identity private keys are never exposed by
+   v1.
+9. Every persisted one-byte companion namespace is immutably bound to its
+   full public identity before restore or activation. Deleting configuration
+   does not delete that binding or history; a different key with the same
+   first byte is always refused.
 
-This document specifies a **versioned, cursor-based sync API** for mobile
-clients, built around an **event journal** as the single synchronization
-mechanism. One journal feeds three access patterns — snapshot bootstrap, delta
-poll, and live SSE — with one event schema. The design deliberately reuses
-existing infrastructure: CherryPy HTTP server, JWT + API-token auth
-(`repeater/web/auth/`), the SQLite store and migration pattern
-(`repeater/data_acquisition/sqlite_handler.py`), and the existing
-`CompanionBridge` callbacks.
+## 2. Two clients, one companion
 
-The TCP frame protocol remains fully supported for standard MeshCore clients;
-this API is additive.
-
----
-
-## 2. Background
-
-### 2.1 What exists today
-
-| Surface | File(s) | Characteristics |
-|---|---|---|
-| Companion frame protocol (TCP) | `repeater/companion/frame_server.py`, `openhop_core.companion` | MeshCore-standard binary frames; port 5000 by default; one client at a time; destructive message pop; SQLite persistence of contacts/channels/messages/prefs |
-| WebSocket proxy | `repeater/web/companion_ws_proxy.py` | Raw byte pipe from browser WS to the TCP frame server; JWT-authenticated; inherits all frame-protocol limitations |
-| Companion REST + SSE | `repeater/web/companion_endpoints.py` | `/api/companion/*`; proxies bridge methods (contacts, channels, send_text, telemetry, …); SSE broadcast of bridge push callbacks with no IDs or replay |
-| General repeater API | `repeater/web/api_endpoints.py`, `repeater/web/openapi.yaml` | ~100 endpoints: packets, adverts, stats, noise floor, policy, identities, room server, … |
-| Auth | `repeater/web/auth/` | Login → JWT (short expiry) + `/auth/refresh`; long-lived API tokens hashed at rest in the `api_tokens` table; `require_auth` accepts either |
-
-Relevant storage (all SQLite, WAL mode, single `repeater.db`):
-
-- `packets` — every reception and transmission with `timestamp`, `type`,
-  `route`, `rssi`, `snr`, `packet_hash`, `original_path`, `forwarded_path`,
-  `upstream_hash`, `is_duplicate`, `transmitted`, `drop_reason`. Indexed by
-  timestamp, type, and `packet_hash`. This is already an RF observation log.
-- `companion_messages` — persisted companion inbox per `companion_hash`, and
-  each row already carries `packet_hash`, `snr`, `rssi`, `path_len`.
-- `companion_contacts`, `companion_channels`, `companion_prefs` — companion
-  state, keyed by `companion_hash`.
-- `room_messages` / `room_client_sync` — the room-server watermark pattern
-  (see §5.3 for lessons learned from it).
-
-### 2.2 Why the frame protocol can't be the mobile protocol
-
-The MeshCore companion protocol was designed for a phone talking to a
-firmware node over BLE/serial: a single trusted client that owns the node's
-state. Mapped onto a repeater daemon it inherits assumptions that break the
-mobile use case:
-
-1. **Single consumer.** `CMD_SYNC_NEXT_MESSAGE` deletes the message from the
-   queue on delivery. Two clients means messages are split arbitrarily between
-   them.
-2. **Connection-oriented.** All state transfer requires a live socket. iOS
-   terminates sockets aggressively in background; every foreground event would
-   require a full reconnect + contact re-sync.
-3. **No resumability.** There is no "give me everything since X". A client that
-   was offline for a day must trust that the queue held everything (bounded by
-   `offline_queue_size`) and drain it message-by-message.
-4. **No RF context.** The frame protocol carries one SNR/RSSI per message (the
-   copy that was delivered), with no access to other receptions or repeats.
-
-These are protocol-shape problems, not implementation bugs, which is why the
-answer is a new surface rather than more patches to the proxy.
-
----
-
-## 3. Goals and non-goals
-
-### Goals
-
-1. **Multi-client, non-destructive sync.** Any number of clients (mobile, web
-   UI, scripts) can independently sync the same companion identity to
-   completeness.
-2. **Cheap catch-up.** A client that has been offline for minutes or days can
-   fetch exactly what it missed with one bounded request, resuming from a
-   client-held cursor.
-3. **One event schema everywhere.** Delta poll and live SSE deliver identical
-   event objects; a client implements one decoder.
-4. **RF observability.** Expose per-message reception detail, incoming path
-   aggregation, and heard repeats of the repeater's own transmissions —
-   the data a repeater operator's companion app should surface that a stock
-   MeshCore client cannot.
-5. **iOS-friendly.** Endpoints shaped for `BGAppRefreshTask` budgets
-   (small, bounded, conditional), plus an optional push-notification relay so
-   the app learns about messages without polling.
-6. **Fit the deployment reality.** Pi-class hardware, SD-card storage where
-   unbounded table scans have already caused production incidents. Every
-   endpoint must be index-served and bounded.
-7. **Coexistence.** Standard MeshCore clients on the TCP frame protocol keep
-   working, unchanged, concurrently with API clients.
-
-### Non-goals
-
-- **Not a new mesh protocol.** Nothing here touches RF or MeshCore framing.
-- **Not a message store redesign.** `companion_messages` remains the message
-  table; the journal references state, it doesn't duplicate it (§5.2).
-- **Not federation.** One repeater, its companions, its clients. Multi-node
-  aggregation is future work (§15).
-- **Not an app spec.** UI, local persistence, and offline authoring UX belong
-  to the client project. The API contract is the boundary.
-- **v1 does not implement the push relay** — it defines the interface and
-  registration endpoints so the relay can ship later without API changes (§12).
-
----
-
-## 4. Architecture overview
-
-```
-                             ┌──────────────────────────────────────────────┐
-                             │                repeater daemon               │
-                             │                                              │
- LoRa RF ──► packet_router ──►  CompanionBridge (per companion identity)    │
-                             │        │ callbacks (message, advert, ack…)   │
-                             │        ▼                                     │
-                             │  CompanionEventJournal  ──►  SQLite          │
-                             │        │                     companion_events│
-                             │        │ notify                companion_*   │
-                             │        ▼                      packets        │
-                             │  ┌───────────────┐                           │
- TCP frame clients ◄─────────┼──┤ frame_server  │  (unchanged, legacy path) │
-                             │  └───────────────┘                           │
-                             │  ┌───────────────┐                           │
- Mobile / web API clients ◄──┼──┤ CherryPy HTTP │  /api/v1/companions/…     │
-                             │  └───────────────┘  snapshot / sync / SSE    │
-                             │        │                                     │
-                             │        ▼ (optional, outbound only)           │
-                             │   Push relay client ──► APNs relay ──► APNs  │
-                             └──────────────────────────────────────────────┘
+```text
+TCP frame client ─┐
+                  ├─> CompanionBridge ─> shared injector/queue ─> radio
+REST/SSE clients ─┘          │
+                             └─> SQLite state + ordered event journal
 ```
 
-New components, all inside the existing daemon:
+The bridge is the compatibility boundary. Frame commands and REST actions call
+the same bridge methods. Transport-neutral bridge observers report accepted
+outbound messages and ACKs so history and lifecycle events do not depend on
+which client sent them.
 
-- **`CompanionEventJournal`** (`repeater/companion/journal.py`, new): an
-  append-only table of companion-scoped events with a monotonically increasing
-  sequence number. Written from the same bridge callbacks that today feed the
-  SSE broadcast. This is the *only* new write path.
-- **Mobile API endpoints** (`repeater/web/mobile_endpoints.py`, new, mounted at
-  `/api/v1/companions/`): snapshot, sync, SSE, receptions, send, devices.
-- **Push relay client** (phase 4): outbound HTTPS notifier to a relay service.
+Source ownership prevents double persistence:
 
-Everything else is reuse.
+- REST creates its outbound row as `pending` before calling the bridge. The
+  bridge observer updates that row.
+- A frame send has no pre-created REST row. The observer creates it exactly
+  once with `source: frame`.
+- An unversioned operator API send is recorded the same way with
+  `source: operator`, so a parallel chat client never mistakes it for its
+  connected frame peer.
+- Inbound radio messages are stored and journaled atomically before the frame
+  pending queue is considered.
 
----
+The TCP listener allows one connection per companion, matching the upstream
+frame protocol. Its default port is `5000` and its safe default bind is
+`127.0.0.1`. It is unauthenticated and can expose private identity/channel
+material; bind it to a LAN only as an explicit trusted-network choice. Its
+idle timeout defaults to 28,800 seconds (8 hours); `tcp_timeout: 0` disables
+that timeout. Every enabled listener in this process uses a different port,
+including the HTTP listener. Give additional companions `5001`, `5002`, and
+so on; the deliberately simple process-wide rule avoids ambiguous wildcard
+binds and platform-dependent socket reuse.
 
-## 5. The event journal
+Set `settings.frame_enabled: false` when a companion is REST/SSE-only. This
+does not disable its bridge, identity, durable history, or shared radio path;
+it only avoids opening and reserving an unauthenticated frame port. The
+default remains `true` for upstream compatibility. If an enabled frame
+listener cannot bind, activation fails visibly instead of silently dropping
+that companion's REST surface.
 
-### 5.1 Journal as the canonical sync mechanism
+The `/ws/companion_frame` compatibility proxy is itself a frame client. Because
+the upstream frame server permits only one client, opening that proxy evicts
+the directly connected frame client (and vice versa). It is an operator
+compatibility tool, not a parallel chat transport. A chat client that must run
+beside a frame client uses `/api/v1` REST, sync, and SSE. Its URL `?token=`
+escape hatch accepts an operator JWT only; an admin API token must use the
+`X-API-Key` header and a device-scoped token cannot enter the proxy. Supply
+exactly one credential and one `companion_name`; duplicate or unknown query
+fields fail the handshake. The proxy closes at JWT expiry or within 15 seconds
+of API-token revocation, scope change, or an unavailable authorization store.
 
-The core design decision: **clients synchronize by consuming a journal, not by
-querying state tables**. Every change a client could care about (message
-arrived, contact updated, ack confirmed, telemetry answered) appends one row
-with a sequence number. A client's entire sync state is one integer — the last
-sequence it has applied. Snapshot, delta, and live streaming are three ways of
-reading the same journal:
+Each companion has two deliberately different names:
 
-- **Snapshot** = current state tables + the journal head sequence.
-- **Delta** = `SELECT … WHERE seq > ? ORDER BY seq LIMIT ?`.
-- **SSE** = the same rows, pushed as they are appended, with `id:` = seq.
+- `name` is the stable registration slug used in configuration, URL paths,
+  pairing, and authorization scopes. It is 1–64 ASCII characters, starts with
+  a letter or digit, and otherwise permits only letters, digits, `.`, `_`, and
+  `-` (`my-companion` is typical).
+- `settings.node_name` is the human-facing advertised/display name. It may use
+  human-readable text subject to MeshCore's 31-byte UTF-8 limit. Rename this
+  field when only presentation should change.
 
-This collapses what would otherwise be three synchronization mechanisms with
-three consistency models into one, and it makes client recovery trivial: any
-failure mode degrades to "re-fetch from cursor", and a pruned cursor degrades
-to "re-snapshot". There is no server-side per-client delivery state to corrupt.
+### Adopting storage from an older build
 
-### 5.2 Journal scope: references, not payload duplication (and what stays out)
+An empty namespace binds automatically. If any older, unbound companion rows
+already exist for the same one-byte hash—contacts, channels, messages,
+preferences, events, devices, or journal floors—activation stops instead of
+guessing ownership.
 
-Two constraints shape what goes *into* the journal:
+To adopt those rows:
 
-1. **SD-card write budget.** The `packets` table already records every RF event
-   (~50k rows/day on a busy deployment). Journaling raw RF traffic would
-   roughly double the write load for data that is already queryable by
-   timestamp and `packet_hash`. Therefore: **the journal records
-   companion-scoped events only** — things that pass the companion's decrypt/
-   filter layer — not general RF activity. Packet-level data is fetched on
-   demand through reception endpoints (§10) keyed by `packet_hash`.
-2. **Single source of truth.** Message text lives in `companion_messages`;
-   contacts live in `companion_contacts`. Journal rows carry a compact JSON
-   payload sufficient for the client to apply the event *without a follow-up
-   request* in the common case (message events embed the message), but the
-   journal is never consulted to answer "what is the current state" — state
-   endpoints read state tables. Pruning the journal (§5.4) must never lose
-   information that isn't reconstructable from state tables + snapshot.
+1. Back up the database and verify that the rows belong to the configured
+   companion's full public identity.
+2. Set `settings.adopt_legacy_namespace: true`.
+3. Start or activate the companion once, then remove the setting (or return it
+   to `false`).
 
-One class of RF event crosses the companion boundary and *is* journaled by
-default: **receptions correlated to a companion message** — another copy of an
-inbound message arriving over a different path, or a repeat of the companion's
-own transmission heard from a neighboring repeater. These are bounded by the
-companion's own message volume (dozens of events per day, not tens of
-thousands) and they power two time-sensitive UI features: live incoming-path
-accumulation and the "your message was heard repeated" cue after a send
-(repeats typically arrive within seconds of transmission). See §9 and §10.4.
+This switch can create a missing binding only. It cannot replace an existing
+binding, even when left enabled. A genuine full-key collision therefore
+requires restoring the original identity or choosing a key with a different
+first byte; there is no in-place reassignment. Legacy paired devices whose
+token rows lack an unambiguous full identity must be revoked and paired again.
 
-### 5.3 Sequence and cursor semantics
+REST has no single-client delivery state. Several phones, browsers, or agents
+can independently consume the same journal without stealing messages from one
+another or from the frame client.
 
-- `seq` is `INTEGER PRIMARY KEY AUTOINCREMENT` — strictly monotonic, never
-  reused, gaps allowed (`AUTOINCREMENT` guarantees no rowid reuse after
-  deletes; plain `INTEGER PRIMARY KEY` does not, and cursor semantics require
-  the guarantee).
-- **Cursors are client-held and opaque-ish**: the server returns `next_cursor`
-  as a string; clients store and echo it. v1 encodes the seq directly; the
-  string type leaves room to encode journal-generation info later without
-  breaking clients.
-- **The server keeps no per-client read position.** This is a deliberate
-  lesson from the room-server sync code: server-tracked watermarks
-  (`room_client_sync`) have produced a series of subtle bugs — the author-post
-  watermark advance and the non-monotonic replay watermark were both fixed on
-  this branch (`fix(room_server): stop advancing the author sync watermark on
-  post`, `fix(acl): keep the session replay watermark monotonic`). The frame
-  protocol *forces* server-side delivery state; the HTTP API does not, so we
-  don't take that bug class on. The `devices` registry (§11.3) exists for
-  token management and push routing, not for sync correctness.
-- **Journal epoch.** The snapshot and every sync response include a
-  `journal_epoch` (random ID generated when the journal table is created or
-  reset). If a database is wiped or restored from backup, epochs won't match
-  and the client must discard its cursor and re-snapshot. This prevents the
-  nastiest cursor failure: a *smaller-but-valid-looking* seq after a DB reset
-  silently replaying or skipping history.
+The unversioned `/api/companion/*` routes remain operator-only Repeater API
+compatibility endpoints. They intentionally keep their existing request and
+response shapes, so their send routes do not gain v1 idempotency semantics.
+New human or agent chat clients should use `/api/v1`; retries there are safe
+when they reuse the same `Idempotency-Key`.
 
-### 5.4 Schema
+## 3. v1 resources
 
-Added via the existing migration mechanism in `sqlite_handler.py`:
-
-```sql
-CREATE TABLE companion_events (
-    seq             INTEGER PRIMARY KEY AUTOINCREMENT,
-    companion_hash  TEXT NOT NULL,          -- '0x'-prefixed, matches companion_* tables
-    event_type      TEXT NOT NULL,          -- see §9
-    created_at      REAL NOT NULL,          -- unix seconds
-    ref_table       TEXT,                   -- optional: 'companion_messages', 'companion_contacts', …
-    ref_id          INTEGER,                -- optional: rowid in ref_table
-    packet_hash     TEXT,                   -- optional: RF correlation key into packets
-    payload         TEXT NOT NULL           -- compact JSON, event-type-specific
-);
-CREATE INDEX idx_companion_events_sync
-    ON companion_events (companion_hash, seq);
-
-CREATE TABLE companion_devices (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    companion_hash  TEXT NOT NULL,
-    device_id       TEXT NOT NULL UNIQUE,   -- client-generated UUID
-    name            TEXT NOT NULL,          -- "Adam's iPhone"
-    token_id        INTEGER NOT NULL,       -- FK → api_tokens.id
-    platform        TEXT,                   -- 'ios' | 'android' | 'other'
-    push_token      TEXT,                   -- APNs/FCM token, NULL until registered
-    push_relay_url  TEXT,                   -- relay chosen by the client build
-    created_at      REAL NOT NULL,
-    last_seen       REAL,
-    last_synced_seq INTEGER                 -- informational only (UI display), never used for delivery
-);
-```
-
-```sql
-CREATE TABLE companion_idempotency (
-    device_id       TEXT NOT NULL,
-    idempotency_key TEXT NOT NULL,      -- client-generated per logical send
-    request_hash    TEXT NOT NULL,      -- detect key reuse with different body
-    response_json   TEXT NOT NULL,      -- original response, replayed on retry
-    created_at      REAL NOT NULL,
-    PRIMARY KEY (device_id, idempotency_key)
-);
-```
-
-One existing table gains columns (additive migration): `companion_messages`
-gets derived reception counters — `observation_count`, `unique_path_count`,
-`heard_repeat_count`, `unique_repeater_count`, `send_state` — updated as
-correlated receptions are journaled (§10.4). They make the headline counts
-("received 3× via 2 paths", "heard by 2 repeaters") part of the message
-object in snapshots and history pages, and they survive after the underlying
-`packets` rows age out (§10.6).
-
-Journal metadata (`journal_epoch`, prune floor) lives in a small
-`companion_journal_meta` key-value table.
-
-**Retention:** prune `companion_events` on the existing cleanup schedule
-(`storage.retention`, default 31 days, configurable as
-`storage.retention.companion_events_days`). Pruning moves the "floor" seq;
-sync requests with a cursor below the floor get `snapshot_required: true`
-rather than silently incomplete results.
-
-**Tombstones:** deletions (e.g. a removed contact) are ordinary journal events
-(`contact` with `change: removed`), so they replay like any other change. No
-separate tombstone retention rule is needed: a tombstone only matters to a
-client whose cursor predates it, and any cursor older than the journal floor
-is forced through a fresh snapshot, which reflects the deletion implicitly.
-The invariant to preserve is simply that state-table deletion and its journal
-event commit together (same transaction), like every other state change.
-
-Rows in `companion_idempotency` are pruned after 48 h — long past any
-plausible mobile retry horizon.
-
-**Write pattern:** journal appends happen on the daemon's asyncio loop in the
-same transaction scope as the state write they describe where possible (e.g.
-message persist + journal append), via `asyncio.to_thread` like the existing
-persistence hooks in `repeater/companion/frame_server.py`. Expected volume is
-companion-scoped (messages, adverts from contacts, acks) — orders of magnitude
-below the packets table — so the SD-card impact is negligible.
-
----
-
-## 6. Consistency model
-
-- **Per-companion total order.** Events for a given `companion_hash` are
-  totally ordered by `seq`. Clients apply events in order; state converges.
-- **At-least-once delivery.** A client may see an event twice (e.g. SSE
-  delivered it, then a paranoid delta poll re-fetched it). Every event carries
-  `seq`; clients ignore `seq <= last_applied`. Idempotency is the client's
-  one obligation.
-- **Snapshot consistency.** The snapshot is assembled in one read transaction:
-  head seq is read first, then state tables. Events with `seq >` snapshot head
-  may duplicate snapshot content (e.g. a message that is both in the snapshot's
-  recent-messages list and in the first delta); message IDs make this
-  deduplicable.
-- **Outbound sends** are commands, not journal writes, from the client's view:
-  `POST …/messages` returns an accepted message with its ID; delivery
-  progress (heard repeats, `send_confirmed` ack, path used) arrives later as
-  journal events referencing that ID. This gives mobile clients honest outbox
-  UX (sending → sent → heard/confirmed/failed) without inventing a second
-  channel.
-- **Sends are idempotent.** Mobile requests get retried after timeouts, and a
-  duplicated send doesn't just duplicate a UI row — it transmits a second RF
-  packet and burns airtime. Every `POST …/messages` requires an
-  `Idempotency-Key` header (client-generated UUID per logical send, scoped to
-  the device). A retry with the same key returns the original response from
-  `companion_idempotency` without touching the radio; the same key with a
-  different body is a `409`.
-
----
-
-## 7. REST API specification
-
-All endpoints under `/api/v1/`, mounted alongside the existing `/api/` tree in
-`repeater/web/http_server.py`, behind the same `require_auth` (§11). All
-responses use the existing repo envelope: `{"success": true, "data": {…}}` or
-`{"success": false, "error": "…"}` (the convention of
-`repeater/web/companion_endpoints.py`; JSON examples below show the `data`
-payload). All list endpoints require and clamp
-`limit` (default 100, max 500). Multi-companion selection follows the existing
-convention: companion name in the path, resolved via `identity_manager`
-exactly as `companion_endpoints._get_bridge` does today.
-
-### 7.1 Discovery and pairing
-
-| Method & path | Purpose |
+| Method and path | Purpose |
 |---|---|
-| `GET /api/v1/server_info` | Unauthenticated-safe minimum: server name, API version(s), auth modes, companion names list requires auth. Lets the app validate a scanned URL before pairing. |
-| `POST /api/v1/pair` | Exchange a short-lived pairing code for a device API token (§11.2). |
+| `GET /server_info` | Public discovery and transport warning |
+| `POST /pair/start` | Admin creates a five-minute, single-use pairing code |
+| `POST /pair` | Device exchanges the code for one scoped token |
+| `GET /companions` | Scope-filtered companion list |
+| `GET /companions/{name}/snapshot` | Bootstrap current state and cursor |
+| `GET /companions/{name}/sync` | Bounded ordered journal page |
+| `GET /companions/{name}/events` | Resumable SSE over the same journal |
+| `GET /companions/{name}/messages` | Newest-first durable history |
+| `POST /companions/{name}/messages` | Idempotent DM or channel send |
+| `POST\|DELETE /companions/{name}/contacts/{pubkey}` | Contact mutation |
+| `PUT\|DELETE /companions/{name}/channels/{index}` | Channel mutation |
+| `POST .../login` | Synchronous remote login |
+| `GET .../connection` | Current non-expired remote login-session state |
+| `POST .../logout` | Close the local remote session and best-effort RF logout |
+| `POST .../status_request` | Synchronous remote status request |
+| `POST .../telemetry_request` | Synchronous remote telemetry request |
+| `POST .../reset_path` | Local learned-path reset |
+| `GET .../messages/{id}/receptions` | RF copies correlated to one message |
+| `GET .../contacts/{pubkey}/paths` | Bounded incoming-path aggregation |
+| `GET .../transmissions/{hash}/repeats` | Heard repeats of a companion-owned send |
+| `GET /devices` | Admin-only redacted paired-device list |
+| `DELETE /devices/{device_id}` | Device revokes itself; admin may revoke any device |
+| `POST\|DELETE /devices/{device_id}/push` | Own-device push registration |
 
-### 7.2 Companion state
+JSON success responses use:
 
-| Method & path | Purpose |
-|---|---|
-| `GET /api/v1/companions` | List companion identities (name, hash, node name, frame-protocol port). |
-| `GET /api/v1/companions/{name}/snapshot` | Bootstrap document (§7.4). |
-| `GET /api/v1/companions/{name}/sync?cursor=&limit=` | Delta events since cursor (§7.5). |
-| `GET /api/v1/companions/{name}/events` | SSE live stream (§8). |
-| `GET /api/v1/companions/{name}/contacts?limit=&offset=` | Paged contacts (state read). |
-| `GET /api/v1/companions/{name}/channels` | Channel list (names + indexes; secrets only with `admin` scope). |
-| `GET /api/v1/companions/{name}/messages?before_id=&limit=` | Paged message history, newest-first, keyed by message rowid — serves infinite scroll without touching the journal. |
+```json
+{"success": true, "data": {}}
+```
 
-### 7.3 Actions
+JSON errors use:
 
-Thin wrappers over the same `CompanionBridge` coroutines the existing
-`/api/companion/*` endpoints call (send_text, send_channel_message, login,
-request_status, request_telemetry, send_command, reset_path):
+```json
+{"success": false, "error": "human-readable message"}
+```
 
-| Method & path | Purpose |
-|---|---|
-| `POST /api/v1/companions/{name}/messages` | Send DM or channel message. Requires `Idempotency-Key` header (§6). Body: `{to | channel_idx, text, txt_type?}`. Returns `{message_id, packet_hash}` immediately; heard-repeat and confirmation progress arrives as events. |
-| `POST /api/v1/companions/{name}/contacts/{pubkey}/login` | Room/repeater login. |
-| `POST /api/v1/companions/{name}/contacts/{pubkey}/status_request` | Remote status query. |
-| `POST /api/v1/companions/{name}/contacts/{pubkey}/telemetry_request` | Remote telemetry query. |
-| `POST /api/v1/companions/{name}/contacts/{pubkey}/reset_path` | Reset outbound path. |
+Some error paths also include `status` and structured `data`. Clients should
+branch on HTTP status and stable structured fields, not parse error prose.
 
-Repeater-admin actions (policy, radio config, restarts) are **not** part of the
-companion API; they stay on the existing `/api/` surface and require the
-`admin` scope. The mobile app can gain them later by acquiring that scope; the
-companion API stays messaging-shaped.
+Every non-empty v1 request body uses `Content-Type: application/json`; other
+media types return `415`. Actions with no fields may omit the body or send an
+empty JSON object (`{}`).
 
-### 7.4 Snapshot
+Authenticated state/action responses use `Cache-Control: no-store`.
+`snapshot` uses `private, no-store, no-cache, no-transform` plus an `ETag`, so
+an explicit client may revalidate without storing authenticated chat state.
+Its `304` carries the same cache policy.
+Credentialed SSE uses
+`no-store, no-cache, no-transform`.
 
-`GET /api/v1/companions/{name}/snapshot`
+## 4. Snapshot and cursor sync
 
-```jsonc
+### 4.1 Cursor form
+
+A cursor is an opaque string with a readable representation:
+
+```text
+<journal_epoch>:<sequence>
+```
+
+Clients must store and echo the full string. A bare historical sequence is
+recognized only so the server can return an explicit reset instruction; it
+does not establish continuity.
+
+The epoch changes when companion journal state is deliberately purged. A
+small owner-only lineage sidecar is compared with the lineage stored in
+SQLite at startup; replacing or restoring `repeater.db` rotates the epoch
+before the API starts. Restoring the entire storage directory, including that
+sidecar, must likewise rotate or remove the sidecar before startup. The
+sequence is monotonic within an epoch. Gaps are allowed.
+
+### 4.2 Snapshot
+
+`GET .../snapshot` returns:
+
+- the full companion public identity and public preferences;
+- contacts;
+- configured channel indices and names, never secrets;
+- recent inbound and outbound messages, oldest first;
+- `journal_epoch` and the matching `cursor`;
+- server version. Current server time is available from `/server_info` and
+  the standard HTTP `Date` header, so the cacheable snapshot contains no
+  moving clock field.
+
+The reset baseline under `self` contains `public_key` plus every public
+preference later carried by `prefs` events: `node_name`, `adv_type`,
+`latitude`, `longitude`, `autoadd_config`, `autoadd_max_hops`,
+`path_hash_mode`, `rx_delay_base`, `airtime_factor`, `client_repeat`,
+`manual_add_contacts`, all three `telemetry_mode_*` fields,
+`advert_loc_policy`, `multi_acks`, and `default_scope_name`. Radio tuning and
+secret scope material remain excluded.
+
+The server reads journal head before state. A mutation racing the snapshot may
+therefore appear in both the state and a later event. This is safe
+at-least-once behavior: clients upsert by stable message/contact/channel
+identity. The reverse ordering could lose an event and is not used.
+
+Snapshot is the only conditional endpoint. Its `ETag` includes companion,
+epoch, journal head, `messages_limit`, and server version; `If-None-Match` is
+valid only for the same request shape.
+
+### 4.3 Delta
+
+`GET .../sync?cursor=<epoch:seq>&limit=100` validates the cursor and reads the
+page in one SQLite transaction. A valid response contains:
+
+```json
 {
-  "success": true,
-  "journal_epoch": "b3f1…",
-  "cursor": "184223",              // journal head at snapshot time
-  "self": { "node_name": "…", "pubkey": "…", "adv_type": 1, "radio": {…} },
-  "contacts": [ … ],               // full contact list (bounded by max_contacts, default 1000)
-  "channels": [ … ],
-  "messages": [ … ],               // most recent N (default 100) message objects, newest last
-  "server": { "version": "…", "time": 1789… }
+  "journal_epoch": "4b88bb302f988c17",
+  "events": [],
+  "next_cursor": "4b88bb302f988c17:42",
+  "has_more": false,
+  "snapshot_required": false
 }
 ```
 
-Supports `ETag`/`If-None-Match` (ETag = `journal_epoch:head_seq`) so a client
-re-validating an unchanged snapshot pays ~zero.
+If continuity cannot be proven, the response is HTTP 200 with no events,
+`snapshot_required: true`, a fresh snapshot cursor, and one stable
+`reset_reason`:
 
-### 7.5 Sync (delta)
+- `missing_epoch`
+- `epoch_mismatch`
+- `future_cursor`
+- `pruned_cursor`
 
-`GET /api/v1/companions/{name}/sync?cursor=184223&limit=200`
+A syntactically invalid or negative sequence is HTTP 400.
 
-```jsonc
+`sync` deliberately has no ETag. The cursor is already the condition, and
+`has_more` is computed from the same bounded read. Continue until
+`has_more` is false. A client may impose an explicit safety cap, but reaching
+it must be an error—not a partial result presented as caught up. The reference
+client's `follow()` follows that rule.
+
+### 4.4 Optional RF events
+
+`rf_reception` is a high-volume diagnostic event and is off by default at two
+levels:
+
+1. the companion must set `settings.rf_reception_events: true`;
+2. the request must pass `include=rf_receptions`.
+
+The `include` selector is strict so a typo cannot silently hide data: blank
+or unknown comma-separated tokens return `400`. Repeating
+`rf_receptions` is harmless.
+
+Filtering happens after the bounded journal read. Filtered rows still advance
+the cursor, preserving one unambiguous scan position.
+
+## 5. SSE
+
+`GET .../events` is a live view of the same rows and JSON event objects as
+`sync`.
+
+```text
+id: 4b88bb302f988c17:43
+event: message
+data: {"seq":43,"type":"message","ts":...,"packet_hash":null,"data":{...}}
+```
+
+Resume priority is:
+
+1. `Last-Event-ID`
+2. `?cursor=`
+3. current head (live tail, no backlog)
+
+Invalid/reset cursors receive one `snapshot_required` control event, then the
+stream closes. Idle streams emit `: ka` at
+`http.sse_keepalive_sec` (15 seconds by default).
+
+Journal listeners carry only a coalescing wake signal. The stream reads every
+page back from SQLite in sequence order, so concurrent writers and event
+bursts cannot reorder or overflow the event data.
+
+There is one stream per principal and companion. The v1 stream and deprecated
+legacy operator stream share one process-wide cap
+(`mobile_api.sse_max_connections`, default 8); opening one surface consumes
+capacity from the other. The configured value is limited to 256 and must also
+be no greater than the effective `http.thread_pool_max - 2`, reserving two
+workers for ordinary API requests.
+Capacity rejection is HTTP 429 with `Retry-After`; a slow legacy consumer is
+disconnected if its bounded callback queue fills rather than being left on a
+silently incomplete stream.
+
+`http.sse_queue_maxsize` defaults to 64, is clamped to at least 32, and may
+not exceed 4096. `http.sse_keepalive_sec` defaults to 15, is clamped to at
+least 5, and may not exceed 60 seconds. Both must be positive JSON/YAML
+integers (booleans and numeric strings are not accepted); oversized settings
+fail at startup instead of allocating or waiting unexpectedly.
+
+Use `Authorization: Bearer` from native clients or streaming `fetch`.
+`?token=` exists only for a short-lived operator JWT used by browser
+`EventSource`. Device tokens are deliberately rejected in query strings.
+Query URLs may be recorded by reverse proxies and browser or developer tooling.
+Keep those JWTs short-lived, scrub query strings from upstream logs, and use
+the header form whenever the client permits it. The embedded server disables
+its access log, but that does not protect logs maintained by an upstream proxy.
+An open stream is not an authorization snapshot: it closes at JWT expiry or
+within 15 seconds of API-token revocation, scope change, device unpairing, or
+loss of the immutable companion binding. Authorization-storage uncertainty
+also closes the stream. Reconnect with a current credential and the last
+durably applied cursor; the stream itself never refreshes credentials.
+
+## 6. Events and durable messages
+
+Every event has:
+
+```json
 {
-  "success": true,
-  "journal_epoch": "b3f1…",
-  "events": [ { "seq": 184224, "type": "message", "ts": 1789…, "data": {…} }, … ],
-  "next_cursor": "184301",
-  "has_more": false,               // true → immediately request again with next_cursor
-  "snapshot_required": false       // true → cursor below prune floor or epoch mismatch
+  "seq": 43,
+  "type": "message",
+  "ts": 1789012345.0,
+  "packet_hash": "AABBCCDDEEFF0011",
+  "data": {}
 }
 ```
 
-One indexed range scan (`idx_companion_events_sync`), bounded by `limit`.
-Returns `200` with empty `events` when up to date — cheap enough for
-`BGAppRefreshTask` (§12.1). `ETag` = head seq supports `If-None-Match` polling
-at effectively zero read cost.
+Known event types:
 
----
-
-## 8. SSE stream
-
-`GET /api/v1/companions/{name}/events` — `text/event-stream`.
-
-- Each event: `id:` = seq, `event:` = event type, `data:` = the same JSON
-  object as `sync` returns. One schema, two transports.
-- **Resume:** standard `Last-Event-ID` header (or `?cursor=`). On connect the
-  server first drains the journal from that seq (reusing the sync query), then
-  switches to live tail. This upgrades the existing broadcast plumbing in
-  `companion_endpoints.py` (per-client `queue.Queue`, keepalive comments every
-  `sse_keepalive_sec`) from fire-and-forget to resumable.
-- Keepalive comments (`: ka`) every 15 s (existing config
-  `http.sse_keepalive_sec`).
-- Queue overflow (slow client) → close the stream; the client reconnects with
-  `Last-Event-ID` and misses nothing. Today's code silently drops the client's
-  queue; with a journal behind it, disconnection becomes safe instead of lossy.
-
-**Client guidance:** SSE is for foregrounded apps and the web UI. On cellular,
-a persistent stream costs battery; the intended mobile pattern is
-push-notification wake (or `BGAppRefreshTask`) → one `sync` call. The API
-supports both; the app chooses per lifecycle state.
-
----
-
-## 9. Event schema
-
-`type` discriminates; `data` is type-specific. v1 types, mapped from existing
-`CompanionBridge` callbacks (the same list `companion_endpoints._ensure_callbacks`
-registers today, plus message persistence):
-
-| `type` | Emitted when | `data` (summary) |
-|---|---|---|
-| `message` | DM or channel message persisted for this companion | full message object: `id`, `packet_hash`, sender key/prefix, `txt_type`, text, `is_channel`, `channel_idx`, `path_len`, `snr`, `rssi`, timestamps |
-| `message_reception` | another RF copy of a known inbound companion message is heard (different or repeated path) | `message_id`, `packet_hash`, `path` (raw hashes + resolution, §10.5), `rssi`, `snr`, `observed_at`, running `observation_count` / `unique_path_count` |
-| `message_send_state` | outbound send progresses: transmitted, heard repeated by a neighbor, ack confirmed, or failed | `message_id`, `state: sent|heard_repeated|confirmed|failed`, and for `heard_repeated`: the repeat's `path`, terminal repeater hash (+resolution), `rssi`, `snr`, running `heard_repeat_count` / `unique_repeater_count` |
-| `contact` | contact added/updated (advert received, path update, import) | full contact object + `change: new|advert|path|removed` |
-| `channel` | channel added/renamed/removed | `index`, `name`, `change: update\|remove` — **never the PSK secret** (it would reach every synced device and persist in the journal table; §11.4) |
-| ~~`login_result`~~ | *(NOT IMPLEMENTED — see note below)* | contact pubkey, success, permissions |
-| ~~`status_response`~~ | *(NOT IMPLEMENTED — see note below)* | contact pubkey + parsed status |
-| ~~`telemetry_response`~~ | *(NOT IMPLEMENTED — see note below)* | contact pubkey + decoded sensor values |
-| `prefs` | node prefs changed (any surface: API, frame client, web UI) | changed fields |
-| `rf_reception` | *(flagged, default off)* any packet heard again, regardless of companion relevance | `packet_hash`, `rssi`, `snr`, `path` |
-
-Unknown-type tolerance is mandatory: clients must skip event types they don't
-recognize (log + advance cursor), so the server can add types without a
-version bump.
-
-**Implementation status (audited 2026-07-18).** The journal emits exactly
-`message`, `message_reception`, `message_send_state`, `contact`, `channel`,
-`prefs`, `rf_reception`. The three struck-through rows above were specified
-here but never implemented, and a client waiting on them would wait forever:
-
-- `login_result`, `status_response`, `telemetry_response` — not emitted,
-  because the corresponding REST actions
-  (`POST .../contacts/{pubkey}/login`, `/status_request`,
-  `/telemetry_request`) are **synchronous**: they block on the bridge call
-  with a 15s timeout and return the result inline, rather than acknowledging
-  and reporting later. That is simpler and adequate for a nearby contact, but
-  a multi-hop round trip can exceed 15s, and when it does the caller gets a
-  timeout and the response is **dropped** — where a frame client would still
-  receive `PUSH_CODE_STATUS_RESPONSE` whenever it arrived. If that proves to
-  matter, the fix is to implement these three events and have the actions
-  return `202 Accepted`.
-
-`channel` was likewise documented-but-absent (the emit site was marked
-"deferred to phase 2" in `frame_server._save_channels` and never picked up);
-it is now implemented, emitted from `_cmd_set_channel` on a real change.
-
-See [companion-frame-vs-rest.md](companion-frame-vs-rest.md) for a full
-inventory of frame-protocol features against this API.
-
-**Correlated vs. uncorrelated receptions.** `message_reception` and the
-`heard_repeated` send state are **on by default**: they are bounded by the
-companion's own message volume and they carry the two live cues clients need —
-incoming paths accumulating on a message, and the near-immediate "your
-transmission was heard repeated" signal after a send. The uncorrelated
-firehose (`rf_reception`, every duplicate of every flood the repeater hears)
-remains **opt-in** (`?include=rf_receptions` on sync/SSE) for "signal view"
-style screens; at ~50k packets/day it would otherwise dominate both the
-journal and every delta. The pull endpoints in §10 remain the exhaustive RF
-surface either way.
-
----
-
-## 10. RF observation surface
-
-This is the part a repeater-attached companion can do that no stock client
-can: the repeater sees every reception, including duplicates that arrive over
-different paths. All of it is already in the `packets` table
-(`is_duplicate`, `original_path`, `forwarded_path`, `rssi`, `snr`,
-`packet_hash`, indexed by `packet_hash` and timestamp) — this surface is
-read-only queries, no new write path.
-
-| Method & path | Purpose |
+| Type | Meaning |
 |---|---|
-| `GET /api/v1/companions/{name}/messages/{id}/receptions` | Every reception of that message's `packet_hash`: per-copy RSSI/SNR, incoming path, arrival time, whether we retransmitted it. Answers "how did this message reach me, and how well". |
-| `GET /api/v1/companions/{name}/contacts/{pubkey}/paths?window=24h` | Incoming path aggregation for a contact: distinct first-hop/last-hop paths observed on their traffic in the window, with counts and RSSI/SNR stats. Serves a "route diversity" view. |
-| `GET /api/v1/companions/{name}/transmissions/{packet_hash}/repeats` | Heard repeats of our own transmission: receptions of the same `packet_hash` after we transmitted it, i.e. neighbors repeating us. The strongest available signal that a send actually propagated. |
+| `message` | Durable inbound or outbound message row |
+| `message_send_state` | Outbound lifecycle or heard-repeat transition |
+| `message_reception` | Another RF copy of a known inbound message |
+| `contact` | `new`, `update`, `remove`, or learned-path change |
+| `channel` | Channel `update` or `remove`; never includes the secret |
+| `prefs` | Preferences changed through another surface |
+| `rf_reception` | Opt-in uncorrelated RF diagnostic |
 
-### 10.1 Query-shape rules
+Known event payloads are exact public shapes: all documented fields are
+present and storage-only fields are projected out. A safe, syntactically valid
+future event type keeps its envelope so clients can advance the cursor, but
+this server replaces its unreviewed payload with `{}`. Clients should ignore
+that unknown type. `snapshot_required` is reserved for the non-journal SSE
+reset control event and is rejected as a durable journal type.
+For `message`, `message_reception`, `message_send_state`, and `rf_reception`,
+the envelope and payload `packet_hash` values are identical; a conflicting
+durable row fails closed instead of exposing two correlation identities.
 
-- All three resolve through `idx_packets_hash` or the timestamp index with a
-  **mandatory bounded window** (default 24 h, max 7 d) — the July 2026
-  airtime-chart incident (unbounded scan of a 760 MB packets table saturating
-  SD I/O) is the anti-pattern these limits exist to prevent.
-- Path aggregation for a contact requires resolving that contact's recent
-  `packet_hash`es first (via `companion_messages.packet_hash` and adverts),
-  then a hash-keyed lookup per packet — never a scan of `packets` filtered by
-  a non-indexed column.
+Message rows explicitly carry:
 
-### 10.2 How the data gets there
+- `direction`: `in` or `out`;
+- `state`: `received`, `pending`, `transmitted`, `confirmed`, `failed`, or
+  `indeterminate` (and `heard_repeated` when applied as a lifecycle state);
+- `source`: `radio`, `rest`, `frame`, or `operator`;
+- `id` (the message ID), `packet_hash`, recipient/channel fields, and ACK
+  correlation; lifecycle event payloads refer to that row as `message_id`;
+- no frame-delivery `pending_for_frame` or `consumed_at` markers. Those are
+  private to the parallel frame queue and are not REST chat state.
 
-No new write path is needed: the engine's duplicate handler
-(`repeater/engine.py`, `record_duplicate`) already writes a full
-`packets` row for **every** repeated copy — per-copy `original_path`, `rssi`,
-`snr`, timestamp, `is_duplicate=1` — keyed by a `packet_hash` that excludes
-the mutable path bytes, so all OTA copies of one logical packet share the
-hash. Transmissions are recorded with `transmitted=1`. Receptions and repeats
-are therefore reconstructable entirely from existing rows.
+Clients should render lifecycle from these fields, not infer it from timing.
 
-One nuance to carry into the API contract: the stored `packet_hash` is the
-full hash truncated to 16 hex chars (64 bits). Within a correlation window
-(minutes to hours) collisions are negligible, but the API documents the
-identifier as an opaque correlation key, not a cryptographic commitment, and
-correlation queries always pair the hash with a bounded time window.
+Durable does not mean unbounded. `storage.retention.companion_events_days`
+controls journal and soft-consumed message-history retention (1–36,500 days;
+default 31). Pruning advances the journal floor, so an older cursor receives
+`snapshot_required` instead of a silent gap. Unconsumed Frame queue entries
+are never deleted by age alone.
 
-### 10.3 Heard-repeat semantics
+## 7. Sending and idempotency
 
-A heard repeat is a derived relationship, not a separate radio phenomenon:
-a reception row with the same `packet_hash` as one of our `transmitted=1`
-rows, arriving after it. The retransmitting repeater is identified by the
-**terminal path hash** of the repeat's `original_path` — the hash each
-repeater appends as it forwards. Two counts are exposed and neither is
-collapsed: `heard_repeat_count` (every matching OTA copy — one repeater heard
-twice counts twice) and `unique_repeater_count` (distinct terminal hashes).
+`POST .../messages` requires exactly one target:
 
-**Local echo exclusion:** a locally injected outbound frame, or the
-transmission record itself, must never count as a heard repeat — only a
-genuine OTA reception arriving *after* our transmit row qualifies. The
-correlation predicate is `is_duplicate=1 AND transmitted=0 AND timestamp >
-tx.timestamp`, and any future radio backend that surfaces self-receptions
-must mark them so they are excluded here.
-
-Hash-changing rebroadcast variants (packet types whose hash semantics
-incorporate path data) are out of scope for v1; the endpoints document
-repeat counts as a lower bound.
-
-### 10.4 Live correlation (default-on journal events)
-
-The pull endpoints above serve history; the live cues come from the journal
-(§9). On each duplicate reception the engine consults a small in-memory TTL
-map of recent companion-message hashes — inbound message `packet_hash`es and
-our own recent outbound sends, with a lifetime matching the `seen_packets`
-dedup cache — and on a hit appends a `message_reception` or
-`message_send_state(heard_repeated)` event. Cost per duplicate is one dict
-lookup; volume is bounded by the companion's message rate, not the mesh's
-packet rate. This is what makes "sent → heard by 2 repeaters" appear in the
-app seconds after transmission (SSE) and survive into the next background
-sync (journal).
-
-### 10.5 Path-hash identity resolution
-
-Path entries are abbreviated hashes (commonly one byte) and genuinely
-collide. Wherever the API renders a path element it returns both the raw
-value and its interpretation:
-
-```jsonc
-{ "raw_hash": "71", "resolution": "unique|ambiguous|unknown",
-  "candidates": [ { "pubkey": "…", "name": "Everett North" }, … ] }
+```json
+{"channel_idx": 0, "text": "hello"}
 ```
 
-Clients display the raw hash unless resolution is `unique`. Resolution is
-computed at read time against current contacts/adverts — it can improve as
-contacts are learned, which is another reason observations store raw bytes
-and never a resolved identity.
+or:
 
-### 10.6 Pruning honesty
-
-`packets` retention (default 31 d) is shorter than the lifetime of messages
-in `companion_messages`. Reception queries whose window reaches past the
-packets retention floor set `"observations_pruned": true` in the response so
-clients can distinguish "heard once" from "older copies aged out". The
-running counters journaled on events (§9) are preserved in the message
-row's derived fields at prune time, so headline counts survive raw-row
-pruning.
-
----
-
-## 11. Authentication and security
-
-### 11.1 Model
-
-Reuse the existing two-tier scheme, extended with scopes:
-
-- **Web UI:** username/password → JWT (short-lived, `/auth/refresh`) —
-  unchanged.
-- **Mobile devices:** long-lived **device API token**, stored in the existing
-  `api_tokens` table (hashed at rest, `Authorization: Bearer`), linked 1:1 to
-  a `companion_devices` row. Tokens get a `scope` column (migration):
-  - `companion:{name}` — full companion API for one companion identity
-  - `companion:*` — all companions
-  - `admin` — existing behavior; implied for all pre-migration tokens
-    (backward compatible)
-- `require_auth` grows scope enforcement; the `/api/v1/companions/{name}/…`
-  router checks the token's scope against the path.
-
-### 11.2 Pairing flow
-
-Typing a URL + token on a phone is the adoption killer; pairing is QR-based:
-
-1. Operator (authenticated in the web UI) opens *Settings → Mobile devices →
-   Pair*, which calls `POST /api/v1/pair/start` (admin scope) → server
-   generates a **pairing code**: single-use, 5-minute TTL, displayed as QR
-   encoding `{url, fingerprint, code}`.
-2. App scans, validates reachability via `GET /api/v1/server_info`, then calls
-   `POST /api/v1/pair` with `{code, device_id, name, platform}`.
-3. Server atomically consumes the code, creates the device row + scoped token,
-   returns the token **once**. App stores it in the iOS Keychain.
-4. Web UI lists devices (name, platform, created, last seen) with revoke —
-   revocation deletes the token; the next request 401s and the app returns to
-   pairing.
-
-### 11.3 Transport security
-
-Honest position: most deployments are plain HTTP on a LAN or a WireGuard/
-Tailscale overlay. The design accommodates rather than pretends:
-
-- `server_info` reports the transport situation; the app warns when pairing a
-  bearer token over plain HTTP on a non-private address.
-- Documented recommended remote-access path: Tailscale/WireGuard to the LAN
-  (already common in this community), keeping the repeater unexposed. Direct
-  internet exposure requires TLS (reverse proxy) and is documented as
-  such.
-- Pairing QR includes a server key fingerprint so the app can pin the identity
-  it paired with (TOFU) and detect later substitution even without TLS.
-- Rate limiting on `/api/v1/pair` and auth endpoints (small fixed-window
-  counter, in-memory) to blunt code guessing; pairing codes are 128-bit.
-
-### 11.4 Privacy note
-
-Channel secrets and identity private keys never leave the server through this
-API except: channel secrets with `admin` scope (existing behavior for the web
-UI). The mobile client does not need channel secrets — decryption happens
-server-side in the bridge, which is the companion model's trust boundary
-already (the repeater holds the companion identity key).
-
----
-
-## 12. iOS client integration
-
-### 12.1 Background refresh
-
-Designed-for pattern with `BGAppRefreshTask` (~30 s budget, opportunistic
-scheduling):
-
-1. Wake → `GET …/sync?cursor=<stored>&limit=200` with `If-None-Match`.
-2. `304` (common case) → done in one round trip, minimal radio time.
-3. Events → apply, store `next_cursor`, optionally post local notifications
-   for `message` events, loop while `has_more` (bounded iterations).
-4. `snapshot_required` → schedule a `BGProcessingTask` for the full snapshot
-   rather than burning the refresh budget.
-
-This is why sync is a single bounded indexed read with ETag support: the
-endpoint's worst case must fit a background-task budget on a Pi serving it
-from an SD card.
-
-### 12.2 Push notifications (APNs relay)
-
-The constraint: APNs requires the developer's key; a self-hosted repeater
-can't sign APNs requests for the app's bundle ID. Standard solution — a thin
-**push relay** operated by the app maintainer (the pattern Home Assistant
-uses):
-
-```
-bridge callback → journal append → push notifier (debounced)
-    → POST {relay_url}/notify {push_token, badge_hint, collapse_id}
-    → relay signs & forwards to APNs (content-available + optional alert)
-    → app wakes → sync from stored cursor
+```json
+{"to": "<64 hex characters>", "text": "hello", "txt_type": 0}
 ```
 
-Design properties:
+It also requires `Idempotency-Key`: 1–128 visible ASCII characters (`!`
+through `~`) with no whitespace. UUIDs are the recommended readable form.
+Message text must be valid UTF-8 and cannot contain NUL; MeshCore text payloads
+are NUL-terminated, so accepting it would make stored and received text differ.
 
-- **Payload-free by default.** The push is a wake signal ("new events");
-  message content stays on the repeater unless the operator opts into
-  alert-bearing pushes (`push_detail: none | count | preview`, per device).
-  This keeps the relay low-trust: it learns *that* a device got traffic, not
-  *what*.
-- The repeater side is only: `push_token`/`push_relay_url` registration
-  (`POST /api/v1/devices/{device_id}/push`, already in the schema §5.4), a
-  debounced outbound POST on journal append (collapse per device, min
-  interval ~30 s), and failure backoff with token invalidation on relay 410.
-- Relay URL is client-supplied at registration (the app build knows its
-  relay), so third-party app builds or self-hosted relays need no repeater
-  changes.
-- **v1 ships the registration endpoints and the notifier interface; the relay
-  service itself is a separate deliverable** (phase 4). Until then the app
-  runs on background refresh alone — functional, just slower.
+For a paired device, the principal is the full companion identity plus the
+stable `device_id`—not a database row or token ID. Rotating the token or
+re-pairing that same device therefore cannot make an unresolved key transmit
+again. A client must not switch device IDs to bypass an unknown result.
 
-#### Mentions (time-sensitive) — content-free alert, not `preview`
+The server:
 
-Mentions (the user @-named in a channel/DM) are the one class where the
-"payload-free wake vs. background-refresh cadence" default is too slow: an
-opportunistic `BGAppRefreshTask` (§12.1) or a coalesced `content-available`
-push can lag well past when a mention matters. But the obvious fix — an
-alert-bearing `push_detail: preview` push — is exactly the case §11.4's
-privacy posture is trying to avoid, because the mention text then transits
-the relay and APNs in the clear.
+1. checks for an existing principal/key record;
+2. replays a matching completed/failed result without charging RF admission;
+3. rejects conflicting, in-progress, or indeterminate reuse;
+4. charges RF admission only for an absent key;
+5. atomically reserves the key;
+6. creates a durable outbound `pending` message;
+7. calls the shared bridge/radio path;
+8. records the resulting lifecycle, then closes the replay record. If any
+   partial finalization leaves the RF outcome uncertain, compensation marks
+   both surfaces `indeterminate` instead of pretending the send failed. If
+   that compensation write is temporarily unavailable, the running process
+   remembers the key as indeterminate, blocks redispatch, and repairs both
+   durable rows on a later same-key request. Startup recovery performs the
+   same fail-closed repair after a process restart.
 
-Resolve this in phase 4 with a **third, distinct push class** rather than
-the `none | count | preview` binary:
+Two simultaneous first attempts cannot both transmit: the atomic reservation
+selects one winner. A terminal radio rejection is stored and replayed just
+like a success. If the server cannot even hand the operation to its event
+loop, it does not call the bridge or radio; it closes the reservation as the
+same terminal `sent: false`, `state: failed` result. Every terminal failed
+response includes a short human-readable `reason` and is replayed unchanged.
 
-- A **content-free "mention" alert** — a real APNs *alert* (so it surfaces
-  promptly, unlike a silent wake iOS may defer/coalesce) whose body is only
-  *"You were mentioned"* (optionally the sender name), **never the message
-  text**. The app enriches on open via `sync`. The relay/APNs learn *that*
-  the device was mentioned, not *what was said* — same low-trust guarantee
-  as the default wake, just prompt.
+Completed and failed keys replay for at least 48 hours from their first
+reservation; maintenance timing may retain them longer. A client with a lost
+result must reconcile within that window. Afterward, inspect durable history
+and require an explicit decision rather than assuming the old key still
+suppresses RF. Indeterminate outcomes are retained and never made reusable by
+that terminal-record cleanup.
 
-This needs two additions, both new and phase-4-scoped (no change to phases
-1–3 or the journal contract, whose `message` events already carry the full
-text for client-side rendering):
+If RF may have started but the request times out or final persistence fails,
+the result is `indeterminate`. Retry only with the same key. Creating a new
+key could duplicate the RF send.
 
-1. **Server-side mention detection** in the bridge callback. The bridge
-   already decrypts server-side (§11.4), so it can scan message text; it
-   just needs a per-device notion of *what counts as a mention* — the
-   companion's `node_name` by default, plus an optional per-device
-   handle/keyword list stored alongside the device's push registration.
-2. A **per-device mention toggle** independent of `push_detail`, so a
-   mention fires the higher-priority content-free alert even when ordinary
-   traffic is set to a silent wake (`push_detail: none`).
+Direct sends return after radio acceptance and do not block for an ACK. A
+later ACK produces `message_send_state: confirmed` with the same message ID.
+Channel sends have no ACK.
 
-Clients that never register for mention alerts, and repeaters with no
-mention trigger configured, fall back to the payload-free wake — mentions
-then arrive on the normal sync/background-refresh path, just not promptly.
+All REST RF actions share a small per-principal and process-wide token bucket.
+Defaults are documented in `config.yaml.example`. The radio queue and duty
+cycle remain authoritative after API admission.
 
----
+Login/status/telemetry are synchronous RF actions without idempotency keys.
+Login passwords are at most 15 UTF-8 bytes and cannot contain NUL, matching
+MeshCore's NUL-terminated credential wire format.
+Treat their timeout as unknown and do not blindly retry. `logout` also has no
+idempotency key: it orders itself after an in-flight Frame or REST login for
+the same destination, clears the local remote-session record, and attempts one
+best-effort RF send. Its response keeps those outcomes explicit as
+`{logged_out, sent}`. `connection` and `reset_path` are local state operations
+and do not consume the RF budget.
 
-## 13. Performance and capacity
+## 8. Contacts and channels
 
-Binding constraints (from a production Pi 4 + SD-card deployment): ~25 MB/s
-random-read I/O ceiling, packets table ~1.5M rows/760 MB at
-31-day retention, SQLite WAL with a single writer, and a demonstrated failure
-mode where one unbounded scan times out the dashboard and backs up the TX
-queue.
+Mutations run on the shared companion event loop. In-memory state, SQLite
+state, and the journal are reconciled as one operation; a storage failure
+rolls back the in-memory mutation instead of leaving REST and frame clients
+with different views.
 
-Budget rules for every endpoint in this document:
+Writable contact fields are intentionally narrow:
 
-1. **Index-only access paths.** Sync uses `idx_companion_events_sync`;
-   receptions use `idx_packets_hash`; message history uses the
-   `companion_messages` rowid. No endpoint may filter `packets` on a
-   non-indexed column.
-2. **Mandatory limits.** Every list is clamped (≤500 events, ≤200 messages,
-   ≤7 d RF windows). `has_more` pagination instead of large responses.
-3. **Write amplification.** Journal appends are companion-scoped (hundreds/
-   day, not tens of thousands) and ride the existing WAL. Correlated
-   reception events (§10.4) preserve this bound — they scale with the
-   companion's message volume, and the mesh-wide `rf_reception` firehose
-   stays opt-in for exactly this reason.
-4. **SSE fan-out** stays in-memory per client (existing pattern); the journal
-   is the durability layer, so overflow handling is "drop connection", never
-   "buffer unboundedly".
-5. **Expected mobile load** (one operator household, a handful of devices,
-   background sync every ~15 min + push wakes) is noise compared to the web
-   dashboard; the risk is not QPS but a single bad query shape, hence rules
-   1–2.
+- `name`
+- `adv_type`
+- `favorite`
+- `gps_lat`
+- `gps_lon`
 
----
+`name` is required when inserting a new contact; `adv_type` accepts `1..255`
+and defaults to the normal chat-contact type (`1`). Core reserves `0` for its
+transient non-contact value, so the API rejects it instead of creating a row
+that would be absent from the next snapshot. On update, every omitted field
+keeps its current value.
 
-## 14. Migration and compatibility
+Learned route fields, advert timestamps, and unrelated flag bits are
+server-owned and preserved.
 
-- **TCP frame protocol: preserved via soft-consume.** Standard MeshCore
-  clients keep working, but this required one storage-semantics change:
-  `companion_pop_message` historically **deleted** the row (the frame
-  protocol destructively drained history), which would have erased message
-  history out from under the API. Pop now *soft-consumes* — it sets a
-  `consumed_at` timestamp instead of deleting. Frame-protocol reads filter
-  `consumed_at IS NULL`, and offline-queue capacity/eviction counts only
-  unconsumed rows, so MeshCore clients observe identical queue behavior;
-  API history reads see all rows. Consumed rows age out on the normal
-  retention schedule. Journal appends hook the same persistence path
-  (`_persist_companion_message`), so both consumers see every message.
-- **Existing `/api/companion/*`: kept, frozen.** The web UI migrates to
-  `/api/v1/companions/*` opportunistically (the SSE upgrade in §8 is the main
-  win — reconnect without missing events). Once migrated, the old endpoints
-  and the WS proxy can be deprecated on their own schedule.
-- **Database:** all changes are additive migrations (journal + devices tables,
-  `scope` column on `api_tokens` defaulting existing tokens to `admin`).
-  Rollback = ignore new tables.
-- **Versioning policy:** `/api/v1` is the contract. Additive changes (new
-  event types, new optional fields) don't bump the version; clients must
-  tolerate unknown fields and event types (§9). Breaking changes require
-  `/api/v2` served alongside v1.
+Channel `secret` accepts 16 or 32 bytes as hex and is write-only. Snapshot,
+responses, device listings, and events expose only channel index/name.
 
----
+## 9. Authentication and pairing
 
-## 15. Implementation plan
+Credential classes:
 
-Phases are independently shippable; each ends in a working state.
+| Credential | Effective access |
+|---|---|
+| Operator JWT | Admin |
+| Explicit `admin` API token | Admin |
+| Legacy stored token with NULL scope | Admin migration compatibility |
+| `companion:*` API token | All v1 companions |
+| Paired `companion:{name}` token | Its immutable companion identity in v1 |
+| Unknown explicit scope | Rejected |
 
-**Phase 1 — Journal + sync core**
-- `companion_events` + meta tables, migrations, retention pruning.
-- `CompanionEventJournal` writer hooked into bridge callbacks and message
-  persistence.
-- `GET snapshot`, `GET sync`, `GET messages` endpoints; epoch/cursor
-  semantics; ETag support.
-- Tests: ordering, prune-floor → `snapshot_required`, epoch mismatch, restart
-  continuity, concurrent frame-client + API-client message delivery.
+Device tokens may use `Authorization: Bearer` or `X-API-Key`, but authorization
+still restricts them to `/api/v1`. A v1 request presents exactly one credential
+transport: `Authorization`, `X-API-Key`, or the SSE-only `?token=` operator
+JWT. Multiple transports return `400` instead of silently choosing a broader
+or stale principal. Legacy Repeater API credential precedence is unchanged.
+The paired device row binds the token to the full public identity, not only
+the mutable name or eight-bit companion hash.
+Push fan-out and the final pre-delivery check both require that same full
+identity, so a hash collision cannot select, wake, or preview another
+identity's paired device.
 
-**Phase 2 — Live + actions + auth**
-- SSE endpoint with `Last-Event-ID` replay (upgrade existing SSE plumbing).
-- Action endpoints (send, login, status/telemetry requests) + send-state
-  events, with `Idempotency-Key` enforcement and the
-  `companion_idempotency` table.
-- Token scopes, pairing flow, device registry, web UI device management page.
-- Tests: SSE resume equivalence with sync, scope enforcement, pairing
-  single-use/TTL, send retry with same/different body under one key.
+`repeater.security.jwt_secret` is either generated and durably saved before
+the HTTP server starts, or is an explicit value of at least 32 UTF-8 bytes.
+Changing an established value invalidates both operator JWTs and the keyed
+hashes of stored API/device tokens, so rotate it only with a plan to reissue
+tokens and pair devices again. If token storage is temporarily unavailable,
+HTTP authentication returns `503` and packet WebSockets close with `1011`;
+neither condition is presented as a bad credential.
 
-**Phase 3 — RF observation surface**
-- Receptions, contact paths, heard-repeats endpoints with window clamps,
-  path-hash resolution (§10.5), and `observations_pruned` signaling (§10.6).
-- Live correlation hook in `record_duplicate` (§10.4): default-on
-  `message_reception` / `heard_repeated` events + derived counters on
-  `companion_messages`; local echo exclusion tests (§10.3).
-- Opt-in `rf_reception` event type behind `?include=`.
-- Load-test query shapes against a production-scale packets table (the
-  31-day Pi 4 dataset from §13 is the reference workload).
+Long-lived transports recheck the same decision. Companion and legacy SSE
+streams and `/ws/companion_frame` close at JWT expiry; an idle packet
+WebSocket closes no later than its next 15-second authorization check.
+API-token metadata is likewise revalidated at most every 15 seconds. The
+packet WebSocket keeps its existing 30-second wire ping cadence; the
+authorization check is a separate internal wake. WebSocket handshakes accept
+exactly one credential. Their documented query keys are strict
+(`token`/`client_id` for
+packets; `token`/`companion_name` for the frame proxy), so duplicates, unknown
+keys, and a simultaneous query credential plus `X-API-Key` fail visibly.
+Packet WebSocket clients should put API tokens in `X-API-Key`; its legacy
+`?token=<api-token>` form remains accepted for compatibility, is deprecated,
+and receives the same admin-scope and periodic-revocation checks. The
+companion Frame proxy accepts only JWTs in its query and API tokens in
+`X-API-Key`.
 
-**Phase 4 — Push**
-- Push registration endpoints + debounced notifier with backoff.
-- Relay service (separate repo/deliverable) + documentation.
+Pairing:
 
-Each phase updates `repeater/web/openapi.yaml` — the spec ships with the
-endpoints, not after them.
+1. an admin calls `/pair/start`;
+2. the server returns a random 128-bit code, five-minute TTL, companion name,
+   immutable public identity, and its SHA-256 fingerprint;
+3. the device calls `/pair` with code, stable `device_id`, display name, and
+   optional platform;
+4. device row and hashed token are created in one transaction;
+5. plaintext token, immutable identity, and fingerprint are returned once;
+6. before storing the token, the device constant-time compares that
+   fingerprint with the value transferred through the trusted pairing channel
+   (for example, a QR code).
 
----
+Codes are in memory, single-use, and rate-limited per remote address. A
+transient storage failure restores a still-live code. Device revocation
+deletes the device/token binding atomically.
 
-## 16. Future work
+`device_id` is globally unique on one repeater, not scoped to a companion.
+An app pairing the same installation with multiple companion identities must
+derive and persist a distinct stable ID for each one (for example,
+`<installation-id>:<companion-identity-prefix>`). Reusing an ID returns `409`;
+the server does not silently move the existing device or retain the newly
+minted token.
 
-- **Android / FCM** through the same relay interface (`platform` field already
-  present).
-- **Room-server browsing** from mobile: the room tables and sync machinery
-  exist; a read-only room surface could reuse the journal pattern
-  per-room.
-- **Multi-repeater aggregation**: a client paired with several repeaters
-  merging journals client-side; `journal_epoch` + per-server cursors already
-  make this safe. Cross-repeater dedup by `packet_hash` is the interesting
-  problem.
-- **Web dashboard on the journal**: converge the dashboard's various pollers
-  onto sync/SSE.
-- **Offline outbox with scheduled TX**: client queues messages while
-  unreachable and drains them on reconnect — the v1 `Idempotency-Key`
-  contract already makes the drain safe against retries.
+The fingerprint is an identity-change/TOFU check, not proof that a plaintext
+HTTP endpoint possesses the companion key: a malicious endpoint could copy a
+public value. TLS, an encrypted overlay, or a trusted LAN remains necessary.
 
-## 17. Open questions
+`GET /devices` is admin-only and redacts token IDs, push tokens, relay values,
+and mention keywords.
 
-1. **Snapshot size vs `max_contacts`=1000.** Is a full contact list in one
-   snapshot response acceptable on Pi + cellular (~150–300 KB), or should
-   snapshot page contacts from the start?
-2. **`message_send_state` fidelity.** How reliably can `send_confirmed` be
-   correlated to a specific outbound message in `openhop_core` today? If ack
-   correlation is weak, v1 may only expose `sent` (transmitted) without
-   `confirmed`.
-3. **Pairing without the web UI** (headless installs): is a CLI generator
-   (`manage.sh pair`) enough for v1?
-4. **Relay hosting/funding** for phase 4 — maintainer-operated, and under what
-   availability expectations?
+## 10. Network and input safety
+
+- The setup wizard and first-run config restore share one serialized,
+  persisted bootstrap gate. A malformed request does not consume it, and once
+  one valid request sets `setup_complete`, another public mutation cannot win
+  a race; later imports require an administrator.
+- `/server_info` reports HTTP/HTTPS and whether a trusted network is required.
+- Plain HTTP is suitable only on a trusted LAN or encrypted overlay.
+- CORS is off by default. When enabled, `web.cors_origins` is an exact
+  allow-list; wildcard origins and credentialed wildcard behavior are not
+  supported.
+- JSON request bodies are bounded to 16 KiB.
+- Endpoints reject unknown writable fields and bound text, identifiers,
+  arrays, channel indices, public keys, GPS values, and non-finite numbers.
+- Client and push HTTP implementations do not follow redirects with
+  credentials or request bodies.
+- The SQLite database contains decrypted companion message history. Protect
+  the storage directory and backups as sensitive data.
+
+## 11. Push wakes
+
+Push delivery is optional. Configure one operator-controlled endpoint:
+
+```yaml
+companion:
+  push:
+    relay_url: "https://push.example.net/notify"
+```
+
+HTTPS is required by default. `allow_insecure_http: true` exists only for an
+explicitly trusted local test relay. Redirects are not followed.
+
+A device registers:
+
+- `push_token`
+- `push_detail`: `none`, `count`, or `preview`
+- `mention_push`
+- optional `mention_keywords`
+
+It cannot register a relay URL. `none` is a content-free wake; `count` adds a
+badge hint; `preview` deliberately sends truncated message content. Mention
+alerts contain only “You were mentioned,” never the message text.
+
+Exact mention matching retains at most 64 texts per coalesced burst. If a
+larger burst arrives, mention-enabled devices conservatively receive the same
+content-free alert; this keeps memory bounded without silently missing a
+mention, at the cost of a possible generic false-positive alert during an
+exceptional burst.
+
+Only inbound durable message events produce push wakes. Local sends from the
+REST or parallel frame client are already known locally and do not wake paired
+devices.
+
+The notifier uses one coordinator and a bounded worker pool (1–4). It
+coalesces bursts, retries transient failures with capped backoff, drops after
+the attempt cap, and clears a device push token on HTTP 410. With no relay URL,
+the worker does not start and sync/SSE remain fully functional.
+
+## 12. RF observations
+
+Packet storage is process-wide, so every RF endpoint first establishes
+companion ownership before exposing global packet rows.
+
+- Message receptions require a message ID scoped to the companion.
+- Heard repeats require a packet hash belonging to a durable outbound message
+  for that companion, then query only post-transmit OTA duplicate rows.
+- Contact paths begin with companion-scoped messages from that sender.
+
+An RF duplicate can race the blocking message insert. The correlation tracker
+holds one bounded cumulative aggregate until the row has a durable message ID,
+then advances the row and appends the detailed observation event atomically.
+It never publishes a correlation event with `message_id: null`; failed or
+deduplicated provisional inbound inserts are discarded.
+
+All observation queries have a bounded window (default 24 hours, clamped from
+60 seconds to 7 days), use indexed packet hashes, and return at most 500
+packet observations. `truncated: true` means the returned counts cover only
+that bounded result. Responses say `observations_pruned: true` when the
+requested window extends beyond retained packet history. Path hash resolution
+can be `unique`, `ambiguous`, or `unknown`; clients should display the raw
+hash unless it is unique.
+
+## 13. Client loop
+
+A complete chat client needs only this loop:
+
+1. Pair once and store the device token in protected storage.
+2. Fetch snapshot; atomically persist state and cursor.
+3. Apply `sync` pages in order until `has_more` is false.
+4. Optionally hold SSE and persist each event `id` after applying its data.
+5. On `snapshot_required`, discard the old cursor and take a new snapshot.
+6. For every send, generate one key and persist it with the local draft before
+   calling the API.
+7. Reuse that key after transport uncertainty; never invent a new key for an
+   indeterminate attempt.
+
+Events are forward-compatible at the type boundary: ignore unknown event
+types. Validate the exact documented shape for known types, and never advance
+the stored cursor until the containing event/page has been durably applied.
+
+## 14. Deliberate exclusions
+
+The v1 chat surface does not expose:
+
+- private-key export/import or signing;
+- raw packet injection;
+- radio, tuning, repeat, or daemon configuration;
+- frame socket/session control;
+- self-advert setters/sending;
+- contact import/export/share blobs;
+- auto-add policy mutation;
+- arbitrary binary/anonymous/control requests.
+
+These are operator, diagnostic, or high-trust frame capabilities. Adding them
+to a device-token surface would collide with shared-radio ownership or expand
+the effect of a leaked chat credential.

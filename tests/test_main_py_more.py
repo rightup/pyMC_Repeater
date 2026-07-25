@@ -81,3 +81,29 @@ async def test_run_starts_http_and_handles_dispatcher_cancelled_gracefully():
 
     fake_http_instance.start.assert_called_once()
     daemon.dispatcher.run_forever.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_run_with_http_disabled_does_not_construct_http_server():
+    config = _base_config()
+    config["http"]["enabled"] = False
+    daemon = RepeaterDaemon(config, radio=SimpleNamespace(cleanup=MagicMock()))
+
+    async def _init_stub():
+        daemon.local_identity = SimpleNamespace(get_public_key=lambda: b"\x22" * 32)
+        daemon.dispatcher = SimpleNamespace(
+            run_forever=AsyncMock(side_effect=asyncio.CancelledError())
+        )
+
+    daemon.initialize = _init_stub
+    fake_loop_for_signals = SimpleNamespace(add_signal_handler=MagicMock())
+
+    with (
+        patch("asyncio.get_running_loop", return_value=fake_loop_for_signals),
+        patch("repeater.main.HTTPStatsServer") as server_factory,
+        patch("os.path.exists", return_value=False),
+    ):
+        await daemon.run()
+
+    server_factory.assert_not_called()
+    daemon.dispatcher.run_forever.assert_awaited_once()

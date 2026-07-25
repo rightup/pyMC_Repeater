@@ -11,12 +11,18 @@ docs/architecture/mobile-companion-api.md §5 (journal) and §13 (performance).
 
 from __future__ import annotations
 
+import logging
 import sqlite3
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from repeater.data_acquisition.sqlite_handler import SQLiteHandler
+from repeater.data_acquisition.sqlite_handler import (
+    CompanionStorageError,
+    SQLiteHandler,
+)
 
 _HASH = "0x01"
 _HASH2 = "0x02"
@@ -160,7 +166,9 @@ def test_event_payload_round_trip(tmp_path):
     assert event["payload"] == payload
 
 
-def test_event_payload_parse_failure_falls_back_to_raw(tmp_path):
+def test_event_payload_parse_failure_fails_closed_without_returning_raw(
+    tmp_path, caplog
+):
     h = _handler(tmp_path)
     seq = h.companion_append_event(_HASH, "message", {"ok": True})
     assert seq is not None
@@ -173,10 +181,20 @@ def test_event_payload_parse_failure_falls_back_to_raw(tmp_path):
     conn.commit()
     conn.close()
 
-    events = h.companion_get_events(_HASH, after_seq=0)
-    assert len(events) == 1
-    assert events[0]["payload"] == {}
-    assert events[0]["payload_raw"] == "{not json"
+    with caplog.at_level(logging.ERROR, logger="SQLiteHandler"):
+        events = h.companion_get_events(_HASH, after_seq=0)
+
+    # The compatibility reader cannot signal storage failure to its caller, so
+    # it omits the corrupt page and logs it. Never surface malformed storage as
+    # a synthetic event or expose its raw contents.
+    assert events == []
+    assert "{not json" not in repr(events)
+    assert "invalid JSON payload" in caplog.text
+
+    # The strict mobile sync path can signal failure and must do so.
+    state = h.companion_sync_state(_HASH)
+    with pytest.raises(CompanionStorageError, match="invalid JSON payload"):
+        h.companion_sync_page(_HASH, state["epoch"], after_seq=0)
 
 
 # --- journal_head, epoch stability ---
@@ -247,6 +265,39 @@ def test_prune_events_advances_floor_to_max_deleted_seq(tmp_path):
 
     remaining = h.companion_get_events(_HASH, after_seq=0)
     assert [e["seq"] for e in remaining] == [fresh_seq]
+
+
+def test_prune_events_locks_before_floor_scan_and_delete(tmp_path):
+    h = _handler(tmp_path)
+    old_time = time.time() - (40 * 86400)
+    assert h.companion_append_event(
+        _HASH,
+        "message",
+        {"n": 1},
+        created_at=old_time,
+    )
+    trace = []
+    conn = h._connect()
+    conn.set_trace_callback(trace.append)
+    try:
+        assert h.companion_prune_events(max_age_days=31) == 1
+    finally:
+        conn.set_trace_callback(None)
+
+    statements = [statement.strip().upper() for statement in trace]
+    begin = statements.index("BEGIN IMMEDIATE")
+    floor_scan = next(
+        index
+        for index, statement in enumerate(statements)
+        if statement.startswith("SELECT COMPANION_HASH, MAX(SEQ)")
+    )
+    delete = next(
+        index
+        for index, statement in enumerate(statements)
+        if statement.startswith("DELETE FROM COMPANION_EVENTS")
+    )
+    commit = statements.index("COMMIT")
+    assert begin < floor_scan < delete < commit
 
 
 def test_prune_events_floor_never_regresses(tmp_path):
@@ -357,6 +408,25 @@ def test_second_pop_returns_next_unconsumed_message(tmp_path):
     second = h.companion_pop_message(_HASH)
     assert second["text"] == "second"
 
+    assert h.companion_pop_message(_HASH) is None
+
+
+def test_concurrent_pop_claims_each_message_once(tmp_path):
+    h = _handler(tmp_path)
+    assert h.companion_push_message(_HASH, _msg("only", text="only"))
+    start = threading.Barrier(9)
+
+    def pop_once(_unused):
+        start.wait()
+        return h.companion_pop_message(_HASH)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = [pool.submit(pop_once, number) for number in range(8)]
+        start.wait()
+        results = [future.result() for future in futures]
+
+    delivered = [result for result in results if result is not None]
+    assert [message["text"] for message in delivered] == ["only"]
     assert h.companion_pop_message(_HASH) is None
 
 

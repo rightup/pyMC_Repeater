@@ -5,7 +5,10 @@ from pathlib import Path
 
 import pytest
 
-from repeater.data_acquisition.sqlite_handler import SQLiteHandler
+from repeater.data_acquisition.sqlite_handler import (
+    CompanionStorageError,
+    SQLiteHandler,
+)
 
 
 def _make_handler(tmp_path: Path) -> SQLiteHandler:
@@ -22,13 +25,56 @@ def test_api_token_crud_cycle(tmp_path):
     assert verified is not None
     assert verified["id"] == token_id
     assert verified["name"] == "svc-a"
+    assert h.get_api_token_by_id_strict(token_id)["name"] == "svc-a"
 
     listed = h.list_api_tokens()
     assert any(t["id"] == token_id for t in listed)
 
     assert h.revoke_api_token(token_id) is True
+    assert h.get_api_token_by_id_strict(token_id) is None
     assert h.verify_api_token("hash-a") is None
     assert h.revoke_api_token(token_id) is False
+
+
+def test_api_token_strict_verification_distinguishes_storage_failure(
+    tmp_path,
+    monkeypatch,
+):
+    handler = _make_handler(tmp_path)
+
+    def unavailable():
+        raise OSError("private database detail")
+
+    monkeypatch.setattr(handler, "_connect", unavailable)
+
+    with pytest.raises(CompanionStorageError, match="Failed to verify API token"):
+        handler.verify_api_token_strict("hash-a")
+    with pytest.raises(CompanionStorageError, match="Failed to read API token"):
+        handler.get_api_token_by_id_strict(1)
+    assert handler.verify_api_token("hash-a") is None
+
+
+def test_api_token_strict_crud_distinguishes_storage_failure(
+    tmp_path,
+    monkeypatch,
+):
+    handler = _make_handler(tmp_path)
+
+    def unavailable():
+        raise OSError("private database detail")
+
+    monkeypatch.setattr(handler, "_connect", unavailable)
+
+    with pytest.raises(CompanionStorageError, match="Failed to create API token"):
+        handler.create_api_token_strict("operator", "hash-a")
+    with pytest.raises(CompanionStorageError, match="Failed to revoke API token"):
+        handler.revoke_api_token_strict(1)
+    with pytest.raises(CompanionStorageError, match="Failed to list API tokens"):
+        handler.list_api_tokens_strict()
+
+    # Historical direct callers keep their fail-soft read/delete behavior.
+    assert handler.revoke_api_token(1) is False
+    assert handler.list_api_tokens() == []
 
 
 def test_transport_key_crud_cycle(tmp_path):
@@ -128,6 +174,17 @@ def test_room_messages_and_sync_flow(tmp_path):
     sync = h.get_client_sync(room_hash, a_pub)
     assert sync is not None
     assert sync["sync_since"] == 50.0
+
+    # Dynamic upsert identifiers are a fixed API, never caller-provided SQL.
+    assert (
+        h.upsert_client_sync(
+            room_hash,
+            a_pub,
+            **{"last_activity = 0; DROP TABLE room_client_sync; --": 0},
+        )
+        is False
+    )
+    assert h.get_client_sync(room_hash, a_pub) is not None
 
     clients = h.get_all_room_clients(room_hash)
     assert len(clients) == 1

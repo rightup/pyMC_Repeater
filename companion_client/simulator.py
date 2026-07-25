@@ -4,7 +4,7 @@ Existing companion tests build the frame server with ``__new__`` and hand-set
 attributes, which is fine for unit-testing persistence hooks but never opens a
 port. This harness runs the actual server so ``companion_client`` can drive it
 over TCP -- closing the gap the handoff flags twice as untestable ("needs a
-companion frame client, TCP 15050, out of scope for a curl smoke").
+companion frame client, TCP 5000, out of scope for a curl smoke").
 
 The bridge is a double. Everything above it -- framing, command dispatch,
 SQLite persistence, the journal, and the push notifier -- is real.
@@ -221,15 +221,27 @@ async def start_harness(
     tmp_path, *, companion_hash: str = "f5", port: int = 0, channels=None
 ) -> Harness:
     """Start a real frame server on ``port`` (0 = pick a free one)."""
+    hash_hex = str(companion_hash).strip().lower()
+    if hash_hex.startswith("0x"):
+        hash_hex = hash_hex[2:]
+    try:
+        valid_hash = len(hash_hex) == 2 and 0 <= int(hash_hex, 16) <= 0xFF
+    except ValueError:
+        valid_hash = False
+    if not valid_hash:
+        raise ValueError("companion_hash must be one byte in hex")
+    canonical_hash = f"0x{hash_hex}"
+
     handler = SQLiteHandler(tmp_path)
-    journal = CompanionEventJournal(handler, companion_hash)
+    journal = CompanionEventJournal(handler, canonical_hash)
     bridge = FakeBridge(
-        public_key=bytes([int(companion_hash, 16)]) + bytes(range(31)), channels=channels
+        public_key=bytes([int(hash_hex, 16)]) + bytes(range(31)),
+        channels=channels,
     )
 
     server = CompanionFrameServer(
         bridge=bridge,
-        companion_hash=companion_hash,
+        companion_hash=canonical_hash,
         port=port,
         bind_address="127.0.0.1",
         sqlite_handler=handler,
@@ -243,7 +255,7 @@ async def start_harness(
         bridge=bridge,
         handler=handler,
         journal=journal,
-        companion_hash=companion_hash,
+        companion_hash=canonical_hash,
         port=bound_port,
     )
 
