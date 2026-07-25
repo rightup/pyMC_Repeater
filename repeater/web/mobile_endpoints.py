@@ -1057,8 +1057,16 @@ class CompanionsV1:
     def _begin_sse(self, principal: str, companion_identity: str) -> bool:
         return self._sse_admission.acquire(principal, companion_identity)
 
-    def _end_sse(self, principal: str, companion_identity: str) -> None:
-        self._sse_admission.release(principal, companion_identity)
+    def _replace_sse(self, principal: str, companion_identity: str):
+        return self._sse_admission.replace(principal, companion_identity)
+
+    def _end_sse(
+        self,
+        principal: str,
+        companion_identity: str,
+        lease=None,
+    ) -> None:
+        self._sse_admission.release(principal, companion_identity, lease)
 
     @property
     def _sse_total(self) -> int:
@@ -2602,7 +2610,8 @@ class CompanionsV1:
                 ) from exc
 
         stream_principal = self._sse_principal()
-        if not self._begin_sse(stream_principal, companion_identity):
+        stream_lease = self._replace_sse(stream_principal, companion_identity)
+        if stream_lease is None:
             cherrypy.response.headers["Retry-After"] = "5"
             raise cherrypy.HTTPError(
                 429,
@@ -2615,6 +2624,12 @@ class CompanionsV1:
         if not status["valid"]:
 
             def _snapshot_required_stream():
+                if not self._sse_admission.is_current(
+                    stream_principal,
+                    companion_identity,
+                    stream_lease,
+                ):
+                    return
                 try:
                     if not authorization.is_active():
                         return
@@ -2638,7 +2653,11 @@ class CompanionsV1:
 
             return _ClosingIterator(
                 _snapshot_required_stream(),
-                lambda: self._end_sse(stream_principal, companion_identity),
+                lambda: self._end_sse(
+                    stream_principal,
+                    companion_identity,
+                    stream_lease,
+                ),
             )
 
         wake_queue: queue.Queue = queue.Queue(maxsize=1)
@@ -2673,6 +2692,13 @@ class CompanionsV1:
                 )
                 return False
 
+        def _stream_is_current() -> bool:
+            return self._sse_admission.is_current(
+                stream_principal,
+                companion_identity,
+                stream_lease,
+            )
+
         def generate():
             last_sent_seq = cursor_seq
             stream_epoch = status["epoch"]
@@ -2681,12 +2707,21 @@ class CompanionsV1:
             page_was_prefetched = page is not None
             listener_registered = False
             try:
-                if not _bridge_is_active() or not _authorization_is_active():
+                if (
+                    not _stream_is_current()
+                    or not _bridge_is_active()
+                    or not _authorization_is_active()
+                ):
                     return
                 journal.register_listener(_on_event)
                 listener_registered = True
+                stream_started = False
                 while True:
-                    if not _bridge_is_active() or not _authorization_is_active():
+                    if (
+                        not _stream_is_current()
+                        or not _bridge_is_active()
+                        or not _authorization_is_active()
+                    ):
                         return
                     if page is None:
                         page = handler.companion_sync_page(
@@ -2719,9 +2754,10 @@ class CompanionsV1:
                             include_rf_receptions=want_rf_receptions,
                         )
                     for event in page_wire:
-                        if not _authorization_is_active():
+                        if not _stream_is_current() or not _authorization_is_active():
                             return
                         yield self._sse_wire_frame(event, stream_epoch)
+                        stream_started = True
                     has_more = page["has_more"]
                     refresh_before_wait = page_was_prefetched
                     page = None
@@ -2734,10 +2770,20 @@ class CompanionsV1:
                         # listener. One immediate indexed refresh closes that
                         # gap without turning the stream into a polling loop.
                         continue
+                    if not stream_started:
+                        # SSE comments are ignored by clients but flush the
+                        # authenticated response through proxies immediately
+                        # when there is no replay event to send.
+                        yield ": connected\n\n"
+                        stream_started = True
                     keepalive_deadline = time.monotonic() + keepalive_sec
                     woke_for_event = False
                     while True:
-                        if not _bridge_is_active() or not _authorization_is_active():
+                        if (
+                            not _stream_is_current()
+                            or not _bridge_is_active()
+                            or not _authorization_is_active()
+                        ):
                             return
                         keepalive_remaining = keepalive_deadline - time.monotonic()
                         if keepalive_remaining <= 0:
@@ -2773,7 +2819,7 @@ class CompanionsV1:
                         )
                         yield f"event: snapshot_required\ndata: {payload}\n\n"
                         return
-                    if not _authorization_is_active():
+                    if not _stream_is_current() or not _authorization_is_active():
                         return
                     yield ": ka\n\n"
             except GeneratorExit:
@@ -2788,7 +2834,11 @@ class CompanionsV1:
 
         return _ClosingIterator(
             generate(),
-            lambda: self._end_sse(stream_principal, companion_identity),
+            lambda: self._end_sse(
+                stream_principal,
+                companion_identity,
+                stream_lease,
+            ),
         )
 
     events._cp_config = {"response.stream": True}

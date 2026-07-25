@@ -291,9 +291,9 @@ class TestReplayEquivalence:
         monkeypatch.setattr(endpoints, "_sse_settings", lambda: (64, 0.05))
 
         gen = _open_stream(endpoints)  # no cursor, no Last-Event-ID
-        # Nothing to replay -> straight to live tail -> keepalive.
+        # Nothing to replay -> flush the authenticated live handshake.
         frame = next(gen)
-        assert frame == ": ka\n\n"
+        assert frame == ": connected\n\n"
 
 
 # --- Live tail ------------------------------------------------------------
@@ -557,8 +557,8 @@ class TestKeepalive:
         monkeypatch.setattr(endpoints, "_sse_settings", lambda: (64, 0.05))
 
         gen = _open_stream(endpoints, cursor=_cursor(handler, seqs[-1]))
-        frame = next(gen)
-        assert frame == ": ka\n\n"
+        assert next(gen) == ": connected\n\n"
+        assert next(gen) == ": ka\n\n"
 
     def test_idle_stream_detects_epoch_rotation_before_keepalive(
         self,
@@ -587,6 +587,7 @@ class TestKeepalive:
         monkeypatch.setattr(endpoints, "_sse_settings", lambda: (64, 0.01))
 
         gen = _open_stream(endpoints, cursor=f"{old_epoch}:{seqs[-1]}")
+        assert next(gen) == ": connected\n\n"
         frame = next(gen)
         assert frame.startswith("event: snapshot_required\n")
         payload = json.loads(frame.split("data: ", 1)[1].strip())
@@ -602,6 +603,26 @@ class TestKeepalive:
 
 
 class TestListenerCleanup:
+    def test_new_stream_supersedes_stale_stream_for_same_client(
+        self,
+        endpoints,
+        handler,
+    ):
+        seqs = _seed(handler, 1)
+        cursor = _cursor(handler, seqs[-1])
+        stale = _open_stream(endpoints, cursor=cursor)
+        current = _open_stream(endpoints, cursor=cursor)
+
+        with pytest.raises(StopIteration):
+            next(stale)
+        assert next(current) == ": connected\n\n"
+        assert endpoints._sse_total == 1
+
+        stale.close()
+        assert endpoints._sse_total == 1
+        current.close()
+        assert endpoints._sse_total == 0
+
     def test_hot_removed_companion_closes_idle_stream_and_releases_slot(
         self,
         endpoints,
@@ -611,7 +632,7 @@ class TestListenerCleanup:
         seqs = _seed(handler, 1)
         monkeypatch.setattr(endpoints, "_sse_settings", lambda: (64, 0.01))
         stream = _open_stream(endpoints, cursor=_cursor(handler, seqs[-1]))
-        assert next(stream) == ": ka\n\n"
+        assert next(stream) == ": connected\n\n"
         assert endpoints._sse_total == 1
 
         endpoints.daemon_instance.companion_bridges.pop(_HASH_BYTE)
@@ -669,7 +690,7 @@ class TestListenerCleanup:
 
         monkeypatch.setattr(journal, "unregister_listener", fail_cleanup)
         gen = _open_stream(endpoints, cursor=_cursor(handler, seqs[-1]))
-        assert next(gen) == ": ka\n\n"
+        assert next(gen) == ": connected\n\n"
         assert endpoints._sse_total == 1
 
         with pytest.raises(RuntimeError, match="cleanup failed"):

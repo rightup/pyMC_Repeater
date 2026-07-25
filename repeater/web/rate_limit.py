@@ -6,7 +6,7 @@ import math
 import threading
 import time
 from dataclasses import dataclass
-from typing import Dict, Hashable, Iterable, Optional, Set, Tuple
+from typing import Dict, Hashable, Iterable, Optional, Tuple
 
 MAX_SSE_QUEUE_SIZE = 4096
 MAX_SSE_KEEPALIVE_SEC = 60
@@ -121,13 +121,15 @@ class PrincipalTokenBucket:
 class SSEAdmission:
     """One shared, thread-safe connection budget for companion SSE routes."""
 
+    _FIXED_LEASE = object()
+
     def __init__(self, max_connections: int) -> None:
         if isinstance(max_connections, bool) or not isinstance(max_connections, int):
             raise ValueError("sse_max_connections must be a positive integer")
         if max_connections < 1:
             raise ValueError("sse_max_connections must be a positive integer")
         self.max_connections = max_connections
-        self._active: Set[Tuple[str, Hashable]] = set()
+        self._active: Dict[Tuple[str, Hashable], object] = {}
         self._lock = threading.Lock()
 
     def acquire(self, principal: str, companion: Hashable) -> bool:
@@ -137,14 +139,46 @@ class SSEAdmission:
         with self._lock:
             if key in self._active or len(self._active) >= self.max_connections:
                 return False
-            self._active.add(key)
+            self._active[key] = self._FIXED_LEASE
             return True
 
-    def release(self, principal: str, companion: Hashable) -> None:
-        """Release a reservation. Repeated cleanup is intentionally harmless."""
+    def replace(self, principal: str, companion: Hashable) -> Optional[object]:
+        """Reserve a replaceable stream lease, superseding its prior lease."""
+
+        key = (principal, companion)
+        with self._lock:
+            current = self._active.get(key)
+            if current is self._FIXED_LEASE:
+                return None
+            if current is None and len(self._active) >= self.max_connections:
+                return None
+            lease = object()
+            self._active[key] = lease
+            return lease
+
+    def is_current(
+        self,
+        principal: str,
+        companion: Hashable,
+        lease: object,
+    ) -> bool:
+        """Return whether a replaceable lease still owns its stream slot."""
 
         with self._lock:
-            self._active.discard((principal, companion))
+            return self._active.get((principal, companion)) is lease
+
+    def release(
+        self,
+        principal: str,
+        companion: Hashable,
+        lease: Optional[object] = None,
+    ) -> None:
+        """Release a reservation. Repeated cleanup is intentionally harmless."""
+
+        key = (principal, companion)
+        with self._lock:
+            if lease is None or self._active.get(key) is lease:
+                self._active.pop(key, None)
 
     @property
     def active_count(self) -> int:

@@ -214,6 +214,25 @@ def test_sse_admission_is_shared_across_legacy_and_v1_surfaces():
     assert legacy._sse_total == mobile._sse_total == 0
 
 
+def test_sse_admission_replaces_only_replaceable_leases():
+    admission = SSEAdmission(1)
+
+    first = admission.replace("jwt:operator:chat", "companion")
+    second = admission.replace("jwt:operator:chat", "companion")
+
+    assert first is not None
+    assert second is not None
+    assert admission.is_current("jwt:operator:chat", "companion", first) is False
+    assert admission.is_current("jwt:operator:chat", "companion", second) is True
+    admission.release("jwt:operator:chat", "companion", first)
+    assert admission.active_count == 1
+    admission.release("jwt:operator:chat", "companion", second)
+    assert admission.active_count == 0
+
+    assert admission.acquire("jwt:operator:chat", "companion") is True
+    assert admission.replace("jwt:operator:chat", "companion") is None
+
+
 def test_legacy_and_v1_use_the_same_jwt_sse_principal(monkeypatch):
     monkeypatch.setattr(
         cherrypy.request,
