@@ -68,9 +68,8 @@ class CompanionFrameWebSocket(WebSocket):
             logger.warning("Connection rejected: invalid query")
             self.close(code=1008, reason="invalid query")
             return
-        if (
-            set(params) - {"token", "companion_name"}
-            or any(len(params.get(name, ())) > 1 for name in params)
+        if set(params) - {"token", "companion_name"} or any(
+            len(params.get(name, ())) > 1 for name in params
         ):
             logger.warning("Connection rejected: ambiguous query")
             self.close(code=1008, reason="invalid query")
@@ -78,11 +77,7 @@ class CompanionFrameWebSocket(WebSocket):
         token_parameter_present = "token" in params
         token = params.get("token", [None])[0]
         companion_name = params.get("companion_name", [None])[0]
-        api_key = (
-            self.environ.get("HTTP_X_API_KEY", "")
-            if hasattr(self, "environ")
-            else ""
-        )
+        api_key = self.environ.get("HTTP_X_API_KEY", "") if hasattr(self, "environ") else ""
 
         if not jwt_handler:
             logger.warning("Connection rejected: no JWT handler configured")
@@ -117,9 +112,7 @@ class CompanionFrameWebSocket(WebSocket):
                     try:
                         authorization = AuthorizationLease.from_jwt_payload(payload)
                     except ValueError:
-                        logger.error(
-                            "JWT verifier returned a payload without a valid expiration"
-                        )
+                        logger.error("JWT verifier returned a payload without a valid expiration")
                         jwt_auth_unavailable = True
                         authenticated_user = None
                     else:
@@ -151,9 +144,7 @@ class CompanionFrameWebSocket(WebSocket):
                         )
                         self.close(code=1008, reason="forbidden")
                         return
-                    token_name = safe_api_token_name(
-                        token_info.get("name", "unknown")
-                    )
+                    token_name = safe_api_token_name(token_info.get("name", "unknown"))
                     authenticated_user = f"api_token:{token_name}"
                     authorization = AuthorizationLease.from_api_token(
                         token_info,
@@ -354,8 +345,7 @@ class CompanionFrameWebSocket(WebSocket):
             endpoint = self._bound_listener_endpoint(server)
             if endpoint is None:
                 logger.warning(
-                    "_resolve_tcp_endpoint: running '%s' has no usable bound "
-                    "INET socket",
+                    "_resolve_tcp_endpoint: running '%s' has no usable bound INET socket",
                     companion_name,
                 )
                 return None
@@ -391,9 +381,7 @@ class CompanionFrameWebSocket(WebSocket):
                     close_args = self._authorization_close_args()
                     break
                 authorization = getattr(self, "_authorization", None)
-                wait_for = authorization.check_in(
-                    AUTHORIZATION_RECHECK_SECONDS
-                )
+                wait_for = authorization.check_in(AUTHORIZATION_RECHECK_SECONDS)
                 tcp.settimeout(max(0.001, wait_for))
                 try:
                     data = tcp.recv(4096)

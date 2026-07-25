@@ -136,9 +136,7 @@ def test_set_channel_uses_unambiguous_32_byte_hex_secret():
     data = payload[1:]
 
     assert len(data) == 1 + 32 + 64
-    assert bytes.fromhex(data[33:97].decode("ascii")) == (
-        b"\x01" * 16 + b"\x00" * 16
-    )
+    assert bytes.fromhex(data[33:97].decode("ascii")) == (b"\x01" * 16 + b"\x00" * 16)
 
 
 # --- response parsing -----------------------------------------------------

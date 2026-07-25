@@ -95,9 +95,7 @@ def test_opened_rejects_ambiguous_or_unknown_query_fields_before_auth(
 @pytest.mark.parametrize("query_token", ["operator-jwt", ""])
 def test_opened_rejects_simultaneous_jwt_and_api_key(cp_cfg, query_token):
     verify_jwt = MagicMock(return_value=_jwt_payload())
-    verify_token = MagicMock(
-        return_value={"id": 1, "name": "operator", "scope": "admin"}
-    )
+    verify_token = MagicMock(return_value={"id": 1, "name": "operator", "scope": "admin"})
     cp_cfg["jwt_handler"] = SimpleNamespace(verify_jwt=verify_jwt)
     cp_cfg["token_manager"] = SimpleNamespace(verify_token=verify_token)
     ws = _ws(
@@ -130,9 +128,7 @@ def test_opened_rejects_malformed_token_before_verification(cp_cfg, token):
 def test_opened_rejects_companion_api_token(cp_cfg):
     cp_cfg["jwt_handler"] = SimpleNamespace(verify_jwt=lambda _t: None)
     cp_cfg["token_manager"] = SimpleNamespace(
-        verify_token=MagicMock(
-            return_value={"id": 7, "name": "phone", "scope": "companion:home"}
-        )
+        verify_token=MagicMock(return_value={"id": 7, "name": "phone", "scope": "companion:home"})
     )
     ws = _ws("token=device-token&companion_name=c1")
 
@@ -146,9 +142,7 @@ def test_opened_rejects_companion_api_token(cp_cfg):
 
 @pytest.mark.parametrize("scope", ["companion:home", "companion:*", "read", ""])
 def test_opened_rejects_non_admin_api_key(cp_cfg, scope):
-    verify_token = MagicMock(
-        return_value={"id": 7, "name": "phone", "scope": scope}
-    )
+    verify_token = MagicMock(return_value={"id": 7, "name": "phone", "scope": scope})
     cp_cfg["jwt_handler"] = SimpleNamespace(verify_jwt=MagicMock())
     cp_cfg["token_manager"] = SimpleNamespace(verify_token=verify_token)
     ws = _ws("companion_name=c1", api_key="device-token")
@@ -214,9 +208,7 @@ def test_opened_reports_missing_api_token_manager(cp_cfg):
 
 
 def test_opened_reports_api_token_storage_failure(cp_cfg):
-    verify_token = MagicMock(
-        side_effect=CompanionStorageError("private database detail")
-    )
+    verify_token = MagicMock(side_effect=CompanionStorageError("private database detail"))
     cp_cfg["jwt_handler"] = SimpleNamespace(verify_jwt=MagicMock())
     cp_cfg["token_manager"] = SimpleNamespace(verify_token=verify_token)
     ws = _ws("companion_name=c1", api_key="operator-token")
@@ -245,9 +237,7 @@ def test_opened_reports_unexpected_api_token_verifier_failure(cp_cfg):
 
 def test_opened_reports_unexpected_jwt_verifier_failure(cp_cfg):
     cp_cfg["jwt_handler"] = SimpleNamespace(
-        verify_jwt=MagicMock(
-            side_effect=RuntimeError("private implementation detail")
-        )
+        verify_jwt=MagicMock(side_effect=RuntimeError("private implementation detail"))
     )
     ws = _ws("token=operator-jwt&companion_name=c1")
 
@@ -267,9 +257,7 @@ def test_opened_escapes_api_token_name_in_logs(
     raw_name = "legacy\n\u202eoperator"
     cp_cfg["jwt_handler"] = SimpleNamespace(verify_jwt=MagicMock())
     cp_cfg["token_manager"] = SimpleNamespace(
-        verify_token=MagicMock(
-            return_value={"id": 7, "name": raw_name, "scope": "admin"}
-        )
+        verify_token=MagicMock(return_value={"id": 7, "name": raw_name, "scope": "admin"})
     )
     ws = _ws("companion_name=c1", api_key="operator-token")
     _allow_tcp_connection(ws, monkeypatch)
@@ -364,9 +352,7 @@ def test_opened_success_starts_reader_thread(cp_cfg, monkeypatch):
 def test_idle_proxy_closes_when_its_jwt_expires(cp_cfg, monkeypatch):
     clock = {"wall": 1000.0}
     monkeypatch.setattr(auth_lease.time, "time", lambda: clock["wall"])
-    cp_cfg["jwt_handler"] = SimpleNamespace(
-        verify_jwt=lambda _token: {"sub": "u", "exp": 1001.0}
-    )
+    cp_cfg["jwt_handler"] = SimpleNamespace(verify_jwt=lambda _token: {"sub": "u", "exp": 1001.0})
     ws = _ws("token=t&companion_name=c1")
     fake_socket, _thread = _allow_tcp_connection(ws, monkeypatch)
     ws.opened()
@@ -434,9 +420,7 @@ def test_proxy_closes_on_auth_storage_failure_after_open(
     }
     token_manager = SimpleNamespace(
         verify_token=MagicMock(return_value=token_info),
-        get_token=MagicMock(
-            side_effect=CompanionStorageError("private database detail")
-        ),
+        get_token=MagicMock(side_effect=CompanionStorageError("private database detail")),
     )
     cp_cfg["jwt_handler"] = SimpleNamespace(verify_jwt=MagicMock())
     cp_cfg["token_manager"] = token_manager

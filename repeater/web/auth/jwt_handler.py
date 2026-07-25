@@ -14,11 +14,7 @@ JWT_SECRET_MIN_BYTES = 32
 def validate_jwt_expiry_minutes(value: object) -> int:
     """Return an exact, bounded JWT lifetime from configuration."""
 
-    if (
-        type(value) is not int
-        or value < JWT_EXPIRY_MINUTES_MIN
-        or value > JWT_EXPIRY_MINUTES_MAX
-    ):
+    if type(value) is not int or value < JWT_EXPIRY_MINUTES_MIN or value > JWT_EXPIRY_MINUTES_MAX:
         raise ValueError(
             "repeater.security.jwt_expiry_minutes must be an integer between "
             f"{JWT_EXPIRY_MINUTES_MIN} and {JWT_EXPIRY_MINUTES_MAX}"
@@ -102,10 +98,7 @@ class JWTHandler:
             encoded_size = len(value.encode("utf-8"))
         except UnicodeEncodeError:
             return False
-        return (
-            encoded_size <= max_bytes
-            and all(character.isprintable() for character in value)
-        )
+        return encoded_size <= max_bytes and all(character.isprintable() for character in value)
 
 
 def verify_jwt_for_auth_fallback(

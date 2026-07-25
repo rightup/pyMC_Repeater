@@ -644,11 +644,7 @@ class TestPacketRouterRoutingBranches(unittest.IsolatedAsyncioTestCase):
     async def test_concurrent_authenticated_path_copies_are_consumed_once(self):
         for destination in (0x01, 0xFE):
             with self.subTest(
-                delivery=(
-                    "targeted"
-                    if destination == 0x01
-                    else "anonymous-path-response"
-                )
+                delivery=("targeted" if destination == 0x01 else "anonymous-path-response")
             ):
                 daemon = _make_daemon()
                 router = PacketRouter(daemon)
@@ -673,9 +669,7 @@ class TestPacketRouterRoutingBranches(unittest.IsolatedAsyncioTestCase):
 
                 first = asyncio.create_task(router._route_packet(first_packet))
                 await delivery_started.wait()
-                duplicate = asyncio.create_task(
-                    router._route_packet(duplicate_packet)
-                )
+                duplicate = asyncio.create_task(router._route_packet(duplicate_packet))
                 await asyncio.sleep(0)
                 self.assertEqual(calls, 1)
 
@@ -1100,9 +1094,7 @@ class TestPacketRouterRoutingBranches(unittest.IsolatedAsyncioTestCase):
     async def test_route_path_dedupes_companion_delivery(self):
         daemon = _make_daemon()
         bridge = _make_bridge()
-        bridge.process_received_packet = AsyncMock(
-            return_value=HandlerResult.consumed()
-        )
+        bridge.process_received_packet = AsyncMock(return_value=HandlerResult.consumed())
         daemon.companion_bridges = {0x01: bridge}
         router = PacketRouter(daemon)
         pkt = _make_packet(PathHandler.payload_type())
@@ -1594,8 +1586,8 @@ class TestCompanionDeliveryFailureHandling(unittest.IsolatedAsyncioTestCase):
         await router._route_packet(pkt)
         recovered.assert_awaited_once()
 
-    async def test_path_partial_bridge_failure_still_marks_delivered(self):
-        """One healthy bridge is a delivery: the duplicate copy stays suppressed."""
+    async def test_path_partial_bridge_failure_retries_without_authentication(self):
+        """A completed but unauthenticated fan-out remains eligible for retry."""
         daemon = _make_daemon()
         raising = _make_bridge()
         raising.process_received_packet = AsyncMock(side_effect=RuntimeError("boom"))
@@ -1610,8 +1602,8 @@ class TestCompanionDeliveryFailureHandling(unittest.IsolatedAsyncioTestCase):
         await router._route_packet(pkt)
         await router._route_packet(pkt)
 
-        healthy.process_received_packet.assert_awaited_once()
-        raising.process_received_packet.assert_awaited_once()
+        self.assertEqual(healthy.process_received_packet.await_count, 2)
+        self.assertEqual(raising.process_received_packet.await_count, 2)
 
     async def test_protocol_response_all_bridges_raising_is_retried_on_next_copy(self):
         daemon = _make_daemon()

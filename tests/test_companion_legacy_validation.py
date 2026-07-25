@@ -116,12 +116,8 @@ def test_companion_selector_rejects_non_byte_hash(raw_hash):
 def test_companion_selector_keeps_legacy_decimal_and_hex_strings():
     endpoint = CompanionAPIEndpoints.__new__(CompanionAPIEndpoints)
 
-    assert endpoint._resolve_bridge_params({"companion_hash": "66"}) == {
-        "companion_hash": 66
-    }
-    assert endpoint._resolve_bridge_params({"companion_hash": "0x42"}) == {
-        "companion_hash": 0x42
-    }
+    assert endpoint._resolve_bridge_params({"companion_hash": "66"}) == {"companion_hash": 66}
+    assert endpoint._resolve_bridge_params({"companion_hash": "0x42"}) == {"companion_hash": 0x42}
 
 
 @pytest.mark.parametrize(
@@ -143,9 +139,7 @@ def test_legacy_direct_send_rejects_invalid_wire_values(body):
 
 
 def test_legacy_direct_send_preserves_numeric_string_txt_type():
-    endpoint = _endpoint(
-        {"pub_key": _PUBLIC_KEY, "text": "status", "txt_type": "1"}
-    )
+    endpoint = _endpoint({"pub_key": _PUBLIC_KEY, "text": "status", "txt_type": "1"})
 
     response = _invoke("send_text", endpoint)
 
@@ -533,9 +527,7 @@ def test_legacy_import_skips_corrupt_numeric_rows(caplog):
     bridge._notify_observers = notify
     endpoint = CompanionAPIEndpoints.__new__(CompanionAPIEndpoints)
     endpoint._get_bridge = lambda **_params: bridge
-    endpoint._get_sqlite_handler = lambda: SimpleNamespace(
-        get_neighbors=lambda: invalid_rows
-    )
+    endpoint._get_sqlite_handler = lambda: SimpleNamespace(get_neighbors=lambda: invalid_rows)
 
     with caplog.at_level("WARNING"):
         result = asyncio.run(

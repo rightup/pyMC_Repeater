@@ -36,9 +36,7 @@ def _websocket(query_string="", api_key=""):
 
 def _configure(monkeypatch, token_info):
     config = {
-        "jwt_handler": SimpleNamespace(
-            verify_jwt=lambda _token, **_kwargs: None
-        ),
+        "jwt_handler": SimpleNamespace(verify_jwt=lambda _token, **_kwargs: None),
         "token_manager": SimpleNamespace(verify_token=lambda _token: token_info),
     }
     monkeypatch.setattr(cherrypy, "config", config, raising=False)
@@ -63,9 +61,7 @@ def test_packet_websocket_rejects_non_admin_api_token(monkeypatch, scope):
         {"id": 3, "name": "legacy-null", "scope": None},
     ],
 )
-def test_packet_websocket_accepts_admin_and_migrated_legacy_tokens(
-    monkeypatch, token_info
-):
+def test_packet_websocket_accepts_admin_and_migrated_legacy_tokens(monkeypatch, token_info):
     _configure(monkeypatch, token_info)
     websocket = _websocket(api_key="operator-token")
 
@@ -98,16 +94,12 @@ def test_packet_websocket_escapes_legacy_token_name_in_identity_and_logs(
 
 
 def test_packet_websocket_reports_api_token_storage_failure(monkeypatch):
-    verify_token = MagicMock(
-        side_effect=CompanionStorageError("private database detail")
-    )
+    verify_token = MagicMock(side_effect=CompanionStorageError("private database detail"))
     monkeypatch.setattr(
         cherrypy,
         "config",
         {
-            "jwt_handler": SimpleNamespace(
-                verify_jwt=lambda _token, **_kwargs: None
-            ),
+            "jwt_handler": SimpleNamespace(verify_jwt=lambda _token, **_kwargs: None),
             "token_manager": SimpleNamespace(verify_token=verify_token),
         },
         raising=False,
@@ -127,11 +119,7 @@ def test_packet_websocket_reports_missing_api_token_manager(monkeypatch):
     monkeypatch.setattr(
         cherrypy,
         "config",
-        {
-            "jwt_handler": SimpleNamespace(
-                verify_jwt=lambda _token, **_kwargs: None
-            )
-        },
+        {"jwt_handler": SimpleNamespace(verify_jwt=lambda _token, **_kwargs: None)},
         raising=False,
     )
     websocket = _websocket(api_key="operator-token")
@@ -151,9 +139,7 @@ def test_packet_websocket_reports_unexpected_api_token_verifier_failure(monkeypa
         cherrypy,
         "config",
         {
-            "jwt_handler": SimpleNamespace(
-                verify_jwt=lambda _token, **_kwargs: None
-            ),
+            "jwt_handler": SimpleNamespace(verify_jwt=lambda _token, **_kwargs: None),
             "token_manager": SimpleNamespace(verify_token=verify_token),
         },
         raising=False,
@@ -332,9 +318,7 @@ def test_idle_packet_websocket_closes_after_api_token_revocation(monkeypatch):
         cherrypy,
         "config",
         {
-            "jwt_handler": SimpleNamespace(
-                verify_jwt=lambda _token, **_kwargs: None
-            ),
+            "jwt_handler": SimpleNamespace(verify_jwt=lambda _token, **_kwargs: None),
             "token_manager": token_manager,
         },
         raising=False,
@@ -386,9 +370,7 @@ def test_packet_websocket_accepts_legacy_query_admin_api_token(
     jwt_handler = JWTHandler(_JWT_SECRET)
     verify_jwt = MagicMock(wraps=jwt_handler.verify_jwt)
     jwt_handler.verify_jwt = verify_jwt
-    verify_token = MagicMock(
-        return_value={"id": 1, "name": "operator", "scope": "admin"}
-    )
+    verify_token = MagicMock(return_value={"id": 1, "name": "operator", "scope": "admin"})
     monkeypatch.setattr(
         cherrypy,
         "config",
@@ -418,9 +400,7 @@ def test_packet_websocket_accepts_legacy_query_admin_api_token(
 
 def test_packet_websocket_rejects_legacy_query_device_api_token(monkeypatch):
     verify_jwt = MagicMock(return_value=None)
-    verify_token = MagicMock(
-        return_value={"id": 1, "name": "phone", "scope": "companion:home"}
-    )
+    verify_token = MagicMock(return_value={"id": 1, "name": "phone", "scope": "companion:home"})
     monkeypatch.setattr(
         cherrypy,
         "config",
@@ -485,9 +465,7 @@ def test_idle_packet_websocket_closes_after_legacy_query_api_token_revocation(
         cherrypy,
         "config",
         {
-            "jwt_handler": SimpleNamespace(
-                verify_jwt=lambda _token, **_kwargs: None
-            ),
+            "jwt_handler": SimpleNamespace(verify_jwt=lambda _token, **_kwargs: None),
             "token_manager": token_manager,
         },
         raising=False,
@@ -621,9 +599,7 @@ def test_packet_websocket_rejects_invalid_client_id_before_verification(
         },
         raising=False,
     )
-    websocket = _websocket(
-        query_string=f"token=operator-jwt&client_id={client_id}"
-    )
+    websocket = _websocket(query_string=f"token=operator-jwt&client_id={client_id}")
 
     websocket.opened()
 

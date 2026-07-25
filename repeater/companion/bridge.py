@@ -134,8 +134,7 @@ class ChannelTextCapacityError(ValueError):
     def __init__(self, max_bytes: int) -> None:
         self.max_bytes = int(max_bytes)
         super().__init__(
-            f"text exceeds {self.max_bytes} UTF-8 bytes for the current "
-            "channel sender name"
+            f"text exceeds {self.max_bytes} UTF-8 bytes for the current channel sender name"
         )
 
 
@@ -233,9 +232,7 @@ def _validated_persisted_pref(key: str, value: Any) -> Any:
             raise ValueError(f"persisted preference {key!r} must be an integer")
         low, high = _PERSISTED_PREF_INT_RANGES[key]
         if not low <= value <= high:
-            raise ValueError(
-                f"persisted preference {key!r} must be between {low} and {high}"
-            )
+            raise ValueError(f"persisted preference {key!r} must be between {low} and {high}")
         return value
 
     if key in _PERSISTED_PREF_FLOAT_RANGES:
@@ -245,8 +242,7 @@ def _validated_persisted_pref(key: str, value: Any) -> Any:
         low, high = _PERSISTED_PREF_FLOAT_RANGES[key]
         if not math.isfinite(parsed) or not low <= parsed <= high:
             raise ValueError(
-                f"persisted preference {key!r} must be finite and between "
-                f"{low} and {high}"
+                f"persisted preference {key!r} must be finite and between {low} and {high}"
             )
         return parsed
 
@@ -256,14 +252,10 @@ def _validated_persisted_pref(key: str, value: Any) -> Any:
         try:
             size = len(value.encode("utf-8"))
         except UnicodeEncodeError as exc:
-            raise ValueError(
-                f"persisted preference {key!r} must contain valid UTF-8"
-            ) from exc
+            raise ValueError(f"persisted preference {key!r} must contain valid UTF-8") from exc
         max_bytes = _PERSISTED_PREF_STRING_MAX_BYTES[key]
         if size > max_bytes:
-            raise ValueError(
-                f"persisted preference {key!r} exceeds {max_bytes} UTF-8 bytes"
-            )
+            raise ValueError(f"persisted preference {key!r} exceeds {max_bytes} UTF-8 bytes")
         if key == "default_scope_name" and value and value != value.strip():
             raise ValueError(
                 "persisted preference 'default_scope_name' must not have "
@@ -273,21 +265,14 @@ def _validated_persisted_pref(key: str, value: Any) -> Any:
 
     if key == "default_scope_key":
         if type(value) is not str:
-            raise ValueError(
-                "persisted preference 'default_scope_key' must be a hex string"
-            )
+            raise ValueError("persisted preference 'default_scope_key' must be a hex string")
         if len(value) not in (0, 32):
-            raise ValueError(
-                "persisted preference 'default_scope_key' must be empty or "
-                "16 bytes"
-            )
+            raise ValueError("persisted preference 'default_scope_key' must be empty or 16 bytes")
         try:
             return bytes.fromhex(value)
         except ValueError as exc:
             # Scope material is secret. Never include its value in diagnostics.
-            raise ValueError(
-                "persisted preference 'default_scope_key' must be valid hex"
-            ) from exc
+            raise ValueError("persisted preference 'default_scope_key' must be valid hex") from exc
 
     raise ValueError(f"no validation rule for persisted preference {key!r}")
 
@@ -337,9 +322,7 @@ class RepeaterCompanionBridge(CompanionBridge):
         self._outbound_by_ack: OrderedDict[int, OutboundMessageEvent] = OrderedDict()
         self._ack_tokens_by_crc: OrderedDict[int, int] = OrderedDict()
         self._message_sources_by_token: OrderedDict[int, str] = OrderedDict()
-        self._early_confirmations_by_token: OrderedDict[
-            int, tuple[int, int]
-        ] = OrderedDict()
+        self._early_confirmations_by_token: OrderedDict[int, tuple[int, int]] = OrderedDict()
         self._local_message_token = 0
         # Snapshot-visible bridge state and its journal commit move together.
         # Frame commands, REST mutations, snapshots, and inbound contact
@@ -355,9 +338,7 @@ class RepeaterCompanionBridge(CompanionBridge):
         # would otherwise overwrite that shared slot. Both Frame and REST
         # enter through _start_login_request, so one lock here protects both
         # transports without adding a second request path.
-        self._login_locks: WeakValueDictionary[int, asyncio.Lock] = (
-            WeakValueDictionary()
-        )
+        self._login_locks: WeakValueDictionary[int, asyncio.Lock] = WeakValueDictionary()
         # Status and telemetry use Core's same (public key, request tag)
         # callback table. Serialize those request types per exact contact so a
         # Frame request and a parallel REST request can never replace each
@@ -468,15 +449,9 @@ class RepeaterCompanionBridge(CompanionBridge):
                 change = "new"
             else:
                 changed_fields = {
-                    field
-                    for field in current
-                    if current.get(field) != previous.get(field)
+                    field for field in current if current.get(field) != previous.get(field)
                 }
-                change = (
-                    "path"
-                    if changed_fields <= {"out_path_len", "out_path"}
-                    else "update"
-                )
+                change = "path" if changed_fields <= {"out_path_len", "out_path"} else "update"
             changes.append({"change": change, "contact": current})
         return changes
 
@@ -494,9 +469,7 @@ class RepeaterCompanionBridge(CompanionBridge):
         # contact capacity. The low-level transaction stays policy-free.
         max_changes = max(2, int(self.contacts.max_contacts) * 2)
         if len(changes) > max_changes:
-            raise RuntimeError(
-                f"Contact diff has {len(changes)} changes; maximum is {max_changes}"
-            )
+            raise RuntimeError(f"Contact diff has {len(changes)} changes; maximum is {max_changes}")
         if self._journal is not None:
             await self._await_blocking_commit(
                 self._journal.apply_contact_changes,
@@ -808,8 +781,7 @@ class RepeaterCompanionBridge(CompanionBridge):
                         round((time.monotonic() - waiter["started_at"]) * 1000),
                     ),
                     "hop_count": 1,
-                    "trace_hop_count": len(waiter["path"])
-                    // waiter["trace_hash_size"],
+                    "trace_hop_count": len(waiter["path"]) // waiter["trace_hash_size"],
                     "trace_hash_size": waiter["trace_hash_size"],
                 }
             )
@@ -978,8 +950,7 @@ class RepeaterCompanionBridge(CompanionBridge):
     async def _fire_callbacks(self, event_name: str, *args: Any) -> None:
         """Forward core events to transient clients and durable host observers."""
         if (
-            event_name
-            in {"message_event", "channel_message_event", "channel_data_event"}
+            event_name in {"message_event", "channel_message_event", "channel_data_event"}
             and args
             and self._sqlite_handler is not None
         ):
@@ -1082,8 +1053,7 @@ class RepeaterCompanionBridge(CompanionBridge):
 
         if ambiguous:
             logger.warning(
-                "Companion %s: ACK %s ownership is ambiguous; "
-                "history confirmation suppressed",
+                "Companion %s: ACK %s ownership is ambiguous; history confirmation suppressed",
                 self._companion_hash,
                 expected_ack,
             )
@@ -1120,10 +1090,7 @@ class RepeaterCompanionBridge(CompanionBridge):
                 expected_ack,
                 trip_ms,
             )
-            while (
-                len(self._early_confirmations_by_token)
-                > MAX_PENDING_ACK_CRCS
-            ):
+            while len(self._early_confirmations_by_token) > MAX_PENDING_ACK_CRCS:
                 self._early_confirmations_by_token.popitem(last=False)
         if cancellation is not None:
             raise cancellation
@@ -1164,9 +1131,7 @@ class RepeaterCompanionBridge(CompanionBridge):
         """
         for callbacks in self._push_callbacks.values():
             callbacks[:] = [
-                callback
-                for callback in callbacks
-                if not self._is_frame_server_callback(callback)
+                callback for callback in callbacks if not self._is_frame_server_callback(callback)
             ]
 
     def remove_frame_server_callbacks(self, server) -> None:
@@ -1238,10 +1203,7 @@ class RepeaterCompanionBridge(CompanionBridge):
             return
         crc = int(ack_crc)
         previous_token = self._ack_tokens_by_crc.pop(crc, None)
-        if (
-            previous_token is not None
-            and previous_token != int(correlation_token)
-        ):
+        if previous_token is not None and previous_token != int(correlation_token):
             self._ack_tokens_by_crc[crc] = _AMBIGUOUS_ACK_TOKEN
             self._outbound_by_ack.pop(crc, None)
             if previous_token != _AMBIGUOUS_ACK_TOKEN:
@@ -1301,11 +1263,7 @@ class RepeaterCompanionBridge(CompanionBridge):
         outcome_context = injected_tx_outcome.set(tx_outcome)
 
         def _publish_send_outcome(initial_state: str) -> None:
-            expected_ack = (
-                holder.get("expected_ack")
-                if holder is not None
-                else expected_crc
-            )
+            expected_ack = holder.get("expected_ack") if holder is not None else expected_crc
             if holder is not None:
                 holder["initial_state"] = initial_state
                 if packet_hash and initial_state != "failed":
@@ -1380,11 +1338,7 @@ class RepeaterCompanionBridge(CompanionBridge):
             self._message_sources_by_token[token] = event.source
             while len(self._message_sources_by_token) > MAX_PENDING_ACK_CRCS:
                 self._message_sources_by_token.popitem(last=False)
-        if (
-            event.correlation_token is None
-            and self._tracker is not None
-            and self._companion_hash
-        ):
+        if event.correlation_token is None and self._tracker is not None and self._companion_hash:
             self._tracker.register_outbound(
                 event.packet_hash,
                 self._companion_hash,
@@ -1401,16 +1355,10 @@ class RepeaterCompanionBridge(CompanionBridge):
                     and event_token is not None
                     and prior_token != int(event_token)
                 )
-                or (
-                    prior_event is not None
-                    and prior_event is not event
-                )
+                or (prior_event is not None and prior_event is not event)
             )
             if collision:
-                if (
-                    prior_event is not None
-                    and prior_event.correlation_token is not None
-                ):
+                if prior_event is not None and prior_event.correlation_token is not None:
                     self._message_sources_by_token.pop(
                         int(prior_event.correlation_token),
                         None,
@@ -1419,9 +1367,7 @@ class RepeaterCompanionBridge(CompanionBridge):
                     self._message_sources_by_token.pop(int(event_token), None)
                 self._outbound_by_ack.pop(expected_ack, None)
                 self._ack_tokens_by_crc.pop(expected_ack, None)
-                self._ack_tokens_by_crc[
-                    expected_ack
-                ] = _AMBIGUOUS_ACK_TOKEN
+                self._ack_tokens_by_crc[expected_ack] = _AMBIGUOUS_ACK_TOKEN
             else:
                 self._outbound_by_ack.pop(expected_ack, None)
                 self._outbound_by_ack[expected_ack] = event
@@ -1437,8 +1383,7 @@ class RepeaterCompanionBridge(CompanionBridge):
                     )
                 if (
                     old_event.correlation_token is None
-                    or self._ack_tokens_by_crc.get(old_crc)
-                    == old_event.correlation_token
+                    or self._ack_tokens_by_crc.get(old_crc) == old_event.correlation_token
                 ):
                     self._ack_tokens_by_crc.pop(old_crc, None)
         early_confirmation = (
@@ -1663,15 +1608,11 @@ class RepeaterCompanionBridge(CompanionBridge):
             prefs_dict = dataclasses.asdict(self.prefs)
             current_known = _to_json_safe(prefs_dict)
             previous_known = (
-                _to_json_safe(dataclasses.asdict(previous))
-                if previous is not None
-                else {}
+                _to_json_safe(dataclasses.asdict(previous)) if previous is not None else {}
             )
             # Ignore unknown future fields at runtime, but do not destroy them
             # when this older process later saves a known preference.
-            unknown = copy.deepcopy(
-                getattr(self, "_unknown_persisted_prefs", {})
-            )
+            unknown = copy.deepcopy(getattr(self, "_unknown_persisted_prefs", {}))
             prefs_safe = {**unknown, **current_known}
             previous_safe = {**unknown, **previous_known}
             if prefs_safe == previous_safe:
@@ -1693,9 +1634,7 @@ class RepeaterCompanionBridge(CompanionBridge):
                 raise RuntimeError("storage rejected the preferences write")
             storage_committed = True
 
-            old_node_name = (
-                getattr(previous, "node_name", None) if previous is not None else None
-            )
+            old_node_name = getattr(previous, "node_name", None) if previous is not None else None
             if self._on_prefs_saved and self.prefs.node_name != old_node_name:
                 self._on_prefs_saved(self.prefs.node_name)
             self._persisted_prefs = copy.deepcopy(self.prefs)
@@ -1715,9 +1654,7 @@ class RepeaterCompanionBridge(CompanionBridge):
                         str(self._companion_hash),
                         previous_safe,
                     ):
-                        raise RuntimeError(
-                            "storage rejected the preference compensation"
-                        )
+                        raise RuntimeError("storage rejected the preference compensation")
                 except Exception:
                     logger.exception(
                         "Failed to compensate companion prefs after config sync failure"
@@ -1767,20 +1704,17 @@ class RepeaterCompanionBridge(CompanionBridge):
                 scope_key = self.prefs.default_scope_key
                 if bool(scope_name) != bool(scope_key):
                     raise ValueError(
-                        "persisted default scope name and key must both be set "
-                        "or both be empty"
+                        "persisted default scope name and key must both be set or both be empty"
                     )
                 if scope_key and len(scope_key) != 16:
                     raise ValueError(
-                        "persisted preference 'default_scope_key' must be "
-                        "exactly 16 bytes when set"
+                        "persisted preference 'default_scope_key' must be exactly 16 bytes when set"
                     )
                 self._unknown_persisted_prefs = unknown
             self._persisted_prefs = copy.deepcopy(self.prefs)
         except Exception as e:
             logger.error(
-                "Refusing companion activation because persisted prefs "
-                "could not be loaded: %s",
+                "Refusing companion activation because persisted prefs could not be loaded: %s",
                 e,
             )
             raise

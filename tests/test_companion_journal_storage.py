@@ -166,18 +166,14 @@ def test_event_payload_round_trip(tmp_path):
     assert event["payload"] == payload
 
 
-def test_event_payload_parse_failure_fails_closed_without_returning_raw(
-    tmp_path, caplog
-):
+def test_event_payload_parse_failure_fails_closed_without_returning_raw(tmp_path, caplog):
     h = _handler(tmp_path)
     seq = h.companion_append_event(_HASH, "message", {"ok": True})
     assert seq is not None
 
     # Corrupt the stored payload directly to simulate unparseable JSON.
     conn = sqlite3.connect(str(h.sqlite_path))
-    conn.execute(
-        "UPDATE companion_events SET payload = ? WHERE seq = ?", ("{not json", seq)
-    )
+    conn.execute("UPDATE companion_events SET payload = ? WHERE seq = ?", ("{not json", seq))
     conn.commit()
     conn.close()
 
@@ -500,9 +496,10 @@ def test_push_never_evicts_direct_messages(tmp_path):
 
     # No unconsumed channel rows exist to evict, and the direct message may
     # not be displaced: the push must be rejected.
-    assert h.companion_push_message(
-        _HASH, _msg("p2", is_channel=True, text="channel"), max_messages=1
-    ) is False
+    assert (
+        h.companion_push_message(_HASH, _msg("p2", is_channel=True, text="channel"), max_messages=1)
+        is False
+    )
 
     # The direct message is untouched and still poppable.
     popped = h.companion_pop_message(_HASH)

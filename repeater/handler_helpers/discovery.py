@@ -111,8 +111,7 @@ class DiscoveryHelper:
                     continue
                 try:
                     conflict = bool(
-                        self._tag_conflict is not None
-                        and self._tag_conflict(candidate)
+                        self._tag_conflict is not None and self._tag_conflict(candidate)
                     )
                 except Exception as exc:
                     logger.error(
@@ -120,9 +119,7 @@ class DiscoveryHelper:
                         exc,
                         exc_info=True,
                     )
-                    raise RuntimeError(
-                        "Could not verify discovery response tag ownership"
-                    ) from exc
+                    raise RuntimeError("Could not verify discovery response tag ownership") from exc
                 if not conflict:
                     tag = candidate
                     break
@@ -266,9 +263,7 @@ class DiscoveryHelper:
                 if status == "created":
                     reference_time = session.get("created_at", 0)
                 elif status in {"completed", "timed_out", "error", "cancelled"}:
-                    reference_time = session.get("completed_at") or session.get(
-                        "created_at", 0
-                    )
+                    reference_time = session.get("completed_at") or session.get("created_at", 0)
                 else:
                     continue
                 if reference_time < cutoff:

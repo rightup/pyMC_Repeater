@@ -158,11 +158,8 @@ def _infer_methods(fn: ast.FunctionDef) -> tuple[set[str], bool]:
         target.id
         for node in ast.walk(fn)
         if isinstance(node, (ast.Assign, ast.AnnAssign))
-        for target in (
-            node.targets if isinstance(node, ast.Assign) else [node.target]
-        )
-        if isinstance(target, ast.Name)
-        and _is_cherrypy_request_method_expr(node.value)
+        for target in (node.targets if isinstance(node, ast.Assign) else [node.target])
+        if isinstance(target, ast.Name) and _is_cherrypy_request_method_expr(node.value)
     }
 
     for node in ast.walk(fn):
@@ -225,8 +222,7 @@ def _infer_methods(fn: ast.FunctionDef) -> tuple[set[str], bool]:
             )
         ]
         if branch_indexes and any(
-            isinstance(statement, ast.Return)
-            for statement in fn.body[min(branch_indexes) + 1 :]
+            isinstance(statement, ast.Return) for statement in fn.body[min(branch_indexes) + 1 :]
         ):
             methods.add("GET")
 
@@ -346,9 +342,7 @@ def _collect_routes() -> dict[str, RouteInfo]:
             ("/companion",),
         ),
         # Nested /api/update/* endpoints are described as /update/* when documented.
-        ClassRouteSpec(
-            WEB_DIR / "update_endpoints.py", "UpdateAPIEndpoints", ("/update",)
-        ),
+        ClassRouteSpec(WEB_DIR / "update_endpoints.py", "UpdateAPIEndpoints", ("/update",)),
         # Auth top-level endpoints are mounted at /auth/*
         ClassRouteSpec(WEB_DIR / "auth_endpoints.py", "AuthEndpoints", ("/auth",)),
         # APIEndpoints.auth mounts this below the checker's implicit /api base,
@@ -361,9 +355,7 @@ def _collect_routes() -> dict[str, RouteInfo]:
         # Mobile companion API v1.  The root and PairV1 use ordinary
         # attribute dispatch; CompanionsV1 and DevicesV1 use _cp_dispatch
         # for collection members and actions.
-        ClassRouteSpec(
-            WEB_DIR / "mobile_endpoints.py", "MobileAPIEndpoints", ("/v1",)
-        ),
+        ClassRouteSpec(WEB_DIR / "mobile_endpoints.py", "MobileAPIEndpoints", ("/v1",)),
         ClassRouteSpec(
             WEB_DIR / "mobile_endpoints.py",
             "PairV1",

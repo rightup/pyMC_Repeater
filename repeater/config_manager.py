@@ -312,8 +312,7 @@ class ConfigManager:
                     os.close(directory_descriptor)
             except OSError as exc:
                 logger.warning(
-                    "Configuration replaced at %s, but its directory could not "
-                    "be synced: %s",
+                    "Configuration replaced at %s, but its directory could not be synced: %s",
                     target_path,
                     exc,
                 )
@@ -549,9 +548,7 @@ class ConfigManager:
                     settings = {}
                     entry["settings"] = settings
                 elif not isinstance(settings, dict):
-                    raise ValueError(
-                        f"Companion '{companion_name}' settings must be an object"
-                    )
+                    raise ValueError(f"Companion '{companion_name}' settings must be an object")
 
                 previous_present = "node_name" in settings
                 previous = settings.get("node_name")

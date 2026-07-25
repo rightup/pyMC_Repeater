@@ -107,11 +107,7 @@ def read_json_object(
     raw = cherrypy.request.body.read(max_bytes + 1)
     if len(raw) > max_bytes:
         raise cherrypy.HTTPError(413, f"JSON body exceeds {max_bytes} bytes")
-    if (
-        raw
-        and require_json_content_type
-        and media_type != "application/json"
-    ):
+    if raw and require_json_content_type and media_type != "application/json":
         raise cherrypy.HTTPError(
             415,
             "Content-Type must be application/json",

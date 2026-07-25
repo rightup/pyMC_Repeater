@@ -151,9 +151,7 @@ async def test_contact_delete_failure_keeps_state_and_suppresses_transient_callb
 
 
 @pytest.mark.asyncio
-async def test_import_rolls_back_memory_and_push_when_contact_commit_fails(
-    tmp_path, monkeypatch
-):
+async def test_import_rolls_back_memory_and_push_when_contact_commit_fails(tmp_path, monkeypatch):
     handler = SQLiteHandler(tmp_path)
     journal = CompanionEventJournal(handler, COMPANION_HASH)
     bridge = _bridge(handler, journal)

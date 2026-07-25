@@ -291,9 +291,7 @@ class TestRfReceptionEventsSettingWiring:
             "repeater": {"node_name": "n"},
             "logging": {},
             "identities": {
-                "companions": [
-                    {"name": _NAME, "identity_key": "33" * 32, "settings": settings}
-                ]
+                "companions": [{"name": _NAME, "identity_key": "33" * 32, "settings": settings}]
             },
         }
         daemon = RepeaterDaemon(config, radio=object())

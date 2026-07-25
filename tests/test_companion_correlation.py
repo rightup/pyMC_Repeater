@@ -122,10 +122,10 @@ class TestTrackerInboundCorrelation:
 
         hits = tracker.observe_duplicate(_record(packet_hash=packet_hash))
 
-        assert [
-            (hit["companion_hash"], hit["message_id"])
-            for hit in hits
-        ] == [("0x01", 11), ("0x02", 22)]
+        assert [(hit["companion_hash"], hit["message_id"]) for hit in hits] == [
+            ("0x01", 11),
+            ("0x02", 22),
+        ]
 
     def test_running_counts_across_repeated_observations(self):
         tracker = CompanionCorrelationTracker(ttl_seconds=300)
@@ -188,12 +188,8 @@ class TestTrackerOutboundCorrelation:
         tracker = CompanionCorrelationTracker(ttl_seconds=300)
         h = "1234567890ABCDEF"
         tracker.register_outbound(h, _HASH)
-        assert tracker.observe_duplicate(
-            _record(packet_hash=h, original_path=["11"])
-        ) == []
-        assert tracker.observe_duplicate(
-            _record(packet_hash=h, original_path=["22"])
-        ) == []
+        assert tracker.observe_duplicate(_record(packet_hash=h, original_path=["11"])) == []
+        assert tracker.observe_duplicate(_record(packet_hash=h, original_path=["22"])) == []
 
         buffered = tracker.promote_outbound(h, _HASH, message_id=42)
 
@@ -214,13 +210,16 @@ class TestTrackerOutboundCorrelation:
         ):
             tracker.register_outbound(h, _HASH)
             clock[0] = 101.0
-            assert tracker.observe_duplicate(
-                _record(
-                    packet_hash=h,
-                    original_path=["11"],
-                    ts=clock[0],
+            assert (
+                tracker.observe_duplicate(
+                    _record(
+                        packet_hash=h,
+                        original_path=["11"],
+                        ts=clock[0],
+                    )
                 )
-            ) == []
+                == []
+            )
 
             clock[0] = 102.0
             buffered = tracker.promote_outbound(h, _HASH, message_id=42)
@@ -242,9 +241,7 @@ class TestTrackerOutboundCorrelation:
 
             # Promotion must not restart the original registration's TTL.
             clock[0] = 401.0
-            assert tracker.observe_duplicate(
-                _record(packet_hash=h, ts=clock[0])
-            ) == []
+            assert tracker.observe_duplicate(_record(packet_hash=h, ts=clock[0])) == []
 
     def test_empty_path_has_no_terminal_hash(self):
         tracker = CompanionCorrelationTracker(ttl_seconds=300)
@@ -270,10 +267,10 @@ class TestTrackerOutboundCorrelation:
 
         hits = tracker.observe_duplicate(_record(packet_hash=h))
 
-        assert {
-            (hit["companion_hash"], hit["message_id"])
-            for hit in hits
-        } == {("0x01", 1), ("0x02", 2)}
+        assert {(hit["companion_hash"], hit["message_id"]) for hit in hits} == {
+            ("0x01", 1),
+            ("0x02", 2),
+        }
 
     def test_same_companion_mixed_direction_hash_fails_closed(self):
         tracker = CompanionCorrelationTracker(ttl_seconds=300)
@@ -300,9 +297,9 @@ class TestTrackerTTLAndEviction:
 
         assert len(tracker) == 2
         assert tracker.observe_duplicate(_record(packet_hash="1111111111111111")) == []
-        assert tracker.observe_duplicate(_record(packet_hash="3333333333333333"))[0][
-            "message_id"
-        ] == 3
+        assert (
+            tracker.observe_duplicate(_record(packet_hash="3333333333333333"))[0]["message_id"] == 3
+        )
 
 
 # ===================================================================
@@ -468,11 +465,7 @@ class TestJournalSendState:
         # The 16-char observation key must not truncate durable send history.
         assert result["message"]["packet_hash"] == "1234567890ABCDEF" + "00" * 24
         events = handler.companion_get_events(_HASH, 0)
-        send_events = [
-            event
-            for event in events
-            if event["event_type"] == "message_send_state"
-        ]
+        send_events = [event for event in events if event["event_type"] == "message_send_state"]
         assert len(send_events) == 1
         assert send_events[0]["payload"] == {
             "message_id": stored["message_id"],
@@ -726,9 +719,7 @@ async def test_frame_history_promotion_yields_one_durable_heard_repeat(tmp_path)
     )
     assert durable["state"] == "heard_repeated"
     events = sqlite_handler.companion_get_events(_HASH, 0)
-    send_events = [
-        item for item in events if item["event_type"] == "message_send_state"
-    ]
+    send_events = [item for item in events if item["event_type"] == "message_send_state"]
     assert len(send_events) == 1
     assert send_events[0]["payload"] == {
         "message_id": stored["id"],
@@ -813,8 +804,7 @@ async def test_frame_operator_and_v1_sends_share_bridge_without_history_cross_at
         v1_hash,
     )
     messages = {
-        message["text"]: message
-        for message in sqlite_handler.companion_get_messages(_HASH)
+        message["text"]: message for message in sqlite_handler.companion_get_messages(_HASH)
     }
     assert {
         text: (messages[text]["source"], messages[text]["packet_hash"])
@@ -845,10 +835,7 @@ async def test_frame_operator_and_v1_sends_share_bridge_without_history_cross_at
             messages[text]["id"],
         )
 
-    assert {
-        text: messages[text]["state"]
-        for text in ("frame", "operator", "v1")
-    } == {
+    assert {text: messages[text]["state"] for text in ("frame", "operator", "v1")} == {
         "frame": "heard_repeated",
         "operator": "heard_repeated",
         "v1": "heard_repeated",
@@ -859,9 +846,7 @@ async def test_frame_operator_and_v1_sends_share_bridge_without_history_cross_at
         if event["event_type"] == "message_send_state"
         and event["payload"]["state"] == "heard_repeated"
     ]
-    assert {
-        event["payload"]["message_id"] for event in heard_events
-    } == {
+    assert {event["payload"]["message_id"] for event in heard_events} == {
         messages["frame"]["id"],
         messages["operator"]["id"],
         messages["v1"]["id"],
@@ -1034,9 +1019,7 @@ async def test_operator_ack_timeout_retains_transmitted_history_and_correlation(
         tracker=daemon.correlation_tracker,
     )
     peer_key = LocalIdentity().get_public_key()
-    assert bridge.contacts.add(
-        Contact(public_key=peer_key, name="peer", adv_type=1)
-    )
+    assert bridge.contacts.add(Contact(public_key=peer_key, name="peer", adv_type=1))
     RepeaterDaemon._wire_companion_history_observers(bridge, journal)
 
     source_context = outbound_message_source.set("operator")
@@ -1151,9 +1134,7 @@ class TestRfReceptionWriteGate:
         h = "2121212121212121"
         daemon.correlation_tracker.register_outbound(h, _HASH)
 
-        daemon._companion_duplicate_observer(
-            _record(packet_hash=h, original_path=["11"])
-        )
+        daemon._companion_duplicate_observer(_record(packet_hash=h, original_path=["11"]))
 
         events = sqlite_handler.companion_get_events(_HASH, 0)
         assert events == []
@@ -1261,9 +1242,7 @@ class TestFrameServerInboundRegistration:
             {"repeater": {"node_name": "n"}, "logging": {}},
             radio=object(),
         )
-        daemon.repeater_handler = SimpleNamespace(
-            storage=SimpleNamespace(sqlite_handler=handler)
-        )
+        daemon.repeater_handler = SimpleNamespace(storage=SimpleNamespace(sqlite_handler=handler))
         daemon.correlation_tracker = tracker
         daemon.companion_journals[_HASH] = journal
 
@@ -1282,9 +1261,7 @@ class TestFrameServerInboundRegistration:
             "packet_hash": "CD" * 8 + "00" * 24,
             "timestamp": 1,
         }
-        persist_task = asyncio.create_task(
-            fs._persist_companion_message(msg, object())
-        )
+        persist_task = asyncio.create_task(fs._persist_companion_message(msg, object()))
         try:
             assert await asyncio.to_thread(store_started.wait, 2)
             daemon._companion_duplicate_observer(
@@ -1348,9 +1325,7 @@ class TestFrameServerInboundRegistration:
             "timestamp": 1,
         }
         queue_entry = object()
-        task = asyncio.create_task(
-            fs._persist_companion_message(msg, queue_entry)
-        )
+        task = asyncio.create_task(fs._persist_companion_message(msg, queue_entry))
         assert await asyncio.to_thread(store_started.wait, 2)
         task.cancel()
         await asyncio.sleep(0)

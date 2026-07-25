@@ -57,9 +57,7 @@ def test_retention_defaults_and_boundaries_are_explicit():
         DEFAULT_RETENTION_DAYS,
     )
     assert validate_retention_days(1, "retention") == 1
-    assert validate_retention_days(MAX_RETENTION_DAYS, "retention") == (
-        MAX_RETENTION_DAYS
-    )
+    assert validate_retention_days(MAX_RETENTION_DAYS, "retention") == (MAX_RETENTION_DAYS)
 
 
 @pytest.mark.parametrize("value", _INVALID_DAYS)

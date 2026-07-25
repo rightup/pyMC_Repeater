@@ -89,9 +89,7 @@ def test_bridge_preserves_upstream_positional_constructor_prefix():
     from openhop_core.companion import CompanionBridge
 
     upstream = list(inspect.signature(CompanionBridge.__init__).parameters)
-    repeater = list(
-        inspect.signature(RepeaterCompanionBridge.__init__).parameters
-    )
+    repeater = list(inspect.signature(RepeaterCompanionBridge.__init__).parameters)
 
     assert repeater[: len(upstream)] == upstream
 
@@ -200,12 +198,10 @@ def test_bridge_load_prefs_ignores_invalid_or_missing_backend():
 async def test_logins_with_same_destination_hash_are_serialized():
     bridge = object.__new__(RepeaterCompanionBridge)
     bridge._state_mutation_lock = asyncio.Lock()
-    bridge.contacts = SimpleNamespace(
-        get_proxy_by_key=lambda _key: SimpleNamespace(dest_hash=0xAA)
-    )
+    bridge.contacts = SimpleNamespace(get_proxy_by_key=lambda _key: SimpleNamespace(dest_hash=0xAA))
     bridge._login_locks = {}
-    bridge._spawn_background_task = (
-        lambda coro, _label: asyncio.get_running_loop().create_task(coro)
+    bridge._spawn_background_task = lambda coro, _label: asyncio.get_running_loop().create_task(
+        coro
     )
     loop = asyncio.get_running_loop()
     first_result = loop.create_future()
@@ -219,9 +215,9 @@ async def test_logins_with_same_destination_hash_are_serialized():
     base_bridge = RepeaterCompanionBridge.__mro__[1]
 
     with patch.object(base_bridge, "_start_login_request", new=base_start):
-        first = await bridge._start_login_request(b"\xAA" + b"\x01" * 31, "one")
+        first = await bridge._start_login_request(b"\xaa" + b"\x01" * 31, "one")
         second_start = asyncio.create_task(
-            bridge._start_login_request(b"\xAA" + b"\x02" * 31, "two")
+            bridge._start_login_request(b"\xaa" + b"\x02" * 31, "two")
         )
         await asyncio.sleep(0)
         assert base_start.await_count == 1
@@ -240,10 +236,8 @@ async def test_logins_with_same_destination_hash_are_serialized():
 async def test_logout_waits_for_login_and_clears_session_before_rf_send():
     bridge = object.__new__(RepeaterCompanionBridge)
     bridge._state_mutation_lock = asyncio.Lock()
-    pubkey = b"\xAA" + b"\x03" * 31
-    bridge.contacts = SimpleNamespace(
-        get_proxy_by_key=lambda _key: SimpleNamespace(dest_hash=0xAA)
-    )
+    pubkey = b"\xaa" + b"\x03" * 31
+    bridge.contacts = SimpleNamespace(get_proxy_by_key=lambda _key: SimpleNamespace(dest_hash=0xAA))
     login_lock = asyncio.Lock()
     await login_lock.acquire()
     bridge._login_locks = {0xAA: login_lock}
@@ -273,8 +267,8 @@ async def test_status_and_telemetry_for_same_contact_are_serialized():
     bridge = object.__new__(RepeaterCompanionBridge)
     bridge._state_mutation_lock = asyncio.Lock()
     bridge._protocol_request_locks = {}
-    bridge._spawn_background_task = (
-        lambda coro, _label: asyncio.get_running_loop().create_task(coro)
+    bridge._spawn_background_task = lambda coro, _label: asyncio.get_running_loop().create_task(
+        coro
     )
     loop = asyncio.get_running_loop()
     frame_result = loop.create_future()
@@ -286,7 +280,7 @@ async def test_status_and_telemetry_for_same_contact_are_serialized():
         ]
     )
     base_bridge = RepeaterCompanionBridge.__mro__[1]
-    pubkey = b"\xBB" * 32
+    pubkey = b"\xbb" * 32
 
     with patch.object(base_bridge, "_start_protocol_request", new=base_start):
         frame = await bridge._start_protocol_request(
@@ -323,14 +317,12 @@ async def test_parallel_rest_login_neither_steals_nor_pushes_frame_result():
     bridge = object.__new__(RepeaterCompanionBridge)
     bridge._state_mutation_lock = asyncio.Lock()
     bridge._login_locks = {}
-    pubkey = b"\xBC" * 32
+    pubkey = b"\xbc" * 32
     bridge.contacts = SimpleNamespace(
-        get_proxy_by_key=lambda key: (
-            SimpleNamespace(dest_hash=pubkey[0]) if key == pubkey else None
-        )
+        get_proxy_by_key=lambda key: SimpleNamespace(dest_hash=pubkey[0]) if key == pubkey else None
     )
-    bridge._spawn_background_task = (
-        lambda coro, _label: asyncio.get_running_loop().create_task(coro)
+    bridge._spawn_background_task = lambda coro, _label: asyncio.get_running_loop().create_task(
+        coro
     )
     frame_result = asyncio.get_running_loop().create_future()
     rest_result = asyncio.get_running_loop().create_future()
@@ -397,10 +389,10 @@ async def test_parallel_rest_telemetry_neither_steals_nor_pushes_frame_status():
     bridge = object.__new__(RepeaterCompanionBridge)
     bridge._state_mutation_lock = asyncio.Lock()
     bridge._protocol_request_locks = {}
-    bridge._spawn_background_task = (
-        lambda coro, _label: asyncio.get_running_loop().create_task(coro)
+    bridge._spawn_background_task = lambda coro, _label: asyncio.get_running_loop().create_task(
+        coro
     )
-    pubkey = b"\xBD" * 32
+    pubkey = b"\xbd" * 32
     frame_result = asyncio.get_running_loop().create_future()
     rest_result = asyncio.get_running_loop().create_future()
     sent = SentResult(
@@ -430,16 +422,12 @@ async def test_parallel_rest_telemetry_neither_steals_nor_pushes_frame_status():
             server._client_sessions.pop(current_task, None)
         assert server._write_queue.qsize() == 1  # Frame SENT
 
-        rest_call = asyncio.create_task(
-            bridge.send_telemetry_request(pubkey, timeout=20.0)
-        )
+        rest_call = asyncio.create_task(bridge.send_telemetry_request(pubkey, timeout=20.0))
         await asyncio.sleep(0)
         assert base_start.await_count == 1
         assert not rest_call.done()
 
-        frame_result.set_result(
-            {"success": True, "stats": {"raw_bytes": b"\x01\x02"}}
-        )
+        frame_result.set_result({"success": True, "stats": {"raw_bytes": b"\x01\x02"}})
         for _ in range(10):
             if server._write_queue.qsize() == 2 and base_start.await_count == 2:
                 break
@@ -498,9 +486,7 @@ async def test_channel_send_emits_one_semantic_outbound_event():
     async def _inject(_packet, **_kwargs):
         return True
 
-    bridge = RepeaterCompanionBridge(
-        LocalIdentity(), _inject, companion_hash="0x01"
-    )
+    bridge = RepeaterCompanionBridge(LocalIdentity(), _inject, companion_hash="0x01")
     events = []
     bridge.add_observer("message_sent", events.append)
     assert bridge.set_channel(1, "test", bytes(32))
@@ -716,9 +702,7 @@ async def test_parallel_api_acks_only_confirm_the_frame_owned_send_to_frame():
             frame_acks.append((crc, trip_ms))
 
     bridge.on_send_confirmed(_FrameOwner().on_ack)
-    bridge.on_send_confirmed(
-        lambda crc, trip_ms: host_acks.append((crc, trip_ms))
-    )
+    bridge.on_send_confirmed(lambda crc, trip_ms: host_acks.append((crc, trip_ms)))
 
     def _event(source, token, crc):
         return OutboundMessageEvent(
@@ -776,9 +760,7 @@ async def test_reused_pending_ack_crc_fails_closed_and_maps_stay_bounded():
             frame_acks.append((crc, trip_ms))
 
     bridge.on_send_confirmed(_FrameOwner().on_ack)
-    bridge.on_send_confirmed(
-        lambda crc, trip_ms: host_acks.append((crc, trip_ms))
-    )
+    bridge.on_send_confirmed(lambda crc, trip_ms: host_acks.append((crc, trip_ms)))
 
     def _event(index, expected_ack):
         return OutboundMessageEvent(
@@ -867,9 +849,7 @@ async def test_main_persists_frame_send_and_correlated_ack_only():
 
     assert journal.store_outbound_message.call_count == 1
     assert journal.update_outbound_state.call_count == 2
-    journal.update_outbound_state.assert_called_with(
-        84, "confirmed", rest_event.packet_hash, 88
-    )
+    journal.update_outbound_state.assert_called_with(84, "confirmed", rest_event.packet_hash, 88)
 
     operator_event = replace(
         frame_event,
@@ -1235,9 +1215,7 @@ async def test_frame_reconnect_waits_for_command_before_replacing_response_queue
     ):
         command = asyncio.create_task(_old_command())
         await command_started.wait()
-        reconnect = asyncio.create_task(
-            server._handle_client(object(), new_writer)
-        )
+        reconnect = asyncio.create_task(server._handle_client(object(), new_writer))
         await asyncio.sleep(0)
 
         assert server._client_writer is old_writer
@@ -1494,13 +1472,8 @@ async def test_frame_contact_change_notifies_durable_observer():
 
 
 def _contact_command(public_key: bytes, name: str, path_len: int = 0) -> bytes:
-    path = (b"\xAA" if path_len else b"").ljust(64, b"\x00")
-    return (
-        public_key
-        + bytes([1, 0, path_len])
-        + path
-        + name.encode().ljust(32, b"\x00")
-    )
+    path = (b"\xaa" if path_len else b"").ljust(64, b"\x00")
+    return public_key + bytes([1, 0, path_len]) + path + name.encode().ljust(32, b"\x00")
 
 
 def _stateful_frame_server(tmp_path):
@@ -1811,7 +1784,7 @@ async def test_frame_discovery_owns_tag_locally_without_shared_callback_collisio
     bridge.send_control_data.assert_awaited_once_with(request)
     assert owner._response_session_map("control")[tag] is owner._active_client_session
 
-    response = bytes([0x92, 0x00]) + tag.to_bytes(4, "little") + b"\xAA" * 8
+    response = bytes([0x92, 0x00]) + tag.to_bytes(4, "little") + b"\xaa" * 8
     await owner.push_control_data(1.0, -70, 0, b"", response)
     await other.push_control_data(1.0, -70, 0, b"", response)
 
@@ -1828,11 +1801,7 @@ async def test_frame_discovery_owns_tag_locally_without_shared_callback_collisio
     assert not owner.owns_response_tag("control", tag)
 
     operator_tag = tag + 1
-    operator_response = (
-        bytes([0x92, 0x00])
-        + operator_tag.to_bytes(4, "little")
-        + b"\xBB" * 8
-    )
+    operator_response = bytes([0x92, 0x00]) + operator_tag.to_bytes(4, "little") + b"\xbb" * 8
     await owner.push_control_data(1.0, -70, 0, b"", operator_response)
     await other.push_control_data(1.0, -70, 0, b"", operator_response)
     assert owner._write_queue.qsize() == 4
@@ -1842,7 +1811,7 @@ async def test_frame_discovery_owns_tag_locally_without_shared_callback_collisio
 @pytest.mark.asyncio
 async def test_frame_trace_rejects_repeater_owned_tag_before_radio_send():
     tag = 0x12345678
-    request = tag.to_bytes(4, "little") + b"\x00" * 4 + b"\x00\xAA"
+    request = tag.to_bytes(4, "little") + b"\x00" * 4 + b"\x00\xaa"
     bridge = SimpleNamespace(
         send_trace_path_raw=AsyncMock(
             return_value=SentResult(
@@ -1877,9 +1846,7 @@ async def test_frame_trace_rejects_repeater_owned_tag_before_radio_send():
     await server._cmd_send_trace_path(request)
 
     bridge.send_trace_path_raw.assert_not_awaited()
-    server._write_frame.assert_called_once_with(
-        bytes([RESP_CODE_ERR, ERR_CODE_TABLE_FULL])
-    )
+    server._write_frame.assert_called_once_with(bytes([RESP_CODE_ERR, ERR_CODE_TABLE_FULL]))
     assert not server.owns_response_tag("trace", tag)
     assert reservation_seen == [True]
 
@@ -1892,7 +1859,7 @@ async def test_frame_trace_rejects_repeater_owned_tag_before_radio_send():
         tag,
         0,
         0,
-        b"\xAA",
+        b"\xaa",
     )
     assert server._response_session_map("trace")[tag] is session
 
@@ -1905,10 +1872,8 @@ async def test_companion_api_ping_awaits_its_correlated_trace_response():
         companion_hash="0x01",
         trace_tag_conflict=lambda _bridge, _tag: False,
     )
-    public_key = b"\xAA" * 32
-    bridge.add_update_contact(
-        Contact(public_key=public_key, name="Repeater", adv_type=2)
-    )
+    public_key = b"\xaa" * 32
+    bridge.add_update_contact(Contact(public_key=public_key, name="Repeater", adv_type=2))
     bridge.send_trace_path_raw = AsyncMock(
         return_value=SentResult(
             success=True,
@@ -1951,7 +1916,7 @@ async def test_companion_api_ping_awaits_its_correlated_trace_response():
 @pytest.mark.asyncio
 async def test_frame_trace_fails_closed_when_tag_ownership_check_errors(caplog):
     tag = 0x12345678
-    request = tag.to_bytes(4, "little") + b"\x00" * 4 + b"\x00\xAA"
+    request = tag.to_bytes(4, "little") + b"\x00" * 4 + b"\x00\xaa"
     bridge = SimpleNamespace(send_trace_path_raw=AsyncMock())
 
     def ownership_check(_server, _kind, _key):
@@ -1970,9 +1935,7 @@ async def test_frame_trace_fails_closed_when_tag_ownership_check_errors(caplog):
         await server._cmd_send_trace_path(request)
 
     bridge.send_trace_path_raw.assert_not_awaited()
-    server._write_frame.assert_called_once_with(
-        bytes([RESP_CODE_ERR, ERR_CODE_TABLE_FULL])
-    )
+    server._write_frame.assert_called_once_with(bytes([RESP_CODE_ERR, ERR_CODE_TABLE_FULL]))
     assert not server.owns_response_tag("trace", tag)
     assert "could not verify trace tag" in caplog.text
 
@@ -1980,7 +1943,7 @@ async def test_frame_trace_fails_closed_when_tag_ownership_check_errors(caplog):
 @pytest.mark.asyncio
 async def test_two_frame_trace_requests_with_same_tag_send_only_first():
     tag = 0x12345678
-    request = tag.to_bytes(4, "little") + b"\x00" * 4 + b"\x00\xAA"
+    request = tag.to_bytes(4, "little") + b"\x00" * 4 + b"\x00\xaa"
     first_send_started = asyncio.Event()
     release_first_send = asyncio.Event()
 
@@ -1994,9 +1957,7 @@ async def test_two_frame_trace_requests_with_same_tag_send_only_first():
             timeout_ms=1000,
         )
 
-    first_bridge = SimpleNamespace(
-        send_trace_path_raw=AsyncMock(side_effect=send_first)
-    )
+    first_bridge = SimpleNamespace(send_trace_path_raw=AsyncMock(side_effect=send_first))
     second_bridge = SimpleNamespace(
         send_trace_path_raw=AsyncMock(
             return_value=SentResult(
@@ -2035,9 +1996,7 @@ async def test_two_frame_trace_requests_with_same_tag_send_only_first():
     await second._cmd_send_trace_path(request)
 
     second_bridge.send_trace_path_raw.assert_not_awaited()
-    second._write_frame.assert_called_once_with(
-        bytes([RESP_CODE_ERR, ERR_CODE_TABLE_FULL])
-    )
+    second._write_frame.assert_called_once_with(bytes([RESP_CODE_ERR, ERR_CODE_TABLE_FULL]))
     assert first.owns_response_tag("trace", tag)
     assert not second.owns_response_tag("trace", tag)
 
@@ -2045,7 +2004,7 @@ async def test_two_frame_trace_requests_with_same_tag_send_only_first():
     await asyncio.wait_for(first_command, timeout=1.0)
     first_bridge.send_trace_path_raw.assert_awaited_once()
 
-    first.push_trace_data(1, 0, tag, 0, b"\xAA", b"\x00", 0)
+    first.push_trace_data(1, 0, tag, 0, b"\xaa", b"\x00", 0)
 
     first._write_frame.assert_called_once()  # SENT
     assert first._write_queue.qsize() == 1  # owned trace response
@@ -2066,9 +2025,7 @@ async def test_two_frame_control_requests_with_same_tag_send_only_first():
         await release_first_send.wait()
         return True
 
-    first_bridge = SimpleNamespace(
-        send_control_data=AsyncMock(side_effect=send_first)
-    )
+    first_bridge = SimpleNamespace(send_control_data=AsyncMock(side_effect=send_first))
     second_bridge = SimpleNamespace(send_control_data=AsyncMock(return_value=True))
     daemon = RepeaterDaemon.__new__(RepeaterDaemon)
     first = CompanionFrameServer(
@@ -2098,9 +2055,7 @@ async def test_two_frame_control_requests_with_same_tag_send_only_first():
     await second._cmd_send_control_data(request)
 
     second_bridge.send_control_data.assert_not_awaited()
-    second._write_frame.assert_called_once_with(
-        bytes([RESP_CODE_ERR, ERR_CODE_TABLE_FULL])
-    )
+    second._write_frame.assert_called_once_with(bytes([RESP_CODE_ERR, ERR_CODE_TABLE_FULL]))
     assert first.owns_response_tag("control", tag)
     assert not second.owns_response_tag("control", tag)
 
@@ -2108,7 +2063,7 @@ async def test_two_frame_control_requests_with_same_tag_send_only_first():
     await asyncio.wait_for(first_command, timeout=1.0)
     first_bridge.send_control_data.assert_awaited_once_with(request)
 
-    response = bytes([0x92, 0x00]) + tag.to_bytes(4, "little") + b"\xAA" * 8
+    response = bytes([0x92, 0x00]) + tag.to_bytes(4, "little") + b"\xaa" * 8
     await first.push_control_data(1.0, -70, 0, b"", response)
 
     first._write_frame.assert_called_once()  # OK
@@ -2174,9 +2129,7 @@ async def test_discovery_allocation_and_frame_claim_on_daemon_loop_send_only_fir
     assert session["tag"] == tag
     discovery_injector.assert_awaited_once()
     frame_bridge.send_control_data.assert_not_awaited()
-    frame._write_frame.assert_called_once_with(
-        bytes([RESP_CODE_ERR, ERR_CODE_TABLE_FULL])
-    )
+    frame._write_frame.assert_called_once_with(bytes([RESP_CODE_ERR, ERR_CODE_TABLE_FULL]))
     assert discovery.owns_response_tag(tag)
     assert not frame.owns_response_tag("control", tag)
 
@@ -2199,7 +2152,7 @@ async def test_trace_fanout_reaches_only_exact_owner_server_and_session():
     tag = 41
     owner._claim_response_session("trace", tag, owner_session)
 
-    args = (1, 0, tag, 9, b"\xAA", b"\x10", 0x20)
+    args = (1, 0, tag, 9, b"\xaa", b"\x10", 0x20)
     await owner.push_trace_data_async(*args)
     await other.push_trace_data_async(*args)
     assert owner._write_queue.qsize() == 1
@@ -2213,7 +2166,7 @@ async def test_trace_fanout_reaches_only_exact_owner_server_and_session():
         0,
         stale_tag,
         9,
-        b"\xAA",
+        b"\xaa",
         b"\x10",
         0x20,
     )
@@ -2265,12 +2218,10 @@ async def test_frame_unexpected_contact_command_failure_rolls_back_and_cleans_st
     tmp_path,
 ):
     server, bridge, _handler = _stateful_frame_server(tmp_path)
-    public_key = b"\xB1" * 32
+    public_key = b"\xb1" * 32
 
     async def _mutate_then_fail(_server, _data):
-        bridge.add_update_contact(
-            Contact(public_key=public_key, name="partial", adv_type=1)
-        )
+        bridge.add_update_contact(Contact(public_key=public_key, name="partial", adv_type=1))
         raise RuntimeError("unexpected command failure")
 
     with patch.object(
@@ -2279,9 +2230,7 @@ async def test_frame_unexpected_contact_command_failure_rolls_back_and_cleans_st
         new=_mutate_then_fail,
     ):
         with pytest.raises(RuntimeError, match="unexpected command failure"):
-            await server._cmd_add_update_contact(
-                _contact_command(public_key, "Alice")
-            )
+            await server._cmd_add_update_contact(_contact_command(public_key, "Alice"))
 
     assert bridge.get_contact_by_key(public_key) is None
     assert server._defer_command_response is False
@@ -2306,7 +2255,7 @@ async def test_frame_cancelled_contact_commit_finishes_and_cleans_state(
     contact_present,
 ):
     server, bridge, _handler = _stateful_frame_server(tmp_path)
-    public_key = b"\xB2" * 32
+    public_key = b"\xb2" * 32
     started = threading.Event()
     release = threading.Event()
     finished = threading.Event()
@@ -2341,11 +2290,9 @@ async def test_frame_cancelled_contact_commit_finishes_and_cleans_state(
 @pytest.mark.asyncio
 async def test_frame_contact_add_reset_remove_each_journal_once(tmp_path):
     server, _bridge, handler = _stateful_frame_server(tmp_path)
-    public_key = b"\xA1" * 32
+    public_key = b"\xa1" * 32
 
-    await server._cmd_add_update_contact(
-        _contact_command(public_key, "Alice", path_len=1)
-    )
+    await server._cmd_add_update_contact(_contact_command(public_key, "Alice", path_len=1))
     await server._cmd_reset_path(public_key)
     await server._cmd_remove_contact(public_key)
 
@@ -2369,19 +2316,15 @@ async def test_reset_path_storage_failure_rolls_back_and_returns_one_error(
     caplog,
 ):
     server, bridge, _handler = _stateful_frame_server(tmp_path)
-    public_key = b"\xA2" * 32
-    await server._cmd_add_update_contact(
-        _contact_command(public_key, "Alice", path_len=1)
-    )
+    public_key = b"\xa2" * 32
+    await server._cmd_add_update_contact(_contact_command(public_key, "Alice", path_len=1))
     before = server._contact_state(public_key)
     server._write_frame.reset_mock()
     server.journal.store_contact = MagicMock(side_effect=RuntimeError("disk failed"))
 
     await server._cmd_reset_path(public_key)
 
-    server._write_frame.assert_called_once_with(
-        bytes([RESP_CODE_ERR, ERR_CODE_FILE_IO_ERROR])
-    )
+    server._write_frame.assert_called_once_with(bytes([RESP_CODE_ERR, ERR_CODE_FILE_IO_ERROR]))
     assert server._contact_state(public_key) == before
     assert "Save contact after path reset failed" in caplog.text
 
@@ -2389,21 +2332,19 @@ async def test_reset_path_storage_failure_rolls_back_and_returns_one_error(
 @pytest.mark.asyncio
 async def test_contact_add_storage_failure_rolls_back_and_returns_one_error(tmp_path):
     server, bridge, _handler = _stateful_frame_server(tmp_path)
-    public_key = b"\xA3" * 32
+    public_key = b"\xa3" * 32
     server.journal.store_contact = MagicMock(side_effect=RuntimeError("disk failed"))
 
     await server._cmd_add_update_contact(_contact_command(public_key, "Alice"))
 
-    server._write_frame.assert_called_once_with(
-        bytes([RESP_CODE_ERR, ERR_CODE_FILE_IO_ERROR])
-    )
+    server._write_frame.assert_called_once_with(bytes([RESP_CODE_ERR, ERR_CODE_FILE_IO_ERROR]))
     assert bridge.get_contact_by_key(public_key) is None
 
 
 @pytest.mark.asyncio
 async def test_contact_remove_storage_failure_rolls_back_and_returns_one_error(tmp_path):
     server, bridge, _handler = _stateful_frame_server(tmp_path)
-    public_key = b"\xA4" * 32
+    public_key = b"\xa4" * 32
     await server._cmd_add_update_contact(_contact_command(public_key, "Alice"))
     before = server._contact_state(public_key)
     server._write_frame.reset_mock()
@@ -2411,9 +2352,7 @@ async def test_contact_remove_storage_failure_rolls_back_and_returns_one_error(t
 
     await server._cmd_remove_contact(public_key)
 
-    server._write_frame.assert_called_once_with(
-        bytes([RESP_CODE_ERR, ERR_CODE_FILE_IO_ERROR])
-    )
+    server._write_frame.assert_called_once_with(bytes([RESP_CODE_ERR, ERR_CODE_FILE_IO_ERROR]))
     assert server._contact_state(public_key) == before
 
 
@@ -2422,9 +2361,7 @@ async def test_channel_storage_failure_rolls_back_and_returns_one_error(tmp_path
     server, bridge, _handler = _stateful_frame_server(tmp_path)
     original_secret = b"\x44" * 32
     replacement_secret = b"\x55" * 32
-    await server._cmd_set_channel(
-        bytes([3]) + b"original".ljust(32, b"\x00") + original_secret
-    )
+    await server._cmd_set_channel(bytes([3]) + b"original".ljust(32, b"\x00") + original_secret)
     server._write_frame.reset_mock()
     server.journal.store_channel = MagicMock(side_effect=RuntimeError("disk failed"))
 
@@ -2432,9 +2369,7 @@ async def test_channel_storage_failure_rolls_back_and_returns_one_error(tmp_path
         bytes([3]) + b"replacement".ljust(32, b"\x00") + replacement_secret
     )
 
-    server._write_frame.assert_called_once_with(
-        bytes([RESP_CODE_ERR, ERR_CODE_FILE_IO_ERROR])
-    )
+    server._write_frame.assert_called_once_with(bytes([RESP_CODE_ERR, ERR_CODE_FILE_IO_ERROR]))
     channel = bridge.get_channel(3)
     assert channel.name == "original"
     assert channel.secret == original_secret
@@ -2464,9 +2399,7 @@ async def test_frame_preference_event_failure_rolls_back_and_returns_file_error(
 
     await server._cmd_set_advert_name(b"Renamed")
 
-    server._write_frame.assert_called_once_with(
-        bytes([RESP_CODE_ERR, ERR_CODE_FILE_IO_ERROR])
-    )
+    server._write_frame.assert_called_once_with(bytes([RESP_CODE_ERR, ERR_CODE_FILE_IO_ERROR]))
     assert bridge.prefs.node_name == original_name
     assert handler.companion_load_prefs("0x01") is None
     assert handler.companion_get_events("0x01", 0) == []
@@ -2514,9 +2447,7 @@ async def test_frame_channel_change_is_atomic_deduplicated_and_secret_free(tmp_p
 @pytest.mark.asyncio
 async def test_frame_server_persistence_paths_and_stop():
     sqlite = SimpleNamespace(
-        companion_store_inbound_message=MagicMock(
-            return_value={"inserted": True, "message_id": 1}
-        ),
+        companion_store_inbound_message=MagicMock(return_value={"inserted": True, "message_id": 1}),
         companion_pop_message=MagicMock(
             return_value={
                 "sender_key": b"k",
@@ -2554,9 +2485,7 @@ async def test_frame_server_persistence_paths_and_stop():
         srv._build_message_frame = MagicMock(return_value=b"frame")
 
         await srv._persist_companion_message({"text": "x"}, queue_entry)
-        sqlite.companion_store_inbound_message.assert_called_once_with(
-            "h", {"text": "x"}, None
-        )
+        sqlite.companion_store_inbound_message.assert_called_once_with("h", {"text": "x"}, None)
         bridge.message_queue.remove.assert_called_once_with(queue_entry)
 
         msg = srv._sync_next_from_persistence()
@@ -2612,9 +2541,7 @@ async def test_persistence_removes_the_supplied_entry_not_a_later_receive():
             return False
 
     sqlite = SimpleNamespace(
-        companion_store_inbound_message=MagicMock(
-            return_value={"inserted": True, "message_id": 1}
-        )
+        companion_store_inbound_message=MagicMock(return_value={"inserted": True, "message_id": 1})
     )
     bridge = SimpleNamespace(message_queue=_Queue())
     server = CompanionFrameServer.__new__(CompanionFrameServer)

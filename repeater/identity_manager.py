@@ -192,7 +192,9 @@ class IdentityManager:
         with self._lock:
             if namespace is not None:
                 return (hash_byte, namespace) in self.identities
-            return any(registered_hash == hash_byte for registered_hash, _namespace in self.identities)
+            return any(
+                registered_hash == hash_byte for registered_hash, _namespace in self.identities
+            )
 
     def list_identities(self) -> list:
         with self._lock:
@@ -204,32 +206,20 @@ class IdentityManager:
                         "hash": f"0x{hash_byte:02X}",
                         "name": name,
                         "type": id_type,
-                        "address": (
-                            identity.get_address_bytes().hex()
-                            if identity
-                            else "N/A"
-                        ),
-                        "public_key": (
-                            identity.get_public_key().hex()
-                            if identity
-                            else None
-                        ),
+                        "address": (identity.get_address_bytes().hex() if identity else "N/A"),
+                        "public_key": (identity.get_public_key().hex() if identity else None),
                     }
                 )
             return identities
 
     def has_identity_type(self, identity_type: str) -> bool:
         with self._lock:
-            return any(
-                id_type == identity_type
-                for _, _, id_type in self.identities.values()
-            )
+            return any(id_type == identity_type for _, _, id_type in self.identities.values())
 
     def get_identities_by_type(self, identity_type: str) -> list:
         with self._lock:
             return [
                 (name, identity, config)
-                for name, (identity, config, id_type)
-                in self.named_identities.items()
+                for name, (identity, config, id_type) in self.named_identities.items()
                 if id_type == identity_type
             ]

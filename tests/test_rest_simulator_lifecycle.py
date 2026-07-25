@@ -63,9 +63,7 @@ def test_rest_simulator_startup_failure_stops_its_event_loop(
     monkeypatch,
 ):
     existing_threads = {
-        thread.ident
-        for thread in threading.enumerate()
-        if thread.name == "rest-harness-loop"
+        thread.ident for thread in threading.enumerate() if thread.name == "rest-harness-loop"
     }
     monkeypatch.setattr(rest_simulator, "_free_port", lambda: 12345)
     monkeypatch.setattr(

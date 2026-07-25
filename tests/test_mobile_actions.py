@@ -1025,9 +1025,7 @@ class TestSendMessage:
         message = handler.companion_message_get_by_id(_HASH, message_id)
         assert key["state"] == message["state"] == "indeterminate"
         assert key["packet_hash"] == message["packet_hash"] == "AB" * 8
-        assert key["expected_ack"] == message["expected_ack"] == (
-            None if is_channel else 123
-        )
+        assert key["expected_ack"] == message["expected_ack"] == (None if is_channel else 123)
 
         _post(endpoints, body, idempotency_key="prune-race")
         retry = _call(endpoints.messages, companion_name=_NAME)
@@ -1522,9 +1520,7 @@ class TestContactActions:
         cherrypy.serving.request.method = "POST"
 
         with pytest.raises(cherrypy.HTTPError) as exc:
-            endpoints.ping.__wrapped__(
-                endpoints, companion_name=_NAME, contact_pubkey=_PUBKEY_HEX
-            )
+            endpoints.ping.__wrapped__(endpoints, companion_name=_NAME, contact_pubkey=_PUBKEY_HEX)
 
         assert exc.value.status == 400
         assert bridge.ping_requests == []

@@ -134,9 +134,7 @@ def test_startup_preflight_rejects_duplicate_companion_listener_ports():
             match=r"tcp_port 5000.*second.*companion 'first'",
         ),
     ):
-        daemon._preflight_configured_local_identities(
-            _SeedFirstByteIdentity(b"\x10" * 32)
-        )
+        daemon._preflight_configured_local_identities(_SeedFirstByteIdentity(b"\x10" * 32))
 
 
 def test_startup_preflight_rejects_http_listener_port_collision():
@@ -157,9 +155,7 @@ def test_startup_preflight_rejects_http_listener_port_collision():
         patch("openhop_core.LocalIdentity", _SeedFirstByteIdentity),
         pytest.raises(IdentityConfigurationError, match="Repeater HTTP API"),
     ):
-        daemon._preflight_configured_local_identities(
-            _SeedFirstByteIdentity(b"\x10" * 32)
-        )
+        daemon._preflight_configured_local_identities(_SeedFirstByteIdentity(b"\x10" * 32))
 
 
 @pytest.mark.asyncio
@@ -292,9 +288,7 @@ async def test_deleted_companion_hash_cannot_be_rebound_or_leak_state_and_push(t
             identity_a,
         )
         calls_before_replacement = bridge_cls.call_count
-        listeners_before_replacement = (
-            daemon.push_notifier.make_listener.call_count
-        )
+        listeners_before_replacement = daemon.push_notifier.make_listener.call_count
 
         with pytest.raises(
             CompanionNamespaceCollisionError,
@@ -305,18 +299,14 @@ async def test_deleted_companion_hash_cannot_be_rebound_or_leak_state_and_push(t
     # Refusal happened before a replacement journal, listener, state restore,
     # bridge, or server existed. The original namespace remains untouched.
     assert bridge_cls.call_count == calls_before_replacement
-    assert (
-        daemon.push_notifier.make_listener.call_count
-        == listeners_before_replacement
-    )
+    assert daemon.push_notifier.make_listener.call_count == listeners_before_replacement
     assert daemon.companion_bridges == {}
     assert daemon.companion_journals == {}
     assert handler.companion_namespace_binding("0x31") == identity_a
     assert handler.companion_load_contacts_strict("0x31")[0]["name"] == "owned by first"
     assert handler.companion_devices_with_push("0x31", identity_b) == []
     assert [
-        item["device_id"]
-        for item in handler.companion_devices_with_push("0x31", identity_a)
+        item["device_id"] for item in handler.companion_devices_with_push("0x31", identity_a)
     ] == ["first-phone"]
 
 
@@ -437,9 +427,7 @@ async def test_hot_add_rejects_listener_collision_before_stateful_setup():
         {},
         "companion",
     )
-    daemon.companion_frame_servers = [
-        SimpleNamespace(companion_hash="0x21", port=5000)
-    ]
+    daemon.companion_frame_servers = [SimpleNamespace(companion_hash="0x21", port=5000)]
     comp_config = {
         "name": "second",
         "identity_key": "22" * 32,

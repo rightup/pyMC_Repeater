@@ -320,7 +320,7 @@ class PacketRouter:
         async with self._companion_delivery_lock:
             if self._was_delivered_to_companions(packet):
                 return None
-            authenticated = await self._fan_out_to_bridges(
+            _, authenticated = await self._fan_out_to_bridges(
                 packet,
                 bridges,
                 context=context,

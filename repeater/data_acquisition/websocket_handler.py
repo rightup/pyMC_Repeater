@@ -67,9 +67,8 @@ class PacketWebSocket(WebSocket):
             logger.warning("WebSocket connection rejected: invalid query")
             self.close(code=1008, reason="invalid query")
             return
-        if (
-            set(params) - {"token", "client_id"}
-            or any(len(params.get(name, ())) > 1 for name in params)
+        if set(params) - {"token", "client_id"} or any(
+            len(params.get(name, ())) > 1 for name in params
         ):
             logger.warning("WebSocket connection rejected: ambiguous query")
             self.close(code=1008, reason="invalid query")
@@ -130,13 +129,10 @@ class PacketWebSocket(WebSocket):
                         self.close(code=1008, reason="unauthorized")
                         return
                     try:
-                        authorization = AuthorizationLease.from_jwt_payload(
-                            payload
-                        )
+                        authorization = AuthorizationLease.from_jwt_payload(payload)
                     except ValueError:
                         logger.error(
-                            "WebSocket JWT verifier returned a payload without "
-                            "a valid expiration"
+                            "WebSocket JWT verifier returned a payload without a valid expiration"
                         )
                         self.close(
                             code=1011,
@@ -182,9 +178,7 @@ class PacketWebSocket(WebSocket):
                         )
                         self.close(code=1008, reason="forbidden")
                         return
-                    token_name = safe_api_token_name(
-                        token_info.get("name", "unknown")
-                    )
+                    token_name = safe_api_token_name(token_info.get("name", "unknown"))
                     self.user = f"api_token:{token_name}"
                     self._authorization = AuthorizationLease.from_api_token(
                         token_info,
@@ -359,12 +353,8 @@ def init_websocket():
     # leave its old thread finishing a slow authorization/storage call after
     # the one-second join bound. Its stop event is already set, so it must not
     # suppress the replacement heartbeat on an immediate HTTP restart.
-    heartbeat_stopping = (
-        _heartbeat_stop is not None and _heartbeat_stop.is_set()
-    )
-    heartbeat_alive = (
-        _heartbeat_thread is not None and _heartbeat_thread.is_alive()
-    )
+    heartbeat_stopping = _heartbeat_stop is not None and _heartbeat_stop.is_set()
+    heartbeat_alive = _heartbeat_thread is not None and _heartbeat_thread.is_alive()
     if not _heartbeat_running or not heartbeat_alive or heartbeat_stopping:
         _heartbeat_stop = threading.Event()
         _heartbeat_running = True
@@ -386,10 +376,7 @@ def shutdown_websocket():
     if _heartbeat_stop is not None:
         _heartbeat_stop.set()
     heartbeat_thread = _heartbeat_thread
-    if (
-        heartbeat_thread is not None
-        and heartbeat_thread is not threading.current_thread()
-    ):
+    if heartbeat_thread is not None and heartbeat_thread is not threading.current_thread():
         heartbeat_thread.join(timeout=1.0)
         if heartbeat_thread.is_alive():
             logger.warning("WebSocket heartbeat thread did not stop promptly")

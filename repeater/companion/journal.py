@@ -50,9 +50,7 @@ class CompanionEventJournal:
         database_key = str(sqlite_path) if sqlite_path is not None else str(id(sqlite_handler))
         lock_key = (database_key, companion_hash)
         with self._append_locks_guard:
-            self._append_lock = self._append_locks.setdefault(
-                lock_key, threading.RLock()
-            )
+            self._append_lock = self._append_locks.setdefault(lock_key, threading.RLock())
 
     # -----------------------------------------------------------------
     # Listener support (live SSE and push wakeups)
@@ -159,9 +157,7 @@ class CompanionEventJournal:
     # Atomic state + event helpers
     # -----------------------------------------------------------------
 
-    def store_inbound_message(
-        self, msg_dict: dict, max_pending: Optional[int] = None
-    ) -> dict:
+    def store_inbound_message(self, msg_dict: dict, max_pending: Optional[int] = None) -> dict:
         """Store inbound history and its event atomically, then notify."""
         with self._append_lock:
             result = self.sqlite_handler.companion_store_inbound_message(
@@ -393,7 +389,9 @@ class CompanionEventJournal:
         payload["change"] = change
         return self._append("contact", payload)
 
-    def record_channel(self, index: int, name: Optional[str], change: str = "update") -> Optional[int]:
+    def record_channel(
+        self, index: int, name: Optional[str], change: str = "update"
+    ) -> Optional[int]:
         """Journal a channel add/rename/removal (architecture §6: ``type: channel``).
 
         Deliberately carries only ``index`` and ``name`` — never the PSK

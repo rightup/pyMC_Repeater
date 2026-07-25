@@ -146,12 +146,10 @@ def test_common_and_mobile_wire_objects_require_every_always_present_key():
 
 def test_mobile_expected_ack_is_documented_as_an_unsigned_32_bit_value():
     spec = _spec()
-    message_ack = spec["components"]["schemas"]["MobileMessage"]["properties"][
-        "expected_ack"
-    ]
-    send_ack = _success_data_schema(
-        spec["paths"]["/v1/companions/{name}/messages"]["post"]
-    )["properties"]["expected_ack"]
+    message_ack = spec["components"]["schemas"]["MobileMessage"]["properties"]["expected_ack"]
+    send_ack = _success_data_schema(spec["paths"]["/v1/companions/{name}/messages"]["post"])[
+        "properties"
+    ]["expected_ack"]
 
     for schema in (message_ack, send_ack):
         assert schema["type"] == "integer"
@@ -179,9 +177,9 @@ def test_mobile_cursor_bounds_and_empty_action_bodies_match_runtime():
     assert event_seq["maximum"] == (1 << 63) - 1
 
     for operation_name in ("status_request", "telemetry_request", "ping", "reset_path"):
-        operation = spec["paths"][
-            f"/v1/companions/{{name}}/contacts/{{pubkey}}/{operation_name}"
-        ]["post"]
+        operation = spec["paths"][f"/v1/companions/{{name}}/contacts/{{pubkey}}/{operation_name}"][
+            "post"
+        ]
         body = operation["requestBody"]
         assert body["required"] is False
         assert body["content"]["application/json"]["schema"] == {
@@ -191,21 +189,14 @@ def test_mobile_cursor_bounds_and_empty_action_bodies_match_runtime():
 
     sync_cursor = next(
         parameter
-        for parameter in spec["paths"]["/v1/companions/{name}/sync"]["get"][
-            "parameters"
-        ]
+        for parameter in spec["paths"]["/v1/companions/{name}/sync"]["get"]["parameters"]
         if parameter["name"] == "cursor"
     )
-    assert all(
-        choice["maxLength"] == 128
-        for choice in sync_cursor["schema"]["oneOf"]
-    )
+    assert all(choice["maxLength"] == 128 for choice in sync_cursor["schema"]["oneOf"])
 
     event_parameters = {
         parameter["name"]: parameter
-        for parameter in spec["paths"]["/v1/companions/{name}/events"]["get"][
-            "parameters"
-        ]
+        for parameter in spec["paths"]["/v1/companions/{name}/events"]["get"]["parameters"]
     }
     for parameter_name in ("cursor", "Last-Event-ID"):
         assert all(
@@ -348,9 +339,7 @@ def test_first_run_contract_exposes_permission_boundary_and_body_limits():
 
     config_import = spec["paths"]["/config_import"]["post"]
     assert "1,048,576 bytes" in config_import["description"]
-    assert {"400", "401", "403", "405", "413", "415"} <= set(
-        config_import["responses"]
-    )
+    assert {"400", "401", "403", "405", "413", "415"} <= set(config_import["responses"])
     import_body = config_import["requestBody"]["content"]["application/json"]["schema"]
     assert import_body["required"] == ["config"]
 

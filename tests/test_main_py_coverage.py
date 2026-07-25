@@ -589,9 +589,7 @@ async def test_keyboard_interrupt_uses_single_shutdown_owner():
         radio=object(),
     )
     daemon.initialize = AsyncMock()
-    daemon.dispatcher = SimpleNamespace(
-        run_forever=AsyncMock(side_effect=KeyboardInterrupt)
-    )
+    daemon.dispatcher = SimpleNamespace(run_forever=AsyncMock(side_effect=KeyboardInterrupt))
     frame_server = SimpleNamespace(stop=AsyncMock())
     bridge = SimpleNamespace(stop=AsyncMock())
     daemon.companion_frame_servers = [frame_server]
@@ -662,17 +660,11 @@ async def test_shutdown_stops_components_and_handles_errors():
     daemon.config["radio_type"] = "none"
 
     stop_order = []
-    frame_server = SimpleNamespace(
-        stop=AsyncMock(side_effect=lambda: stop_order.append("frame"))
-    )
-    bridge = SimpleNamespace(
-        stop=AsyncMock(side_effect=lambda: stop_order.append("bridge"))
-    )
+    frame_server = SimpleNamespace(stop=AsyncMock(side_effect=lambda: stop_order.append("frame")))
+    bridge = SimpleNamespace(stop=AsyncMock(side_effect=lambda: stop_order.append("bridge")))
     daemon.companion_frame_servers = [frame_server]
     daemon.companion_bridges = {1: bridge}
-    daemon.router = SimpleNamespace(
-        stop=AsyncMock(side_effect=lambda: stop_order.append("router"))
-    )
+    daemon.router = SimpleNamespace(stop=AsyncMock(side_effect=lambda: stop_order.append("router")))
     daemon.http_server = SimpleNamespace(
         stop=MagicMock(side_effect=lambda: stop_order.append("http"))
     )
@@ -705,9 +697,7 @@ async def test_run_finalizer_joins_signal_owned_shutdown_task():
         await allow_frame_stop.wait()
 
     daemon.http_server = SimpleNamespace(stop=MagicMock())
-    daemon.companion_frame_servers = [
-        SimpleNamespace(stop=AsyncMock(side_effect=slow_frame_stop))
-    ]
+    daemon.companion_frame_servers = [SimpleNamespace(stop=AsyncMock(side_effect=slow_frame_stop))]
     daemon.companion_bridges = {}
 
     daemon._signal_shutdown(

@@ -125,11 +125,7 @@ def parse_companion_send_response(value: Any) -> Dict[str, Any]:
         raise ValueError("stored send response data must be an object")
 
     message_id = data.get("message_id")
-    if (
-        type(message_id) is not int
-        or message_id < 1
-        or message_id > _SQLITE_ROW_ID_MAX
-    ):
+    if type(message_id) is not int or message_id < 1 or message_id > _SQLITE_ROW_ID_MAX:
         raise ValueError("stored send response has an invalid message_id")
     if type(data.get("sent")) is not bool:
         raise ValueError("stored send response has an invalid sent flag")
@@ -140,17 +136,13 @@ def parse_companion_send_response(value: Any) -> Dict[str, Any]:
 
     packet_hash = data.get("packet_hash")
     if packet_hash is not None and (
-        not isinstance(packet_hash, str)
-        or _PACKET_HASH_RE.fullmatch(packet_hash) is None
+        not isinstance(packet_hash, str) or _PACKET_HASH_RE.fullmatch(packet_hash) is None
     ):
         raise ValueError("stored send response has an invalid packet_hash")
     if (
         "expected_ack" in data
         and data["expected_ack"] is not None
-        and (
-            type(data["expected_ack"]) is not int
-            or not 0 <= data["expected_ack"] <= _UINT32_MAX
-        )
+        and (type(data["expected_ack"]) is not int or not 0 <= data["expected_ack"] <= _UINT32_MAX)
     ):
         raise ValueError("stored send response has an invalid expected_ack")
     if "is_flood" in data and type(data["is_flood"]) is not bool:
@@ -270,9 +262,7 @@ def validate_companion_seconds_setting(
             f"{setting_name} must be between {minimum:g} and {maximum:g} seconds"
         ) from None
     if not math.isfinite(seconds) or not minimum <= seconds <= maximum:
-        raise ValueError(
-            f"{setting_name} must be between {minimum:g} and {maximum:g} seconds"
-        )
+        raise ValueError(f"{setting_name} must be between {minimum:g} and {maximum:g} seconds")
     return seconds
 
 
@@ -295,9 +285,7 @@ def validate_companion_bind_address(value: Any) -> str:
         not address
         or encoded_size > 255
         or any(
-            character.isspace()
-            or ord(character) < 0x20
-            or ord(character) == 0x7F
+            character.isspace() or ord(character) < 0x20 or ord(character) == 0x7F
             for character in address
         )
     ):
@@ -346,12 +334,8 @@ def validate_companion_listener_config(
         )
         if not frame_enabled:
             continue
-        port = validate_companion_tcp_port(
-            settings.get("tcp_port", DEFAULT_COMPANION_TCP_PORT)
-        )
-        validate_companion_bind_address(
-            settings.get("bind_address", "127.0.0.1")
-        )
+        port = validate_companion_tcp_port(settings.get("tcp_port", DEFAULT_COMPANION_TCP_PORT))
+        validate_companion_bind_address(settings.get("bind_address", "127.0.0.1"))
         owner = owners.get(port)
         if owner is not None:
             raise ValueError(

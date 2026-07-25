@@ -354,9 +354,7 @@ def test_concurrent_discovery_allocations_are_serial_on_the_daemon_loop(
             "start:sess-1",
         ],
     )
-    assert {thread_id for _action, thread_id in actions} == {
-        loop_thread_id[0]
-    }
+    assert {thread_id for _action, thread_id in actions} == {loop_thread_id[0]}
 
 
 def test_trace_tag_retries_pending_frame_and_companion_owned_values():
@@ -851,9 +849,7 @@ def test_public_config_import_is_single_use_under_concurrency(
             second_body_read.set()
         return {
             "config": {
-                "repeater": {
-                    "security": {"admin_password": f"{thread_name}-password"}
-                },
+                "repeater": {"security": {"admin_password": f"{thread_name}-password"}},
                 "web": {"site_name": thread_name},
             }
         }
@@ -1180,25 +1176,25 @@ def test_config_import_updates_sections_and_preserves_redacted(cherrypy_ctx):
     _set_json_body(
         request,
         {
-        "config": {
-            "repeater": {
-                "security": {
-                    "admin_password": "*** REDACTED ***",
-                    "guest_password": "new-guest",
-                    "jwt_secret": "*** REDACTED ***",
+            "config": {
+                "repeater": {
+                    "security": {
+                        "admin_password": "*** REDACTED ***",
+                        "guest_password": "new-guest",
+                        "jwt_secret": "*** REDACTED ***",
+                    },
+                    "identity_key": "AABBCC",
+                    "identity_file": "/tmp/remove-me",
                 },
-                "identity_key": "AABBCC",
-                "identity_file": "/tmp/remove-me",
+                "identities": {
+                    "companions": [
+                        {"name": "c1", "identity_key": "*** REDACTED ***"},
+                    ]
+                },
+                "radio": {"frequency": 915000000},
+                "radio_type": "pymc_usb",
+                "unknown": {"x": 1},
             },
-            "identities": {
-                "companions": [
-                    {"name": "c1", "identity_key": "*** REDACTED ***"},
-                ]
-            },
-            "radio": {"frequency": 915000000},
-            "radio_type": "pymc_usb",
-            "unknown": {"x": 1},
-        },
         },
     )
     api._require_admin_on_public_route = MagicMock()
@@ -1762,12 +1758,12 @@ def test_config_import_invalid_identity_key_hex_is_skipped(cherrypy_ctx):
     _set_json_body(
         request,
         {
-        "config": {
-            "repeater": {
-                "security": {"admin_password": "strong-password"},
-                "identity_key": "NOTHEX",
-            }
-        },
+            "config": {
+                "repeater": {
+                    "security": {"admin_password": "strong-password"},
+                    "identity_key": "NOTHEX",
+                }
+            },
         },
     )
 
@@ -2262,14 +2258,14 @@ def test_config_import_identity_redaction_preserves_by_name_for_room_servers(che
     _set_json_body(
         request,
         {
-        "config": {
-            "identities": {
-                "room_servers": [
-                    {"name": "main-room", "identity_key": "*** REDACTED ***"},
-                    {"name": "new-room", "identity_key": "*** REDACTED ***"},
-                ]
-            }
-        },
+            "config": {
+                "identities": {
+                    "room_servers": [
+                        {"name": "main-room", "identity_key": "*** REDACTED ***"},
+                        {"name": "new-room", "identity_key": "*** REDACTED ***"},
+                    ]
+                }
+            },
         },
     )
 
@@ -2296,14 +2292,14 @@ def test_config_import_rejects_listener_collision_without_partial_apply(cherrypy
     _set_json_body(
         request,
         {
-        "config": {
-            "web": {"site_name": "must-not-apply"},
-            "identities": {
-                "companions": [
-                    {"name": "chat", "settings": {"tcp_port": 5000}},
-                ]
+            "config": {
+                "web": {"site_name": "must-not-apply"},
+                "identities": {
+                    "companions": [
+                        {"name": "chat", "settings": {"tcp_port": 5000}},
+                    ]
+                },
             },
-        },
         },
     )
 
@@ -3276,11 +3272,14 @@ def test_identity_endpoints_paths(cherrypy_ctx):
     ):
         normalized = api.create_identity()
     assert normalized["success"] is True
-    assert next(
-        companion["identity_key"]
-        for companion in api.config["identities"]["companions"]
-        if companion["name"] == "normalized-key"
-    ) == "AB" * 32
+    assert (
+        next(
+            companion["identity_key"]
+            for companion in api.config["identities"]["companions"]
+            if companion["name"] == "normalized-key"
+        )
+        == "AB" * 32
+    )
 
     response.status = 200
     request.json = {
@@ -3320,11 +3319,14 @@ def test_identity_endpoints_paths(cherrypy_ctx):
     }
     assert api.update_identity()["success"] is False
     assert response.status == 400
-    assert next(
-        companion["identity_key"]
-        for companion in api.config["identities"]["companions"]
-        if companion["name"] == "new-comp"
-    ) == "cc" * 32
+    assert (
+        next(
+            companion["identity_key"]
+            for companion in api.config["identities"]["companions"]
+            if companion["name"] == "new-comp"
+        )
+        == "cc" * 32
+    )
     response.status = 200
     request.json = {
         "name": "new-comp",
@@ -3343,12 +3345,10 @@ def test_identity_endpoints_paths(cherrypy_ctx):
     assert api.update_identity()["success"] is False
     assert response.status == 400
     assert any(
-        companion["name"] == "new-comp"
-        for companion in api.config["identities"]["companions"]
+        companion["name"] == "new-comp" for companion in api.config["identities"]["companions"]
     )
     assert not any(
-        companion["name"] == "renamed-comp"
-        for companion in api.config["identities"]["companions"]
+        companion["name"] == "renamed-comp" for companion in api.config["identities"]["companions"]
     )
     response.status = 200
     api.daemon_instance = None
@@ -3448,11 +3448,9 @@ def test_generated_identity_key_never_enters_logs_or_response(
     request, _response = cherrypy_ctx
     request.method = "POST"
     request.json = {"name": "generated-comp", "type": "companion"}
-    api = _make_api(
-        {"identities": {"room_servers": [], "companions": []}}
-    )
+    api = _make_api({"identities": {"room_servers": [], "companions": []}})
     api.config_manager.save_to_file.return_value = True
-    private_key = b"\xDE" * 64
+    private_key = b"\xde" * 64
 
     with (
         patch(
@@ -3512,9 +3510,7 @@ def test_create_companion_reports_durable_namespace_collision(cherrypy_ctx):
         "identity_key": "ab" * 32,
         "settings": {"tcp_port": 5001},
     }
-    api = _make_api(
-        {"identities": {"room_servers": [], "companions": []}}
-    )
+    api = _make_api({"identities": {"room_servers": [], "companions": []}})
     api.config_manager.save_to_file.return_value = True
     api.event_loop = object()
     api.daemon_instance = SimpleNamespace(
@@ -3545,9 +3541,7 @@ def test_create_companion_reports_frame_listener_activation_failure(cherrypy_ctx
         "identity_key": "ac" * 32,
         "settings": {"tcp_port": 5001},
     }
-    api = _make_api(
-        {"identities": {"room_servers": [], "companions": []}}
-    )
+    api = _make_api({"identities": {"room_servers": [], "companions": []}})
     api.config_manager.save_to_file.return_value = True
     api.event_loop = object()
     api.daemon_instance = SimpleNamespace(
@@ -3579,9 +3573,7 @@ def test_create_companion_timeout_leaves_live_activation_running(
         "identity_key": "ad" * 32,
         "settings": {"frame_enabled": False},
     }
-    api = _make_api(
-        {"identities": {"room_servers": [], "companions": []}}
-    )
+    api = _make_api({"identities": {"room_servers": [], "companions": []}})
     api.config_manager.save_to_file.return_value = True
     add_companion = MagicMock()
     api.daemon_instance = SimpleNamespace(

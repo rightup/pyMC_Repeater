@@ -213,11 +213,11 @@ def _validate_include(value: Optional[str]) -> None:
         raise ValueError("include must be valid UTF-8") from None
     if len(encoded) > 128:
         raise ValueError("include must not exceed 128 UTF-8 bytes")
-    tokens = [token.strip() for token in value.split(",")]
+    selectors = [selector.strip() for selector in value.split(",")]
     if (
-        not tokens
-        or any(not token for token in tokens)
-        or any(token != "rf_receptions" for token in tokens)
+        not selectors
+        or any(not selector for selector in selectors)
+        or any(selector != "rf_receptions" for selector in selectors)
     ):
         raise ValueError("include may contain only rf_receptions")
 
@@ -265,7 +265,7 @@ def _read_bounded(response, limit: int = _MAX_RESPONSE_BYTES) -> bytes:
 
 
 def _bearer_header(token: Optional[str]) -> Optional[str]:
-    if token is None or token == "":
+    if not token:
         return None
     if (
         not isinstance(token, str)
@@ -1407,7 +1407,13 @@ class CompanionRestClient:
 
     # -- contact actions and RF observations -------------------------------
 
-    def login(self, companion_name: str, pubkey: str, password: str = "") -> dict:
+    # An empty login password is valid protocol input.
+    def login(  # nosec B107
+        self,
+        companion_name: str,
+        pubkey: str,
+        password: str = "",
+    ) -> dict:
         return self._object_data(
             "POST",
             f"/companions/{_path_segment(companion_name)}/contacts/{_path_segment(pubkey)}/login",

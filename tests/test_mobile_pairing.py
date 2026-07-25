@@ -70,9 +70,7 @@ def _daemon(handler, names=(_NAME, _OTHER_NAME)):
     identity_manager = SimpleNamespace(
         get_identities_by_type=lambda t: identities if t == "companion" else []
     )
-    bridges = {
-        _HASH_BYTES_BY_NAME[name]: _FakeBridge(_HASH_BYTES_BY_NAME[name]) for name in names
-    }
+    bridges = {_HASH_BYTES_BY_NAME[name]: _FakeBridge(_HASH_BYTES_BY_NAME[name]) for name in names}
     return SimpleNamespace(
         identity_manager=identity_manager,
         companion_bridges=bridges,
@@ -384,9 +382,7 @@ class TestPairExchange:
         assert data["scope"] == f"companion:{_NAME}"
         expected_identity = (bytes([_HASH_BYTE]) + b"\x22" * 31).hex()
         assert data["companion_identity"] == expected_identity
-        assert data["fingerprint"] == hashlib.sha256(
-            bytes.fromhex(expected_identity)
-        ).hexdigest()
+        assert data["fingerprint"] == hashlib.sha256(bytes.fromhex(expected_identity)).hexdigest()
 
         verified = token_manager.verify_token(data["token"])
         assert verified is not None
@@ -414,12 +410,8 @@ class TestPairExchange:
         handler,
     ):
         code = self._start_code(pair)
-        pair.daemon_instance.identity_manager.get_identities_by_type = (
-            lambda identity_type: (
-                [(_NAME, _FakeIdentity(0x7F), {})]
-                if identity_type == "companion"
-                else []
-            )
+        pair.daemon_instance.identity_manager.get_identities_by_type = lambda identity_type: (
+            [(_NAME, _FakeIdentity(0x7F), {})] if identity_type == "companion" else []
         )
 
         _post(
@@ -727,9 +719,7 @@ class TestScopeEnforcement:
             companions._resolve(_NAME)
         assert exc.value.status == 404
 
-    def test_exact_api_token_rejects_legacy_device_without_identity(
-        self, companions, handler
-    ):
+    def test_exact_api_token_rejects_legacy_device_without_identity(self, companions, handler):
         token_id = handler.create_api_token(
             "legacy",
             "legacy-device-hash",
@@ -751,9 +741,7 @@ class TestScopeEnforcement:
             companions._resolve(_NAME)
         assert exc.value.status == 404
 
-    def test_exact_api_token_uses_full_identity_across_a_slug_rename(
-        self, companions, handler
-    ):
+    def test_exact_api_token_uses_full_identity_across_a_slug_rename(self, companions, handler):
         token_id = handler.create_api_token(
             "phone",
             "renamed-device-hash",
@@ -775,9 +763,7 @@ class TestScopeEnforcement:
         _bridge, companion_hash = companions._resolve(_NAME)
         assert companion_hash == _HASH
 
-    def test_exact_api_token_rejects_a_different_full_identity(
-        self, companions, handler
-    ):
+    def test_exact_api_token_rejects_a_different_full_identity(self, companions, handler):
         token_id = handler.create_api_token(
             "wrong identity",
             "wrong-identity-hash",
@@ -800,9 +786,7 @@ class TestScopeEnforcement:
             companions._resolve(_NAME)
         assert exc.value.status == 404
 
-    def test_exact_api_token_rejects_ambiguous_device_bindings(
-        self, companions, handler
-    ):
+    def test_exact_api_token_rejects_ambiguous_device_bindings(self, companions, handler):
         token_id = handler.create_api_token(
             "ambiguous",
             "ambiguous-device-hash",
@@ -922,9 +906,7 @@ class TestDevicesList:
             _call(devices.index)
         assert exc.value.status == 405
 
-    def test_storage_failure_is_503_not_an_empty_registry(
-        self, devices, handler, monkeypatch
-    ):
+    def test_storage_failure_is_503_not_an_empty_registry(self, devices, handler, monkeypatch):
         _set_user(scope="admin")
 
         def unavailable():
@@ -989,9 +971,7 @@ class TestDevicesRevoke:
 
         def check_then_repair(storage, device_id):
             original_check(storage, device_id)
-            assert storage.companion_revoke_device(
-                device_id=device_id
-            )["devices_deleted"] == 1
+            assert storage.companion_revoke_device(device_id=device_id)["devices_deleted"] == 1
             new_token_id = storage.create_api_token(
                 "new",
                 "hash-new",
@@ -1021,12 +1001,8 @@ class TestDevicesRevoke:
         assert handler.verify_api_token("hash-new") is not None
 
     def test_device_token_cannot_revoke_another_device(self, devices, handler):
-        own_token_id = handler.create_api_token(
-            "own", "hash-own", scope=f"companion:{_NAME}"
-        )
-        other_token_id = handler.create_api_token(
-            "other", "hash-other", scope=f"companion:{_NAME}"
-        )
+        own_token_id = handler.create_api_token("own", "hash-own", scope=f"companion:{_NAME}")
+        other_token_id = handler.create_api_token("other", "hash-other", scope=f"companion:{_NAME}")
         handler.companion_device_create(_HASH, "dev-own", "Own", own_token_id)
         handler.companion_device_create(_HASH, "dev-other", "Other", other_token_id)
 
@@ -1054,9 +1030,7 @@ class TestDevicesRevoke:
 
         assert exc.value.status == 400
 
-    def test_lookup_failure_is_503_not_not_found(
-        self, devices, handler, monkeypatch
-    ):
+    def test_lookup_failure_is_503_not_not_found(self, devices, handler, monkeypatch):
         _set_user(scope="admin")
         cherrypy.serving.request.method = "DELETE"
 
@@ -1089,19 +1063,20 @@ class TestDevicesDispatch:
 
 class TestDevicesPush:
     def _make_device(self, handler, device_id="dev-p", token_hash="hash-p"):
-        token_id = handler.create_api_token(
-            "phone", token_hash, scope=f"companion:{_NAME}"
-        )
+        token_id = handler.create_api_token("phone", token_hash, scope=f"companion:{_NAME}")
         handler.companion_device_create(_HASH, device_id, "Phone P", token_id)
         return token_id
 
     def test_device_registers_own_push(self, devices, handler):
         token_id = self._make_device(handler)
         _set_user(scope=f"companion:{_NAME}", token_id=token_id)
-        _post(devices, {
-            "push_token": "apns-xyz",
-            "push_detail": "count",
-        })
+        _post(
+            devices,
+            {
+                "push_token": "apns-xyz",
+                "push_detail": "count",
+            },
+        )
         result = _call(devices.push, device_id="dev-p")
         assert result["success"] is True
         assert result["data"]["push_detail"] == "count"
@@ -1213,9 +1188,7 @@ class TestDevicesPush:
         # dev-p is paired to token_a; the caller authenticates as a DIFFERENT
         # device's token and must not be able to touch dev-p.
         self._make_device(handler, "dev-p", "hash-a")
-        other_token = handler.create_api_token(
-            "other", "hash-b", scope=f"companion:{_NAME}"
-        )
+        other_token = handler.create_api_token("other", "hash-b", scope=f"companion:{_NAME}")
         handler.companion_device_create(_HASH, "dev-other", "Other", other_token)
         _set_user(scope=f"companion:{_NAME}", token_id=other_token)
         _post(devices, {"push_token": "tok"})
@@ -1224,9 +1197,7 @@ class TestDevicesPush:
         assert exc.value.status == 404
         assert handler.companion_device_get("dev-p")["push_token"] is None
 
-    def test_device_binding_read_failure_is_503_not_not_found(
-        self, devices, handler, monkeypatch
-    ):
+    def test_device_binding_read_failure_is_503_not_not_found(self, devices, handler, monkeypatch):
         token_id = self._make_device(handler)
         _set_user(scope=f"companion:{_NAME}", token_id=token_id)
         _post(devices, {"push_token": "tok"})
@@ -1341,9 +1312,7 @@ class TestDevicesPush:
         assert current["token_id"] == replacement["token_id"]
         assert current["push_token"] == "new-push-token"
 
-    def test_push_write_failure_is_503_not_not_found(
-        self, devices, handler, monkeypatch
-    ):
+    def test_push_write_failure_is_503_not_not_found(self, devices, handler, monkeypatch):
         self._make_device(handler)
         _set_user(scope="admin")
         _post(devices, {"push_token": "tok"})
@@ -1360,9 +1329,7 @@ class TestDevicesPush:
             _call(devices.push, device_id="dev-p")
         assert exc.value.status == 503
 
-    def test_push_clear_failure_is_503_not_not_found(
-        self, devices, handler, monkeypatch
-    ):
+    def test_push_clear_failure_is_503_not_not_found(self, devices, handler, monkeypatch):
         self._make_device(handler)
         _set_user(scope="admin")
         cherrypy.serving.request.method = "DELETE"
@@ -1390,16 +1357,20 @@ class TestDevicesPush:
     def test_registers_mention_fields(self, devices, handler):
         token_id = self._make_device(handler)
         _set_user(scope=f"companion:{_NAME}", token_id=token_id)
-        _post(devices, {
-            "push_token": "tok",
-            "mention_push": True,
-            "mention_keywords": ["adam", "@adam"],
-        })
+        _post(
+            devices,
+            {
+                "push_token": "tok",
+                "mention_push": True,
+                "mention_keywords": ["adam", "@adam"],
+            },
+        )
         result = _call(devices.push, device_id="dev-p")
         assert result["data"]["mention_push"] is True
         device = handler.companion_device_get("dev-p")
         assert device["mention_push"] is True
         import json as _json
+
         assert _json.loads(device["mention_keywords"]) == ["adam", "@adam"]
 
     def test_invalid_mention_push_type_400(self, devices, handler):

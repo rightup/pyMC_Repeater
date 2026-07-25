@@ -341,11 +341,7 @@ def test_config_save_failure_compensates_prefs_and_reports_error(
     config = {
         "repeater": {"node_name": "repeater"},
         "logging": {},
-        "identities": {
-            "companions": [
-                {"name": "field-radio", "settings": {"node_name": "Old"}}
-            ]
-        },
+        "identities": {"companions": [{"name": "field-radio", "settings": {"node_name": "Old"}}]},
     }
     daemon = RepeaterDaemon(config, radio=object())
     daemon.config_path = str(tmp_path / "config.yaml")

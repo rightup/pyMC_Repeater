@@ -2417,9 +2417,7 @@ class CompanionsV1:
             "failed",
         }:
             try:
-                recovered_response = parse_companion_send_response(
-                    persisted["response_json"]
-                )
+                recovered_response = parse_companion_send_response(persisted["response_json"])
             except (KeyError, TypeError, ValueError, RecursionError) as exc:
                 logger.error(
                     "Committed send response is unavailable for message %s: %s",

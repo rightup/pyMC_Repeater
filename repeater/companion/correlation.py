@@ -208,9 +208,7 @@ class CompanionCorrelationTracker:
             and candidate.companion_hash == entry.companion_hash
         }
         if len(remaining_directions) <= 1:
-            self._reported_ambiguities.discard(
-                (entry.packet_hash, entry.companion_hash, "mixed")
-            )
+            self._reported_ambiguities.discard((entry.packet_hash, entry.companion_hash, "mixed"))
 
     def _prune_locked(self, now: float) -> None:
         while self._entries:
@@ -240,9 +238,7 @@ class CompanionCorrelationTracker:
         with self._lock:
             self._prune_locked(now)
             token = (
-                self._next_token_locked()
-                if registration_token is None
-                else int(registration_token)
+                self._next_token_locked() if registration_token is None else int(registration_token)
             )
             self._next_token = max(self._next_token, token)
             self._remove_locked(token)
@@ -375,21 +371,19 @@ class CompanionCorrelationTracker:
                     # fresh provisional registration own the new TTL.
                     target.created = entry.created
                     self._entries.move_to_end(target.registration_token)
-                    target.observation_count = max(
-                        target.observation_count,
-                        int(existing_message.get("observation_count") or 1),
-                    ) + entry.observation_count
+                    target.observation_count = (
+                        max(
+                            target.observation_count,
+                            int(existing_message.get("observation_count") or 1),
+                        )
+                        + entry.observation_count
+                    )
                     target.unique_path_count = max(
                         target.unique_path_count,
                         int(existing_message.get("unique_path_count") or 1),
                     ) + max(0, entry.unique_path_count - 1)
                     target.paths.update(entry.paths)
-                    seed = dict(
-                        entry.pending_hit
-                        or entry.initial_hit
-                        or target.pending_hit
-                        or {}
-                    )
+                    seed = dict(entry.pending_hit or entry.initial_hit or target.pending_hit or {})
                     seed.update(
                         {
                             "direction": "in",
@@ -514,10 +508,7 @@ class CompanionCorrelationTracker:
             return
         with self._lock:
             entry = self._entries.get(int(token))
-            if (
-                entry is not None
-                and entry.pending_generation == int(generation)
-            ):
+            if entry is not None and entry.pending_generation == int(generation):
                 entry.pending_hit = None
 
     def discard_registration(self, registration_token: Optional[int]) -> None:
@@ -667,10 +658,7 @@ class CompanionCorrelationTracker:
                 # direction == "out": a heard repeat of our own recent send.
                 terminal_hash = path[-1] if path else None
                 entry.heard_repeat_count += 1
-                if (
-                    terminal_hash is not None
-                    and terminal_hash not in entry.terminal_hashes
-                ):
+                if terminal_hash is not None and terminal_hash not in entry.terminal_hashes:
                     entry.terminal_hashes.add(terminal_hash)
                     entry.unique_repeater_count += 1
                 hit = {

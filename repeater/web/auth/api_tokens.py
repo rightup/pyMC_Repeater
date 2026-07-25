@@ -21,11 +21,7 @@ def safe_api_token_name(value: object) -> str:
             piece = character
         else:
             codepoint = ord(character)
-            piece = (
-                f"\\u{codepoint:04x}"
-                if codepoint <= 0xFFFF
-                else f"\\U{codepoint:08x}"
-            )
+            piece = f"\\u{codepoint:04x}" if codepoint <= 0xFFFF else f"\\U{codepoint:08x}"
         piece_bytes = len(piece.encode("utf-8"))
         if rendered_bytes + piece_bytes > _TOKEN_NAME_DISPLAY_MAX_BYTES:
             truncated = True
@@ -91,7 +87,4 @@ class APITokenManager:
         return deleted
 
     def list_tokens(self) -> List[Dict]:
-        return [
-            _safe_token_info(token_info)
-            for token_info in self.db.list_api_tokens_strict()
-        ]
+        return [_safe_token_info(token_info) for token_info in self.db.list_api_tokens_strict()]

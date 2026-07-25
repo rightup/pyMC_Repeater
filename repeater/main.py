@@ -224,9 +224,7 @@ class RepeaterDaemon:
                         validate_companion_tcp_port(
                             settings.get("tcp_port", DEFAULT_COMPANION_TCP_PORT)
                         )
-                        validate_companion_bind_address(
-                            settings.get("bind_address", "127.0.0.1")
-                        )
+                        validate_companion_bind_address(settings.get("bind_address", "127.0.0.1"))
                         validate_companion_tcp_timeout(
                             settings.get(
                                 "tcp_timeout",
@@ -967,9 +965,7 @@ class RepeaterDaemon:
                 companion_hash_str = f"0x{companion_hash:02x}"
                 companion_identity = pubkey.hex()
 
-                node_name = validate_companion_node_name(
-                    settings.get("node_name", name[:31])
-                )
+                node_name = validate_companion_node_name(settings.get("node_name", name[:31]))
                 frame_enabled = validate_companion_boolean_setting(
                     settings.get("frame_enabled", True),
                     "frame_enabled",
@@ -990,9 +986,7 @@ class RepeaterDaemon:
                             DEFAULT_COMPANION_TCP_TIMEOUT_SEC,
                         )
                     )
-                    client_idle_timeout_sec = (
-                        None if tcp_timeout_raw == 0 else int(tcp_timeout_raw)
-                    )
+                    client_idle_timeout_sec = None if tcp_timeout_raw == 0 else int(tcp_timeout_raw)
                 adopt_legacy_namespace = validate_companion_legacy_adoption(
                     settings.get("adopt_legacy_namespace", False)
                 )
@@ -1082,7 +1076,7 @@ class RepeaterDaemon:
 
                 # Share the dispatcher's served-region map so this bridge re-scopes
                 # its own flood replies to the region the request arrived under.
-                bridge.region_map = self._region_map
+                bridge.region_map = getattr(self, "_region_map", None)
 
                 # Restore persisted state (contacts/channels/messages) from SQLite.
                 # Raises CompanionStateLoadError instead of continuing with an
@@ -1115,9 +1109,7 @@ class RepeaterDaemon:
                         local_hash=self.local_hash,
                         stats_getter=self._get_companion_stats,
                         control_handler=(
-                            self.discovery_helper.control_handler
-                            if self.discovery_helper
-                            else None
+                            self.discovery_helper.control_handler if self.discovery_helper else None
                         ),
                         journal=journal,
                         tracker=self.correlation_tracker,
@@ -1359,8 +1351,7 @@ class RepeaterDaemon:
         if error is not None or bridge.prefs.node_name != desired_name:
             detail = f": {error}" if error is not None else ""
             raise CompanionStateLoadError(
-                f"Companion '{companion_name}' could not persist configured "
-                f"node_name{detail}"
+                f"Companion '{companion_name}' could not persist configured node_name{detail}"
             )
 
     @staticmethod
@@ -1381,9 +1372,7 @@ class RepeaterDaemon:
         # one radio.  The ACK fallback keeps manually constructed/older bridge
         # events compatible without inventing a second protocol.
         transport_message_ids: OrderedDict[tuple[str, int], int] = OrderedDict()
-        transport_confirmations_before_store: OrderedDict[
-            tuple[str, int], object
-        ] = OrderedDict()
+        transport_confirmations_before_store: OrderedDict[tuple[str, int], object] = OrderedDict()
 
         def _send_key(event) -> tuple[str, int]:
             token = getattr(event, "correlation_token", None)
@@ -1423,9 +1412,7 @@ class RepeaterDaemon:
             except BaseException:
                 tracker = getattr(bridge, "_tracker", None)
                 if tracker is not None:
-                    tracker.discard_registration(
-                        getattr(event, "correlation_token", None)
-                    )
+                    tracker.discard_registration(getattr(event, "correlation_token", None))
                 raise
             cancellation = _remember_cancellation(
                 cancellation,
@@ -1571,11 +1558,7 @@ class RepeaterDaemon:
             except Exception as exc:
                 logger.warning("Companion push listener cleanup failed: %s", exc)
         deactivate = getattr(self.push_notifier, "deactivate", None)
-        if (
-            callable(deactivate)
-            and companion_hash is not None
-            and companion_identity is not None
-        ):
+        if callable(deactivate) and companion_hash is not None and companion_identity is not None:
             try:
                 deactivate(companion_hash, companion_identity)
             except Exception as exc:
@@ -1619,6 +1602,7 @@ class RepeaterDaemon:
             CompanionFrameServer,
             RepeaterCompanionBridge,
         )
+
         name = comp_config.get("name")
         identity_key = comp_config.get("identity_key")
         raw_settings = comp_config.get("settings")
@@ -1685,9 +1669,7 @@ class RepeaterDaemon:
             else self.config.get("radio", {})
         )
 
-        node_name = validate_companion_node_name(
-            settings.get("node_name", name[:31])
-        )
+        node_name = validate_companion_node_name(settings.get("node_name", name[:31]))
         frame_enabled = validate_companion_boolean_setting(
             settings.get("frame_enabled", True),
             "frame_enabled",
@@ -1708,9 +1690,7 @@ class RepeaterDaemon:
                     DEFAULT_COMPANION_TCP_TIMEOUT_SEC,
                 )
             )
-            client_idle_timeout_sec = (
-                None if tcp_timeout_raw == 0 else int(tcp_timeout_raw)
-            )
+            client_idle_timeout_sec = None if tcp_timeout_raw == 0 else int(tcp_timeout_raw)
         adopt_legacy_namespace = validate_companion_legacy_adoption(
             settings.get("adopt_legacy_namespace", False)
         )
@@ -1725,9 +1705,7 @@ class RepeaterDaemon:
 
         configured = (self.config.get("identities") or {}).get("companions") or []
         prospective = [
-            entry
-            for entry in configured
-            if str(entry.get("name") or "").strip() != name
+            entry for entry in configured if str(entry.get("name") or "").strip() != name
         ]
         prospective.append(comp_config)
         validate_companion_listener_config(
@@ -1864,9 +1842,7 @@ class RepeaterDaemon:
                     local_hash=self.local_hash,
                     stats_getter=self._get_companion_stats,
                     control_handler=(
-                        self.discovery_helper.control_handler
-                        if self.discovery_helper
-                        else None
+                        self.discovery_helper.control_handler if self.discovery_helper else None
                     ),
                     journal=journal,
                     tracker=self.correlation_tracker,
@@ -1893,17 +1869,9 @@ class RepeaterDaemon:
         def publish_started_runtime() -> str | None:
             """Publish synchronously, optionally guarded by the config CAS."""
             if require_current_config:
-                current_companions = (
-                    (self.config.get("identities") or {}).get("companions")
-                    or []
-                )
-                if not any(
-                    current == comp_config for current in current_companions
-                ):
-                    return (
-                        f"Companion '{name}' configuration changed before "
-                        "activation completed"
-                    )
+                current_companions = (self.config.get("identities") or {}).get("companions") or []
+                if not any(current == comp_config for current in current_companions):
+                    return f"Companion '{name}' configuration changed before activation completed"
 
             self.companion_bridges[companion_hash] = bridge
             if journal is not None:
@@ -2002,20 +1970,14 @@ class RepeaterDaemon:
                 from openhop_core import LocalIdentity
 
                 if isinstance(identity_key, str):
-                    key_bytes = bytes.fromhex(
-                        normalize_companion_identity_key(identity_key)
-                    )
+                    key_bytes = bytes.fromhex(normalize_companion_identity_key(identity_key))
                 elif isinstance(identity_key, bytes):
                     key_bytes = identity_key
                 else:
                     raise ValueError("Companion identity_key has unknown type")
                 if len(key_bytes) not in (32, 64):
-                    raise ValueError(
-                        "Companion identity_key must be 32 or 64 bytes"
-                    )
-                expected_public_key = bytes(
-                    LocalIdentity(seed=key_bytes).get_public_key()
-                )
+                    raise ValueError("Companion identity_key must be 32 or 64 bytes")
+                expected_public_key = bytes(LocalIdentity(seed=key_bytes).get_public_key())
 
             retiring_name = name
             retiring = self._retiring_companions.get(retiring_name)
@@ -2027,10 +1989,7 @@ class RepeaterDaemon:
                 retiring = None
             if retiring is None and expected_public_key is not None:
                 for candidate_name, candidate in self._retiring_companions.items():
-                    if (
-                        candidate.get("companion_public_key")
-                        == expected_public_key
-                    ):
+                    if candidate.get("companion_public_key") == expected_public_key:
                         retiring_name = candidate_name
                         retiring = candidate
                         break
@@ -2049,9 +2008,11 @@ class RepeaterDaemon:
             ):
                 registered = None
             if registered is None and expected_public_key is not None:
-                for registered_name, identity, config in (
-                    self.identity_manager.get_identities_by_type("companion")
-                ):
+                for (
+                    registered_name,
+                    identity,
+                    config,
+                ) in self.identity_manager.get_identities_by_type("companion"):
                     if bytes(identity.get_public_key()) == expected_public_key:
                         name = registered_name
                         registered = (identity, config, "companion")
@@ -2142,9 +2103,7 @@ class RepeaterDaemon:
                 if retiring.get(key) is component:
                     retiring[key] = None
 
-        if failed or any(
-            retiring.get(key) is not None for key in ("frame_server", "bridge")
-        ):
+        if failed or any(retiring.get(key) is not None for key in ("frame_server", "bridge")):
             return False
         if self._retiring_companions.get(name) is retiring:
             self._retiring_companions.pop(name, None)
@@ -2289,17 +2248,14 @@ class RepeaterDaemon:
     def _frame_response_owners(self, kind: str, tag: int) -> tuple:
         """Resolve one globally unique Frame owner for a shared-radio response."""
         owners = []
-        for frame_server in tuple(
-            getattr(self, "companion_frame_servers", ())
-        ):
+        for frame_server in tuple(getattr(self, "companion_frame_servers", ())):
             owns = getattr(frame_server, "owns_response_tag", None)
             if callable(owns) and owns(kind, tag):
                 owners.append(frame_server)
         if len(owners) <= 1:
             return tuple(owners)
         logger.warning(
-            "Dropping ambiguous %s response tag 0x%08X claimed by %s "
-            "companion Frame servers",
+            "Dropping ambiguous %s response tag 0x%08X claimed by %s companion Frame servers",
             kind,
             tag,
             len(owners),
@@ -2313,9 +2269,7 @@ class RepeaterDaemon:
     def _frame_has_response_owner(self, kind: str, tag: int) -> bool:
         """Return whether any Frame request already reserves this radio tag."""
 
-        for frame_server in tuple(
-            getattr(self, "companion_frame_servers", ())
-        ):
+        for frame_server in tuple(getattr(self, "companion_frame_servers", ())):
             owns = getattr(frame_server, "owns_response_tag", None)
             if callable(owns) and owns(kind, tag):
                 return True
@@ -2350,9 +2304,7 @@ class RepeaterDaemon:
             return True
         if kind == "trace" and self._companion_has_trace_owner(key):
             return True
-        for frame_server in tuple(
-            getattr(self, "companion_frame_servers", ())
-        ):
+        for frame_server in tuple(getattr(self, "companion_frame_servers", ())):
             if frame_server is requesting_frame_server:
                 continue
             owns = getattr(frame_server, "owns_response_tag", None)
@@ -2781,14 +2733,10 @@ class RepeaterDaemon:
                 logger.warning(f"Push notifier stop error: {e}")
         self._companion_push_listeners.clear()
 
-        retiring = tuple(
-            getattr(self, "_retiring_companions", {}).values()
-        )
+        retiring = tuple(getattr(self, "_retiring_companions", {}).values())
         frame_servers = list(getattr(self, "companion_frame_servers", ()))
         frame_servers.extend(
-            item.get("frame_server")
-            for item in retiring
-            if item.get("frame_server") is not None
+            item.get("frame_server") for item in retiring if item.get("frame_server") is not None
         )
         # Stop companion frame servers first to close client sockets and child workers.
         seen_components = set()
@@ -2803,11 +2751,7 @@ class RepeaterDaemon:
 
         # Stop companion bridges to flush/persist state.
         bridges = list(getattr(self, "companion_bridges", {}).values())
-        bridges.extend(
-            item.get("bridge")
-            for item in retiring
-            if item.get("bridge") is not None
-        )
+        bridges.extend(item.get("bridge") for item in retiring if item.get("bridge") is not None)
         seen_components.clear()
         for bridge in bridges:
             if id(bridge) in seen_components:
@@ -2962,9 +2906,7 @@ class RepeaterDaemon:
                     self.http_server.start()
                 except Exception as e:
                     logger.error(f"Failed to start HTTP server: {e}")
-                    raise RuntimeError(
-                        "Enabled HTTP API failed to start"
-                    ) from e
+                    raise RuntimeError("Enabled HTTP API failed to start") from e
             else:
                 logger.info("HTTP server startup skipped (http.enabled=false)")
 

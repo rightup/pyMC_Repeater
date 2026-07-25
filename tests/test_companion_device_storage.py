@@ -111,9 +111,7 @@ def test_idempotency_get_missing_returns_none(tmp_path):
 
 def test_idempotency_put_then_get_round_trip(tmp_path):
     h = _handler(tmp_path)
-    ok = h.companion_idempotency_put(
-        "dev-1", "key-1", "hash-abc", '{"message_id": 7}'
-    )
+    ok = h.companion_idempotency_put("dev-1", "key-1", "hash-abc", '{"message_id": 7}')
     assert ok is True
 
     record = h.companion_idempotency_get("dev-1", "key-1")
@@ -175,9 +173,7 @@ def test_idempotency_prune_respects_custom_max_age(tmp_path):
 
     ten_min_ago = time.time() - 600
     conn = sqlite3.connect(str(h.sqlite_path))
-    conn.execute(
-        "UPDATE companion_idempotency SET created_at = ?", (ten_min_ago,)
-    )
+    conn.execute("UPDATE companion_idempotency SET created_at = ?", (ten_min_ago,))
     conn.commit()
     conn.close()
 
@@ -471,7 +467,9 @@ def test_set_push_registers_token_relay_and_detail(tmp_path):
     h = _handler(tmp_path)
     device_id = _device_with_token(h)
     ok = h.companion_device_set_push(
-        device_id, "apns-token-abc", push_relay_url="https://relay.example/notify",
+        device_id,
+        "apns-token-abc",
+        push_relay_url="https://relay.example/notify",
         push_detail="preview",
     )
     assert ok is True
@@ -485,7 +483,9 @@ def test_set_push_token_refresh_leaves_relay_and_detail(tmp_path):
     h = _handler(tmp_path)
     device_id = _device_with_token(h)
     h.companion_device_set_push(
-        device_id, "tok-1", push_relay_url="https://relay.example/notify",
+        device_id,
+        "tok-1",
+        push_relay_url="https://relay.example/notify",
         push_detail="count",
     )
     # Refresh only the token; omit relay/detail.
@@ -500,7 +500,9 @@ def test_clear_push_nulls_token_and_legacy_relay(tmp_path):
     h = _handler(tmp_path)
     device_id = _device_with_token(h)
     h.companion_device_set_push(
-        device_id, "tok", push_relay_url="https://relay.example/notify",
+        device_id,
+        "tok",
+        push_relay_url="https://relay.example/notify",
         push_detail="count",
     )
     assert h.companion_device_clear_push(device_id) is True

@@ -117,23 +117,16 @@ class CompanionAPIEndpoints:
         # SSE clients: each gets a selected bridge key and thread-safe queue.
         self._sse_clients: list[tuple[object, queue.Queue]] = []
         self._sse_lock = threading.Lock()
-        api_cfg = (
-            self.config.get("mobile_api", {})
-            if isinstance(self.config, dict)
-            else {}
-        )
+        api_cfg = self.config.get("mobile_api", {}) if isinstance(self.config, dict) else {}
         if not isinstance(api_cfg, dict):
             raise ValueError("mobile_api must be an object")
-        configured_admission = SSEAdmission(
-            api_cfg.get("sse_max_connections", 8)
-        )
+        configured_admission = SSEAdmission(api_cfg.get("sse_max_connections", 8))
         sse_max_connections = configured_admission.max_connections
         validate_sse_connection_capacity(self.config, sse_max_connections)
         self._sse_admission = sse_admission or configured_admission
         if self._sse_admission.max_connections != sse_max_connections:
             raise ValueError(
-                "shared SSE admission limit does not match "
-                "mobile_api.sse_max_connections"
+                "shared SSE admission limit does not match mobile_api.sse_max_connections"
             )
 
         # Accessed only on the daemon loop. A bridge is registered at most once.
@@ -258,14 +251,10 @@ class CompanionAPIEndpoints:
         """Replace durable contacts while preserving transient request contacts."""
         contacts = list(contacts)
         durable = [
-            copy.deepcopy(contact)
-            for contact in contacts
-            if contact.adv_type != ADV_TYPE_NONE
+            copy.deepcopy(contact) for contact in contacts if contact.adv_type != ADV_TYPE_NONE
         ]
         transient = [
-            copy.deepcopy(contact)
-            for contact in contacts
-            if contact.adv_type == ADV_TYPE_NONE
+            copy.deepcopy(contact) for contact in contacts if contact.adv_type == ADV_TYPE_NONE
         ]
         bridge.contacts.load_from(durable)
         for contact in transient:
@@ -376,10 +365,7 @@ class CompanionAPIEndpoints:
             if (
                 not isinstance(hex_str, str)
                 or len(hex_str) != 64
-                or any(
-                    character not in "0123456789abcdefABCDEF"
-                    for character in hex_str
-                )
+                or any(character not in "0123456789abcdefABCDEF" for character in hex_str)
             ):
                 raise ValueError("Expected 64 hexadecimal characters")
             key = bytes.fromhex(hex_str)
@@ -521,10 +507,7 @@ class CompanionAPIEndpoints:
             return f"jwt:{username}:{client_id}"
         if auth_type == "api_token" and user.get("token_id") is not None:
             return f"api_token:{user['token_id']}"
-        remote_ip = (
-            getattr(getattr(cherrypy.request, "remote", None), "ip", None)
-            or "unknown"
-        )
+        remote_ip = getattr(getattr(cherrypy.request, "remote", None), "ip", None) or "unknown"
         return f"{auth_type}:{remote_ip}"
 
     def _begin_sse(self, stream_principal: tuple[str, object]) -> bool:
@@ -562,9 +545,7 @@ class CompanionAPIEndpoints:
         async def _snapshot():
             if not self.daemon_instance:
                 raise cherrypy.HTTPError(503, "Daemon not initialized")
-            bridges = list(
-                getattr(self.daemon_instance, "companion_bridges", {}).items()
-            )
+            bridges = list(getattr(self.daemon_instance, "companion_bridges", {}).items())
             identity_manager = getattr(
                 self.daemon_instance,
                 "identity_manager",
@@ -629,9 +610,7 @@ class CompanionAPIEndpoints:
                 "longitude": prefs.longitude,
             }
 
-        return self._success(
-            self._run_async(self._read_bridge_state(bridge_params, _read))
-        )
+        return self._success(self._run_async(self._read_bridge_state(bridge_params, _read)))
 
     # ----- Contacts -----
 
@@ -664,9 +643,7 @@ class CompanionAPIEndpoints:
                 for contact in bridge.get_contacts(since=since)
             ]
 
-        return self._success(
-            self._run_async(self._read_bridge_state(bridge_params, _read))
-        )
+        return self._success(self._run_async(self._read_bridge_state(bridge_params, _read)))
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
@@ -694,20 +671,14 @@ class CompanionAPIEndpoints:
                 "adv_type": contact.adv_type,
                 "flags": contact.flags,
                 "out_path_len": contact.out_path_len,
-                "out_path": (
-                    contact.out_path.hex()
-                    if isinstance(contact.out_path, bytes)
-                    else ""
-                ),
+                "out_path": (contact.out_path.hex() if isinstance(contact.out_path, bytes) else ""),
                 "last_advert_timestamp": contact.last_advert_timestamp,
                 "lastmod": contact.lastmod,
                 "gps_lat": contact.gps_lat,
                 "gps_lon": contact.gps_lon,
             }
 
-        return self._success(
-            self._run_async(self._read_bridge_state(bridge_params, _read))
-        )
+        return self._success(self._run_async(self._read_bridge_state(bridge_params, _read)))
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
@@ -805,9 +776,7 @@ class CompanionAPIEndpoints:
                 latitude = float(row.get("latitude") or 0.0)
                 longitude = float(row.get("longitude") or 0.0)
             except (TypeError, ValueError, OverflowError):
-                logger.warning(
-                    "Skipping repeater advert with malformed timestamp or coordinates"
-                )
+                logger.warning("Skipping repeater advert with malformed timestamp or coordinates")
                 continue
             if (
                 not math.isfinite(last_seen)
@@ -818,19 +787,14 @@ class CompanionAPIEndpoints:
                 or not math.isfinite(longitude)
                 or not -180.0 <= longitude <= 180.0
             ):
-                logger.warning(
-                    "Skipping repeater advert with invalid timestamp or coordinates"
-                )
+                logger.warning("Skipping repeater advert with invalid timestamp or coordinates")
                 continue
             if cutoff is not None and last_seen < cutoff:
                 continue
             if (
                 not isinstance(raw_public_key, str)
                 or len(raw_public_key) != 64
-                or any(
-                    character not in "0123456789abcdefABCDEF"
-                    for character in raw_public_key
-                )
+                or any(character not in "0123456789abcdefABCDEF" for character in raw_public_key)
             ):
                 logger.warning("Skipping repeater advert with invalid public key")
                 continue
@@ -846,15 +810,10 @@ class CompanionAPIEndpoints:
             except UnicodeEncodeError:
                 logger.warning("Skipping repeater advert with invalid node name")
                 continue
-            if (
-                node_name_size > 31
-                or any(character in node_name for character in "\x00\r\n")
-            ):
+            if node_name_size > 31 or any(character in node_name for character in "\x00\r\n"):
                 logger.warning("Skipping repeater advert with invalid node name")
                 continue
-            candidates.append(
-                (last_seen, public_key, contact_type, node_name, row)
-            )
+            candidates.append((last_seen, public_key, contact_type, node_name, row))
 
         candidates.sort(key=lambda item: (-item[0], item[1]))
 
@@ -900,9 +859,7 @@ class CompanionAPIEndpoints:
                 }
 
             favourites = [
-                contact
-                for contact in merged.values()
-                if int(contact.get("flags", 0)) & 0x01
+                contact for contact in merged.values() if int(contact.get("flags", 0)) & 0x01
             ]
             if len(favourites) > max_contacts:
                 raise cherrypy.HTTPError(
@@ -910,9 +867,7 @@ class CompanionAPIEndpoints:
                     f"Favourite contacts exceed max_contacts={max_contacts}",
                 )
             non_favourites = [
-                contact
-                for contact in merged.values()
-                if not (int(contact.get("flags", 0)) & 0x01)
+                contact for contact in merged.values() if not (int(contact.get("flags", 0)) & 0x01)
             ]
             non_favourites.sort(
                 key=lambda contact: (
@@ -923,10 +878,7 @@ class CompanionAPIEndpoints:
             selected = favourites + non_favourites[: max_contacts - len(favourites)]
             selected.sort(key=lambda contact: contact["pubkey"])
             selected_keys = {contact["pubkey"] for contact in selected}
-            candidate_keys = {
-                public_key
-                for _seen, public_key, _type, _name, _row in candidates
-            }
+            candidate_keys = {public_key for _seen, public_key, _type, _name, _row in candidates}
             imported_keys = candidate_keys & selected_keys
             added = len(imported_keys - before_durable.keys())
             # Preserve the legacy import/trim counters: ``imported`` is the
@@ -971,9 +923,7 @@ class CompanionAPIEndpoints:
                 for contact in selected
             ]
             transients = [
-                contact
-                for contact in before_contacts
-                if contact.adv_type == ADV_TYPE_NONE
+                contact for contact in before_contacts if contact.adv_type == ADV_TYPE_NONE
             ]
             self._replace_contacts(bridge, after_contacts + transients)
             committed_changes = bridge._contact_changes(
@@ -1020,9 +970,7 @@ class CompanionAPIEndpoints:
                         )
                 return items
 
-            return self._success(
-                self._run_async(self._read_bridge_state(bridge_params, _read))
-            )
+            return self._success(self._run_async(self._read_bridge_state(bridge_params, _read)))
         except cherrypy.HTTPError:
             raise
         except Exception as exc:
@@ -1450,9 +1398,7 @@ class CompanionAPIEndpoints:
             )
             if identity_manager:
                 public_key = bridge.get_public_key()
-                for name, identity, _config in identity_manager.get_identities_by_type(
-                    "companion"
-                ):
+                for name, identity, _config in identity_manager.get_identities_by_type("companion"):
                     if identity.get_public_key() == public_key:
                         companion_name = name
                         break
@@ -1582,10 +1528,7 @@ class CompanionAPIEndpoints:
             raise cherrypy.HTTPError(405, "Method not allowed. Use GET.")
 
         stream_user = getattr(cherrypy.request, "user", None)
-        if (
-            not isinstance(stream_user, dict)
-            or not is_admin_scope(stream_user.get("scope"))
-        ):
+        if not isinstance(stream_user, dict) or not is_admin_scope(stream_user.get("scope")):
             raise cherrypy.HTTPError(403, "Admin scope required")
         try:
             authorization = AuthorizationLease.from_request(
@@ -1619,9 +1562,7 @@ class CompanionAPIEndpoints:
                 "Only one legacy event stream per companion is allowed",
             )
         cherrypy.response.headers["Content-Type"] = "text/event-stream"
-        cherrypy.response.headers["Cache-Control"] = (
-            "no-store, no-cache, no-transform"
-        )
+        cherrypy.response.headers["Cache-Control"] = "no-store, no-cache, no-transform"
         cherrypy.response.headers["Connection"] = "keep-alive"
         cherrypy.response.headers["X-Accel-Buffering"] = "no"
         with self._sse_lock:
@@ -1647,9 +1588,7 @@ class CompanionAPIEndpoints:
                         or not _authorization_is_active()
                     ):
                         return
-                    keepalive_deadline = (
-                        time.monotonic() + float(self._sse_keepalive_sec)
-                    )
+                    keepalive_deadline = time.monotonic() + float(self._sse_keepalive_sec)
                     item = None
                     while True:
                         if (
@@ -1657,9 +1596,7 @@ class CompanionAPIEndpoints:
                             or not _authorization_is_active()
                         ):
                             return
-                        keepalive_remaining = (
-                            keepalive_deadline - time.monotonic()
-                        )
+                        keepalive_remaining = keepalive_deadline - time.monotonic()
                         if keepalive_remaining <= 0:
                             break
                         wait_for = authorization.check_in(keepalive_remaining)

@@ -2777,9 +2777,7 @@ class TestEngineTransmissionAndBackgroundLifecycle:
         handler.storage.cleanup_old_data.assert_called_once_with(days=31, companion_events_days=31)
 
     @pytest.mark.asyncio
-    async def test_background_timer_loop_continues_when_db_cleanup_fails(
-        self, handler, caplog
-    ):
+    async def test_background_timer_loop_continues_when_db_cleanup_fails(self, handler, caplog):
         handler.last_noise_measurement = 0
         handler.noise_floor_interval = 999999
         handler.send_advert_interval_hours = 0

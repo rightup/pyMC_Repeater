@@ -201,9 +201,7 @@ def test_legacy_schema_migrates_and_defaults(tmp_path):
     # migration (consumed_at), so its marker must be cleared too -- otherwise
     # that migration thinks it already ran and never restores the column onto
     # the freshly recreated (legacy-shape) table.
-    conn.execute(
-        "DELETE FROM migrations WHERE migration_name = 'add_companion_event_journal'"
-    )
+    conn.execute("DELETE FROM migrations WHERE migration_name = 'add_companion_event_journal'")
     conn.execute("ALTER TABLE companion_messages RENAME TO companion_messages_old")
     conn.execute(
         """

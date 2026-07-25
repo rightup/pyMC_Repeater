@@ -377,11 +377,7 @@ class APIEndpoints:
         manager = getattr(self.daemon_instance, "identity_manager", None)
         get_by_name = getattr(manager, "get_identity_by_name", None)
         registered = get_by_name(name) if callable(get_by_name) else None
-        if (
-            registered is not None
-            and name != exclude_companion
-            and name != exclude_room_server
-        ):
+        if registered is not None and name != exclude_companion and name != exclude_room_server:
             return str(registered[2])
         return None
 
@@ -426,10 +422,7 @@ class APIEndpoints:
 
             if clear_requested:
                 if replacement is not missing and replacement != "":
-                    raise ValueError(
-                        f"{clear_field} cannot be combined with a replacement "
-                        f"{field}"
-                    )
+                    raise ValueError(f"{clear_field} cannot be combined with a replacement {field}")
                 update[field] = ""
 
         merged.update(update)
@@ -503,9 +496,7 @@ class APIEndpoints:
         wire = {
             "name": identity_config.get("name"),
             "type": kind,
-            "settings": self._public_identity_settings(
-                identity_config.get("settings")
-            ),
+            "settings": self._public_identity_settings(identity_config.get("settings")),
             "hash": identity_hash,
             "public_key": public_key,
             "address": address,
@@ -914,7 +905,8 @@ class APIEndpoints:
         if not isinstance(password, str):
             return False
         visible_password = password.strip()
-        return len(visible_password) >= 8 and visible_password != "admin123"
+        # Reject the documented default password.
+        return len(visible_password) >= 8 and visible_password != "admin123"  # nosec B105
 
     @staticmethod
     def _validate_config_import_shape(imported_config: dict) -> Optional[str]:
@@ -928,10 +920,7 @@ class APIEndpoints:
 
         repeater_config = imported_config.get("repeater")
         if isinstance(repeater_config, dict):
-            if (
-                "security" in repeater_config
-                and not isinstance(repeater_config["security"], dict)
-            ):
+            if "security" in repeater_config and not isinstance(repeater_config["security"], dict):
                 return "Configuration field 'repeater.security' must be an object"
             security = repeater_config.get("security", {})
             if (
@@ -944,8 +933,7 @@ class APIEndpoints:
                     validate_new_admin_password(password)
                 except ValueError as exc:
                     return (
-                        "Configuration field "
-                        f"'repeater.security.admin_password' is invalid: {exc}"
+                        f"Configuration field 'repeater.security.admin_password' is invalid: {exc}"
                     )
 
         identities = imported_config.get("identities")
@@ -957,9 +945,7 @@ class APIEndpoints:
                 if not isinstance(entries, list):
                     return f"Configuration field 'identities.{collection}' must be an array"
                 if any(not isinstance(entry, dict) for entry in entries):
-                    return (
-                        f"Every entry in 'identities.{collection}' must be an object"
-                    )
+                    return f"Every entry in 'identities.{collection}' must be an object"
         return None
 
     @staticmethod
@@ -974,9 +960,7 @@ class APIEndpoints:
             return "Configuration field 'repeater.security' must be an object"
 
         try:
-            validate_jwt_expiry_minutes(
-                security.get("jwt_expiry_minutes", 60)
-            )
+            validate_jwt_expiry_minutes(security.get("jwt_expiry_minutes", 60))
             jwt_secret = security.get("jwt_secret")
             # Null and empty string are the two historical auto-generation
             # sentinels. Every explicit value must already be safe to start.
@@ -1021,7 +1005,8 @@ class APIEndpoints:
             cors_origins = ()
         return (
             http_config.get("enabled", True),
-            http_config.get("host", "0.0.0.0"),
+            # This is an operator-configurable service listener default.
+            http_config.get("host", "0.0.0.0"),  # nosec B104
             http_config.get("port", 8000),
             web_config.get("cors_enabled", False),
             cors_origins,
@@ -1865,9 +1850,7 @@ class APIEndpoints:
                 return {"success": False, "error": "Radio preset selection is required"}
 
             try:
-                admin_password = validate_new_admin_password(
-                    data.get("admin_password")
-                )
+                admin_password = validate_new_admin_password(data.get("admin_password"))
             except ValueError as exc:
                 return self._error(exc)
 
@@ -5223,19 +5206,14 @@ class APIEndpoints:
             if tag in pending:
                 continue
             try:
-                conflict = bool(
-                    callable(frame_has_owner)
-                    and frame_has_owner("trace", tag)
-                )
+                conflict = bool(callable(frame_has_owner) and frame_has_owner("trace", tag))
             except Exception as exc:
                 logger.error(
                     "Could not verify trace response tag ownership: %s",
                     exc,
                     exc_info=True,
                 )
-                raise RuntimeError(
-                    "Could not verify trace response tag ownership"
-                ) from exc
+                raise RuntimeError("Could not verify trace response tag ownership") from exc
             companion_has_owner = getattr(
                 self.daemon_instance,
                 "_companion_has_trace_owner",
@@ -5243,8 +5221,7 @@ class APIEndpoints:
             )
             try:
                 companion_conflict = bool(
-                    callable(companion_has_owner)
-                    and companion_has_owner(tag)
+                    callable(companion_has_owner) and companion_has_owner(tag)
                 )
             except Exception as exc:
                 logger.error(
@@ -5252,9 +5229,7 @@ class APIEndpoints:
                     exc,
                     exc_info=True,
                 )
-                raise RuntimeError(
-                    "Could not verify Companion API trace tag ownership"
-                ) from exc
+                raise RuntimeError("Could not verify Companion API trace tag ownership") from exc
             if not conflict and not companion_conflict:
                 return tag
         logger.error(
@@ -5877,12 +5852,8 @@ class APIEndpoints:
                 if identity_key:
                     try:
                         identity_key = normalize_companion_identity_key(identity_key)
-                        if (
-                            len(identity_key) not in (64, 128)
-                            or any(
-                                character not in "0123456789abcdefABCDEF"
-                                for character in identity_key
-                            )
+                        if len(identity_key) not in (64, 128) or any(
+                            character not in "0123456789abcdefABCDEF" for character in identity_key
                         ):
                             raise ValueError("identity_key is not exact hexadecimal")
                         key_bytes = bytes.fromhex(identity_key)
@@ -5901,8 +5872,7 @@ class APIEndpoints:
                 conflict_owner = self._local_identity_name_conflict(name)
                 if conflict_owner is not None:
                     return self._error(
-                        f"Companion name '{name}' conflicts with existing "
-                        f"{conflict_owner} identity"
+                        f"Companion name '{name}' conflicts with existing {conflict_owner} identity"
                     )
 
                 manager = getattr(self.daemon_instance, "identity_manager", None)
@@ -5971,19 +5941,14 @@ class APIEndpoints:
                 conflict_owner = self._local_identity_name_conflict(name)
                 if conflict_owner is not None:
                     return self._error(
-                        f"Identity name '{name}' conflicts with existing "
-                        f"{conflict_owner} identity"
+                        f"Identity name '{name}' conflicts with existing {conflict_owner} identity"
                     )
                 try:
                     room_key_bytes = bytes.fromhex(str(identity_key))
                 except ValueError:
-                    return self._bad_request(
-                        "identity_key must be a valid hexadecimal string"
-                    )
+                    return self._bad_request("identity_key must be a valid hexadecimal string")
                 if len(room_key_bytes) not in (32, 64):
-                    return self._bad_request(
-                        "identity_key must be 32 or 64 bytes"
-                    )
+                    return self._bad_request("identity_key must be 32 or 64 bytes")
                 manager = getattr(self.daemon_instance, "identity_manager", None)
                 registration_error = getattr(manager, "registration_error", None)
                 if callable(registration_error):
@@ -6007,10 +5972,7 @@ class APIEndpoints:
             # Frame name changes share this same lock and therefore cannot be
             # overwritten by a stale create snapshot.
             with self.config_manager.mutation():
-                current_collection = (
-                    (self.config.get("identities") or {}).get(collection_key)
-                    or []
-                )
+                current_collection = (self.config.get("identities") or {}).get(collection_key) or []
                 if current_collection != original_collection:
                     cherrypy.response.status = 409
                     return self._error(
@@ -6018,9 +5980,7 @@ class APIEndpoints:
                         "retry with the current settings"
                     )
                 committed_collection = [*current_collection, new_identity]
-                self.config.setdefault("identities", {})[
-                    collection_key
-                ] = committed_collection
+                self.config.setdefault("identities", {})[collection_key] = committed_collection
                 saved = self.config_manager.save_to_file()
                 if not saved:
                     self.config["identities"][collection_key] = current_collection
@@ -6134,8 +6094,7 @@ class APIEndpoints:
                             )
                         else:
                             logger.info(
-                                "Background activation for companion '%s' "
-                                "completed",
+                                "Background activation for companion '%s' completed",
                                 companion_name,
                             )
 
@@ -6270,9 +6229,7 @@ class APIEndpoints:
 
                 if "new_name" in data:
                     try:
-                        new_name = validate_companion_registration_name(
-                            data["new_name"]
-                        )
+                        new_name = validate_companion_registration_name(data["new_name"])
                     except ValueError as e:
                         return self._bad_request(str(e))
                     conflict_owner = self._local_identity_name_conflict(
@@ -6342,9 +6299,7 @@ class APIEndpoints:
                                     e.companion_hash,
                                 )
                             else:
-                                contacts = sqlite_handler.companion_load_contacts(
-                                    e.companion_hash
-                                )
+                                contacts = sqlite_handler.companion_load_contacts(e.companion_hash)
                                 if contacts is None:
                                     raise CompanionStorageError(
                                         "Persisted contacts could not be loaded"
@@ -6378,18 +6333,14 @@ class APIEndpoints:
                         return self._bad_request(str(e))
 
                 with self.config_manager.mutation():
-                    current_companions = (
-                        (self.config.get("identities") or {}).get("companions")
-                        or []
-                    )
+                    current_companions = (self.config.get("identities") or {}).get(
+                        "companions"
+                    ) or []
                     current_index, current_error = find_companion_index(
                         current_companions,
                         name=resolved_name,
                     )
-                    if (
-                        current_error
-                        or current_companions[current_index] != original_identity
-                    ):
+                    if current_error or current_companions[current_index] != original_identity:
                         cherrypy.response.status = 409
                         return self._error(
                             "Companion configuration changed during this request; "
@@ -6470,13 +6421,9 @@ class APIEndpoints:
                 try:
                     key_bytes = bytes.fromhex(new_key)
                 except ValueError:
-                    return self._bad_request(
-                        "identity_key must be a valid hexadecimal string"
-                    )
+                    return self._bad_request("identity_key must be a valid hexadecimal string")
                 if len(key_bytes) not in (32, 64):
-                    return self._bad_request(
-                        "identity_key must be 32 or 64 bytes"
-                    )
+                    return self._bad_request("identity_key must be 32 or 64 bytes")
                 identity["identity_key"] = new_key
                 logger.info("Updated identity key for '%s'", name_s)
 
@@ -6636,10 +6583,9 @@ class APIEndpoints:
                 deleted_identity_key = deleted_identity.get("identity_key")
                 original_companions = copy.deepcopy(companions)
                 with self.config_manager.mutation():
-                    current_companions = (
-                        (self.config.get("identities") or {}).get("companions")
-                        or []
-                    )
+                    current_companions = (self.config.get("identities") or {}).get(
+                        "companions"
+                    ) or []
                     if current_companions != original_companions:
                         cherrypy.response.status = 409
                         return self._error(
@@ -6651,9 +6597,7 @@ class APIEndpoints:
                     self.config["identities"]["companions"] = committed_companions
                     saved = self.config_manager.save_to_file()
                     if not saved:
-                        self.config["identities"][
-                            "companions"
-                        ] = current_companions
+                        self.config["identities"]["companions"] = current_companions
                         return self._error("Failed to save configuration to file")
                 logger.info(f"Deleted companion: {resolved_name}")
                 unregister_success = False
@@ -6696,8 +6640,7 @@ class APIEndpoints:
                             else:
                                 log = logger.info if completed else logger.warning
                                 log(
-                                    "Background deactivation for companion '%s' "
-                                    "%s",
+                                    "Background deactivation for companion '%s' %s",
                                     companion_name,
                                     (
                                         "completed"
@@ -8149,8 +8092,7 @@ class APIEndpoints:
             # Authenticated users may import config at any time.
             request_headers = getattr(cherrypy.request, "headers", {})
             has_credentials = bool(
-                request_headers.get("Authorization")
-                or request_headers.get("X-API-Key")
+                request_headers.get("Authorization") or request_headers.get("X-API-Key")
             )
             current_config = self.config
             if self._config_path:
@@ -8159,8 +8101,7 @@ class APIEndpoints:
                         current_config = yaml.safe_load(f) or {}
                 except Exception as exc:
                     logger.warning(
-                        "config_import could not verify persisted bootstrap state "
-                        "%s: %s",
+                        "config_import could not verify persisted bootstrap state %s: %s",
                         self._config_path,
                         exc,
                     )
@@ -8224,19 +8165,16 @@ class APIEndpoints:
                     503,
                     "Persisted configuration root must be an object",
                 )
-            if (
-                not self._public_bootstrap_allowed(locked_config)
-                and not admin_authenticated
-            ):
+            if not self._public_bootstrap_allowed(locked_config) and not admin_authenticated:
                 self._require_admin_on_public_route()
                 admin_authenticated = True
 
             working_config = copy.deepcopy(locked_config)
-            previous_restart_sensitive_config = (
-                self._restart_sensitive_repeater_config(working_config)
+            previous_restart_sensitive_config = self._restart_sensitive_repeater_config(
+                working_config
             )
-            previous_restart_sensitive_http_config = (
-                self._restart_sensitive_http_config(working_config)
+            previous_restart_sensitive_http_config = self._restart_sensitive_http_config(
+                working_config
             )
 
             # Sections we allow to be imported
@@ -8278,11 +8216,7 @@ class APIEndpoints:
                     sec = value.get("security", {})
                     if isinstance(sec, dict):
                         cur_sec = working_config.get("repeater", {}).get("security", {})
-                        merged_sec = (
-                            copy.deepcopy(cur_sec)
-                            if isinstance(cur_sec, dict)
-                            else {}
-                        )
+                        merged_sec = copy.deepcopy(cur_sec) if isinstance(cur_sec, dict) else {}
                         for field in ("admin_password", "guest_password", "jwt_secret"):
                             if sec.get(field) == "*** REDACTED ***":
                                 sec.pop(field)
@@ -8304,10 +8238,7 @@ class APIEndpoints:
                     # Preserve identity keys that are redacted
                     for id_section in ("room_servers", "companions"):
                         entries = value.get(id_section, []) or []
-                        cur_entries = (
-                            working_config.get("identities", {}).get(id_section, [])
-                            or []
-                        )
+                        cur_entries = working_config.get("identities", {}).get(id_section, []) or []
                         cur_by_name = {e.get("name"): e for e in cur_entries}
                         for entry in entries:
                             if entry.get("identity_key") == "*** REDACTED ***":
@@ -8339,9 +8270,7 @@ class APIEndpoints:
                 else:
                     if section not in working_config:
                         working_config[section] = {}
-                    if isinstance(value, dict) and isinstance(
-                        working_config[section], dict
-                    ):
+                    if isinstance(value, dict) and isinstance(working_config[section], dict):
                         working_config[section].update(value)
                     else:
                         working_config[section] = value
@@ -8357,21 +8286,15 @@ class APIEndpoints:
                 working_config["repeater"] = repeater_config
             elif not isinstance(repeater_config, dict):
                 return self._error("Configuration section 'repeater' must be an object")
-            if (
-                "security" in repeater_config
-                and not isinstance(repeater_config["security"], dict)
-            ):
-                return self._error(
-                    "Configuration field 'repeater.security' must be an object"
-                )
+            if "security" in repeater_config and not isinstance(repeater_config["security"], dict):
+                return self._error("Configuration field 'repeater.security' must be an object")
 
             # A credentialless restore is another way to complete first-run
             # setup, so it must establish the same usable security boundary as
             # the wizard. Redacted, empty, and public-default passwords cannot
             # permanently close bootstrap.
-            if (
-                not admin_authenticated
-                and not self._config_has_bootstrap_admin_password(working_config)
+            if not admin_authenticated and not self._config_has_bootstrap_admin_password(
+                working_config
             ):
                 return self._error(
                     "Unauthenticated first-run import requires a non-default "
@@ -8381,23 +8304,17 @@ class APIEndpoints:
             auth_config_error = self._validate_auth_startup_config(working_config)
             if auth_config_error is not None:
                 return self._error(auth_config_error)
-            current_restart_sensitive_config = (
-                self._restart_sensitive_repeater_config(working_config)
+            current_restart_sensitive_config = self._restart_sensitive_repeater_config(
+                working_config
             )
             if current_restart_sensitive_config != previous_restart_sensitive_config:
                 restart_required = True
-            current_restart_sensitive_http_config = (
-                self._restart_sensitive_http_config(working_config)
+            current_restart_sensitive_http_config = self._restart_sensitive_http_config(
+                working_config
             )
-            if (
-                current_restart_sensitive_http_config
-                != previous_restart_sensitive_http_config
-            ):
+            if current_restart_sensitive_http_config != previous_restart_sensitive_http_config:
                 restart_required = True
-            if (
-                current_restart_sensitive_config[1]
-                != previous_restart_sensitive_config[1]
-            ):
+            if current_restart_sensitive_config[1] != previous_restart_sensitive_config[1]:
                 logger.warning(
                     "Config import changed the JWT signing secret; restart "
                     "will invalidate current JWT sessions and stored API tokens"
@@ -8409,8 +8326,7 @@ class APIEndpoints:
 
             try:
                 validate_companion_listener_config(
-                    working_config.get("identities", {}).get("companions", [])
-                    or [],
+                    working_config.get("identities", {}).get("companions", []) or [],
                     working_config.get("http", {}),
                 )
             except (AttributeError, TypeError, ValueError) as exc:
@@ -8425,9 +8341,7 @@ class APIEndpoints:
             # Persist and live-reload
             try:
                 live_update_sections = [
-                    section
-                    for section in updated_sections
-                    if section != "http"
+                    section for section in updated_sections if section != "http"
                 ]
                 persistence = self.config_manager.update_and_save(
                     updates={},  # Already applied above
@@ -8437,11 +8351,7 @@ class APIEndpoints:
                     live_update=bool(live_update_sections),
                     live_update_sections=live_update_sections,
                 )
-                saved = (
-                    persistence.get("saved")
-                    if isinstance(persistence, dict)
-                    else None
-                )
+                saved = persistence.get("saved") if isinstance(persistence, dict) else None
                 # Compatibility for older/custom ConfigManager implementations
                 # that predate the structured ``saved`` result.
                 if saved is None:
@@ -8452,9 +8362,7 @@ class APIEndpoints:
             if saved is not True:
                 self._replace_live_config(previous_live_config)
                 cherrypy.response.status = 503
-                return self._error(
-                    "Configuration could not be persisted; no changes were applied"
-                )
+                return self._error("Configuration could not be persisted; no changes were applied")
 
             return {
                 "success": True,
@@ -8697,9 +8605,7 @@ class APIEndpoints:
                 # transaction as its delete. Report the durable winner; a
                 # second rotation here would add a crash window and needless
                 # client reset.
-                journal_epoch = (
-                    storage.sqlite_handler.companion_journal_epoch_strict()
-                )
+                journal_epoch = storage.sqlite_handler.companion_journal_epoch_strict()
                 response["journal_epoch"] = journal_epoch
                 logger.info(
                     "Companion journal epoch after companion state purge: %s",

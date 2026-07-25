@@ -145,9 +145,7 @@ class PushListener:
     def wait_for_push(self, count: int = 1, timeout: float = 5.0) -> bool:
         """Block until at least ``count`` pushes have arrived."""
         if type(count) is not int or not 1 <= count <= MAX_CAPTURED_PUSHES:
-            raise ValueError(
-                f"count must be an integer between 1 and {MAX_CAPTURED_PUSHES}"
-            )
+            raise ValueError(f"count must be an integer between 1 and {MAX_CAPTURED_PUSHES}")
         deadline = time.monotonic() + timeout
         with self._condition:
             while len(self.pushes) < count:

@@ -138,10 +138,7 @@ def test_wizard_pymc_usb_defaults(wizard_env):
     written = _read_yaml(config_path)
     assert written["repeater"]["setup_complete"] is True
     assert endpoints.config["repeater"]["setup_complete"] is True
-    assert (
-        endpoints.config["repeater"]["security"]["admin_password"]
-        == "supersecret"
-    )
+    assert endpoints.config["repeater"]["security"]["admin_password"] == "supersecret"
     assert written["radio_type"] == "pymc_usb"
     assert written["pymc_usb"]["port"] == "/dev/ttyACM0"
     assert written["pymc_usb"]["baudrate"] == 921600
@@ -290,9 +287,7 @@ def test_wizard_and_config_import_share_one_bootstrap_gate(
             return dict(_BASE_REQUEST, hardware_key="kiss")
         return {
             "config": {
-                "repeater": {
-                    "security": {"admin_password": "restored-password"}
-                },
+                "repeater": {"security": {"admin_password": "restored-password"}},
                 "web": {"site_name": "restored"},
             }
         }
@@ -423,10 +418,7 @@ def test_wizard_accepts_admin_password_at_utf8_wire_limit(wizard_env):
     result = _endpoints.setup_wizard()
 
     assert result["success"] is True
-    assert (
-        _read_yaml(config_path)["repeater"]["security"]["admin_password"]
-        == password
-    )
+    assert _read_yaml(config_path)["repeater"]["security"]["admin_password"] == password
 
 
 @pytest.mark.parametrize(

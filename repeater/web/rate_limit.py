@@ -198,9 +198,7 @@ def sse_stream_settings(config: dict) -> Tuple[int, int]:
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
             raise ValueError(f"http.{name} must be a positive integer")
         if value > maximum:
-            raise ValueError(
-                f"http.{name} must be no greater than {maximum}"
-            )
+            raise ValueError(f"http.{name} must be no greater than {maximum}")
         return max(minimum, value)
 
     return (
@@ -222,9 +220,7 @@ def validate_sse_connection_capacity(config: dict, sse_max_connections: int) -> 
             int(http_config.get("thread_pool_max", 16)),
         )
     except (TypeError, ValueError, OverflowError):
-        raise ValueError(
-            "http.thread_pool and http.thread_pool_max must be integers"
-        ) from None
+        raise ValueError("http.thread_pool and http.thread_pool_max must be integers") from None
     maximum_streams = thread_pool_max - 2
     if sse_max_connections > maximum_streams:
         raise ValueError(

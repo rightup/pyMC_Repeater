@@ -325,9 +325,7 @@ def test_web_contact_and_prefs_events_update_resync_state():
         }
     )
 
-    assert session.contacts == [
-        {"public_key": "bb" * 32, "name": "Bob"}
-    ]
+    assert session.contacts == [{"public_key": "bb" * 32, "name": "Bob"}]
     assert session.self_info["node_name"] == "new"
     assert session.self_info["path_hash_mode"] == 2
     queued = []
@@ -345,9 +343,7 @@ def test_web_channel_update_keeps_one_entry_per_index():
         {"index": 3, "name": "#stale-duplicate"},
     ]
 
-    session._apply_channel_change(
-        {"index": 3, "name": "#new", "change": "update"}
-    )
+    session._apply_channel_change({"index": 3, "name": "#new", "change": "update"})
 
     assert session.channels == [{"index": 3, "name": "#new"}]
 
@@ -436,11 +432,15 @@ async def test_web_http_routes_bind_a_send_to_server_and_identity():
             headers={"Content-Type": "application/json"},
         )
         assert deeply_nested.status == 400
-        wrong_scheme_origin = str(browser.make_url("/")).replace(
-            "http://",
-            "https://",
-            1,
-        ).rstrip("/")
+        wrong_scheme_origin = (
+            str(browser.make_url("/"))
+            .replace(
+                "http://",
+                "https://",
+                1,
+            )
+            .rstrip("/")
+        )
         wrong_scheme = await browser.get(
             "/api/state",
             headers={"Origin": wrong_scheme_origin},
@@ -526,7 +526,7 @@ def test_web_index_separates_safety_and_transient_status_and_bounds_push_dom():
 
     assert 'id="pendingStatus"' in source
     assert 'id="connectionStatus"' in source
-    assert "stream.onopen = () => showConnectionStatus(\"\")" in source
+    assert 'stream.onopen = () => showConnectionStatus("")' in source
     assert "try {\n      evt = JSON.parse(e.data);" in source
     assert "const MAX_RENDERED_PUSHES = 256;" in source
     assert "pushesEl.children.length > MAX_RENDERED_PUSHES" in source

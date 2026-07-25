@@ -130,9 +130,7 @@ def test_name_repeater_is_reserved_by_the_default_identity(cherrypy_ctx):
     room_entry = data["configured"][0]
     assert room_entry["registered"] is False
     configured_identity = LocalIdentity(seed=bytes.fromhex("aa" * 32))
-    assert room_entry["hash"] == (
-        f"0x{configured_identity.get_public_key()[0]:02x}"
-    )
+    assert room_entry["hash"] == (f"0x{configured_identity.get_public_key()[0]:02x}")
     assert room_entry["public_key"] == configured_identity.get_public_key().hex()
     assert room_entry["public_key"] != repeater_id.get_public_key().hex()
 
@@ -167,9 +165,7 @@ def test_same_type_runtime_mismatch_stays_separate_from_config(cherrypy_ctx):
 
     for entry in (listed, fetched):
         assert entry["public_key"] == configured_identity.get_public_key().hex()
-        assert entry["hash"] == (
-            f"0x{configured_identity.get_public_key()[0]:02x}"
-        )
+        assert entry["hash"] == (f"0x{configured_identity.get_public_key()[0]:02x}")
         assert entry["registered"] is False
         assert entry["runtime"]["public_key"] == runtime_identity.get_public_key().hex()
         assert entry["runtime"]["type"] == "companion"
@@ -312,9 +308,7 @@ def test_room_password_update_and_explicit_clear_are_unambiguous(cherrypy_ctx):
     rejected = api.update_identity()
     assert rejected["success"] is False
     assert response.status == 400
-    assert config["identities"]["room_servers"][0]["settings"]["admin_password"] == (
-        "replacement"
-    )
+    assert config["identities"]["room_servers"][0]["settings"]["admin_password"] == ("replacement")
 
 
 @pytest.mark.parametrize(

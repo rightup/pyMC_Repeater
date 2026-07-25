@@ -60,6 +60,7 @@ def test_mobile_v1_dynamic_routes_and_methods_are_collected_exactly():
         "/v1/companions/{}/contacts/{}/status_request": {"POST"},
         "/v1/companions/{}/contacts/{}/telemetry_request": {"POST"},
         "/v1/companions/{}/contacts/{}/reset_path": {"POST"},
+        "/v1/companions/{}/contacts/{}/ping": {"POST"},
         "/v1/companions/{}/messages/{}/receptions": {"GET"},
         "/v1/companions/{}/contacts/{}/paths": {"GET"},
         "/v1/companions/{}/transmissions/{}/repeats": {"GET"},

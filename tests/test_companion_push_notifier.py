@@ -218,9 +218,17 @@ def _handler(tmp_path):
     return SQLiteHandler(tmp_path)
 
 
-def _device(handler, device_id="dev-1", token_hash="h1", push_token="apns-1",
-            relay="https://relay.example/notify", detail="none",
-            mention_push=None, mention_keywords=None, platform="ios"):
+def _device(
+    handler,
+    device_id="dev-1",
+    token_hash="h1",
+    push_token="apns-1",
+    relay="https://relay.example/notify",
+    detail="none",
+    mention_push=None,
+    mention_keywords=None,
+    platform="ios",
+):
     token_id = handler.create_api_token("t", token_hash, scope="companion:x")
     handler.companion_device_create(
         _HASH,
@@ -232,8 +240,12 @@ def _device(handler, device_id="dev-1", token_hash="h1", push_token="apns-1",
     )
     if push_token is not None:
         handler.companion_device_set_push(
-            device_id, push_token, push_relay_url=relay, push_detail=detail,
-            mention_push=mention_push, mention_keywords=mention_keywords,
+            device_id,
+            push_token,
+            push_relay_url=relay,
+            push_detail=detail,
+            mention_push=mention_push,
+            mention_keywords=mention_keywords,
         )
     return device_id
 
@@ -485,17 +497,17 @@ def test_burst_within_interval_collapses_to_one_push(tmp_path):
     n = _notifier(h, poster, clock)
 
     _emit(n, _message_event(1))
-    _drive_once(n)                       # first send at t=0
+    _drive_once(n)  # first send at t=0
     assert len(poster.calls) == 1
 
-    clock.advance(5)                     # still within min_interval
+    clock.advance(5)  # still within min_interval
     _emit(n, _message_event(2))
-    due, next_delay = _drive_once(n)     # not due yet
+    due, next_delay = _drive_once(n)  # not due yet
     assert len(poster.calls) == 1
     assert next_delay is not None and next_delay > 0
 
-    clock.advance(30)                    # past the interval
-    _drive_once(n)                       # the trailing event now sends
+    clock.advance(30)  # past the interval
+    _drive_once(n)  # the trailing event now sends
     assert len(poster.calls) == 2
 
 
@@ -513,7 +525,7 @@ def test_count_detail_accumulates_across_debounced_events(tmp_path):
     clock.advance(5)
     _emit(n, _message_event(2))
     _emit(n, _message_event(3))
-    _drive_once(n)                        # queued, not sent
+    _drive_once(n)  # queued, not sent
     clock.advance(30)
     _drive_once(n)
     assert poster.calls[1]["payload"]["badge_hint"] == 2

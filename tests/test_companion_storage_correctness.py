@@ -49,9 +49,7 @@ def test_correctness_migration_is_idempotent(tmp_path):
         WHERE migration_name = 'companion_api_correctness_primitives'
         """
     ).fetchone()[0]
-    message_columns = {
-        row[1] for row in conn.execute("PRAGMA table_info(companion_messages)")
-    }
+    message_columns = {row[1] for row in conn.execute("PRAGMA table_info(companion_messages)")}
     idempotency_columns = {
         row[1] for row in conn.execute("PRAGMA table_info(companion_idempotency)")
     }
@@ -174,9 +172,7 @@ def test_contact_unique_migration_keeps_newest_legacy_duplicate(tmp_path):
 
     upgraded = _handler(tmp_path)
     contacts = upgraded.companion_load_contacts_strict(_HASH)
-    assert [(row["pubkey"], row["name"]) for row in contacts] == [
-        (contact_key, "newer")
-    ]
+    assert [(row["pubkey"], row["name"]) for row in contacts] == [(contact_key, "newer")]
 
 
 def test_missing_legacy_marker_never_restores_global_outbound_dedup(tmp_path):
@@ -246,9 +242,7 @@ def test_namespace_binding_is_durable_idempotent_and_never_purges_history(tmp_pa
     # Refusal is read-only: the original owner and its data remain intact.
     assert restarted.companion_namespace_binding(_HASH) == identity_a
     rows = restarted.companion_load_contacts_strict(_HASH)
-    assert [(row["pubkey"], row["name"]) for row in rows] == [
-        (contact["pubkey"], contact["name"])
-    ]
+    assert [(row["pubkey"], row["name"]) for row in rows] == [(contact["pubkey"], contact["name"])]
 
 
 def test_namespace_migration_is_idempotent(tmp_path):
@@ -263,12 +257,7 @@ def test_namespace_migration_is_idempotent(tmp_path):
             'bind_companion_namespaces_to_public_identities'
         """
     ).fetchone()[0]
-    columns = {
-        row[1]
-        for row in conn.execute(
-            "PRAGMA table_info(companion_namespace_bindings)"
-        )
-    }
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(companion_namespace_bindings)")}
     conn.close()
 
     assert applied == 1
@@ -313,11 +302,14 @@ def test_namespace_migration_never_guesses_from_a_paired_device(tmp_path):
     ):
         upgraded.companion_bind_namespace(_HASH, identity_a)
 
-    assert upgraded.companion_bind_namespace(
-        _HASH,
-        identity_a,
-        adopt_legacy_namespace=True,
-    ) == identity_a
+    assert (
+        upgraded.companion_bind_namespace(
+            _HASH,
+            identity_a,
+            adopt_legacy_namespace=True,
+        )
+        == identity_a
+    )
     with pytest.raises(CompanionNamespaceCollisionError):
         upgraded.companion_bind_namespace(
             _HASH,
@@ -409,11 +401,14 @@ def test_every_legacy_namespace_table_requires_explicit_adoption(tmp_path, table
     ):
         handler.companion_bind_namespace(_HASH, identity)
     assert handler.companion_namespace_binding(_HASH) is None
-    assert handler.companion_bind_namespace(
-        _HASH,
-        identity,
-        adopt_legacy_namespace=True,
-    ) == identity
+    assert (
+        handler.companion_bind_namespace(
+            _HASH,
+            identity,
+            adopt_legacy_namespace=True,
+        )
+        == identity
+    )
 
 
 def test_migration_failures_surface_as_storage_errors():
@@ -485,9 +480,7 @@ def test_startup_repairs_live_message_schema_before_send_recovery(tmp_path):
 
     recovered = _handler(tmp_path)
     conn = sqlite3.connect(recovered.sqlite_path)
-    columns = {
-        row[1] for row in conn.execute("PRAGMA table_info(companion_messages)")
-    }
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(companion_messages)")}
     applied = conn.execute(
         """
         SELECT COUNT(*) FROM migrations
@@ -530,9 +523,7 @@ def test_strict_mobile_storage_distinguishes_failure_from_empty(tmp_path, monkey
     with pytest.raises(CompanionStorageError):
         handler.companion_message_get_by_id_strict(_HASH, 1)
     with pytest.raises(CompanionStorageError):
-        handler.companion_messages_by_sender_strict(
-            _HASH, b"\x11" * 32, 0.0, 1.0
-        )
+        handler.companion_messages_by_sender_strict(_HASH, b"\x11" * 32, 0.0, 1.0)
     with pytest.raises(CompanionStorageError):
         handler.packets_receptions_strict("0123456789ABCDEF", 0.0, 1.0)
     with pytest.raises(CompanionStorageError):
@@ -553,9 +544,7 @@ def test_strict_mobile_storage_distinguishes_failure_from_empty(tmp_path, monkey
     assert handler.companion_device_list() == []
     assert handler.companion_load_contacts(_HASH) is None
     assert handler.companion_message_get_by_id(_HASH, 1) is None
-    assert handler.companion_messages_by_sender(
-        _HASH, b"\x11" * 32, 0.0, 1.0
-    ) == []
+    assert handler.companion_messages_by_sender(_HASH, b"\x11" * 32, 0.0, 1.0) == []
     assert handler.packets_receptions("0123456789ABCDEF", 0.0, 1.0) == []
     assert handler.packets_transmissions("0123456789ABCDEF", 0.0, 1.0) == []
     assert handler.packets_heard_repeats("0123456789ABCDEF", 0.0, 1.0) == []
@@ -609,21 +598,15 @@ def test_contact_diff_and_events_rollback_as_one_transaction(tmp_path):
 def test_prune_floor_is_scoped_to_companion(tmp_path):
     handler = _handler(tmp_path)
     old = time.time() - 40 * 86400
-    busy_old = handler.companion_append_event(
-        _HASH, "message", {"old": True}, created_at=old
-    )
-    quiet_head = handler.companion_append_event(
-        _OTHER_HASH, "message", {"fresh": True}
-    )
+    busy_old = handler.companion_append_event(_HASH, "message", {"old": True}, created_at=old)
+    quiet_head = handler.companion_append_event(_OTHER_HASH, "message", {"fresh": True})
 
     assert handler.companion_prune_events(31) == 1
     assert handler.companion_journal_floor(_HASH) == busy_old
     assert handler.companion_journal_floor(_OTHER_HASH) == 0
 
     quiet_state = handler.companion_sync_state(_OTHER_HASH)
-    status = handler.companion_cursor_status(
-        _OTHER_HASH, quiet_state["epoch"], quiet_head
-    )
+    status = handler.companion_cursor_status(_OTHER_HASH, quiet_state["epoch"], quiet_head)
     assert status["valid"] is True
 
 
@@ -698,13 +681,10 @@ def test_cursor_rejects_epoch_mismatch_and_future_sequence(tmp_path):
     )
 
     assert (
-        handler.companion_cursor_status(_HASH, "wrong", state["head"])["reason"]
-        == "epoch_mismatch"
+        handler.companion_cursor_status(_HASH, "wrong", state["head"])["reason"] == "epoch_mismatch"
     )
     assert (
-        handler.companion_cursor_status(
-            _HASH, state["epoch"], state["head"] + 1
-        )["reason"]
+        handler.companion_cursor_status(_HASH, state["epoch"], state["head"] + 1)["reason"]
         == "future_cursor"
     )
 
@@ -721,9 +701,7 @@ def test_sync_page_validates_and_pages_in_one_storage_snapshot(tmp_path):
     assert [event["payload"]["number"] for event in first["events"]] == [0, 1]
     assert handler.companion_cursor_decode(first["next_cursor"])[1] == first["next_seq"]
 
-    second = handler.companion_sync_page(
-        _HASH, state["epoch"], first["next_seq"], limit=2
-    )
+    second = handler.companion_sync_page(_HASH, state["epoch"], first["next_seq"], limit=2)
     assert second["valid"] is True
     assert second["has_more"] is False
     assert [event["payload"]["number"] for event in second["events"]] == [2]
@@ -838,18 +816,9 @@ def test_idempotency_response_json_rejects_ambiguous_or_nonstandard_objects(
             '{"message_id":9223372036854775808,'
             '"sent":true,"state":"transmitted"}}'
         ),
-        (
-            '{"success":true,"data":'
-            '{"message_id":1,"sent":true,"state":"failed"}}'
-        ),
-        (
-            '{"success":true,"data":'
-            '{"message_id":1,"sent":false,"state":"failed"}}'
-        ),
-        (
-            '{"success":true,"data":'
-            '{"message_id":1,"sent":false,"state":"failed","reason":""}}'
-        ),
+        ('{"success":true,"data":{"message_id":1,"sent":true,"state":"failed"}}'),
+        ('{"success":true,"data":{"message_id":1,"sent":false,"state":"failed"}}'),
+        ('{"success":true,"data":{"message_id":1,"sent":false,"state":"failed","reason":""}}'),
         (
             '{"success":true,"data":'
             '{"message_id":1,"sent":true,"state":"transmitted",'
@@ -993,9 +962,7 @@ def test_non_finite_message_state_never_reaches_history_or_journal(tmp_path):
         pytest.param("pending_for_frame", 2, id="non-boolean-frame-state"),
     ],
 )
-def test_strict_message_history_fails_closed_on_corrupt_row(
-    tmp_path, column, value
-):
+def test_strict_message_history_fails_closed_on_corrupt_row(tmp_path, column, value):
     handler = _handler(tmp_path)
     stored = handler.companion_store_inbound_message(
         _HASH,
@@ -1023,9 +990,7 @@ def test_legacy_message_history_keeps_permissive_frame_contract(tmp_path):
         },
     )
 
-    assert handler.companion_get_messages(_HASH)[0]["packet_hash"] == (
-        "legacy-placeholder"
-    )
+    assert handler.companion_get_messages(_HASH)[0]["packet_hash"] == ("legacy-placeholder")
     with pytest.raises(CompanionStorageError):
         handler.companion_get_messages_strict(_HASH)
 
@@ -1071,10 +1036,13 @@ def test_strict_message_ownership_reads_validate_complete_rows(tmp_path):
         )
 
     # The old wrappers keep their non-raising compatibility contract.
-    assert handler.companion_message_get_by_id(
-        _HASH,
-        inbound["message_id"],
-    )["is_channel"] is True
+    assert (
+        handler.companion_message_get_by_id(
+            _HASH,
+            inbound["message_id"],
+        )["is_channel"]
+        is True
+    )
 
 
 def test_non_finite_auth_timestamps_fail_strict_device_reads(tmp_path):
@@ -1111,9 +1079,9 @@ def test_concurrent_idempotency_reservation_has_one_winner(tmp_path):
     handler = _handler(tmp_path)
 
     def reserve():
-        return handler.companion_idempotency_reserve(
-            "device", "phone", "same-key", "same-request"
-        )["result"]
+        return handler.companion_idempotency_reserve("device", "phone", "same-key", "same-request")[
+            "result"
+        ]
 
     with ThreadPoolExecutor(max_workers=8) as pool:
         results = list(pool.map(lambda _: reserve(), range(16)))
@@ -1124,14 +1092,9 @@ def test_concurrent_idempotency_reservation_has_one_winner(tmp_path):
 
 def test_idempotency_replays_metadata_and_detects_conflict(tmp_path):
     handler = _handler(tmp_path)
-    response_json = (
-        '{"success":true,"data":'
-        '{"message_id":7,"sent":true,"state":"transmitted"}}'
-    )
+    response_json = '{"success":true,"data":{"message_id":7,"sent":true,"state":"transmitted"}}'
     assert (
-        handler.companion_idempotency_reserve(
-            "device", "phone", "key", "request-a"
-        )["result"]
+        handler.companion_idempotency_reserve("device", "phone", "key", "request-a")["result"]
         == "reserved"
     )
     handler.companion_idempotency_complete(
@@ -1145,18 +1108,14 @@ def test_idempotency_replays_metadata_and_detects_conflict(tmp_path):
         expected_ack=123,
     )
 
-    replay = handler.companion_idempotency_reserve(
-        "device", "phone", "key", "request-a"
-    )
+    replay = handler.companion_idempotency_reserve("device", "phone", "key", "request-a")
     assert replay["result"] == "replay"
     assert replay["response_json"] == response_json
     assert replay["message_id"] == 7
     assert replay["packet_hash"] == "aabb"
     assert replay["expected_ack"] == 123
 
-    conflict = handler.companion_idempotency_reserve(
-        "device", "phone", "key", "request-b"
-    )
+    conflict = handler.companion_idempotency_reserve("device", "phone", "key", "request-b")
     assert conflict["result"] == "conflict"
 
 
@@ -1193,10 +1152,7 @@ def test_indeterminate_idempotency_state_cannot_regress(tmp_path):
         "phone",
         "key",
         "request",
-        (
-            '{"success":true,"data":'
-            '{"message_id":7,"sent":true,"state":"transmitted"}}'
-        ),
+        ('{"success":true,"data":{"message_id":7,"sent":true,"state":"transmitted"}}'),
         message_id=7,
         packet_hash="ccdd",
         expected_ack=456,
@@ -1261,9 +1217,7 @@ def test_stale_pending_idempotency_becomes_indeterminate_not_deleted(tmp_path):
     conn.close()
 
     assert handler.companion_idempotency_prune() == 0
-    retry = handler.companion_idempotency_reserve(
-        "device", "phone", "key", "request"
-    )
+    retry = handler.companion_idempotency_reserve("device", "phone", "key", "request")
     assert retry["result"] == "indeterminate"
 
 
@@ -1386,25 +1340,19 @@ def test_stale_send_prune_rolls_back_key_and_message_if_journal_fails(tmp_path):
     message = handler.companion_message_get_by_id(_HASH, reserved["message_id"])
     assert key["state"] == "pending"
     assert message["state"] == "pending"
-    assert [
-        event["event_type"] for event in handler.companion_get_events(_HASH, 0)
-    ] == ["message"]
+    assert [event["event_type"] for event in handler.companion_get_events(_HASH, 0)] == ["message"]
 
 
 def test_inbound_history_survives_disabled_frame_queue(tmp_path):
     handler = _handler(tmp_path)
-    result = handler.companion_store_inbound_message(
-        _HASH, _inbound("packet-1"), max_pending=0
-    )
+    result = handler.companion_store_inbound_message(_HASH, _inbound("packet-1"), max_pending=0)
 
     assert result["inserted"] is True
     assert result["queued"] is False
     assert result["message"]["id"] == result["message_id"]
     assert result["event"]["payload"]["id"] == result["message_id"]
     assert handler.companion_load_messages(_HASH) == []
-    assert [row["text"] for row in handler.companion_get_messages(_HASH)] == [
-        "packet-1"
-    ]
+    assert [row["text"] for row in handler.companion_get_messages(_HASH)] == ["packet-1"]
 
 
 def test_direct_pending_message_is_not_displaced_but_new_history_is_kept(tmp_path):
@@ -1412,9 +1360,7 @@ def test_direct_pending_message_is_not_displaced_but_new_history_is_kept(tmp_pat
     first = handler.companion_store_inbound_message(
         _HASH, _inbound("direct", direct=True), max_pending=1
     )
-    second = handler.companion_store_inbound_message(
-        _HASH, _inbound("channel"), max_pending=1
-    )
+    second = handler.companion_store_inbound_message(_HASH, _inbound("channel"), max_pending=1)
 
     assert first["queued"] is True
     assert second["queued"] is False
@@ -1441,9 +1387,7 @@ def test_message_and_event_rollback_together(tmp_path):
     conn.close()
 
     with pytest.raises(CompanionStorageError):
-        handler.companion_store_inbound_message(
-            _HASH, _inbound("rolled-back"), max_pending=1
-        )
+        handler.companion_store_inbound_message(_HASH, _inbound("rolled-back"), max_pending=1)
     assert handler.companion_get_messages(_HASH) == []
 
 
@@ -1503,10 +1447,7 @@ def test_packet_hash_dedup_is_inbound_only(tmp_path):
 
     assert replay["inserted"] is False
     assert replay["message_id"] == inbound["message_id"]
-    assert (
-        handler.companion_get_message_id(_HASH, packet_hash)
-        == inbound["message_id"]
-    )
+    assert handler.companion_get_message_id(_HASH, packet_hash) == inbound["message_id"]
     assert {
         outbound_a["message_id"],
         outbound_b["message_id"],
@@ -1564,10 +1505,7 @@ def test_heard_repeat_event_failure_rolls_back_message_state(tmp_path):
         stored["message_id"],
     )
     assert message["state"] == "transmitted"
-    assert [
-        event["event_type"]
-        for event in handler.companion_get_events(_HASH, 0)
-    ] == ["message"]
+    assert [event["event_type"] for event in handler.companion_get_events(_HASH, 0)] == ["message"]
 
 
 def test_reception_event_failure_rolls_back_inbound_counters(tmp_path):
@@ -1607,10 +1545,7 @@ def test_reception_event_failure_rolls_back_inbound_counters(tmp_path):
     )
     assert message["observation_count"] == 1
     assert message["unique_path_count"] == 1
-    assert [
-        event["event_type"]
-        for event in handler.companion_get_events(_HASH, 0)
-    ] == ["message"]
+    assert [event["event_type"] for event in handler.companion_get_events(_HASH, 0)] == ["message"]
 
 
 def test_operator_outbound_source_is_preserved(tmp_path):
@@ -1675,10 +1610,7 @@ def test_outbound_reservation_rolls_back_key_message_and_event_together(tmp_path
     finally:
         cached_conn.set_trace_callback(None)
 
-    assert (
-        handler.companion_idempotency_lookup("device", "phone", "key", "request")
-        is None
-    )
+    assert handler.companion_idempotency_lookup("device", "phone", "key", "request") is None
     assert handler.companion_get_messages(_HASH) == []
     statements = [statement.strip().upper() for statement in trace]
     full = statements.index("PRAGMA SYNCHRONOUS=FULL")
@@ -1782,9 +1714,7 @@ def test_outbound_completion_rolls_back_message_and_replay_state_together(tmp_pa
             expected_ack=42,
         )
 
-    key = handler.companion_idempotency_lookup(
-        "device", "phone", "key", "request"
-    )
+    key = handler.companion_idempotency_lookup("device", "phone", "key", "request")
     message = handler.companion_message_get_by_id(_HASH, reserved["message_id"])
     assert key["state"] == "pending"
     assert message["state"] == "pending"
@@ -1934,8 +1864,7 @@ def test_restart_migrates_numeric_device_principal_to_stable_identity(tmp_path):
 
     assert replay["result"] == "replay"
     assert replay["response_json"] == (
-        '{"success":true,"data":'
-        '{"message_id":1,"sent":true,"state":"transmitted"}}'
+        '{"success":true,"data":{"message_id":1,"sent":true,"state":"transmitted"}}'
     )
     assert (
         reopened.companion_idempotency_lookup(
@@ -2043,9 +1972,7 @@ def test_revoke_rekeys_indeterminate_legacy_principal_before_mapping_is_deleted(
     )
     conn.commit()
 
-    assert handler.companion_revoke_device(
-        device_id="repaired-phone"
-    ) == {
+    assert handler.companion_revoke_device(device_id="repaired-phone") == {
         "devices_deleted": 1,
         "tokens_deleted": 1,
     }

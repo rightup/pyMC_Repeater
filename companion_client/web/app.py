@@ -168,10 +168,7 @@ class ChatSession:
             token=self.admin_token,
             timeout=self.client.timeout,
         )
-        if any(
-            device.get("device_id") == self.device_id
-            for device in operator.devices()
-        ):
+        if any(device.get("device_id") == self.device_id for device in operator.devices()):
             raise RuntimeError(
                 f"device_id {self.device_id!r} is already paired. An earlier "
                 "web demo may not have shut down cleanly. Reconcile any "
@@ -213,8 +210,7 @@ class ChatSession:
         self.contacts = data.get("contacts", [])
         self.cursor = str(data.get("cursor", "0"))
         self.messages = [
-            self._to_entry(message)
-            for message in data.get("messages", [])[-MAX_RENDERED_MESSAGES:]
+            self._to_entry(message) for message in data.get("messages", [])[-MAX_RENDERED_MESSAGES:]
         ]
 
     async def stop(self) -> None:
@@ -411,23 +407,15 @@ class ChatSession:
         if not isinstance(public_key, str) or not public_key:
             return
         existing = next(
-            (
-                contact
-                for contact in self.contacts
-                if contact.get("public_key") == public_key
-            ),
+            (contact for contact in self.contacts if contact.get("public_key") == public_key),
             None,
         )
         if data.get("change") == "remove":
             self.contacts = [
-                contact
-                for contact in self.contacts
-                if contact.get("public_key") != public_key
+                contact for contact in self.contacts if contact.get("public_key") != public_key
             ]
             return
-        contact_update = {
-            field: value for field, value in data.items() if field != "change"
-        }
+        contact_update = {field: value for field, value in data.items() if field != "change"}
         if existing is None:
             self.contacts.append(contact_update)
         else:
@@ -446,9 +434,7 @@ class ChatSession:
         try:
             while True:
                 await asyncio.sleep(0.2)
-                latest_sequence, pushes = self.listener.captured_after(
-                    self._push_seen
-                )
+                latest_sequence, pushes = self.listener.captured_after(self._push_seen)
                 self._push_seen = latest_sequence
                 for push in pushes:
                     self.emit("push", {"shape": push.shape, "body": push.body})
@@ -469,9 +455,7 @@ class ChatSession:
             if previous is not None:
                 previous_text, previous_channel, previous_entry = previous
                 if (previous_text, previous_channel) != (text, channel):
-                    raise ValueError(
-                        "idempotency_key is already bound to another draft"
-                    )
+                    raise ValueError("idempotency_key is already bound to another draft")
                 return previous_entry
 
             self._unresolved_send_keys.add(idempotency_key)
@@ -744,12 +728,8 @@ async def send(request: web.Request) -> web.Response:
     idempotency_key = body.get("idempotency_key")
     if not isinstance(idempotency_key, str) or not idempotency_key:
         raise web.HTTPBadRequest(reason="idempotency_key is required")
-    if (
-        len(idempotency_key) > 128
-        or any(
-            not 0x21 <= ord(character) <= 0x7E
-            for character in idempotency_key
-        )
+    if len(idempotency_key) > 128 or any(
+        not 0x21 <= ord(character) <= 0x7E for character in idempotency_key
     ):
         raise web.HTTPBadRequest(reason="idempotency_key is invalid")
     channel_value = body.get("channel", 0)
@@ -837,9 +817,7 @@ def main(argv=None) -> int:
     parser.add_argument("--web-port", type=int, default=8800)
     args = parser.parse_args(argv)
     if web is None:
-        parser.error(
-            "the web demo needs aiohttp; install with: pip install -e '.[companion-web]'"
-        )
+        parser.error("the web demo needs aiohttp; install with: pip install -e '.[companion-web]'")
     if args.live and not args.companion.strip():
         parser.error("--companion is required in live mode")
     if not 1 <= args.web_port <= 65535:

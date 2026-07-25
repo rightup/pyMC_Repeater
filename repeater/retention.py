@@ -15,11 +15,7 @@ _MISSING = object()
 def validate_retention_days(value: Any, field_name: str) -> int:
     """Return one explicit retention period without coercing YAML types."""
 
-    if (
-        type(value) is not int
-        or value < MIN_RETENTION_DAYS
-        or value > MAX_RETENTION_DAYS
-    ):
+    if type(value) is not int or value < MIN_RETENTION_DAYS or value > MAX_RETENTION_DAYS:
         raise ValueError(
             f"{field_name} must be an integer between "
             f"{MIN_RETENTION_DAYS} and {MAX_RETENTION_DAYS} days"

@@ -276,9 +276,7 @@ class TestFrameServerMessageJournaling:
 
         queue_entry = object()
         asyncio.run(
-            fs._persist_companion_message(
-                {"text": "hello", "packet_hash": "ph-2"}, queue_entry
-            )
+            fs._persist_companion_message({"text": "hello", "packet_hash": "ph-2"}, queue_entry)
         )
 
         assert fs.bridge.message_queue.removed == [queue_entry]

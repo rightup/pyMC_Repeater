@@ -221,10 +221,13 @@ def test_json_media_type_requirement_can_allow_a_truly_empty_action_body(
         raising=False,
     )
 
-    assert read_json_object(
-        require_json_content_type=True,
-        allow_empty_without_content_type=True,
-    ) == {}
+    assert (
+        read_json_object(
+            require_json_content_type=True,
+            allow_empty_without_content_type=True,
+        )
+        == {}
+    )
 
 
 def test_empty_action_exception_still_rejects_non_json_content(monkeypatch):

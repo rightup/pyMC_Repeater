@@ -362,8 +362,7 @@ class CompanionPushNotifier:
             existing = self._active_identities.get(active_key)
             if existing is not None and existing != active_identity:
                 raise ValueError(
-                    f"companion hash {active_key} is already active for another "
-                    "public identity"
+                    f"companion hash {active_key} is already active for another public identity"
                 )
             self._active_identities[active_key] = active_identity
 
@@ -386,8 +385,7 @@ class CompanionPushNotifier:
         active_identity = str(companion_identity).strip().lower()
         try:
             valid_identity = (
-                len(active_identity) == 64
-                and len(bytes.fromhex(active_identity)) == 32
+                len(active_identity) == 64 and len(bytes.fromhex(active_identity)) == 32
             )
         except ValueError:
             valid_identity = False
@@ -395,13 +393,8 @@ class CompanionPushNotifier:
             raise ValueError("companion_identity must be a 32-byte public key in hex")
         active_hash = str(companion_hash).strip().lower()
         hash_hex = active_hash[2:] if active_hash.startswith("0x") else active_hash
-        if (
-            len(hash_hex) != 2
-            or active_identity[:2] != hash_hex
-        ):
-            raise ValueError(
-                "companion_identity does not belong to the requested companion_hash"
-            )
+        if len(hash_hex) != 2 or active_identity[:2] != hash_hex:
+            raise ValueError("companion_identity does not belong to the requested companion_hash")
         return f"0x{hash_hex}", active_identity
 
     def deactivate(
@@ -469,11 +462,7 @@ class CompanionPushNotifier:
         preview = self._extract_preview(event)
         text = payload.get("text")
         with self._cv:
-            if (
-                self._stop
-                or self._active_identities.get(active_key)
-                != companion_identity
-            ):
+            if self._stop or self._active_identities.get(active_key) != companion_identity:
                 return
             self._event_order += 1
             event_order = self._event_order
@@ -642,15 +631,10 @@ class CompanionPushNotifier:
                     if device.get("mention_push"):
                         triggers = self._device_triggers(device, companion_hash)
                         mention_hits[device["device_id"]] = bool(triggers) and (
-                            accum.mention_overflow
-                            or self._any_mention(accum.texts, triggers)
+                            accum.mention_overflow or self._any_mention(accum.texts, triggers)
                         )
             with self._cv:
-                if (
-                    self._stop
-                    or self._active_identities.get(companion_hash)
-                    != companion_identity
-                ):
+                if self._stop or self._active_identities.get(companion_hash) != companion_identity:
                     continue
                 for device in devices:
                     device_id = device["device_id"]
@@ -672,10 +656,7 @@ class CompanionPushNotifier:
                         pending.newest_order,
                         accum.newest_order,
                     )
-                    if (
-                        accum.preview is not None
-                        and accum.preview_order >= pending.preview_order
-                    ):
+                    if accum.preview is not None and accum.preview_order >= pending.preview_order:
                         pending.preview = accum.preview
                         pending.preview_order = accum.preview_order
                     if mention_hits.get(device_id):
@@ -755,10 +736,7 @@ class CompanionPushNotifier:
 
         target.count += other.count
         target.newest_order = max(target.newest_order, other.newest_order)
-        if (
-            other.preview is not None
-            and other.preview_order > target.preview_order
-        ):
+        if other.preview is not None and other.preview_order > target.preview_order:
             target.preview = other.preview
             target.preview_order = other.preview_order
         target.mention = target.mention or other.mention
@@ -770,8 +748,7 @@ class CompanionPushNotifier:
             if (
                 self._stop
                 or pending.companion_identity is None
-                or self._active_identities.get(pending.companion_hash)
-                != pending.companion_identity
+                or self._active_identities.get(pending.companion_hash) != pending.companion_identity
             ):
                 return
         # Re-read the device so a token cleared/refreshed since the event is
@@ -813,13 +790,11 @@ class CompanionPushNotifier:
             # but preserve a replacement registered while the request was in
             # flight.
             try:
-                cleared = (
-                    self.sqlite_handler.companion_device_clear_push_if_token_strict(
-                        device_id,
-                        push_token,
-                        device["companion_hash"],
-                        device["companion_identity"],
-                    )
+                cleared = self.sqlite_handler.companion_device_clear_push_if_token_strict(
+                    device_id,
+                    push_token,
+                    device["companion_hash"],
+                    device["companion_identity"],
                 )
             except Exception:
                 logger.exception(
@@ -890,7 +865,7 @@ class CompanionPushNotifier:
             )
             return
         try:
-            delay = min(self.backoff_base ** pending.attempts, self.backoff_cap)
+            delay = min(self.backoff_base**pending.attempts, self.backoff_cap)
         except OverflowError:
             delay = self.backoff_cap
         pending.not_before = self._clock() + delay

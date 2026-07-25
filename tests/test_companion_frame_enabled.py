@@ -189,18 +189,13 @@ async def test_frame_enabled_bridge_persists_once_before_frame_push(
 
     messages = handler.companion_get_messages("0x42")
     assert [message["text"] for message in messages] == ["exactly once"]
-    assert [
-        item["event_type"]
-        for item in handler.companion_get_events("0x42", 0)
-    ] == ["message"]
+    assert [item["event_type"] for item in handler.companion_get_events("0x42", 0)] == ["message"]
     store_inbound.assert_called_once()
     tracker.register_inbound.assert_called_once()
     tracker.promote_inbound.assert_called_once()
     tracker.discard_registration.assert_not_called()
     assert bridge.message_queue.is_empty()
-    assert server._write_queue.get_nowait().endswith(
-        bytes([PUSH_CODE_MSG_WAITING])
-    )
+    assert server._write_queue.get_nowait().endswith(bytes([PUSH_CODE_MSG_WAITING]))
     assert server._write_queue.empty()
 
 
@@ -230,9 +225,7 @@ async def test_frame_push_is_suppressed_when_inbound_commit_fails(
     bridge.on_message_event(host_callback)
     server._setup_push_callbacks()
     store_inbound = MagicMock(side_effect=RuntimeError("storage unavailable"))
-    monkeypatch.setattr(
-        handler, "companion_store_inbound_message", store_inbound
-    )
+    monkeypatch.setattr(handler, "companion_store_inbound_message", store_inbound)
     queue_entry = QueuedMessage(
         sender_key=b"\x03" * 32,
         text="not committed",

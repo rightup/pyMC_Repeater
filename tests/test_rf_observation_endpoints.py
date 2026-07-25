@@ -347,9 +347,7 @@ class TestReceptions:
         assert data["observation_count"] == 0
         assert data["truncated"] is False
 
-    def test_storage_failure_is_503_not_not_found(
-        self, endpoints, handler, monkeypatch
-    ):
+    def test_storage_failure_is_503_not_not_found(self, endpoints, handler, monkeypatch):
         def unavailable(*_args, **_kwargs):
             raise CompanionStorageError("database unavailable")
 
@@ -362,9 +360,7 @@ class TestReceptions:
             _call(endpoints.receptions, companion_name=_NAME, message_id=1)
         assert exc.value.status == 503
 
-    def test_truncated_flag_makes_returned_counts_explicit(
-        self, endpoints, handler, monkeypatch
-    ):
+    def test_truncated_flag_makes_returned_counts_explicit(self, endpoints, handler, monkeypatch):
         msg_id = _push_message(handler)
 
         def bounded(*_args, **_kwargs):
@@ -516,9 +512,7 @@ class TestContactPaths:
         assert result["data"]["message_limit"] == 200
         assert result["data"]["observation_limit"] == 500
 
-    def test_sender_query_failure_is_503(
-        self, endpoints, handler, monkeypatch
-    ):
+    def test_sender_query_failure_is_503(self, endpoints, handler, monkeypatch):
         def unavailable(*_args, **_kwargs):
             raise CompanionStorageError("database unavailable")
 
@@ -535,9 +529,7 @@ class TestContactPaths:
             )
         assert exc.value.status == 503
 
-    def test_sender_limit_propagates_truncated(
-        self, endpoints, handler, monkeypatch
-    ):
+    def test_sender_limit_propagates_truncated(self, endpoints, handler, monkeypatch):
         monkeypatch.setattr(
             handler,
             "companion_messages_by_sender_strict",
@@ -701,9 +693,7 @@ class TestTransmissionRepeats:
             _call(endpoints.repeats, companion_name=_NAME, packet_hash="ffffffffffffffff")
         assert exc.value.status == 404
 
-    def test_transmission_storage_failure_is_503(
-        self, endpoints, handler, monkeypatch
-    ):
+    def test_transmission_storage_failure_is_503(self, endpoints, handler, monkeypatch):
         now = time.time()
         ph16 = "1122334455667788"
         _store_packet(handler, packet_hash=ph16, timestamp=now - 10, transmitted=True)
@@ -716,9 +706,7 @@ class TestTransmissionRepeats:
             _call(endpoints.repeats, companion_name=_NAME, packet_hash=ph16)
         assert exc.value.status == 503
 
-    def test_repeat_limit_propagates_truncated(
-        self, endpoints, handler, monkeypatch
-    ):
+    def test_repeat_limit_propagates_truncated(self, endpoints, handler, monkeypatch):
         now = time.time()
         ph16 = "1122334455667788"
         _store_packet(handler, packet_hash=ph16, timestamp=now - 10, transmitted=True)

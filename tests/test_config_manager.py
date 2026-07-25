@@ -238,9 +238,7 @@ def test_failed_config_serialization_preserves_existing_file(tmp_path):
     assert list(tmp_path.glob(".config.yaml.*.tmp")) == []
 
 
-def test_directory_sync_failure_does_not_misreport_completed_replace(
-    tmp_path, monkeypatch
-):
+def test_directory_sync_failure_does_not_misreport_completed_replace(tmp_path, monkeypatch):
     config_path = tmp_path / "config.yaml"
     config_path.write_text("repeater:\n  node_name: before\n")
     manager = ConfigManager(
@@ -291,10 +289,7 @@ def test_companion_node_name_save_failure_rolls_back_memory(tmp_path, monkeypatc
     monkeypatch.setattr(manager, "_save_to_file_locked", lambda: False)
 
     assert manager.save_companion_node_name("field-radio", "after") is False
-    assert (
-        config["identities"]["companions"][0]["settings"]["node_name"]
-        == "before"
-    )
+    assert config["identities"]["companions"][0]["settings"]["node_name"] == "before"
 
 
 def test_companion_node_name_save_failure_restores_absent_settings(
@@ -412,8 +407,5 @@ def test_frame_name_and_http_update_share_one_serialized_save(
     assert results["http"]["success"] is True
 
     persisted = yaml.safe_load(config_path.read_text())
-    assert (
-        persisted["identities"]["companions"][0]["settings"]["node_name"]
-        == "after"
-    )
+    assert persisted["identities"]["companions"][0]["settings"]["node_name"] == "after"
     assert persisted["web"]["site_name"] == "mesh"

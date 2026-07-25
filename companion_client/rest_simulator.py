@@ -234,12 +234,8 @@ class RestFakeBridge:
         )
         return {
             "base": {"battery_mv": 4200} if want_base else None,
-            "location": {"latitude": 47.6, "longitude": -122.3}
-            if want_location
-            else None,
-            "environment": {"temperature_c": 20.0}
-            if want_environment
-            else None,
+            "location": {"latitude": 47.6, "longitude": -122.3} if want_location else None,
+            "environment": {"temperature_c": 20.0} if want_environment else None,
         }
 
     def set_channel_entry(self, idx: int, name: Optional[str]) -> None:
@@ -305,8 +301,14 @@ def _start_rest_harness(
         repeater_handler=SimpleNamespace(storage=SimpleNamespace(sqlite_handler=handler)),
     )
 
-    token_manager = APITokenManager(handler, secret_key="test-secret-not-for-production")
-    jwt_handler = JWTHandler(secret="test-secret-not-for-production-only")
+    # Fixed secrets are intentional because this server is a local simulator.
+    token_manager = APITokenManager(
+        handler,
+        secret_key="test-secret-not-for-production",  # nosec B106
+    )
+    jwt_handler = JWTHandler(
+        secret="test-secret-not-for-production-only",  # nosec B106
+    )
 
     port = _free_port()
     cherrypy.config.update(
@@ -420,14 +422,10 @@ def stop_rest_harness(harness: Optional[RestHarness] = None) -> None:
     with _harness_lock:
         active = _active_harness
         if harness is not None:
-            if active is None and (
-                harness.event_loop is None or harness.event_loop.is_closed()
-            ):
+            if active is None and (harness.event_loop is None or harness.event_loop.is_closed()):
                 return
             if harness is not active:
-                raise ValueError(
-                    "the supplied REST simulator harness is not active"
-                )
+                raise ValueError("the supplied REST simulator harness is not active")
             target = harness
         elif isinstance(active, RestHarness):
             target = active

@@ -21,7 +21,7 @@ def test_create_identity_schema_matches_supported_identity_types():
             "examples"
         ]
     ) == {"companion", "room_server"}
-    response_data = spec["paths"]["/create_identity"]["post"]["responses"]["200"][
-        "content"
-    ]["application/json"]["schema"]["properties"]["data"]["properties"]
+    response_data = spec["paths"]["/create_identity"]["post"]["responses"]["200"]["content"][
+        "application/json"
+    ]["schema"]["properties"]["data"]["properties"]
     assert response_data["activation_pending"]["type"] == "boolean"

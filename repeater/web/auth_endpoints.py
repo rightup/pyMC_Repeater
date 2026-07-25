@@ -60,9 +60,7 @@ def _auth_storage_unavailable_response(
 
 
 def _auth_storage_unavailable(operation: str, exc: CompanionStorageError) -> bytes:
-    return json.dumps(_auth_storage_unavailable_response(operation, exc)).encode(
-        "utf-8"
-    )
+    return json.dumps(_auth_storage_unavailable_response(operation, exc)).encode("utf-8")
 
 
 def _api_token_candidates(
@@ -72,11 +70,7 @@ def _api_token_candidates(
     """Return distinct API credentials in the same order as the auth middleware."""
 
     api_key = raw_api_key if is_valid_bearer_token(raw_api_key) else ""
-    return tuple(
-        dict.fromkeys(
-            token for token in (bearer_api_token, api_key) if token
-        )
-    )
+    return tuple(dict.fromkeys(token for token in (bearer_api_token, api_key) if token))
 
 
 class _LoginThrottle:
@@ -372,15 +366,9 @@ class AuthEndpoints:
                 require_json_content_type=True,
             )
             reject_unknown_fields(data, {"username", "password", "client_id"})
-            username = text_field(
-                data, "username", required=True, max_bytes=64, strip=True
-            )
-            password = text_field(
-                data, "password", required=True, max_bytes=1024
-            )
-            client_id = text_field(
-                data, "client_id", required=True, max_bytes=128, strip=True
-            )
+            username = text_field(data, "username", required=True, max_bytes=64, strip=True)
+            password = text_field(data, "password", required=True, max_bytes=1024)
+            client_id = text_field(data, "client_id", required=True, max_bytes=128, strip=True)
             reject_control_characters(username, "username")
             reject_control_characters(client_id, "client_id")
             client_ip = self._get_request_ip()
@@ -412,10 +400,7 @@ class AuthEndpoints:
             # The historical default is a setup sentinel, not a credential.
             # Issuing an administrator JWT for it would bypass the public
             # bootstrap boundary that deliberately remains open.
-            if (
-                not isinstance(config_password, str)
-                or config_password in ("", "admin123")
-            ):
+            if not isinstance(config_password, str) or config_password in ("", "admin123"):
                 logger.warning("Login attempt rejected - password not configured")
                 cherrypy.response.status = 409
                 return json.dumps(
@@ -528,7 +513,8 @@ class AuthEndpoints:
                 ).encode("utf-8")
 
             user_info = None
-            bearer_api_token = ""
+            # Request authentication state, not a credential literal.
+            bearer_api_token = ""  # nosec B105
 
             # Check JWT first
             token = bearer_token_from_header(auth_header)
@@ -550,9 +536,7 @@ class AuthEndpoints:
                     raw_api_key,
                 ):
                     try:
-                        token_data = token_manager.verify_token(
-                            presented_api_token
-                        )
+                        token_data = token_manager.verify_token(presented_api_token)
                     except CompanionStorageError as exc:
                         return _auth_storage_unavailable("token refresh", exc)
                     if not token_data:
@@ -656,7 +640,8 @@ class AuthEndpoints:
         # Try JWT authentication first
         auth_header = cherrypy.request.headers.get("Authorization", "")
         user = None
-        bearer_api_token = ""
+        # Request authentication state, not a credential literal.
+        bearer_api_token = ""  # nosec B105
 
         token = bearer_token_from_header(auth_header)
         if token is not None:
@@ -733,9 +718,7 @@ class AuthEndpoints:
                 validate_new_admin_password(new_password)
             except ValueError as exc:
                 cherrypy.response.status = 400
-                return json.dumps(
-                    {"success": False, "error": str(exc)}
-                ).encode("utf-8")
+                return json.dumps({"success": False, "error": str(exc)}).encode("utf-8")
 
             # Verify current password
             repeater_config = self.config.get("repeater", {})

@@ -185,11 +185,7 @@ def test_token_management_storage_failure_is_generic_503(
     cfg["jwt_handler"] = _jwt_handler(ok=True)
     cfg["token_manager"] = manager
 
-    result = (
-        endpoint.default(token_id="1")
-        if operation == "revoke"
-        else endpoint.index()
-    )
+    result = endpoint.default(token_id="1") if operation == "revoke" else endpoint.index()
 
     assert result == {
         "success": False,
@@ -362,9 +358,7 @@ def test_login_rejects_cross_origin_simple_content_type(cp_ctx):
     cp_ctx(
         method="POST",
         headers={"Content-Type": "text/plain"},
-        body=json.dumps(
-            {"username": "admin", "password": "pw", "client_id": "browser"}
-        ).encode(),
+        body=json.dumps({"username": "admin", "password": "pw", "client_id": "browser"}).encode(),
     )
 
     result = json.loads(auth.login().decode())
@@ -382,11 +376,7 @@ def test_login_never_issues_admin_jwt_for_unconfigured_password(
     jwt_handler = _jwt_handler(ok=True)
     jwt_handler.create_jwt = MagicMock(return_value="unsafe-jwt")
     auth = AuthEndpoints(
-        config={
-            "repeater": {
-                "security": {"admin_password": configured_password}
-            }
-        },
+        config={"repeater": {"security": {"admin_password": configured_password}}},
         jwt_handler=jwt_handler,
         token_manager=_token_mgr(),
     )
@@ -920,19 +910,14 @@ def test_change_password_paths(cp_ctx):
     out = json.loads(auth_fail_save.change_password().decode())
     assert out["success"] is False
     assert cherrypy.response.status == 500
-    assert (
-        auth_fail_save.config["repeater"]["security"]["admin_password"]
-        == "old-password"
-    )
+    assert auth_fail_save.config["repeater"]["security"]["admin_password"] == "old-password"
 
     # an unexpected persistence exception also rolls live state back
     auth_raise_save = AuthEndpoints(
         config={"repeater": {"security": {"admin_password": "old-password"}}},
         jwt_handler=_jwt_handler(ok=True),
         token_manager=_token_mgr(),
-        config_manager=SimpleNamespace(
-            save_to_file=MagicMock(side_effect=OSError("read-only"))
-        ),
+        config_manager=SimpleNamespace(save_to_file=MagicMock(side_effect=OSError("read-only"))),
     )
     _req, _resp, cfg = cp_ctx(
         method="POST",
@@ -946,10 +931,7 @@ def test_change_password_paths(cp_ctx):
     out = json.loads(auth_raise_save.change_password().decode())
     assert out["success"] is False
     assert cherrypy.response.status == 500
-    assert (
-        auth_raise_save.config["repeater"]["security"]["admin_password"]
-        == "old-password"
-    )
+    assert auth_raise_save.config["repeater"]["security"]["admin_password"] == "old-password"
 
 
 @pytest.mark.parametrize("scope", ["companion:home", "read"])

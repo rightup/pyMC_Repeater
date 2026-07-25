@@ -98,12 +98,8 @@ class TestCompanionTcpSettings:
             validate_companion_boolean_setting(value, "rf_reception_events")
 
     def test_policy_boolean_accepts_only_real_booleans(self):
-        assert validate_companion_boolean_setting(
-            True, "trim_contacts_on_overflow"
-        ) is True
-        assert validate_companion_boolean_setting(
-            False, "trim_contacts_on_overflow"
-        ) is False
+        assert validate_companion_boolean_setting(True, "trim_contacts_on_overflow") is True
+        assert validate_companion_boolean_setting(False, "trim_contacts_on_overflow") is False
 
     @pytest.mark.parametrize(
         "value",
@@ -337,9 +333,7 @@ class TestRfReceptionEventsSetting:
         assert merged == {"rf_reception_events": True}
 
     def test_default_is_false_when_absent(self):
-        assert validate_companion_boolean_setting(
-            False, "rf_reception_events"
-        ) is False
+        assert validate_companion_boolean_setting(False, "rf_reception_events") is False
 
 
 class TestValidateCompanionConfigCapacity:
@@ -782,7 +776,6 @@ class TestFrameMessagePersistence:
     def test_retention_zero_keeps_history_but_not_frame_pending(self):
         import asyncio
 
-        entry = object()
         fs = self._frame_server(0)
         queue_entry = object()
         asyncio.run(fs._persist_companion_message({"text": "x"}, queue_entry))
@@ -818,9 +811,7 @@ class TestFrameMessagePersistence:
         import asyncio
 
         fs = self._frame_server(7)
-        fs.sqlite_handler.companion_store_inbound_message.side_effect = RuntimeError(
-            "disk failed"
-        )
+        fs.sqlite_handler.companion_store_inbound_message.side_effect = RuntimeError("disk failed")
         with pytest.raises(RuntimeError, match="disk failed"):
             asyncio.run(fs._persist_companion_message({"text": "x"}, object()))
         fs.bridge.message_queue.remove.assert_not_called()

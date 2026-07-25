@@ -156,9 +156,7 @@ async def persist_inbound_message(
                 companion_hash,
                 result.get("message_id"),
                 registration_token=registration_token,
-                existing_message=(
-                    result.get("message") if not result.get("inserted") else None
-                ),
+                existing_message=(result.get("message") if not result.get("inserted") else None),
             )
             or ()
         )

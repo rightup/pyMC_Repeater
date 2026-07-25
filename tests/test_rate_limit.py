@@ -109,9 +109,7 @@ def test_mobile_api_uses_explicit_stricter_global_rf_caps():
     )
 
     assert endpoint._rf_global_limiter.capacity == 2
-    assert endpoint._rf_global_limiter.refill_per_second == pytest.approx(
-        3 / 60.0
-    )
+    assert endpoint._rf_global_limiter.refill_per_second == pytest.approx(3 / 60.0)
 
 
 def test_mobile_api_rejects_huge_integer_rf_rate_cleanly():
@@ -119,9 +117,7 @@ def test_mobile_api_rejects_huge_integer_rf_rate_cleanly():
         ValueError,
         match=r"mobile_api\.rf_per_minute must be a finite positive number",
     ):
-        CompanionsV1(
-            config={"mobile_api": {"rf_per_minute": 10**1000}}
-        )
+        CompanionsV1(config={"mobile_api": {"rf_per_minute": 10**1000}})
 
 
 @pytest.mark.parametrize(
@@ -144,9 +140,7 @@ def test_mobile_sse_rejects_opaque_integer_config(field, value):
 
 
 def test_sse_config_applies_documented_minimums_at_construction():
-    mobile = CompanionsV1(
-        config={"http": {"sse_queue_maxsize": 1, "sse_keepalive_sec": 1}}
-    )
+    mobile = CompanionsV1(config={"http": {"sse_queue_maxsize": 1, "sse_keepalive_sec": 1}})
     legacy = CompanionAPIEndpoints(
         config={"http": {"sse_queue_maxsize": 1, "sse_keepalive_sec": 1}}
     )

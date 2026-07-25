@@ -143,9 +143,7 @@ def _strict_companion_packet_hash(value: Any) -> Optional[str]:
     if not isinstance(value, str) or not value or value != value.strip():
         raise ValueError("companion message packet_hash must be hexadecimal text")
     payload = value[2:] if value.lower().startswith("0x") else value
-    if len(payload) not in {16, 64} or any(
-        character not in _HEX_DIGITS for character in payload
-    ):
+    if len(payload) not in {16, 64} or any(character not in _HEX_DIGITS for character in payload):
         raise ValueError(
             "companion message packet_hash must contain exactly 16 or 64 hexadecimal characters"
         )
@@ -170,9 +168,7 @@ class SQLiteHandler:
     def __init__(self, storage_dir: Path):
         self.storage_dir = storage_dir
         self.sqlite_path = self.storage_dir / "repeater.db"
-        self._companion_lineage_path = (
-            self.storage_dir / ".companion-journal-lineage"
-        )
+        self._companion_lineage_path = self.storage_dir / ".companion-journal-lineage"
         self._api_token_last_used_updates = {}
         self._api_token_last_used_interval_sec = 300
         self._hot_cache_ttl_sec = 60
@@ -318,16 +314,12 @@ class SQLiteHandler:
         sidecar_lineage = None
         try:
             if self._companion_lineage_path.exists():
-                candidate = self._companion_lineage_path.read_text(
-                    encoding="ascii"
-                ).strip()
+                candidate = self._companion_lineage_path.read_text(encoding="ascii").strip()
                 if len(candidate) == 32:
                     int(candidate, 16)
                     sidecar_lineage = candidate
         except (OSError, ValueError):
-            logger.warning(
-                "Companion journal lineage sidecar is unreadable; rotating epoch"
-            )
+            logger.warning("Companion journal lineage sidecar is unreadable; rotating epoch")
 
         with self._connect() as conn:
             row = conn.execute(
@@ -406,9 +398,7 @@ class SQLiteHandler:
         migrations and before recovery runs.
         """
 
-        columns = {
-            column[1] for column in conn.execute("PRAGMA table_info(companion_messages)")
-        }
+        columns = {column[1] for column in conn.execute("PRAGMA table_info(companion_messages)")}
         additions = (
             ("sender_prefix", "sender_prefix TEXT NOT NULL DEFAULT ''"),
             ("snr", "snr REAL"),
@@ -955,9 +945,7 @@ class SQLiteHandler:
                 if not existing:
                     message_columns = {
                         column[1]
-                        for column in conn.execute(
-                            "PRAGMA table_info(companion_messages)"
-                        )
+                        for column in conn.execute("PRAGMA table_info(companion_messages)")
                     }
                     if "direction" not in message_columns:
                         # Every row in this historical shape is inbound. A
@@ -1189,9 +1177,7 @@ class SQLiteHandler:
                     cursor = conn.execute("PRAGMA table_info(companion_messages)")
                     columns = [column[1] for column in cursor.fetchall()]
                     if "consumed_at" not in columns:
-                        conn.execute(
-                            "ALTER TABLE companion_messages ADD COLUMN consumed_at REAL"
-                        )
+                        conn.execute("ALTER TABLE companion_messages ADD COLUMN consumed_at REAL")
                         logger.info("Added consumed_at column to companion_messages table")
 
                     conn.execute(
@@ -1403,9 +1389,7 @@ class SQLiteHandler:
                             "ADD COLUMN state TEXT NOT NULL DEFAULT 'received'"
                         )
                     if "recipient_key" not in message_columns:
-                        conn.execute(
-                            "ALTER TABLE companion_messages ADD COLUMN recipient_key BLOB"
-                        )
+                        conn.execute("ALTER TABLE companion_messages ADD COLUMN recipient_key BLOB")
                     if "expected_ack" not in message_columns:
                         conn.execute(
                             "ALTER TABLE companion_messages ADD COLUMN expected_ack INTEGER"
@@ -1450,9 +1434,7 @@ class SQLiteHandler:
                             "ADD COLUMN state TEXT NOT NULL DEFAULT 'complete'"
                         )
                     if "updated_at" not in idempotency_columns:
-                        conn.execute(
-                            "ALTER TABLE companion_idempotency ADD COLUMN updated_at REAL"
-                        )
+                        conn.execute("ALTER TABLE companion_idempotency ADD COLUMN updated_at REAL")
                         conn.execute(
                             "UPDATE companion_idempotency SET updated_at = created_at "
                             "WHERE updated_at IS NULL"
@@ -1476,8 +1458,7 @@ class SQLiteHandler:
                     )
 
                     device_columns = {
-                        column[1]
-                        for column in conn.execute("PRAGMA table_info(companion_devices)")
+                        column[1] for column in conn.execute("PRAGMA table_info(companion_devices)")
                     }
                     if "companion_identity" not in device_columns:
                         conn.execute(
@@ -1605,17 +1586,11 @@ class SQLiteHandler:
                     if index_row is not None and index_row[0]
                     else ""
                 )
-                inbound_scoped = (
-                    "where packet_hash is not null" in index_sql
-                    and (
-                        "direction = 'in'" in index_sql
-                        or "direction='in'" in index_sql
-                    )
+                inbound_scoped = "where packet_hash is not null" in index_sql and (
+                    "direction = 'in'" in index_sql or "direction='in'" in index_sql
                 )
                 if not inbound_scoped:
-                    conn.execute(
-                        "DROP INDEX IF EXISTS idx_companion_messages_dedup"
-                    )
+                    conn.execute("DROP INDEX IF EXISTS idx_companion_messages_dedup")
                     conn.execute(
                         """
                         CREATE UNIQUE INDEX idx_companion_messages_dedup
@@ -1623,9 +1598,7 @@ class SQLiteHandler:
                         WHERE packet_hash IS NOT NULL AND direction = 'in'
                         """
                     )
-                    logger.info(
-                        "Scoped companion packet-hash deduplication to inbound messages"
-                    )
+                    logger.info("Scoped companion packet-hash deduplication to inbound messages")
                 conn.execute(
                     """
                     INSERT OR IGNORE INTO migrations
@@ -1679,22 +1652,15 @@ class SQLiteHandler:
         except ValueError:
             valid_hash = False
         try:
-            valid_identity = (
-                len(identity_value) == 64
-                and len(bytes.fromhex(identity_value)) == 32
-            )
+            valid_identity = len(identity_value) == 64 and len(bytes.fromhex(identity_value)) == 32
         except ValueError:
             valid_identity = False
         if not valid_hash:
             raise ValueError("companion_hash must be 0x followed by two hex digits")
         if not valid_identity:
-            raise ValueError(
-                "companion_identity must be a 32-byte public key in hex"
-            )
+            raise ValueError("companion_identity must be a 32-byte public key in hex")
         if identity_value[:2] != hash_value[2:]:
-            raise ValueError(
-                "companion_identity does not belong to the requested companion_hash"
-            )
+            raise ValueError("companion_identity does not belong to the requested companion_hash")
         return hash_value, identity_value
 
     @staticmethod
@@ -1719,8 +1685,9 @@ class SQLiteHandler:
             "companion_journal_floors",
         )
         return any(
+            # The table name comes from the fixed tuple above.
             conn.execute(
-                f"SELECT 1 FROM {table} WHERE companion_hash = ? LIMIT 1",
+                f"SELECT 1 FROM {table} WHERE companion_hash = ? LIMIT 1",  # nosec B608
                 (companion_hash,),
             ).fetchone()
             is not None
@@ -1859,9 +1826,7 @@ class SQLiteHandler:
                 )
                 token_id = cursor.lastrowid
                 if token_id is None:
-                    raise CompanionStorageError(
-                        "Created API token has no durable row ID"
-                    )
+                    raise CompanionStorageError("Created API token has no durable row ID")
                 return int(token_id)
         except CompanionStorageError:
             raise
@@ -1975,9 +1940,7 @@ class SQLiteHandler:
                     conn,
                     token_id=token_id,
                 )
-                conn.execute(
-                    "DELETE FROM companion_devices WHERE token_id = ?", (token_id,)
-                )
+                conn.execute("DELETE FROM companion_devices WHERE token_id = ?", (token_id,))
                 cursor = conn.execute("DELETE FROM api_tokens WHERE id = ?", (token_id,))
                 conn.commit()
                 return cursor.rowcount > 0
@@ -3815,11 +3778,7 @@ class SQLiteHandler:
             "storage.retention.sqlite_cleanup_days",
         )
         companion_retention = validate_retention_days(
-            (
-                DEFAULT_RETENTION_DAYS
-                if companion_events_days is None
-                else companion_events_days
-            ),
+            (DEFAULT_RETENTION_DAYS if companion_events_days is None else companion_events_days),
             "storage.retention.companion_events_days",
         )
         cutoff = time.time() - (packet_retention * 24 * 3600)
@@ -3839,12 +3798,7 @@ class SQLiteHandler:
 
             conn.commit()
 
-            if (
-                packets_deleted > 0
-                or adverts_deleted > 0
-                or noise_deleted > 0
-                or crc_deleted > 0
-            ):
+            if packets_deleted > 0 or adverts_deleted > 0 or noise_deleted > 0 or crc_deleted > 0:
                 logger.info(
                     f"Cleaned up {packets_deleted} old packets, {adverts_deleted} old adverts, {noise_deleted} old noise measurements, {crc_deleted} old CRC error records"
                 )
@@ -4446,15 +4400,18 @@ class SQLiteHandler:
                 # reset counters/state such as push_failures. Every interpolated
                 # identifier came through the allowlist above; values stay bound.
                 update_set = ", ".join(f"{col}=excluded.{col}" for col in update_fields.keys())
-                conn.execute(
-                    f"""
-                    INSERT INTO room_client_sync ({", ".join(columns)})
-                    VALUES ({", ".join(placeholders)})
+                query_template = """
+                    INSERT INTO room_client_sync ({columns})
+                    VALUES ({placeholders})
                     ON CONFLICT(room_hash, client_pubkey)
                     DO UPDATE SET {update_set}
-                """,
-                    values,
+                """
+                query = query_template.format(  # nosec B608
+                    columns=", ".join(columns),
+                    placeholders=", ".join(placeholders),
+                    update_set=update_set,
                 )
+                conn.execute(query, values)
                 conn.commit()
                 return True
         except Exception as e:
@@ -4773,8 +4730,7 @@ class SQLiteHandler:
         try:
             with self._connect() as conn:
                 cursor = conn.execute(
-                    "DELETE FROM companion_contacts "
-                    "WHERE companion_hash = ? AND pubkey = ?",
+                    "DELETE FROM companion_contacts WHERE companion_hash = ? AND pubkey = ?",
                     (companion_hash, pubkey),
                 )
                 conn.commit()
@@ -5089,8 +5045,7 @@ class SQLiteHandler:
                 prefs = strict_json_loads(row[0])
                 if not isinstance(prefs, dict):
                     raise CompanionStorageError(
-                        f"Persisted prefs for companion {companion_hash} "
-                        "are not a JSON object"
+                        f"Persisted prefs for companion {companion_hash} are not a JSON object"
                     )
                 return prefs
         except CompanionStorageError:
@@ -5395,9 +5350,7 @@ class SQLiteHandler:
         }
         missing = sorted(required_fields.difference(message))
         if missing:
-            raise ValueError(
-                "companion message row is missing " + ", ".join(missing)
-            )
+            raise ValueError("companion message row is missing " + ", ".join(missing))
 
         _strict_storage_integer(
             message["id"],
@@ -5425,9 +5378,7 @@ class SQLiteHandler:
         if recipient_key is not None and (
             not isinstance(recipient_key, bytes) or len(recipient_key) not in {0, 32}
         ):
-            raise ValueError(
-                "companion message recipient_key must contain zero or 32 bytes"
-            )
+            raise ValueError("companion message recipient_key must contain zero or 32 bytes")
 
         _strict_storage_integer(
             message["txt_type"],
@@ -5448,9 +5399,7 @@ class SQLiteHandler:
         except UnicodeEncodeError as e:
             raise ValueError("companion message text must be valid UTF-8") from e
         if text_size > MAX_TEXT_LEN:
-            raise ValueError(
-                f"companion message text must not exceed {MAX_TEXT_LEN} UTF-8 bytes"
-            )
+            raise ValueError(f"companion message text must not exceed {MAX_TEXT_LEN} UTF-8 bytes")
         _strict_storage_integer(
             message["is_channel"],
             "companion message is_channel",
@@ -5475,9 +5424,7 @@ class SQLiteHandler:
             allow_empty=True,
         )
         if len(sender_prefix) not in {0, 8}:
-            raise ValueError(
-                "companion message sender_prefix must contain zero or four bytes"
-            )
+            raise ValueError("companion message sender_prefix must contain zero or four bytes")
 
         _strict_storage_float(
             message["snr"],
@@ -5494,14 +5441,9 @@ class SQLiteHandler:
                 maximum=_UINT16_MAX,
             )
         channel_data_payload = message["channel_data_payload"]
-        if channel_data_payload is not None and not isinstance(
-            channel_data_payload, bytes
-        ):
+        if channel_data_payload is not None and not isinstance(channel_data_payload, bytes):
             raise ValueError("companion message channel_data_payload must be bytes")
-        if (
-            channel_data_payload is not None
-            and len(channel_data_payload) > MAX_GROUP_DATA_LENGTH
-        ):
+        if channel_data_payload is not None and len(channel_data_payload) > MAX_GROUP_DATA_LENGTH:
             raise ValueError(
                 "companion message channel_data_payload must not exceed "
                 f"{MAX_GROUP_DATA_LENGTH} bytes"
@@ -5529,9 +5471,7 @@ class SQLiteHandler:
             minimum=0,
         )
         if unique_path_count > observation_count:
-            raise ValueError(
-                "companion message unique_path_count cannot exceed observation_count"
-            )
+            raise ValueError("companion message unique_path_count cannot exceed observation_count")
 
         direction = message["direction"]
         if direction not in _COMPANION_MESSAGE_DIRECTIONS:
@@ -5569,13 +5509,9 @@ class SQLiteHandler:
             maximum=1,
         )
         if pending_for_frame and message["consumed_at"] is not None:
-            raise ValueError(
-                "a consumed companion message cannot remain pending for Frame"
-            )
+            raise ValueError("a consumed companion message cannot remain pending for Frame")
         if not pending_for_frame and message["consumed_at"] is None:
-            raise ValueError(
-                "a non-pending companion message must have a consumed timestamp"
-            )
+            raise ValueError("a non-pending companion message must have a consumed timestamp")
         if direction == "out" and pending_for_frame:
             raise ValueError("an outbound companion message cannot be pending for Frame")
 
@@ -5590,15 +5526,13 @@ class SQLiteHandler:
             SQLiteHandler._validate_companion_message_row(message)
         message["sender_key"] = bytes(message.get("sender_key") or b"").hex()
         message["recipient_key"] = bytes(message.get("recipient_key") or b"").hex()
-        message["channel_data_payload"] = bytes(
-            message.get("channel_data_payload") or b""
-        ).hex()
+        message["channel_data_payload"] = bytes(message.get("channel_data_payload") or b"").hex()
         if strict:
             message["sender_prefix"] = message["sender_prefix"].lower()
         message["is_channel"] = bool(message.get("is_channel"))
-        message["pending_for_frame"] = bool(
-            message.get("pending_for_frame")
-        ) and message.get("consumed_at") is None
+        message["pending_for_frame"] = (
+            bool(message.get("pending_for_frame")) and message.get("consumed_at") is None
+        )
         message["snr"] = _finite_storage_float(
             message.get("snr") or 0.0,
             "companion message snr",
@@ -5740,14 +5674,13 @@ class SQLiteHandler:
                             ).fetchall()
                         ]
                         if evict_ids:
-                            placeholders = ",".join("?" for _ in evict_ids)
-                            conn.execute(
-                                f"""
+                            conn.executemany(
+                                """
                                 UPDATE companion_messages
                                 SET pending_for_frame = 0, consumed_at = ?
-                                WHERE id IN ({placeholders})
+                                WHERE id = ?
                                 """,
-                                (now, *evict_ids),
+                                [(now, evict_id) for evict_id in evict_ids],
                             )
                         remaining = excess - len(evict_ids)
                         if remaining > 0:
@@ -5812,9 +5745,7 @@ class SQLiteHandler:
         if state not in {"pending", "transmitted", "confirmed", "failed", "indeterminate"}:
             raise ValueError("invalid outbound message state")
         packet_hash = self._companion_packet_hash(msg.get("packet_hash"))
-        recipient_key = self._companion_key_bytes(
-            msg.get("recipient_key", msg.get("to"))
-        )
+        recipient_key = self._companion_key_bytes(msg.get("recipient_key", msg.get("to")))
         is_channel = (
             bool(msg.get("is_channel"))
             if "is_channel" in msg
@@ -5845,11 +5776,7 @@ class SQLiteHandler:
                 now,
                 now,
                 state,
-                (
-                    int(msg["expected_ack"])
-                    if msg.get("expected_ack") is not None
-                    else None
-                ),
+                (int(msg["expected_ack"]) if msg.get("expected_ack") is not None else None),
                 source,
             ),
         )
@@ -5960,16 +5887,10 @@ class SQLiteHandler:
             "confirmed": {"confirmed"},
         }
         effective_state = (
-            state
-            if state in allowed_next.get(current_state, {current_state})
-            else current_state
+            state if state in allowed_next.get(current_state, {current_state}) else current_state
         )
         next_hash = normalized_hash or existing["packet_hash"]
-        next_ack = (
-            int(expected_ack)
-            if expected_ack is not None
-            else existing["expected_ack"]
-        )
+        next_ack = int(expected_ack) if expected_ack is not None else existing["expected_ack"]
         changed = (
             effective_state != current_state
             or next_hash != existing["packet_hash"]
@@ -5977,8 +5898,7 @@ class SQLiteHandler:
         )
         if not changed:
             row = conn.execute(
-                self._companion_message_select()
-                + " WHERE id = ? AND companion_hash = ?",
+                self._companion_message_select() + " WHERE id = ? AND companion_hash = ?",
                 (int(message_id), companion_hash),
             ).fetchone()
             message = self._companion_message_row_to_dict(row)
@@ -6007,8 +5927,7 @@ class SQLiteHandler:
             ),
         )
         row = conn.execute(
-            self._companion_message_select()
-            + " WHERE id = ? AND companion_hash = ?",
+            self._companion_message_select() + " WHERE id = ? AND companion_hash = ?",
             (int(message_id), companion_hash),
         ).fetchone()
         message = self._companion_message_row_to_dict(row)
@@ -6070,9 +5989,7 @@ class SQLiteHandler:
         except CompanionStorageError:
             raise
         except Exception as e:
-            raise CompanionStorageError(
-                f"Failed to update outbound message {message_id}"
-            ) from e
+            raise CompanionStorageError(f"Failed to update outbound message {message_id}") from e
 
     def companion_record_outbound_heard_repeat(
         self,
@@ -6104,9 +6021,7 @@ class SQLiteHandler:
                     (int(message_id), companion_hash),
                 ).fetchone()
                 if existing is None:
-                    raise CompanionStorageError(
-                        f"Outbound message {message_id} does not exist"
-                    )
+                    raise CompanionStorageError(f"Outbound message {message_id} does not exist")
 
                 current_state = str(existing["state"])
                 if current_state in {
@@ -6132,19 +6047,15 @@ class SQLiteHandler:
                     )
 
                 row = conn.execute(
-                    self._companion_message_select()
-                    + " WHERE id = ? AND companion_hash = ?",
+                    self._companion_message_select() + " WHERE id = ? AND companion_hash = ?",
                     (int(message_id), companion_hash),
                 ).fetchone()
                 if row is None:
-                    raise CompanionStorageError(
-                        f"Outbound message {message_id} could not be read"
-                    )
+                    raise CompanionStorageError(f"Outbound message {message_id} could not be read")
                 message = self._companion_message_row_to_dict(row)
-                observed_hash = (
-                    self._companion_packet_hash(correlation.get("packet_hash"))
-                    or message.get("packet_hash")
-                )
+                observed_hash = self._companion_packet_hash(
+                    correlation.get("packet_hash")
+                ) or message.get("packet_hash")
                 payload = {
                     "message_id": int(message_id),
                     "state": effective_state,
@@ -6155,9 +6066,7 @@ class SQLiteHandler:
                     "snr": correlation.get("snr"),
                     "observed_at": correlation.get("observed_at"),
                     "heard_repeat_count": correlation.get("heard_repeat_count"),
-                    "unique_repeater_count": correlation.get(
-                        "unique_repeater_count"
-                    ),
+                    "unique_repeater_count": correlation.get("unique_repeater_count"),
                 }
                 event = self._companion_append_event_row(
                     conn,
@@ -6287,27 +6196,32 @@ class SQLiteHandler:
                         # counts toward capacity or is delivered again) while
                         # the row survives as history, same as a normal pop.
                         columns = {
-                            row[1]
-                            for row in conn.execute(
-                                "PRAGMA table_info(companion_messages)"
-                            )
+                            row[1] for row in conn.execute("PRAGMA table_info(companion_messages)")
                         }
-                        pending_update = (
-                            ", pending_for_frame = 0"
-                            if "pending_for_frame" in columns
-                            else ""
-                        )
-                        conn.execute(
-                            f"""
+                        if "pending_for_frame" in columns:
+                            eviction_query = """
                             UPDATE companion_messages
-                            SET consumed_at = ?{pending_update}
+                            SET consumed_at = ?, pending_for_frame = 0
                             WHERE id IN (
                                 SELECT id FROM companion_messages
                                 WHERE companion_hash = ? AND is_channel = 1
                                   AND consumed_at IS NULL AND id != ?
                                 ORDER BY id ASC LIMIT ?
                             )
-                            """,
+                            """
+                        else:
+                            eviction_query = """
+                            UPDATE companion_messages
+                            SET consumed_at = ?
+                            WHERE id IN (
+                                SELECT id FROM companion_messages
+                                WHERE companion_hash = ? AND is_channel = 1
+                                  AND consumed_at IS NULL AND id != ?
+                                ORDER BY id ASC LIMIT ?
+                            )
+                            """
+                        conn.execute(
+                            eviction_query,
                             (time.time(), companion_hash, last_id, excess),
                         )
                 conn.execute("RELEASE SAVEPOINT companion_message_push")
@@ -6391,9 +6305,7 @@ class SQLiteHandler:
                     (int(message_id), companion_hash),
                 ).fetchone()
                 if existing is None:
-                    raise CompanionStorageError(
-                        f"Inbound message {message_id} does not exist"
-                    )
+                    raise CompanionStorageError(f"Inbound message {message_id} does not exist")
 
                 observation_count = max(
                     int(existing["observation_count"]),
@@ -6492,22 +6404,21 @@ class SQLiteHandler:
                 msg["channel_data_type"] = int(msg.get("channel_data_type") or 0)
                 msg["channel_data_payload"] = bytes(msg.get("channel_data_payload") or b"")
                 columns = {
-                    item[1]
-                    for item in conn.execute("PRAGMA table_info(companion_messages)")
+                    item[1] for item in conn.execute("PRAGMA table_info(companion_messages)")
                 }
-                pending_update = (
-                    ", pending_for_frame = 0"
-                    if "pending_for_frame" in columns
-                    else ""
-                )
-                conn.execute(
-                    f"""
+                if "pending_for_frame" in columns:
+                    consume_query = """
                     UPDATE companion_messages
-                    SET consumed_at = ?{pending_update}
+                    SET consumed_at = ?, pending_for_frame = 0
                     WHERE id = ? AND consumed_at IS NULL
-                    """,
-                    (time.time(), msg["id"]),
-                )
+                    """
+                else:
+                    consume_query = """
+                    UPDATE companion_messages
+                    SET consumed_at = ?
+                    WHERE id = ? AND consumed_at IS NULL
+                    """
+                conn.execute(consume_query, (time.time(), msg["id"]))
                 conn.commit()
                 return {k: v for k, v in msg.items() if k != "id"}
         except Exception as e:
@@ -6582,10 +6493,7 @@ class SQLiteHandler:
             params.append(limit)
 
             rows = conn.execute(query, params).fetchall()
-            return [
-                self._companion_message_row_to_dict(row, strict=strict)
-                for row in rows
-            ]
+            return [self._companion_message_row_to_dict(row, strict=strict) for row in rows]
 
     # --- Mobile Companion API RF observation surface (design doc §10) ---
     #
@@ -6611,9 +6519,7 @@ class SQLiteHandler:
             return []
         return parsed if isinstance(parsed, list) else []
 
-    def companion_message_get_by_id(
-        self, companion_hash: str, message_id: int
-    ) -> Optional[Dict]:
+    def companion_message_get_by_id(self, companion_hash: str, message_id: int) -> Optional[Dict]:
         """Return one companion message row by id, scoped to companion_hash.
 
         Scoping the WHERE clause to companion_hash (not just id) means a
@@ -6629,9 +6535,7 @@ class SQLiteHandler:
                 strict=False,
             )
         except Exception as e:
-            logger.error(
-                f"Failed to get companion message {message_id} for {companion_hash}: {e}"
-            )
+            logger.error(f"Failed to get companion message {message_id} for {companion_hash}: {e}")
             return None
 
     def companion_message_get_by_id_strict(
@@ -6721,8 +6625,7 @@ class SQLiteHandler:
                 return self._companion_message_row_to_dict(row, strict=True)
         except Exception as e:
             raise CompanionStorageError(
-                f"Failed to resolve outbound packet {normalized_hash} "
-                f"for {companion_hash}"
+                f"Failed to resolve outbound packet {normalized_hash} for {companion_hash}"
             ) from e
 
     def companion_messages_by_sender(
@@ -6750,9 +6653,7 @@ class SQLiteHandler:
             )
             return rows
         except CompanionStorageError as e:
-            logger.error(
-                f"Failed to get companion messages by sender for {companion_hash}: {e}"
-            )
+            logger.error(f"Failed to get companion messages by sender for {companion_hash}: {e}")
             return []
 
     def companion_messages_by_sender_strict(
@@ -6905,9 +6806,7 @@ class SQLiteHandler:
                     query += " LIMIT ?"
                     params.append(normalized_limit + 1)
                 rows = conn.execute(query, params).fetchall()
-                truncated = (
-                    normalized_limit is not None and len(rows) > normalized_limit
-                )
+                truncated = normalized_limit is not None and len(rows) > normalized_limit
                 if normalized_limit is not None:
                     rows = rows[:normalized_limit]
                 return [dict(row) for row in rows], truncated
@@ -6968,9 +6867,7 @@ class SQLiteHandler:
                     results.append(d)
                 return results, len(rows) > limit
         except Exception as e:
-            raise CompanionStorageError(
-                f"Failed to get heard repeats for {packet_hash_16}"
-            ) from e
+            raise CompanionStorageError(f"Failed to get heard repeats for {packet_hash_16}") from e
 
     # --- Mobile Companion API event journal (design doc §5) ---
     #
@@ -6995,8 +6892,7 @@ class SQLiteHandler:
             return value
         if isinstance(value, dict):
             return {
-                str(key): SQLiteHandler._companion_json_safe(item)
-                for key, item in value.items()
+                str(key): SQLiteHandler._companion_json_safe(item) for key, item in value.items()
             }
         if isinstance(value, (list, tuple)):
             return [SQLiteHandler._companion_json_safe(item) for item in value]
@@ -7082,9 +6978,7 @@ class SQLiteHandler:
             logger.error(f"Failed to append companion event for {companion_hash}: {e}")
             return None
 
-    def companion_get_event(
-        self, companion_hash: str, seq: int
-    ) -> Optional[Dict[str, Any]]:
+    def companion_get_event(self, companion_hash: str, seq: int) -> Optional[Dict[str, Any]]:
         """Return one committed event, scoped to its companion."""
         try:
             with self._connect() as conn:
@@ -7101,18 +6995,14 @@ class SQLiteHandler:
                     return None
                 return self._companion_event_row_to_dict(row)
         except Exception as e:
-            logger.error(
-                f"Failed to get companion event seq={seq} for {companion_hash}: {e}"
-            )
+            logger.error(f"Failed to get companion event seq={seq} for {companion_hash}: {e}")
             return None
 
     @staticmethod
     def _companion_event_row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
         created_at = float(row["created_at"])
         if not math.isfinite(created_at):
-            raise CompanionStorageError(
-                f"Companion event {row['seq']} has a non-finite timestamp"
-            )
+            raise CompanionStorageError(f"Companion event {row['seq']} has a non-finite timestamp")
         event = {
             "seq": int(row["seq"]),
             "event_type": row["event_type"],
@@ -7126,9 +7016,7 @@ class SQLiteHandler:
                 f"Companion event {row['seq']} has invalid JSON payload"
             ) from exc
         if not isinstance(payload, dict):
-            raise CompanionStorageError(
-                f"Companion event {row['seq']} payload is not an object"
-            )
+            raise CompanionStorageError(f"Companion event {row['seq']} payload is not an object")
         event["payload"] = payload
         return event
 
@@ -7248,9 +7136,7 @@ class SQLiteHandler:
                 conn.commit()
                 return epoch
         except Exception as e:
-            raise CompanionStorageError(
-                "Failed to get/generate companion journal epoch"
-            ) from e
+            raise CompanionStorageError("Failed to get/generate companion journal epoch") from e
 
     @staticmethod
     def _companion_journal_epoch_in_transaction(conn: sqlite3.Connection) -> str:
@@ -7261,8 +7147,7 @@ class SQLiteHandler:
             return str(row[0])
         epoch = secrets.token_hex(8)
         conn.execute(
-            "INSERT OR IGNORE INTO companion_journal_meta (key, value) "
-            "VALUES ('journal_epoch', ?)",
+            "INSERT OR IGNORE INTO companion_journal_meta (key, value) VALUES ('journal_epoch', ?)",
             (epoch,),
         )
         row = conn.execute(
@@ -7290,14 +7175,10 @@ class SQLiteHandler:
                     (companion_hash,),
                 ).fetchone()
                 stored_head = (
-                    int(head_row[0])
-                    if head_row is not None and head_row[0] is not None
-                    else 0
+                    int(head_row[0]) if head_row is not None and head_row[0] is not None else 0
                 )
                 floor = (
-                    int(floor_row[0])
-                    if floor_row is not None and floor_row[0] is not None
-                    else 0
+                    int(floor_row[0]) if floor_row is not None and floor_row[0] is not None else 0
                 )
                 # A fully pruned, quiet companion has no physical MAX(seq),
                 # but its logical head remains the prune floor. Returning 0
@@ -7393,14 +7274,8 @@ class SQLiteHandler:
                     """,
                     (companion_hash,),
                 ).fetchone()
-                stored_head = (
-                    int(head_row[0]) if head_row and head_row[0] is not None else 0
-                )
-                floor = (
-                    int(floor_row[0])
-                    if floor_row and floor_row[0] is not None
-                    else 0
-                )
+                stored_head = int(head_row[0]) if head_row and head_row[0] is not None else 0
+                floor = int(floor_row[0]) if floor_row and floor_row[0] is not None else 0
                 head = max(stored_head, floor)
                 state = {
                     "epoch": current_epoch,
@@ -7460,10 +7335,7 @@ class SQLiteHandler:
                 ).fetchall()
                 conn.commit()
                 has_more = len(rows) > page_size
-                events = [
-                    self._companion_event_row_to_dict(row)
-                    for row in rows[:page_size]
-                ]
+                events = [self._companion_event_row_to_dict(row) for row in rows[:page_size]]
                 next_seq = events[-1]["seq"] if events else cursor_seq
                 return {
                     **state,
@@ -7471,9 +7343,7 @@ class SQLiteHandler:
                     "reason": None,
                     "events": events,
                     "next_seq": next_seq,
-                    "next_cursor": self.companion_cursor_encode(
-                        current_epoch, next_seq
-                    ),
+                    "next_cursor": self.companion_cursor_encode(current_epoch, next_seq),
                     "has_more": has_more,
                 }
         except CompanionStorageError:
@@ -7581,8 +7451,7 @@ class SQLiteHandler:
                 conn.commit()
                 if deleted:
                     logger.info(
-                        f"Pruned {deleted} companion journal event(s) older than "
-                        f"{retention_days}d"
+                        f"Pruned {deleted} companion journal event(s) older than {retention_days}d"
                     )
                 return deleted
         except Exception as e:
@@ -7812,10 +7681,7 @@ class SQLiteHandler:
                     compatible = (
                         legacy["state"] in terminal_states
                         and target["state"] in terminal_states
-                        and all(
-                            legacy[field] == target[field]
-                            for field in material_fields
-                        )
+                        and all(legacy[field] == target[field] for field in material_fields)
                     )
                     if not compatible:
                         now = time.time()
@@ -8209,8 +8075,7 @@ class SQLiteHandler:
             raise
         except Exception as e:
             raise CompanionStorageError(
-                f"Failed to mark outbound send indeterminate for "
-                f"{principal_type}:{principal_id}"
+                f"Failed to mark outbound send indeterminate for {principal_type}:{principal_id}"
             ) from e
 
     def companion_idempotency_lookup(
@@ -8325,9 +8190,7 @@ class SQLiteHandler:
                 conn.commit()
                 result = self._companion_idempotency_row_to_dict(row)
                 result["result"] = (
-                    "replay"
-                    if result["state"] in {"complete", "failed"}
-                    else result["state"]
+                    "replay" if result["state"] in {"complete", "failed"} else result["state"]
                 )
                 return result
         except CompanionStorageError:
@@ -8420,9 +8283,7 @@ class SQLiteHandler:
                 ).fetchone()
                 return self._companion_idempotency_row_to_dict(row) if row else None
         except Exception as e:
-            logger.error(
-                f"Failed to get companion idempotency record for device {device_id}: {e}"
-            )
+            logger.error(f"Failed to get companion idempotency record for device {device_id}: {e}")
             return None
 
     def companion_idempotency_put(
@@ -8459,9 +8320,7 @@ class SQLiteHandler:
                 conn.commit()
                 return cursor.rowcount > 0
         except Exception as e:
-            logger.error(
-                f"Failed to put companion idempotency record for device {device_id}: {e}"
-            )
+            logger.error(f"Failed to put companion idempotency record for device {device_id}: {e}")
             return False
 
     def companion_idempotency_prune(self, max_age_seconds: float = 48 * 3600) -> int:
@@ -8586,9 +8445,7 @@ class SQLiteHandler:
                     )
                 return result.rowcount
         except Exception as e:
-            raise CompanionStorageError(
-                "Failed to recover interrupted companion sends"
-            ) from e
+            raise CompanionStorageError("Failed to recover interrupted companion sends") from e
 
     # --- Companion devices (design doc §5.4, §11.2 pairing) -----------------
 
@@ -8646,9 +8503,7 @@ class SQLiteHandler:
             "id": row["id"],
             "companion_hash": row["companion_hash"],
             "companion_identity": (
-                row["companion_identity"]
-                if "companion_identity" in row.keys()
-                else None
+                row["companion_identity"] if "companion_identity" in row.keys() else None
             ),
             "device_id": row["device_id"],
             "name": row["name"],
@@ -8656,12 +8511,8 @@ class SQLiteHandler:
             "platform": row["platform"],
             "push_token": row["push_token"],
             "push_relay_url": row["push_relay_url"],
-            "push_detail": (
-                row["push_detail"] if "push_detail" in row.keys() else "none"
-            ),
-            "mention_push": (
-                bool(row["mention_push"]) if "mention_push" in row.keys() else False
-            ),
+            "push_detail": (row["push_detail"] if "push_detail" in row.keys() else "none"),
+            "mention_push": (bool(row["mention_push"]) if "mention_push" in row.keys() else False),
             "mention_keywords": (
                 row["mention_keywords"] if "mention_keywords" in row.keys() else None
             ),
@@ -8768,9 +8619,8 @@ class SQLiteHandler:
                     if row is None:
                         return {"devices_deleted": 0, "tokens_deleted": 0}
                     resolved_token_id = int(row[0])
-                if (
-                    expected_token_id is not None
-                    and int(resolved_token_id) != int(expected_token_id)
+                if expected_token_id is not None and int(resolved_token_id) != int(
+                    expected_token_id
                 ):
                     return {"devices_deleted": 0, "tokens_deleted": 0}
 
@@ -8804,9 +8654,7 @@ class SQLiteHandler:
             logger.error(f"Failed to get companion device {device_id}: {e}")
             return None
 
-    def companion_device_get_strict(
-        self, device_id: str
-    ) -> Optional[Dict[str, Any]]:
+    def companion_device_get_strict(self, device_id: str) -> Optional[Dict[str, Any]]:
         """Return a paired device, raising on an uncertain database read."""
 
         try:
@@ -8817,9 +8665,7 @@ class SQLiteHandler:
                 ).fetchone()
                 return self._companion_device_row_to_dict(row) if row else None
         except Exception as e:
-            raise CompanionStorageError(
-                f"Failed to get companion device {device_id}"
-            ) from e
+            raise CompanionStorageError(f"Failed to get companion device {device_id}") from e
 
     def companion_device_get_by_token(self, token_id: int) -> Optional[Dict[str, Any]]:
         """Return the companion_devices row linked to token_id, or None."""
@@ -8829,9 +8675,7 @@ class SQLiteHandler:
             logger.error(f"Failed to get companion device for token {token_id}: {e}")
             return None
 
-    def companion_device_get_by_token_strict(
-        self, token_id: int
-    ) -> Optional[Dict[str, Any]]:
+    def companion_device_get_by_token_strict(self, token_id: int) -> Optional[Dict[str, Any]]:
         """Return a token's paired device, raising on an uncertain DB read.
 
         Authorization and ownership checks must distinguish a missing binding
@@ -8867,9 +8711,7 @@ class SQLiteHandler:
                 f"Failed to get companion device for token {token_id}"
             ) from e
 
-    def companion_device_list(
-        self, companion_hash: Optional[str] = None
-    ) -> List[Dict[str, Any]]:
+    def companion_device_list(self, companion_hash: Optional[str] = None) -> List[Dict[str, Any]]:
         """List companion_devices rows, optionally filtered to one companion_hash."""
         try:
             return self.companion_device_list_strict(companion_hash)
@@ -8928,8 +8770,9 @@ class SQLiteHandler:
 
             params.append(device_id)
             with self._connect() as conn:
+                # Update fields are selected internally.
                 cursor = conn.execute(
-                    f"UPDATE companion_devices SET {', '.join(updates)} WHERE device_id = ?",
+                    f"UPDATE companion_devices SET {', '.join(updates)} WHERE device_id = ?",  # nosec B608
                     params,
                 )
                 conn.commit()
@@ -9009,17 +8852,16 @@ class SQLiteHandler:
                 params.append(1 if mention_push else 0)
             if mention_keywords is not None:
                 updates.append("mention_keywords = ?")
-                params.append(
-                    json.dumps(list(mention_keywords), allow_nan=False)
-                )
+                params.append(json.dumps(list(mention_keywords), allow_nan=False))
             params.append(device_id)
             where = "device_id = ?"
             if expected_token_id is not None:
                 where += " AND token_id = ?"
                 params.append(int(expected_token_id))
             with self._connect() as conn:
+                # Update and where fields are selected internally.
                 cursor = conn.execute(
-                    f"UPDATE companion_devices SET {', '.join(updates)} WHERE {where}",
+                    f"UPDATE companion_devices SET {', '.join(updates)} WHERE {where}",  # nosec B608
                     params,
                 )
                 conn.commit()
@@ -9049,21 +8891,22 @@ class SQLiteHandler:
         """Clear push credentials, optionally only for the expected pairing."""
 
         try:
-            params: List[Any] = [device_id]
-            token_clause = ""
-            if expected_token_id is not None:
-                token_clause = " AND token_id = ?"
-                params.append(int(expected_token_id))
-            with self._connect() as conn:
-                cursor = conn.execute(
-                    f"""
+            if expected_token_id is None:
+                query = """
                     UPDATE companion_devices
                     SET push_token = NULL, push_relay_url = NULL
                     WHERE device_id = ?
-                    {token_clause}
-                    """,
-                    params,
-                )
+                """
+                params: List[Any] = [device_id]
+            else:
+                query = """
+                    UPDATE companion_devices
+                    SET push_token = NULL, push_relay_url = NULL
+                    WHERE device_id = ? AND token_id = ?
+                """
+                params = [device_id, int(expected_token_id)]
+            with self._connect() as conn:
+                cursor = conn.execute(query, params)
                 conn.commit()
                 return cursor.rowcount > 0
         except Exception as e:
@@ -9142,7 +8985,5 @@ class SQLiteHandler:
                 ).fetchall()
                 return [self._companion_device_row_to_dict(row) for row in rows]
         except Exception as e:
-            logger.error(
-                f"Failed to list push devices for companion {hash_value}: {e}"
-            )
+            logger.error(f"Failed to list push devices for companion {hash_value}: {e}")
             return []

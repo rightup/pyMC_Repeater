@@ -129,9 +129,7 @@ def _safe_cors(origins: tuple[str, ...]) -> None:
     response_headers["Access-Control-Allow-Headers"] = ", ".join(
         sorted(header.title() for header in _CORS_HEADERS)
     )
-    response_headers["Access-Control-Expose-Headers"] = ", ".join(
-        _CORS_EXPOSE_HEADERS
-    )
+    response_headers["Access-Control-Expose-Headers"] = ", ".join(_CORS_EXPOSE_HEADERS)
     response_headers["Access-Control-Max-Age"] = "600"
     _append_vary_origin(response_headers)
 
@@ -293,12 +291,7 @@ def _persist_generated_jwt_secret(config_path: object, jwt_secret: str) -> str:
             "cannot be process-safe on this platform; configure an explicit "
             f"secret containing at least {_JWT_SECRET_MIN_BYTES} UTF-8 bytes"
         )
-    lock_flags = (
-        os.O_RDWR
-        | os.O_CREAT
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-    )
+    lock_flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     with _JWT_SECRET_THREAD_LOCK:
         try:
             lock_descriptor = os.open(lock_path, lock_flags, 0o600)
@@ -431,15 +424,10 @@ class LogBuffer(logging.Handler):
             value = match.group("value")
             value_quote = (
                 value[0]
-                if len(value) >= 2
-                and value[0] in {'"', "'"}
-                and value[-1] == value[0]
+                if len(value) >= 2 and value[0] in {'"', "'"} and value[-1] == value[0]
                 else ""
             )
-            return (
-                f"{key_quote}{key}{key_quote}{separator}"
-                f"{value_quote}[REDACTED]{value_quote}"
-            )
+            return f"{key_quote}{key}{key_quote}{separator}{value_quote}[REDACTED]{value_quote}"
 
         sanitized = cls._SECRET_PATTERNS[0].sub(_replace_secret, sanitized)
         sanitized = cls._SECRET_PATTERNS[1].sub("Bearer [REDACTED]", sanitized)
@@ -737,9 +725,7 @@ class HTTPStatsServer:
             raise ValueError("repeater.security must be an object")
 
         # Validate the full auth policy before generating or persisting anything.
-        jwt_expiry_minutes = _jwt_expiry_minutes(
-            security_config.get("jwt_expiry_minutes", 60)
-        )
+        jwt_expiry_minutes = _jwt_expiry_minutes(security_config.get("jwt_expiry_minutes", 60))
         security_config.setdefault("jwt_expiry_minutes", jwt_expiry_minutes)
 
         configured_secret = security_config.get("jwt_secret")
