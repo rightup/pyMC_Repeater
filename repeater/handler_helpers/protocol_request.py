@@ -166,6 +166,10 @@ class ProtocolRequestHelper:
         # n_sent_flood, n_sent_direct, n_recv_flood, n_recv_direct,
         # uint16 err_events, int16 last_snr (×4), uint16 n_direct_dups, n_flood_dups,
         # uint32 total_rx_air_time_secs, n_recv_errors  → 56 bytes
+        
+        # Battery Readings: uses first configured sensor that reports bus/pack voltage.
+        readings = self._get_sensor_readings()
+        batt = int(min(max(self._battery_voltage(readings) * 1000, 0), 0xFFFF))
 
         # Uptime: use engine start_time when available (fixes wrong "20521 days" from time.time())
         if self.engine and hasattr(self.engine, "start_time"):
@@ -223,7 +227,7 @@ class ProtocolRequestHelper:
         # Pack 56-byte RepeaterStats (layout matches firmware)
         stats = struct.pack(
             "<HHhhIIIIIIIIHhHHII",
-            0,  # batt_milli_volts (not available on Pi)
+            batt,  # battery in mV
             0,  # curr_tx_queue_len (TODO)
             noise_floor,
             last_rssi,
@@ -323,6 +327,7 @@ class ProtocolRequestHelper:
                 except (TypeError, ValueError):
                     continue
         return 0.0
+    
 
     @staticmethod
     def _encode_environment_reading(channel: int, reading) -> bytes:
