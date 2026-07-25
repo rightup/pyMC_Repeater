@@ -5,7 +5,7 @@ import secrets
 import time
 from collections import OrderedDict, deque
 from enum import Enum
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 from openhop_core.node.handlers.base import BaseHandler
 from openhop_core.protocol import Packet
@@ -35,6 +35,7 @@ from repeater.airtime import AirtimeManager
 from repeater.data_acquisition import StorageCollector
 from repeater.neighbour_links import NeighbourLinkTracker
 from repeater.policy_engine import PolicyDecision, PolicyEngine
+from repeater.retention import storage_retention_days
 
 logger = logging.getLogger("RepeaterHandler")
 
@@ -119,13 +120,23 @@ class RepeaterHandler(BaseHandler):
         *,
         local_hash_bytes=None,
         send_advert_func=None,
+        duplicate_observer: Optional[Callable[[dict], None]] = None,
     ):
 
         self.config = config
+        (
+            self.sqlite_cleanup_days,
+            self.companion_events_days,
+        ) = storage_retention_days(config)
         self.dispatcher = dispatcher
         self.local_hash = local_hash
         self.local_hash_bytes = local_hash_bytes or bytes([local_hash])
         self.send_advert_func = send_advert_func
+        # Mobile Companion API live RF correlation hook (design doc §10.4):
+        # called with the just-built packet_record for every genuine OTA
+        # duplicate (never a local echo — see the call sites below). Optional
+        # so RepeaterHandler stays usable with no companion wiring at all.
+        self.duplicate_observer = duplicate_observer
         self.airtime_mgr = AirtimeManager(config)
         self.policy_engine = PolicyEngine.from_runtime_config(config)
         self.seen_packets = OrderedDict()
@@ -565,6 +576,8 @@ class RepeaterHandler(BaseHandler):
             except Exception as e:
                 logger.error(f"Failed to store packet record: {e}")
 
+        self._notify_duplicate_observer(packet_record)
+
         # If this is a duplicate, try to attach it to the original packet
         if is_dupe and len(self.recent_packets) > 0:
             prev_pkt = self._recent_hash_index.get(packet_record["packet_hash"])
@@ -583,6 +596,26 @@ class RepeaterHandler(BaseHandler):
             self._append_recent_packet(packet_record)
 
         return transmitted
+
+    def _notify_duplicate_observer(self, packet_record: dict) -> None:
+        """Invoke the companion correlation hook, guarded so a bug there can
+        never break packet handling (design doc §10.4).
+
+        Local echo exclusion (§10.3): only a genuine OTA duplicate reception
+        qualifies, never a local transmission or injected outbound frame —
+        both duplicate-record call sites already build ``packet_record``
+        with ``transmitted=False`` when they mark ``is_duplicate=True``, but
+        the predicate is checked explicitly here rather than assumed, so it
+        stays correct even if that invariant ever changes upstream.
+        """
+        if self.duplicate_observer is None:
+            return
+        if not packet_record.get("is_duplicate") or packet_record.get("transmitted"):
+            return
+        try:
+            self.duplicate_observer(packet_record)
+        except Exception as e:
+            logger.error(f"Companion duplicate_observer failed: {e}")
 
     @staticmethod
     def _policy_drop_reason(decision: PolicyDecision) -> str:
@@ -718,6 +751,8 @@ class RepeaterHandler(BaseHandler):
                 self.storage.record_packet(packet_record, skip_mqtt_if_invalid=False)
             except Exception as e:
                 logger.error(f"Failed to store duplicate record: {e}")
+
+        self._notify_duplicate_observer(packet_record)
 
         # Group under original in recent_packets
         if len(self.recent_packets) > 0:
@@ -1706,14 +1741,14 @@ class RepeaterHandler(BaseHandler):
                 if current_time - self.last_db_cleanup >= 21600:
                     if self.storage:
                         try:
-                            retention_cfg = self.config.get("storage", {}).get("retention", {})
-                            retention_days = retention_cfg.get("sqlite_cleanup_days", 31)
-                            companion_events_days = retention_cfg.get("companion_events_days", 31)
                             self.storage.cleanup_old_data(
-                                days=retention_days,
-                                companion_events_days=companion_events_days,
+                                days=self.sqlite_cleanup_days,
+                                companion_events_days=self.companion_events_days,
                             )
-                            logger.info("Cleaned up SQLite data older than %d days", retention_days)
+                            logger.info(
+                                "Cleaned up SQLite data older than %d days",
+                                self.sqlite_cleanup_days,
+                            )
                         except Exception as e:
                             logger.warning(f"SQLite cleanup failed: {e}")
                     self.last_db_cleanup = current_time

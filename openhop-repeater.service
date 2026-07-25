@@ -22,6 +22,7 @@ RestartSec=5
 
 # Allow up to 10s for graceful shutdown before SIGKILL
 TimeoutStopSec=10
+UMask=0077
 
 # Resource limits
 MemoryHigh=256M
@@ -31,11 +32,12 @@ StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=openhop-repeater
 
-# Security (relaxed for service self-restart via sudo)
+# Writable runtime paths and the single capability needed for GPS time sync.
 ReadWritePaths=/var/log/openhop_repeater /var/lib/openhop_repeater /etc/openhop_repeater
 SupplementaryGroups=plugdev dialout
 
-# Allow GPS time sync to update CLOCK_REALTIME without running as root, also allow changing user via polkit or sudo
+# GPS time sync needs CAP_SYS_TIME. The documented sudo OTA wrapper also
+# needs CAP_SETUID/CAP_SETGID in the ceiling; neither is granted ambiently.
 CapabilityBoundingSet=CAP_SYS_TIME CAP_SETUID CAP_SETGID
 AmbientCapabilities=CAP_SYS_TIME
 

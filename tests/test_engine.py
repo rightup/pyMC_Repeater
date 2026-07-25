@@ -1609,7 +1609,7 @@ class TestNeighbourLinkObservation:
         snapshot = handler.neighbour_link_tracker.snapshot()
         assert snapshot[0]["last_score"] == pytest.approx(0.42)
 
-    def test_first_sample_initializes_ewma_directly(self, handler):
+    async def test_first_sample_initializes_ewma_directly(self, handler):
         pkt = _make_hashed_flood_packet(["66"], hash_size=1)
         self._observe_with_tracker(handler, pkt, rssi=-90.0, snr=7.0, is_duplicate=False)
 
@@ -1618,7 +1618,7 @@ class TestNeighbourLinkObservation:
         assert snapshot[0]["ewma_snr"] == pytest.approx(7.0)
         assert snapshot[0]["ewma_score"] == pytest.approx(snapshot[0]["last_score"])
 
-    def test_later_samples_apply_configured_ewma_alpha(self, handler):
+    async def test_later_samples_apply_configured_ewma_alpha(self, handler):
         handler.config["repeater"]["neighbour_link_ewma_alpha"] = 0.5
         handler.reload_runtime_config()
 
@@ -1630,7 +1630,7 @@ class TestNeighbourLinkObservation:
         assert snapshot[0]["ewma_rssi"] == pytest.approx(-90.0)
         assert snapshot[0]["ewma_snr"] == pytest.approx(3.0)
 
-    def test_duplicate_samples_increment_duplicate_sample_count(self, handler):
+    async def test_duplicate_samples_increment_duplicate_sample_count(self, handler):
         pkt = _make_hashed_flood_packet(["88"], hash_size=1)
         self._observe_with_tracker(handler, pkt, rssi=-75.0, snr=2.0, is_duplicate=False)
         handler.record_duplicate(pkt, rssi=-74, snr=1.5)
@@ -1639,7 +1639,7 @@ class TestNeighbourLinkObservation:
         assert snapshot[0]["sample_count"] == 2
         assert snapshot[0]["duplicate_sample_count"] == 1
 
-    def test_different_path_hash_widths_do_not_merge(self, handler):
+    async def test_different_path_hash_widths_do_not_merge(self, handler):
         pkt_1b = _make_hashed_flood_packet(["AB"], hash_size=1)
         pkt_2b = _make_hashed_flood_packet(["00AB"], hash_size=2)
 
@@ -1651,7 +1651,7 @@ class TestNeighbourLinkObservation:
         keys = {(row["path_hash_size"], row["peer_hash"]) for row in snapshot}
         assert keys == {(1, "AB"), (2, "00AB")}
 
-    def test_link_state_is_bounded(self, handler):
+    async def test_link_state_is_bounded(self, handler):
         handler.config["repeater"]["neighbour_link_max_entries"] = 2
         handler.config["repeater"]["neighbour_link_ttl_seconds"] = 86400
         handler.reload_runtime_config()
@@ -1665,7 +1665,7 @@ class TestNeighbourLinkObservation:
         peers = {row["peer_hash"] for row in snapshot}
         assert peers == {"20", "30"}
 
-    def test_expired_links_are_removed_using_monotonic_time(self, handler):
+    async def test_expired_links_are_removed_using_monotonic_time(self, handler):
         handler.config["repeater"]["neighbour_link_ttl_seconds"] = 1
         handler.reload_runtime_config()
 
@@ -1678,7 +1678,7 @@ class TestNeighbourLinkObservation:
 
         assert handler.neighbour_link_tracker.snapshot() == []
 
-    def test_snapshot_returns_plain_data_not_live_mapping(self, handler):
+    async def test_snapshot_returns_plain_data_not_live_mapping(self, handler):
         pkt = _make_hashed_flood_packet(["99"], hash_size=1)
         self._observe_with_tracker(handler, pkt, rssi=-64.0, snr=6.0, is_duplicate=False)
 
@@ -2777,7 +2777,9 @@ class TestEngineTransmissionAndBackgroundLifecycle:
         handler.storage.cleanup_old_data.assert_called_once_with(days=31, companion_events_days=31)
 
     @pytest.mark.asyncio
-    async def test_background_timer_loop_continues_when_db_cleanup_fails(self, handler):
+    async def test_background_timer_loop_continues_when_db_cleanup_fails(
+        self, handler, caplog
+    ):
         handler.last_noise_measurement = 0
         handler.noise_floor_interval = 999999
         handler.send_advert_interval_hours = 0
@@ -2789,6 +2791,7 @@ class TestEngineTransmissionAndBackgroundLifecycle:
         handler.storage.cleanup_old_data.side_effect = RuntimeError("cleanup error")
 
         with (
+            caplog.at_level(logging.INFO),
             patch("repeater.engine.time.time", return_value=100000.0),
             patch(
                 "repeater.engine.asyncio.sleep",
@@ -2800,6 +2803,8 @@ class TestEngineTransmissionAndBackgroundLifecycle:
                 await handler._background_timer_loop()
 
         handler.storage.cleanup_old_data.assert_called_once()
+        assert "SQLite cleanup failed: cleanup error" in caplog.text
+        assert "Cleaned up SQLite data older than" not in caplog.text
 
     @pytest.mark.asyncio
     async def test_background_timer_loop_exception_restarts_task(self, handler):

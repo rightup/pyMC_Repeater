@@ -157,6 +157,13 @@ For development tools:
 pip install -e ".[dev]"
 ```
 
+### Debian package builds
+
+The Debian package uses distribution-managed dependencies and does not download
+Python packages from its maintainer scripts. Before building or installing the
+`.deb`, configure a package source that provides `python3-openhop-core`; it is a
+declared runtime dependency and is not bundled in this repository.
+
 ## Configuration
 
 The main configuration file is created during installation:
@@ -234,6 +241,28 @@ glass:
   base_url: "http://localhost:8080"
   inform_interval_seconds: 30
 ```
+
+### Companion clients
+
+A configured companion identity supports both:
+
+- the upstream-compatible TCP frame protocol on port 5000 by default; and
+- the authenticated Mobile Companion API at `/api/v1`.
+
+They share one bridge and radio safely. The frame listener allows one client,
+is unauthenticated, and defaults to `127.0.0.1`; opt into a trusted LAN bind
+only when a standard frame client needs it. REST clients use independent
+durable `epoch:seq` cursors and can run concurrently with that frame client.
+For a REST/SSE-only companion, `settings.frame_enabled: false` keeps the bridge
+and shared radio path active without opening a frame port.
+Every enabled companion listener and the HTTP listener must use a distinct
+port. The WebSocket frame proxy occupies the same single frame-client slot, so
+use REST/SSE—not that proxy—for a chat client running beside a frame client.
+Use a stable ASCII registration slug such as `my-companion` for API paths and
+configuration; keep the human-facing text in `settings.node_name`.
+
+See [Mobile Companion API architecture](docs/architecture/mobile-companion-api.md)
+and [reference clients](companion_client/README.md).
 
 ## Policy Engine
 
@@ -429,13 +458,52 @@ docker compose up -d
 ```
 
 The Docker image bundles the optional PyMC Console frontend at
-`/opt/pymc_console/web/html`. Local builds with `docker-compose.build.yml`
-download the newest PyMC Console release by default. Set `PYMC_CONSOLE_VERSION`
-in `.env` to pin a release tag such as `v0.9.329`.
+`/opt/pymc_console/web/html`. Local and release builds fail closed unless both
+external build artifacts are pinned and verified. Set an exact
+`PYMC_CONSOLE_VERSION`, its `PYMC_CONSOLE_SHA256_*` value, and the matching
+`YQ_SHA256_*` value for each target architecture in `.env`; the names and
+comments are listed in `.env.example`. Published-image builds take the same
+pins from the `PYMC_CONSOLE_VERSION`, `PYMC_CONSOLE_SHA256`, `YQ_VERSION`,
+`YQ_SHA256_AMD64`, and `YQ_SHA256_ARM64` repository variables.
+
+`PYMC_CONSOLE_VERSION=latest` is accepted only when
+`PYMC_CONSOLE_ALLOW_LATEST=1` is explicitly set for a development build. It
+still requires a matching SHA-256 and fails when the upstream asset changes.
 
 After the container starts, open Web Settings and choose `PyMC Console` as the
 web frontend if you want the repeater to serve that UI. The existing
 `/api/check_pymc_console` endpoint should report that the Console path exists.
+
+### Opt-in host Frame client
+
+The default Compose file publishes the HTTP/web service on port 8000. Companion
+state and action routes require credentials; discovery, pairing-code exchange,
+and setup-state-gated first-run routes are intentionally public. The default is
+plaintext HTTP, so expose it only on a trusted network or put it behind TLS.
+
+To connect one standard Frame client from the Docker host:
+
+1. Set the selected companion to `tcp_port: 5000` and
+   `bind_address: "0.0.0.0"` in the container's persisted configuration.
+   `0.0.0.0` is required here because `127.0.0.1` would mean container
+   loopback, which Docker cannot publish.
+2. Restart with the opt-in overlay:
+
+   ```bash
+   docker compose \
+     -f docker-compose.yml \
+     -f docker-compose.frame.yml \
+     up -d
+   ```
+
+The overlay publishes container port 5000 only at
+`127.0.0.1:${OPENHOP_FRAME_PORT:-5000}` on the host. Do not change that host
+address to `0.0.0.0` unless every attached network is trusted: the Frame
+protocol is unauthenticated. Host loopback does not isolate peer containers:
+because the listener binds to `0.0.0.0` inside the container, any container on
+the same Compose network can reach it by container address. Keep that network
+private and trusted. REST/SSE chat clients continue to use port 8000 and share
+the same bridge and radio safely.
 
 ### Example `docker-compose.yml`
 

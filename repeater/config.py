@@ -1,6 +1,7 @@
 import base64
 import logging
 import os
+import stat
 from pathlib import Path
 from typing import Any, Dict, Optional, overload
 
@@ -8,6 +9,7 @@ import yaml
 
 from repeater.exceptions import ConfigurationError
 from repeater.policy_engine import default_policy_engine_config
+from repeater.retention import storage_retention_days
 
 logger = logging.getLogger("Config")
 
@@ -218,10 +220,29 @@ def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
     except Exception as e:
         raise ConfigurationError(f"Failed to load configuration from {config_path}: {e}") from e
 
+    # This file contains identity seeds and authentication secrets. Tighten an
+    # existing installation when possible, but do not prevent a deliberately
+    # read-only deployment from starting with its explicit credentials.
+    try:
+        config_mode = stat.S_IMODE(Path(config_path).stat().st_mode)
+        if config_mode != 0o600:
+            Path(config_path).chmod(0o600)
+            logger.info("Restricted configuration permissions to 0600")
+    except OSError as exc:
+        logger.warning(
+            "Could not restrict configuration permissions for %s to 0600: %s",
+            config_path,
+            exc,
+        )
+
+    sqlite_cleanup_days, companion_events_days = storage_retention_days(config)
     storage_dir = resolve_storage_dir(config, config_path=config_path)
-    if "storage" not in config or not isinstance(config.get("storage"), dict):
+    if "storage" not in config:
         config["storage"] = {}
     config["storage"]["storage_dir"] = str(storage_dir)
+    retention = config["storage"].setdefault("retention", {})
+    retention["sqlite_cleanup_days"] = sqlite_cleanup_days
+    retention["companion_events_days"] = companion_events_days
 
     if config.get("storage_dir"):
         logger.warning(
@@ -340,31 +361,11 @@ def save_config(config_data: Dict[str, Any], config_path: Optional[str] = None) 
             os.getenv("PYMC_REPEATER_CONFIG", "/etc/openhop_repeater/config.yaml"),
         )
 
-    try:
-        # Create backup of existing config
-        config_file = Path(config_path)
-        if config_file.exists():
-            backup_path = config_file.with_suffix(".yaml.backup")
-            config_file.rename(backup_path)
-            logger.info(f"Created backup at {backup_path}")
+    # Retain the public helper for older callers, but route it through the one
+    # atomic, owner-only writer instead of renaming the live file out of place.
+    from repeater.config_manager import ConfigManager
 
-        # Save new config (allow_unicode=True so emojis etc. are not escaped as \U0001F47E)
-        with open(config_path, "w", encoding="utf-8") as f:
-            yaml.safe_dump(
-                config_data,
-                f,
-                default_flow_style=False,
-                sort_keys=False,
-                allow_unicode=True,
-                width=1000000,
-            )
-
-        logger.info(f"Saved configuration to {config_path}")
-        return True
-
-    except Exception as e:
-        logger.error(f"Failed to save configuration: {e}")
-        return False
+    return ConfigManager(config_path, config_data).save_to_file()
 
 
 def update_unscoped_flood_policy(allow: bool, config_path: Optional[str] = None) -> bool:

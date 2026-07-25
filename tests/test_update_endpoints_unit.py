@@ -267,11 +267,20 @@ def test_changelog_guard_when_github_unavailable(cherrypy_ctx, isolated_state, m
 
 
 def test_cors_headers_and_error_helpers(cherrypy_ctx):
-    _, response = cherrypy_ctx
+    request, response = cherrypy_ctx
     api = ue.UpdateAPIEndpoints()
 
-    api._set_cors_headers({"web": {"cors_enabled": True}})
-    assert response.headers["Access-Control-Allow-Origin"] == "*"
+    request.headers = {"Origin": "https://chat.example"}
+    api._set_cors_headers(
+        {
+            "web": {
+                "cors_enabled": True,
+                "cors_origins": ["https://chat.example"],
+            }
+        }
+    )
+    assert response.headers["Access-Control-Allow-Origin"] == "https://chat.example"
+    assert response.headers["Vary"] == "Origin"
 
     response.status = 200
     err = api._err("nope", status=418)

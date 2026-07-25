@@ -6,14 +6,21 @@ import queue
 import re
 import secrets
 import sys
+import tempfile
 import threading
+import urllib.parse
 from collections import deque
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
 
 import cherrypy
-import cherrypy_cors
+import yaml
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - production targets are POSIX.
+    fcntl = None
 
 from repeater.config import resolve_storage_dir
 from repeater.data_acquisition import SQLiteHandler
@@ -21,7 +28,12 @@ from repeater.data_acquisition import SQLiteHandler
 from .api_endpoints import APIEndpoints
 from .auth.api_tokens import APITokenManager
 from .auth.cherrypy_tool import register_require_auth_tool
-from .auth.jwt_handler import JWTHandler
+from .auth.jwt_handler import (
+    JWT_SECRET_MIN_BYTES as _JWT_SECRET_MIN_BYTES,
+    JWTHandler,
+    validate_jwt_expiry_minutes as _jwt_expiry_minutes,
+    validate_jwt_signing_secret as _jwt_signing_secret,
+)
 from .auth_endpoints import AuthEndpoints
 
 # WebSocket support
@@ -44,6 +56,271 @@ except ImportError:
 logger = logging.getLogger("HTTPServer")
 _ORIGINAL_UNRAISABLEHOOK = sys.unraisablehook
 _CHEROOT_UNRAISABLE_HOOK_INSTALLED = False
+_CORS_METHODS = ("GET", "POST", "PUT", "DELETE", "OPTIONS")
+_CORS_HEADERS = frozenset(
+    {
+        "authorization",
+        "content-type",
+        "idempotency-key",
+        "last-event-id",
+        "x-api-key",
+    }
+)
+_CORS_EXPOSE_HEADERS = ("ETag", "Idempotency-Replayed", "Retry-After")
+_JWT_SECRET_THREAD_LOCK = threading.Lock()
+
+
+def _cors_origins(config: dict) -> tuple[str, ...]:
+    """Return validated, exact browser origins from ``web.cors_origins``."""
+
+    web_config = config.get("web", {}) if isinstance(config, dict) else {}
+    raw = web_config.get("cors_origins", ())
+    if isinstance(raw, str):
+        raw = [raw]
+    origins = []
+    for value in raw if isinstance(raw, (list, tuple)) else ():
+        origin = str(value).strip().rstrip("/")
+        try:
+            parsed = urllib.parse.urlsplit(origin)
+            port = parsed.port
+        except ValueError:
+            logger.warning("Ignoring invalid CORS origin: %r", value)
+            continue
+        if (
+            origin == "*"
+            or parsed.scheme not in ("http", "https")
+            or not parsed.netloc
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or port is not None
+            and not 1 <= port <= 65_535
+            or parsed.path
+            or parsed.query
+            or parsed.fragment
+        ):
+            logger.warning("Ignoring invalid CORS origin: %r", value)
+            continue
+        origins.append(origin)
+    return tuple(dict.fromkeys(origins))
+
+
+def _append_vary_origin(headers) -> None:
+    values = [item.strip() for item in headers.get("Vary", "").split(",") if item.strip()]
+    if "Origin" not in values:
+        values.append("Origin")
+    headers["Vary"] = ", ".join(values)
+
+
+def _safe_cors(origins: tuple[str, ...]) -> None:
+    """Serve preflight and response headers for an explicit origin allowlist."""
+
+    origin = cherrypy.request.headers.get("Origin")
+    if not origin:
+        return
+    if origin not in origins:
+        if cherrypy.request.method == "OPTIONS":
+            raise cherrypy.HTTPError(403, "Origin is not allowed")
+        return
+
+    response_headers = cherrypy.response.headers
+    response_headers["Access-Control-Allow-Origin"] = origin
+    response_headers["Access-Control-Allow-Methods"] = ", ".join(_CORS_METHODS)
+    response_headers["Access-Control-Allow-Headers"] = ", ".join(
+        sorted(header.title() for header in _CORS_HEADERS)
+    )
+    response_headers["Access-Control-Expose-Headers"] = ", ".join(
+        _CORS_EXPOSE_HEADERS
+    )
+    response_headers["Access-Control-Max-Age"] = "600"
+    _append_vary_origin(response_headers)
+
+    if cherrypy.request.method != "OPTIONS":
+        return
+    requested_method = cherrypy.request.headers.get("Access-Control-Request-Method", "").upper()
+    if requested_method and requested_method not in _CORS_METHODS:
+        raise cherrypy.HTTPError(405, "CORS method is not allowed")
+    requested_headers = {
+        item.strip().lower()
+        for item in cherrypy.request.headers.get("Access-Control-Request-Headers", "").split(",")
+        if item.strip()
+    }
+    if not requested_headers.issubset(_CORS_HEADERS):
+        raise cherrypy.HTTPError(400, "CORS header is not allowed")
+    cherrypy.response.status = 204
+    cherrypy.request.handler = lambda: b""
+
+
+def _register_safe_cors_tool() -> None:
+    if not hasattr(cherrypy.tools, "safe_cors"):
+        cherrypy.tools.safe_cors = cherrypy.Tool(
+            "before_handler",
+            _safe_cors,
+            priority=20,
+        )
+
+
+def _default_api_no_store() -> None:
+    """Keep authenticated API responses out of shared/browser caches by default."""
+
+    cherrypy.response.headers.setdefault("Cache-Control", "no-store")
+
+
+def _register_api_no_store_tool() -> None:
+    if not hasattr(cherrypy.tools, "api_no_store"):
+        cherrypy.tools.api_no_store = cherrypy.Tool(
+            "before_finalize",
+            _default_api_no_store,
+            priority=80,
+        )
+
+
+def _persist_generated_jwt_secret_locked(
+    config_file: Path,
+    jwt_secret: str,
+) -> str:
+    """Read, compare, and atomically update one config while its lock is held."""
+
+    try:
+        with config_file.open("r", encoding="utf-8") as config_stream:
+            config_data = yaml.safe_load(config_stream) or {}
+    except Exception as exc:
+        raise RuntimeError(
+            "repeater.security.jwt_secret is missing and the config file "
+            f"cannot be read safely: {config_file}: {exc}"
+        ) from exc
+
+    if not isinstance(config_data, dict):
+        raise RuntimeError(f"Configuration root must be an object: {config_file}")
+    repeater_config = config_data.setdefault("repeater", {})
+    if not isinstance(repeater_config, dict):
+        raise RuntimeError("Configuration field repeater must be an object")
+    security_config = repeater_config.setdefault("security", {})
+    if not isinstance(security_config, dict):
+        raise RuntimeError("Configuration field repeater.security must be an object")
+
+    persisted_secret = security_config.get("jwt_secret")
+    # Empty string was the historical example-config sentinel for
+    # auto-generation. Preserve that safe migration path; whitespace and
+    # every other weak explicit value still fail closed.
+    if persisted_secret not in (None, ""):
+        try:
+            return _jwt_signing_secret(persisted_secret)
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from exc
+
+    try:
+        jwt_secret = _jwt_signing_secret(jwt_secret)
+    except ValueError as exc:
+        raise RuntimeError(f"Generated {exc}") from exc
+
+    security_config["jwt_secret"] = jwt_secret
+    temporary_path: str | None = None
+    try:
+        file_descriptor, temporary_path = tempfile.mkstemp(
+            prefix=f".{config_file.name}.",
+            suffix=".tmp",
+            dir=str(config_file.parent),
+            text=True,
+        )
+        with os.fdopen(file_descriptor, "w", encoding="utf-8") as temporary:
+            yaml.safe_dump(
+                config_data,
+                temporary,
+                default_flow_style=False,
+                sort_keys=False,
+                allow_unicode=True,
+                width=1000000,
+            )
+            temporary.flush()
+            os.fsync(temporary.fileno())
+
+        os.replace(temporary_path, config_file)
+        temporary_path = None
+
+        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        directory_descriptor = os.open(config_file.parent, directory_flags)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+    except Exception as exc:
+        if temporary_path is not None:
+            try:
+                os.unlink(temporary_path)
+            except OSError:
+                pass
+        raise RuntimeError(
+            "repeater.security.jwt_secret is missing and could not be persisted "
+            f"durably to {config_file}: {exc}"
+        ) from exc
+
+    logger.info("Saved auto-generated JWT secret to %s", config_file)
+    return jwt_secret
+
+
+def _persist_generated_jwt_secret(config_path: object, jwt_secret: str) -> str:
+    """Generate exactly one durable secret across threads and processes.
+
+    The on-disk YAML is the source document humans edit. A stable sidecar lock
+    serializes the entire read/compare/replace transaction, so concurrent
+    starters either persist the first strong candidate or reuse that winner.
+    """
+
+    if not isinstance(config_path, (str, os.PathLike)) or not str(config_path):
+        raise RuntimeError(
+            "repeater.security.jwt_secret is missing and no config path is available "
+            "for durable persistence"
+        )
+    try:
+        jwt_secret = _jwt_signing_secret(jwt_secret)
+    except ValueError as exc:
+        raise RuntimeError(f"Generated {exc}") from exc
+
+    requested_path = Path(config_path).expanduser()
+    try:
+        config_file = requested_path.resolve(strict=True)
+    except Exception as exc:
+        raise RuntimeError(
+            "repeater.security.jwt_secret is missing and the config file "
+            f"cannot be resolved safely: {requested_path}: {exc}"
+        ) from exc
+
+    lock_path = config_file.with_name(f".{config_file.name}.jwt-secret.lock")
+    if fcntl is None:
+        raise RuntimeError(
+            "repeater.security.jwt_secret is missing and automatic generation "
+            "cannot be process-safe on this platform; configure an explicit "
+            f"secret containing at least {_JWT_SECRET_MIN_BYTES} UTF-8 bytes"
+        )
+    lock_flags = (
+        os.O_RDWR
+        | os.O_CREAT
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    with _JWT_SECRET_THREAD_LOCK:
+        try:
+            lock_descriptor = os.open(lock_path, lock_flags, 0o600)
+        except Exception as exc:
+            raise RuntimeError(
+                "repeater.security.jwt_secret is missing and its persistence "
+                f"lock cannot be opened safely: {lock_path}: {exc}"
+            ) from exc
+
+        try:
+            try:
+                fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
+            except Exception as exc:
+                raise RuntimeError(
+                    "repeater.security.jwt_secret is missing and its persistence "
+                    f"lock cannot be acquired: {lock_path}: {exc}"
+                ) from exc
+            return _persist_generated_jwt_secret_locked(config_file, jwt_secret)
+        finally:
+            # Closing the descriptor releases flock even when the transaction
+            # raises, without risking a cleanup error masking the real failure.
+            os.close(lock_descriptor)
 
 
 def _cors_response_headers(
@@ -88,13 +365,48 @@ def _install_cheroot_bad_fd_unraisable_filter() -> None:
     _CHEROOT_UNRAISABLE_HOOK_INSTALLED = True
 
 
+def _json_error_page_v1(status, message, traceback, version):
+    """error_page.default handler for the /api/v1 tree.
+
+    CherryPy's default error page renders HTML for any status that doesn't
+    have its own error_page.<code> entry (see cherrypy._cperror.get_error_page:
+    ``pages.get(code) or pages.get('default')``). The Mobile Companion API v1
+    (design doc §7.1) needs a consistent JSON envelope for every error, not
+    just 401s, so this covers everything else (400/403/404/500/...) for
+    requests under /api/v1. It intentionally mirrors HTTPStatsServer's
+    error_page.401 handler's response shape.
+    """
+    # CherryPy passes status as e.g. "404 Not Found"; clients get the bare
+    # code (openapi.yaml documents ErrorResponseV1.status as an integer).
+    try:
+        status_code = int(str(status).split(" ", 1)[0])
+    except ValueError:
+        status_code = status
+    cherrypy.response.headers["Content-Type"] = "application/json"
+    return json.dumps({"success": False, "error": message, "status": status_code})
+
+
 # In-memory log buffer
 class LogBuffer(logging.Handler):
     _SECRET_PATTERNS = (
         re.compile(
-            r"(?i)\b(admin_password|guest_password|password|passwd|api[_-]?key|token|jwt_secret)\b(\s*[:=]\s*)(['\"]?)([^,'\"\s]+)(['\"]?)"
+            r"""(?ix)
+            (?P<key_quote>['"]?)
+            (?P<key>\b(
+                admin_password|guest_password|password|passwd|
+                api[_-]?key|token|push_token|jwt_secret|
+                identity_key|private_key|pairing_code|secret|psk
+            )\b)
+            (?P=key_quote)
+            (?P<separator>\s*[:=]\s*)
+            (?P<value>
+                "(?:\\.|[^"\\])*"|
+                '(?:\\.|[^'\\])*'|
+                [^,\s;&}\]]+
+            )
+            """
         ),
-        re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._-]+"),
+        re.compile(r"(?i)\bBearer\s+[^\s,'\"]+"),
     )
 
     def __init__(self, max_lines=100):
@@ -113,11 +425,21 @@ class LogBuffer(logging.Handler):
         sanitized = text
 
         def _replace_secret(match: re.Match) -> str:
-            key = match.group(1)
-            sep = match.group(2)
-            quote_start = match.group(3) or ""
-            quote_end = match.group(5) or quote_start
-            return f"{key}{sep}{quote_start}[REDACTED]{quote_end}"
+            key_quote = match.group("key_quote") or ""
+            key = match.group("key")
+            separator = match.group("separator")
+            value = match.group("value")
+            value_quote = (
+                value[0]
+                if len(value) >= 2
+                and value[0] in {'"', "'"}
+                and value[-1] == value[0]
+                else ""
+            )
+            return (
+                f"{key_quote}{key}{key_quote}{separator}"
+                f"{value_quote}[REDACTED]{value_quote}"
+            )
 
         sanitized = cls._SECRET_PATTERNS[0].sub(_replace_secret, sanitized)
         sanitized = cls._SECRET_PATTERNS[1].sub("Bearer [REDACTED]", sanitized)
@@ -250,7 +572,7 @@ class StatsApp:
         self.node_name = node_name
         self.pub_key = pub_key
         self.dashboard_template = None
-        self.config = config or {}
+        self.config = config if config is not None else {}
         self.default_html_dir = os.path.join(os.path.dirname(__file__), "html")
 
         # Path to the compiled Vue.js application
@@ -364,7 +686,7 @@ class HTTPStatsServer:
 
         self.host = host
         self.port = port
-        self.config = config or {}
+        self.config = config if config is not None else {}
         self.config_path = config_path
         self.daemon_instance = daemon_instance
 
@@ -376,7 +698,7 @@ class HTTPStatsServer:
             node_name,
             pub_key,
             send_advert_func,
-            config,
+            self.config,
             event_loop,
             daemon_instance,
             config_path,
@@ -392,66 +714,78 @@ class HTTPStatsServer:
 
         # Set up CORS at the server level if enabled
         self._cors_enabled = self.config.get("web", {}).get("cors_enabled", False)
-        logger.info(f"CORS enabled: {self._cors_enabled}")
+        self._cors_origins = _cors_origins(self.config)
+        if self._cors_enabled and not self._cors_origins:
+            logger.warning(
+                "CORS requested but web.cors_origins has no valid origins; "
+                "cross-origin browser access remains disabled"
+            )
+            self._cors_enabled = False
+        logger.info(
+            "CORS enabled: %s (origins=%s)",
+            self._cors_enabled,
+            len(self._cors_origins),
+        )
 
     def _init_auth_handlers(self):
         """Initialize JWT handler and API token manager."""
-        # Get or generate JWT secret from repeater.security
-        repeater_config = self.config.get("repeater", {})
-        security_config = repeater_config.get("security", {})
-        jwt_secret = security_config.get("jwt_secret", "")
+        repeater_config = self.config.setdefault("repeater", {})
+        if not isinstance(repeater_config, dict):
+            raise ValueError("repeater must be an object")
+        security_config = repeater_config.setdefault("security", {})
+        if not isinstance(security_config, dict):
+            raise ValueError("repeater.security must be an object")
 
-        if not jwt_secret:
-            # Auto-generate JWT secret
-            jwt_secret = secrets.token_hex(32)
-            logger.warning(
-                "No JWT secret found in config, auto-generated one. Please save this to config.yaml:"
+        # Validate the full auth policy before generating or persisting anything.
+        jwt_expiry_minutes = _jwt_expiry_minutes(
+            security_config.get("jwt_expiry_minutes", 60)
+        )
+        security_config.setdefault("jwt_expiry_minutes", jwt_expiry_minutes)
+
+        configured_secret = security_config.get("jwt_secret")
+        if configured_secret in (None, ""):
+            generated_secret = secrets.token_hex(32)
+            jwt_secret = _persist_generated_jwt_secret(
+                self.config_path,
+                generated_secret,
             )
+            # ConfigManager holds this same dictionary. Updating it prevents a
+            # later settings save from erasing the just-persisted credential.
+            security_config["jwt_secret"] = jwt_secret
+        else:
+            jwt_secret = _jwt_signing_secret(configured_secret)
 
-            # Try to save to config if config_path is available
-            if self.config_path:
-                try:
-                    import yaml
-
-                    with open(self.config_path, "r") as f:
-                        config_data = yaml.safe_load(f) or {}
-
-                    if "repeater" not in config_data:
-                        config_data["repeater"] = {}
-                    if "security" not in config_data["repeater"]:
-                        config_data["repeater"]["security"] = {}
-                    config_data["repeater"]["security"]["jwt_secret"] = jwt_secret
-
-                    with open(self.config_path, "w") as f:
-                        yaml.dump(config_data, f, default_flow_style=False)
-
-                    logger.info(f"Saved auto-generated JWT secret to {self.config_path}")
-                except Exception as e:
-                    logger.error(f"Failed to save JWT secret to config: {e}")
-
-        # Initialize JWT handler with configurable expiry (default 1 hour)
-        jwt_expiry_minutes = security_config.get("jwt_expiry_minutes", 60)
         self.jwt_handler = JWTHandler(jwt_secret, expiry_minutes=jwt_expiry_minutes)
         logger.info(f"JWT handler initialized (token expiry: {jwt_expiry_minutes} minutes)")
 
         # Initialize API token manager
         storage_dir = resolve_storage_dir(self.config, config_path=self.config_path)
 
-        # Ensure storage directory exists
-        os.makedirs(storage_dir, exist_ok=True)
-
-        # Initialize SQLiteHandler and APITokenManager
-        self.sqlite_handler = SQLiteHandler(Path(storage_dir))
+        # The daemon already owns the canonical SQLite handler used by Frame
+        # and the companion journal. Reuse it so bringing up (or rebuilding)
+        # the HTTP surface cannot run startup recovery against a live send.
+        repeater_handler = getattr(
+            getattr(self, "daemon_instance", None),
+            "repeater_handler",
+            None,
+        )
+        storage = getattr(repeater_handler, "storage", None)
+        self.sqlite_handler = getattr(storage, "sqlite_handler", None)
+        if self.sqlite_handler is None:
+            # Standalone embeddings and focused tests do not have a daemon.
+            os.makedirs(storage_dir, exist_ok=True)
+            self.sqlite_handler = SQLiteHandler(Path(storage_dir))
         self.token_manager = APITokenManager(self.sqlite_handler, jwt_secret)
-        logger.info(f"API token manager initialized with database at {storage_dir}/repeater.db")
+        logger.info(
+            "API token manager initialized with shared database at %s/repeater.db",
+            storage_dir,
+        )
 
     def _setup_server_cors(self):
-        """Set up CORS using cherrypy_cors.install()"""
-        # Configure CORS to allow Authorization header
-        # cherrypy-cors will handle preflight requests automatically
-        cherrypy_cors.install()
+        """Install the exact-origin CORS hook."""
 
-        logger.info("CORS support enabled with Authorization header")
+        _register_safe_cors_tool()
+        logger.info("CORS support enabled for %d exact origin(s)", len(self._cors_origins))
 
     def _json_error_handler(self, status, message, traceback, version):
         """Return JSON error responses instead of HTML for API endpoints"""
@@ -463,6 +797,7 @@ class HTTPStatsServer:
         try:
             _install_cheroot_bad_fd_unraisable_filter()
             register_require_auth_tool()
+            _register_api_no_store_tool()
 
             if self._cors_enabled:
                 self._setup_server_cors()
@@ -487,6 +822,8 @@ class HTTPStatsServer:
                 # Require authentication for all /api endpoints
                 "/api": {
                     "tools.require_auth.on": True,
+                    "tools.api_no_store.on": True,
+                    "error_page.default": self._json_error_handler,
                 },
                 # Enable gzip for bulk packet downloads
                 "/api/bulk_packets": {
@@ -521,6 +858,28 @@ class HTTPStatsServer:
                     "tools.require_auth.on": False,
                 },
                 "/api/config_import": {
+                    "tools.require_auth.on": False,
+                },
+                # Mobile Companion API v1 public entry points (design doc
+                # §7.1, §11.2): server_info is the unauthenticated discovery
+                # endpoint an app validates a scanned URL against before it
+                # has any credential. This config path also covers
+                # "/api/v1/pair/start" (CherryPy config cascades to
+                # descendants) even though that endpoint is admin-only —
+                # it carries its own @require_auth decorator for that
+                # reason (see PairV1.start's docstring in mobile_endpoints.py).
+                "/api/v1": {
+                    # JSON error envelope for the whole v1 tree. Only fires
+                    # for statuses without their own error_page.<code> entry;
+                    # the global error_page.401 above still wins for 401s
+                    # (get_error_page checks pages.get(code) before
+                    # pages.get('default')), but that handler is JSON too.
+                    "error_page.default": _json_error_page_v1,
+                },
+                "/api/v1/server_info": {
+                    "tools.require_auth.on": False,
+                },
+                "/api/v1/pair": {
                     "tools.require_auth.on": False,
                 },
             }
@@ -558,16 +917,12 @@ class HTTPStatsServer:
             # Add CORS configuration if enabled
             if self._cors_enabled:
                 cors_config = {
-                    "cors.expose.on": True,
-                    "tools.response_headers.on": True,
-                    "tools.response_headers.headers": _cors_response_headers(),
-                    # Disable automatic trailing slash redirects to prevent CORS issues
+                    "tools.safe_cors.on": True,
+                    "tools.safe_cors.origins": self._cors_origins,
                     "tools.trailing_slash.on": False,
                 }
 
-                # Apply CORS to paths
                 config["/"].update(cors_config)
-                config["/api"].update(cors_config)
 
             http_cfg = self.config.get("http", {}) if isinstance(self.config, dict) else {}
             thread_pool = max(2, int(http_cfg.get("thread_pool", 8)))
@@ -617,15 +972,15 @@ class HTTPStatsServer:
                     "tools.response_headers.on": True,
                     "tools.response_headers.headers": [
                         ("Content-Type", "application/json"),
+                        ("Cache-Control", "no-store"),
                     ],
                     # Disable automatic trailing slash redirects
                     "tools.trailing_slash.on": False,
                 }
             }
             if self._cors_enabled:
-                auth_config["/"]["cors.expose.on"] = True
-                # Add CORS headers for OPTIONS requests
-                auth_config["/"]["tools.response_headers.headers"].extend(_cors_response_headers())
+                auth_config["/"]["tools.safe_cors.on"] = True
+                auth_config["/"]["tools.safe_cors.origins"] = self._cors_origins
 
             cherrypy.tree.mount(self.auth_app, "/auth", auth_config)
 
@@ -641,10 +996,8 @@ class HTTPStatsServer:
                 }
             }
             if self._cors_enabled:
-                doc_config["/"]["cors.expose.on"] = True
-                doc_config["/"]["tools.response_headers.headers"].extend(
-                    _cors_response_headers("GET, POST, OPTIONS")
-                )
+                doc_config["/"]["tools.safe_cors.on"] = True
+                doc_config["/"]["tools.safe_cors.origins"] = self._cors_origins
 
             cherrypy.tree.mount(self.doc_app, "/doc", doc_config)
 

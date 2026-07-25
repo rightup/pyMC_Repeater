@@ -1,3 +1,4 @@
+import logging
 from unittest.mock import patch
 
 import yaml
@@ -604,6 +605,63 @@ def test_policy_engine_channel_decryptable_true_with_matching_secret():
 
     assert decision.matched is True
     assert decision.action == "drop"
+
+
+def test_policy_engine_channel_decrypt_logs_only_non_sensitive_metadata(caplog):
+    channel_secret = (b"never-log-this-secret" + b"\x00" * 32)[:32].hex()
+    message = "never log this private message"
+    sender = "Private Sender"
+    packet = PacketBuilder.create_group_datagram(
+        group_name="ops",
+        local_identity=LocalIdentity(),
+        message=message,
+        sender_name=sender,
+        channels_config=[{"name": "ops", "secret": channel_secret}],
+    )
+    engine = PolicyEngine(
+        {
+            "enabled": True,
+            "default_action": "allow",
+            "objects": {"channels": {"ops": {"secret": channel_secret}}},
+            "rules": [
+                {
+                    "id": 415,
+                    "enabled": True,
+                    "if": {
+                        "all": [
+                            {
+                                "field": "channel_decryptable",
+                                "op": "equals",
+                                "value": True,
+                            },
+                            {
+                                "field": "channel_message_body",
+                                "op": "equals",
+                                "value": message,
+                            },
+                            {
+                                "field": "channel_sender",
+                                "op": "equals",
+                                "value": sender,
+                            },
+                        ]
+                    },
+                    "then": {"action": "allow"},
+                }
+            ],
+        }
+    )
+
+    with caplog.at_level(logging.DEBUG, logger="PolicyEngine"):
+        decision = engine.evaluate(packet, {"payload_type": packet.get_payload_type()})
+
+    assert decision.matched is True
+    assert "Channel decrypt: success" in caplog.text
+    assert "candidate 1" in caplog.text
+    assert channel_secret not in caplog.text
+    assert channel_secret[:8] not in caplog.text
+    assert message not in caplog.text
+    assert sender not in caplog.text
 
 
 def test_policy_engine_channel_decryptable_false_with_non_matching_secret():

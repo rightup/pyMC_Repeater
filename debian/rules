@@ -8,15 +8,11 @@ export DH_VERBOSE=1
 	dh $@ --with python3 --buildsystem=pybuild
 
 override_dh_auto_test:
-	# Skip tests - cherrypy-cors not available in Debian repos
-	# Tests pass in development with: pip install cherrypy-cors
+	# The package build skips the hardware-dependent project test suite.
 
- override_dh_auto_clean:
+override_dh_auto_clean:
 	dh_auto_clean
 	rm -rf build/
 	rm -rf *.egg-info/
 	rm -rf .pybuild/
 	rm -f repeater/_version.py
-
-override_dh_installsystemd:
-	dh_installsystemd --name=openhop-repeater

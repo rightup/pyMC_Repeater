@@ -32,7 +32,6 @@ BUILDROOT_RADIO_SETTINGS_JSON="$SCRIPT_DIR/radio-settings-buildroot.json"
 set_wheel_dependencies() {
     set -- \
         "cherrypy>=18.0.0" \
-        "cherrypy-cors==1.7.0" \
         "paho-mqtt>=1.6.0" \
         "pyjwt>=2.8.0" \
         "ws4py>=0.6.0" \
@@ -1281,7 +1280,6 @@ modules = [
     "sqlite3",
     "yaml",
     "cherrypy",
-    "cherrypy_cors",
     "autocommand",
     "jaraco.collections",
     "jaraco.text",
@@ -1315,7 +1313,6 @@ check_venv_runtime() {
 checks = [
     ("import yaml", "PyYAML"),
     ("import cherrypy", "CherryPy"),
-    ("import cherrypy_cors", "cherrypy-cors"),
     ("import paho.mqtt.client", "paho-mqtt"),
     ("import psutil", "psutil"),
     ("import jwt", "PyJWT"),

@@ -6,6 +6,7 @@ import time
 from typing import Optional
 
 from repeater.config import resolve_storage_dir
+from repeater.retention import DEFAULT_RETENTION_DAYS
 
 from .mqtt_handler import MeshCoreToMqttPusher
 from .rrdtool_handler import RRDToolHandler
@@ -562,7 +563,11 @@ class StorageCollector:
             logger.debug(f"Could not lookup node name for {pubkey[:8] if pubkey else 'None'}: {e}")
             return None
 
-    def cleanup_old_data(self, days: int = 7, companion_events_days: Optional[int] = None):
+    def cleanup_old_data(
+        self,
+        days: int = DEFAULT_RETENTION_DAYS,
+        companion_events_days: Optional[int] = None,
+    ):
         self.sqlite_handler.cleanup_old_data(days, companion_events_days=companion_events_days)
 
     def get_noise_floor_history(self, hours: int = 24, limit: int = None) -> list:

@@ -12,9 +12,13 @@ on:
         required: false
         default: ""
       pymc_console_version:
-        description: "PyMC Console release to bundle (latest or a tag such as v0.9.333)"
+        description: "Exact PyMC Console tag to bundle (defaults to repository variable)"
         required: false
-        default: "latest"
+        default: ""
+      pymc_console_sha256:
+        description: "Verified SHA-256 for that Console archive (defaults to repository variable)"
+        required: false
+        default: ""
 
 jobs:
   docker:
@@ -50,48 +54,105 @@ jobs:
           version="$(python -m setuptools_scm)"
           echo "version=${version}" >> "$GITHUB_OUTPUT"
 
-      - name: Log in to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
       - name: Determine image repository
         id: image_repo
         shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
+          REQUESTED_IMAGE_REPOSITORY: ${{ inputs.image_repository }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.image_repository }}" ]; then
-            image_repository="${{ inputs.image_repository }}"
-          elif [ "${{ github.repository_owner }}" = "yellowcooln" ]; then
+          set -euo pipefail
+
+          if [ "${EVENT_NAME}" = "workflow_dispatch" ] && [ -n "${REQUESTED_IMAGE_REPOSITORY}" ]; then
+            image_repository="${REQUESTED_IMAGE_REPOSITORY}"
+          elif [ "${REPOSITORY_OWNER}" = "yellowcooln" ]; then
             image_repository="yellowcooln/pymc-repeater"
           else
             image_repository="openhop/openhop-repeater"
           fi
 
-          echo "Using image repository: ${image_repository}"
-          echo "image_repository=${image_repository}" >> "$GITHUB_OUTPUT"
+          if [[ ! "${image_repository}" =~ ^[a-z0-9]([a-z0-9._-]{0,126}[a-z0-9])?/[a-z0-9]([a-z0-9._-]{0,126}[a-z0-9])?$ ]]; then
+            echo "image_repository must be a lowercase Docker Hub owner/name pair." >&2
+            exit 1
+          fi
 
-      - name: Resolve bundled Console release
-        id: console_release
+          echo "Using image repository: ${image_repository}"
+          printf 'image_repository=%s\n' "${image_repository}" >> "$GITHUB_OUTPUT"
+
+      - name: Validate verified artifact pins
+        id: artifact_pins
         shell: bash
         env:
-          REQUESTED_CONSOLE_VERSION: ${{ inputs.pymc_console_version || 'latest' }}
+          REQUESTED_CONSOLE_VERSION: ${{ inputs.pymc_console_version }}
+          REQUESTED_CONSOLE_SHA256: ${{ inputs.pymc_console_sha256 }}
+          PINNED_CONSOLE_VERSION: ${{ vars.PYMC_CONSOLE_VERSION }}
+          PINNED_CONSOLE_SHA256: ${{ vars.PYMC_CONSOLE_SHA256 }}
+          PINNED_YQ_VERSION: ${{ vars.YQ_VERSION }}
+          PINNED_YQ_SHA256_AMD64: ${{ vars.YQ_SHA256_AMD64 }}
+          PINNED_YQ_SHA256_ARM64: ${{ vars.YQ_SHA256_ARM64 }}
         run: |
           set -euo pipefail
 
-          if [ "${REQUESTED_CONSOLE_VERSION}" = "latest" ]; then
-            release_json="$(curl -fsSL https://api.github.com/repos/Treehouse-00/pymc_console-dist/releases/latest)"
-            tag="$(jq -r '.tag_name' <<<"${release_json}")"
-            published_at="$(jq -r '.published_at' <<<"${release_json}")"
-            cache_bust="${tag}@${published_at}"
+          if { [ -n "${REQUESTED_CONSOLE_VERSION}" ] && [ -z "${REQUESTED_CONSOLE_SHA256}" ]; } \
+            || { [ -z "${REQUESTED_CONSOLE_VERSION}" ] && [ -n "${REQUESTED_CONSOLE_SHA256}" ]; }; then
+            echo "Workflow overrides must provide both pymc_console_version and pymc_console_sha256." >&2
+            exit 1
+          fi
+          if [ -n "${REQUESTED_CONSOLE_VERSION}" ]; then
+            console_version="${REQUESTED_CONSOLE_VERSION}"
+            console_sha256="${REQUESTED_CONSOLE_SHA256}"
           else
-            tag="${REQUESTED_CONSOLE_VERSION}"
-            cache_bust="${REQUESTED_CONSOLE_VERSION}"
+            console_version="${PINNED_CONSOLE_VERSION}"
+            console_sha256="${PINNED_CONSOLE_SHA256}"
+          fi
+          yq_version="${PINNED_YQ_VERSION:-v4.40.5}"
+
+          validate_sha256() {
+            label="$1"
+            value="$2"
+            if [[ ! "${value}" =~ ^[0-9a-fA-F]{64}$ ]]; then
+              echo "${label} must be a verified 64-character SHA-256." >&2
+              exit 1
+            fi
+          }
+
+          if [ -z "${console_version}" ] || [ "${console_version}" = "latest" ]; then
+            echo "Set PYMC_CONSOLE_VERSION to an exact tag in repository variables or workflow input." >&2
+            exit 1
+          fi
+          if [ "${yq_version}" = "latest" ]; then
+            echo "YQ_VERSION must be an exact tag." >&2
+            exit 1
+          fi
+          if [[ ! "${console_version}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]; then
+            echo "PYMC_CONSOLE_VERSION must contain only tag-safe characters." >&2
+            exit 1
+          fi
+          if [[ ! "${yq_version}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]; then
+            echo "YQ_VERSION must contain only tag-safe characters." >&2
+            exit 1
           fi
 
-          echo "Bundling PyMC Console ${tag}"
-          echo "version=${REQUESTED_CONSOLE_VERSION}" >> "$GITHUB_OUTPUT"
-          echo "cache_bust=${cache_bust}" >> "$GITHUB_OUTPUT"
+          validate_sha256 "PYMC_CONSOLE_SHA256" "${console_sha256}"
+          validate_sha256 "YQ_SHA256_AMD64" "${PINNED_YQ_SHA256_AMD64}"
+          validate_sha256 "YQ_SHA256_ARM64" "${PINNED_YQ_SHA256_ARM64}"
+
+          echo "Bundling verified PyMC Console ${console_version}"
+          {
+            echo "console_version=${console_version}"
+            echo "console_sha256=${console_sha256}"
+            echo "console_cache_bust=${console_version}@${console_sha256}"
+            echo "yq_version=${yq_version}"
+            echo "yq_sha256_amd64=${PINNED_YQ_SHA256_AMD64}"
+            echo "yq_sha256_arm64=${PINNED_YQ_SHA256_ARM64}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Extract Docker metadata
         id: meta
@@ -112,8 +173,14 @@ jobs:
           push: true
           build-args: |
             PACKAGE_VERSION=${{ steps.package_version.outputs.version }}
-            PYMC_CONSOLE_VERSION=${{ steps.console_release.outputs.version }}
-            PYMC_CONSOLE_CACHE_BUST=${{ steps.console_release.outputs.cache_bust }}
+            YQ_VERSION=${{ steps.artifact_pins.outputs.yq_version }}
+            YQ_SHA256_AMD64=${{ steps.artifact_pins.outputs.yq_sha256_amd64 }}
+            YQ_SHA256_ARM64=${{ steps.artifact_pins.outputs.yq_sha256_arm64 }}
+            PYMC_CONSOLE_VERSION=${{ steps.artifact_pins.outputs.console_version }}
+            PYMC_CONSOLE_SHA256_AMD64=${{ steps.artifact_pins.outputs.console_sha256 }}
+            PYMC_CONSOLE_SHA256_ARM64=${{ steps.artifact_pins.outputs.console_sha256 }}
+            PYMC_CONSOLE_ALLOW_LATEST=0
+            PYMC_CONSOLE_CACHE_BUST=${{ steps.artifact_pins.outputs.console_cache_bust }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
@@ -126,14 +193,29 @@ jobs:
           CHANNEL: ${{ github.ref_name }}
           REVISION: ${{ github.sha }}
         run: |
+          set -euo pipefail
+
           if [ -z "${DISPATCH_TOKEN}" ]; then
             echo "HA_ADDON_REPO_DISPATCH_TOKEN is not set" >&2
             exit 1
           fi
+
+          payload="$(
+            jq -cn \
+              --arg channel "${CHANNEL}" \
+              --arg revision "${REVISION}" \
+              '{
+                event_type: "sync-upstream-channel",
+                client_payload: {
+                  channel: $channel,
+                  revision: $revision
+                }
+              }'
+          )"
 
           curl -fsSL \
             -X POST \
             -H "Accept: application/vnd.github+json" \
             -H "Authorization: Bearer ${DISPATCH_TOKEN}" \
             https://api.github.com/repos/openhop-dev/openHop-HA-Add-on/dispatches \
-            -d "{\"event_type\":\"sync-upstream-channel\",\"client_payload\":{\"channel\":\"${CHANNEL}\",\"revision\":\"${REVISION}\"}}"
+            --data-binary "${payload}"

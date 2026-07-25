@@ -1045,10 +1045,18 @@ _startup_dist_info_cleanup()
 class UpdateAPIEndpoints:
     def _set_cors_headers(self, config: dict) -> None:
         if config.get("web", {}).get("cors_enabled", False):
-            cherrypy.response.headers["Access-Control-Allow-Origin"] = "*"
+            configured = config.get("web", {}).get("cors_origins", ())
+            if isinstance(configured, str):
+                configured = [configured]
+            request_headers = getattr(cherrypy.request, "headers", {})
+            origin = request_headers.get("Origin")
+            if not origin or origin not in configured:
+                return
+            cherrypy.response.headers["Access-Control-Allow-Origin"] = origin
+            cherrypy.response.headers["Vary"] = "Origin"
             cherrypy.response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
             cherrypy.response.headers["Access-Control-Allow-Headers"] = (
-                "Content-Type, Authorization"
+                "Authorization, Content-Type, X-API-Key"
             )
 
     def _require_post(self):

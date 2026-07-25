@@ -13,9 +13,15 @@ def test_create_identity_schema_matches_supported_identity_types():
     properties = schema["properties"]
 
     assert properties["type"]["enum"] == ["companion", "room_server"]
-    assert {"node_name", "tcp_port", "bind_address"} <= set(properties["settings"]["properties"])
+    assert {"node_name", "frame_enabled", "tcp_port", "bind_address"} <= set(
+        properties["settings"]["properties"]
+    )
     assert set(
         spec["paths"]["/create_identity"]["post"]["requestBody"]["content"]["application/json"][
             "examples"
         ]
     ) == {"companion", "room_server"}
+    response_data = spec["paths"]["/create_identity"]["post"]["responses"]["200"][
+        "content"
+    ]["application/json"]["schema"]["properties"]["data"]["properties"]
+    assert response_data["activation_pending"]["type"] == "boolean"

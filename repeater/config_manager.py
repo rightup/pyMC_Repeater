@@ -1,5 +1,9 @@
+import copy
 import logging
 import os
+import tempfile
+import threading
+from contextlib import contextmanager
 from typing import Any, Dict, List, Optional
 
 import yaml
@@ -24,6 +28,15 @@ class ConfigManager:
         self.config_path = config_path
         self.config = config
         self.daemon = daemon_instance
+        # Frame callbacks and HTTP handlers can write the same live dictionary.
+        # Keep each mutation and its atomic file replacement together.
+        self._mutation_lock = threading.RLock()
+
+    @contextmanager
+    def mutation(self):
+        """Serialize one in-memory configuration mutation and its save."""
+        with self._mutation_lock:
+            yield
 
     def _get_live_radio_snapshot(self) -> Dict[str, Any]:
         radio_cfg = self.config.get("radio", {}) or {}
@@ -236,14 +249,37 @@ class ConfigManager:
 
     def save_to_file(self) -> bool:
         """
-        Save current config to YAML file.
+        Atomically save current config to the YAML file.
 
         Returns:
             True if successful, False otherwise
         """
+        with self._mutation_lock:
+            return self._save_to_file_locked()
+
+    def _save_to_file_locked(self) -> bool:
+        """Write the current config while ``_mutation_lock`` is held."""
+        temporary_path = None
         try:
-            os.makedirs(os.path.dirname(self.config_path), exist_ok=True)
-            with open(self.config_path, "w") as f:
+            # Write beside the destination and replace it only after the whole
+            # document is durable.  A crash or serialization error must leave
+            # the prior bootstrap/auth boundary intact instead of exposing a
+            # truncated file that looks like a fresh install.
+            target_path = os.path.realpath(self.config_path)
+            config_dir = os.path.dirname(target_path) or "."
+            os.makedirs(config_dir, exist_ok=True)
+            descriptor, temporary_path = tempfile.mkstemp(
+                prefix=f".{os.path.basename(target_path)}.",
+                suffix=".tmp",
+                dir=config_dir,
+                text=True,
+            )
+            with os.fdopen(descriptor, "w") as f:
+                # Configuration contains administrator credentials, identity
+                # seeds, API settings, and transport tokens. Tighten every
+                # successful rewrite even when a legacy file was readable by
+                # group or other users.
+                os.fchmod(f.fileno(), 0o600)
                 # Use safe_dump with explicit width to prevent line wrapping
                 # Setting width to a very large number prevents truncation of long strings like identity keys
                 yaml.safe_dump(
@@ -255,11 +291,50 @@ class ConfigManager:
                     sort_keys=False,
                     allow_unicode=True,
                 )
-            logger.info(f"Configuration saved to {self.config_path}")
+                f.flush()
+                os.fsync(f.fileno())
+
+            os.replace(temporary_path, target_path)
+            temporary_path = None
+
+            # Persist the directory entry when the platform supports it.  The
+            # replacement itself is already complete at this point, so an
+            # unsupported directory fsync must not report a failed save and
+            # make callers roll their live config back behind the new file.
+            try:
+                directory_descriptor = os.open(
+                    config_dir,
+                    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+                )
+                try:
+                    os.fsync(directory_descriptor)
+                finally:
+                    os.close(directory_descriptor)
+            except OSError as exc:
+                logger.warning(
+                    "Configuration replaced at %s, but its directory could not "
+                    "be synced: %s",
+                    target_path,
+                    exc,
+                )
+
+            logger.info(f"Configuration saved to {target_path}")
             return True
         except Exception as e:
             logger.error(f"Failed to save config to {self.config_path}: {e}", exc_info=True)
             return False
+        finally:
+            if temporary_path is not None:
+                try:
+                    os.unlink(temporary_path)
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    logger.warning(
+                        "Could not remove failed configuration temporary file %s: %s",
+                        temporary_path,
+                        exc,
+                    )
 
     def live_update_daemon(self, sections: Optional[List[str]] = None) -> bool:
         """
@@ -380,6 +455,20 @@ class ConfigManager:
         live_update: bool = True,
         live_update_sections: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
+        """Apply updates and persist them as one serialized operation."""
+        with self._mutation_lock:
+            return self._update_and_save_locked(
+                updates,
+                live_update=live_update,
+                live_update_sections=live_update_sections,
+            )
+
+    def _update_and_save_locked(
+        self,
+        updates: Dict[str, Any],
+        live_update: bool = True,
+        live_update_sections: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
         """
         Apply updates to config, save to file, and optionally live update daemon.
 
@@ -399,6 +488,7 @@ class ConfigManager:
                 - error: str (optional) - Error message if failed
         """
         result: Dict[str, Any] = {"success": False, "saved": False, "live_updated": False}
+        previous_config = copy.deepcopy(self.config)
 
         try:
             # Apply updates to config
@@ -415,6 +505,8 @@ class ConfigManager:
             result["saved"] = self.save_to_file()
 
             if not result["saved"]:
+                self.config.clear()
+                self.config.update(previous_config)
                 result["error"] = "Failed to save config to file"
                 return result
 
@@ -430,9 +522,58 @@ class ConfigManager:
             return result
 
         except Exception as e:
+            if not result["saved"]:
+                self.config.clear()
+                self.config.update(previous_config)
             logger.error(f"Error in update_and_save: {e}", exc_info=True)
             result["error"] = str(e)
             return result
+
+    def save_companion_node_name(self, companion_name: str, node_name: str) -> bool:
+        """Atomically update one companion display name, rolling back on failure."""
+        with self._mutation_lock:
+            identities = self.config.get("identities")
+            if not isinstance(identities, dict):
+                raise KeyError("identities configuration is missing")
+            companions = identities.get("companions")
+            if not isinstance(companions, list):
+                raise KeyError("companion configuration is missing")
+
+            for entry in companions:
+                if not isinstance(entry, dict) or entry.get("name") != companion_name:
+                    continue
+                settings_present = "settings" in entry
+                original_settings = entry.get("settings")
+                settings = original_settings
+                if settings is None:
+                    settings = {}
+                    entry["settings"] = settings
+                elif not isinstance(settings, dict):
+                    raise ValueError(
+                        f"Companion '{companion_name}' settings must be an object"
+                    )
+
+                previous_present = "node_name" in settings
+                previous = settings.get("node_name")
+                if previous == node_name:
+                    return True
+
+                settings["node_name"] = node_name
+                if self.save_to_file():
+                    return True
+
+                if settings is not original_settings:
+                    if settings_present:
+                        entry["settings"] = original_settings
+                    else:
+                        entry.pop("settings", None)
+                elif previous_present:
+                    settings["node_name"] = previous
+                else:
+                    settings.pop("node_name", None)
+                return False
+
+            raise KeyError(f"Companion '{companion_name}' is missing from config")
 
     def update_nested(self, path: str, value: Any, live_update: bool = True) -> Dict[str, Any]:
         """

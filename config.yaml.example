@@ -118,18 +118,22 @@ repeater:
     # Maximum number of authenticated clients (across all identities)
     max_clients: 1
 
-    # Admin password for full access
-    admin_password: "admin123"
+    # Set a unique admin password through the first-run setup wizard.
+    # Never deploy a known example credential.
+    admin_password: ""
 
-    # Guest password for limited access
-    guest_password: "guest123"
+    # Optional guest password for limited access (leave empty to disable).
+    guest_password: ""
 
     # Allow read-only access for clients without password/not in ACL
     allow_read_only: false
 
-    # JWT secret key for signing tokens (auto-generated if not provided)
+    # JWT secret key for signing tokens (auto-generated if not provided).
+    # Explicit values need at least 32 UTF-8 bytes. Changing an established
+    # value invalidates existing JWTs and API/device tokens, which must then
+    # be reissued or paired again.
     # Generate with: python -c "import secrets; print(secrets.token_hex(32))"
-    jwt_secret: ""
+    jwt_secret: null
 
     # JWT token expiry time in minutes (default: 60 minutes / 1 hour)
     # Controls how long users stay logged in before needing to re-authenticate
@@ -277,7 +281,7 @@ sensors:
     #     bus_number: 1         # I2C bus number (1 for Raspberry Pi default)
     #     read_timeout_seconds: 1.0  # Max seconds to wait for valid data (polls every 50 ms)
 
-    # Example SHTC3 Ambient 
+    # Example SHTC3 Ambient
     # - type: shtc3
     #   name: ambient
     #   enabled: true
@@ -286,7 +290,7 @@ sensors:
     #     i2c_address: 0x70
     #     bus_number: 1
 
-    # Example Waveshare UPS D Hat 
+    # Example Waveshare UPS D Hat
     # - type: waveshare_ups_d
     #   name: battery
     #   enabled: true
@@ -295,7 +299,7 @@ sensors:
     #     i2c_address: 0x43
     #     bus_number: 1
 
-    # Example Waveshare UPS E Hat 
+    # Example Waveshare UPS E Hat
     # - type: waveshare_ups_e
     #   name: "battery"
     #   enabled: true
@@ -377,22 +381,47 @@ identities:
     #     guest_password: "social_guest_123"
 
   # Companion Identities
-  # Each companion exposes the MeshCore frame protocol over TCP for standard clients.
-  # One TCP client per companion at a time. Clients connect to repeater-ip:tcp_port.
+  # Each companion exposes the MeshCore frame protocol over TCP for standard clients
+  # and the authenticated Mobile Companion API under /api/v1.
+  # One TCP frame client per companion may be connected at a time; REST clients
+  # independently follow the durable journal. Both surfaces share the same
+  # bridge/radio path, so the daemon remains the sole owner of radio access.
+  # Every enabled companion listener and the HTTP listener needs a unique port
+  # process-wide. The WebSocket proxy uses the one frame-client slot; parallel
+  # chat clients should use /api/v1 REST/SSE instead.
+  #
+  # The frame listener is unauthenticated and can expose identity/channel secrets.
+  # It defaults to loopback; opt into a trusted LAN bind only when needed.
+  # Set `frame_enabled: false` for a REST/SSE-only companion; its bridge, durable
+  # history, and shared radio path remain active and no frame port is reserved.
+  # `name` is a stable URL/config slug: 1-64 ASCII characters, starting with
+  # a letter or digit, then only letters, digits, ".", "_", or "-".
+  # Put the human-facing advertised name in `settings.node_name`.
   companions:
-    # - name: "RepeaterCompanion"
+    # - name: "repeater-companion"
     #   identity_key: "your_companion_identity_key_hex_here"
     #   settings:
     #     node_name: "RepeaterCompanion"
+    #     frame_enabled: true
     #     tcp_port: 5000
-    #     bind_address: "0.0.0.0"
-    #     tcp_timeout: 120   # seconds; default 120 when omitted; 0 = disable (no timeout)
-    # - name: "BotCompanion"
+    #     bind_address: "127.0.0.1"
+    #     tcp_timeout: 28800  # idle seconds, 0..2147483647; default 8 hours; 0 = disable
+    #     # One-time recovery only: set true to claim unbound rows written by
+    #     # an older build after verifying they belong to this full identity.
+    #     # Remove it after one successful activation. It never overrides a binding.
+    #     adopt_legacy_namespace: false
+    #     max_contacts: 1000  # 1..2000; upstream default is 1000
+    #     offline_queue_size: 512  # 0..4096; default 512
+    #     # This bounds pending Frame delivery only; REST history remains durable.
+    #     # If stored contacts exceed max_contacts at startup, remove the oldest
+    #     # non-favourite contacts. Default false: startup fails visibly instead.
+    #     trim_contacts_on_overflow: false
+    #     rf_reception_events: false  # opt in to high-volume /sync and /events RF events
+    # - name: "bot-companion"
     #   identity_key: "another_companion_identity_key_hex"
     #   settings:
     #     node_name: "meshcore-bot"
-    #     tcp_port: 5001
-    #     tcp_timeout: 120   # seconds; default 120 when omitted; 0 = disable (no timeout)
+    #     frame_enabled: false  # REST/SSE only; tcp_* settings are ignored
 
 # Radio hardware type
 # Supported:
@@ -525,11 +554,11 @@ storage:
 
   # Data retention settings
   retention:
-    # Clean up SQLite records older than this many days
+    # Clean up SQLite records older than this many days (1..36500; default 31).
     sqlite_cleanup_days: 31
     # Companion event journal / soft-consumed message history retention.
     # Independent of sqlite_cleanup_days so packet RF history and companion
-    # sync history can be sized separately. Defaults to 31 when omitted.
+    # sync history can be sized separately (1..36500; default 31).
     companion_events_days: 31
 
     # RRD archives are managed automatically:
@@ -561,7 +590,7 @@ mqtt_brokers:
   #   mqtt           - legacy openhop-repeater local-broker convention (custom topic, singular 'packet')
   # retain_status: true|false # Sets MQTT "retain" on status messages so they remain on the broker when disconnected. Also enforces a QOS of 1 (guaranteed delivery)
   # tls:
-  #   enabled: true|false # Enable TLS. If the endpoint's certificate is self-signed, the Root CA should be added to the OS's certificate store. 
+  #   enabled: true|false # Enable TLS. If the endpoint's certificate is self-signed, the Root CA should be added to the OS's certificate store.
   #   insecure: true|false # Validate TLS certificates
 
   # Block specific packet types from being published to the MQTT endpoint
@@ -665,11 +694,45 @@ http:
   # socket_queue_size controls pending TCP connection backlog (min: 10).
   socket_queue_size: 100
 
+  # SSE keepalive interval (1..60; values below 5 clamp to 5).
+  # A streaming client should use an inactivity timeout greater than this value.
+  sse_keepalive_sec: 15
+  # Legacy companion callback queue (1..4096; values below 32 clamp to 32).
+  # V1 replays from SQLite and uses only a coalescing wake signal.
+  sse_queue_maxsize: 64
+
+# Companion API admission controls. Radio limits apply to Mobile v1 actions.
+# The resumable v1 stream and deprecated legacy operator stream share this SSE
+# cap and allow only one stream per authenticated principal and companion.
+# Keep sse_max_connections <= the effective http.thread_pool_max - 2 so two
+# workers remain available for ordinary API requests.
+mobile_api:
+  rf_burst: 6                 # 1..10000
+  rf_per_minute: 12          # >0..60000
+  rf_global_burst: 12        # 1..10000
+  rf_global_per_minute: 30   # >0..60000
+  sse_max_connections: 8       # 1..256 and no more than http.thread_pool_max - 2
+
+# Optional mobile push wake delivery. Devices register only their platform
+# token and privacy preference; the relay endpoint is operator-owned.
+companion:
+  push:
+    enabled: true
+    relay_url: null              # absolute HTTPS notify endpoint; null disables push
+    allow_insecure_http: false   # only for an explicitly trusted local test relay
+    min_interval_sec: 30         # finite seconds, 0..86400
+    request_timeout_sec: 10      # finite seconds, 0.1..300
+    worker_count: 2              # clamped to 1..4
+
 # Web interface configuration
 web:
-  # Enable Cross-Origin Resource Sharing (CORS) headers
-  # Allows web frontends from different origins to access the API
+  # Enable Cross-Origin Resource Sharing for explicitly trusted web frontends.
+  # Native apps and same-origin web clients do not need CORS.
   cors_enabled: false
+  # Exact origins only; wildcards and URL paths are rejected.
+  # cors_origins:
+  #   - https://chat.example.net
+  #   - http://localhost:5173
 
   # Custom path to web frontend files (optional)
   # If not specified, uses the default built-in path

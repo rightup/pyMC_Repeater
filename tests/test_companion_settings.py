@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -14,6 +15,8 @@ from openhop_core.protocol import LocalIdentity
 from repeater.companion.utils import (
     COMPANION_SETTINGS_ALLOWLIST,
     CompanionContactCapacityError,
+    DEFAULT_COMPANION_TCP_PORT,
+    DEFAULT_COMPANION_TCP_TIMEOUT_SEC,
     check_companion_contact_capacity,
     effective_max_contacts,
     enforce_companion_contact_capacity,
@@ -22,12 +25,32 @@ from repeater.companion.utils import (
     parse_positive_int,
     select_companion_contacts_to_trim,
     trim_companion_contacts_to_fit,
+    validate_companion_bind_address,
+    validate_companion_boolean_setting,
     validate_companion_config_capacity,
+    validate_companion_legacy_adoption,
+    validate_companion_listener_config,
+    validate_companion_node_name,
+    validate_companion_seconds_setting,
+    validate_companion_tcp_port,
+    validate_companion_tcp_timeout,
 )
 from repeater.main import RepeaterDaemon
+from repeater.data_acquisition.sqlite_handler import CompanionStorageError, SQLiteHandler
+from repeater.web.mobile_endpoints import CompanionsV1
 
 # openhop_core defaults (CompanionBridge / ContactStore)
 _DEFAULT_MAX_CONTACTS = 1000
+
+
+def test_companion_seconds_setting_rejects_huge_integer_cleanly():
+    with pytest.raises(ValueError, match="between 0.1 and 300 seconds"):
+        validate_companion_seconds_setting(
+            10**1000,
+            "request_timeout_sec",
+            minimum=0.1,
+            maximum=300.0,
+        )
 
 
 class TestParsePositiveInt:
@@ -38,9 +61,98 @@ class TestParsePositiveInt:
         with pytest.raises(ValueError, match="max_contacts"):
             parse_positive_int("abc", "max_contacts")
 
+    @pytest.mark.parametrize("value", [True, False, 1.0, 1.5])
+    def test_rejects_json_boolean_and_float_coercion(self, value):
+        with pytest.raises(ValueError, match="max_contacts"):
+            parse_positive_int(value, "max_contacts")
+
     def test_below_minimum(self):
         with pytest.raises(ValueError, match="max_contacts"):
             parse_positive_int(0, "max_contacts")
+
+
+class TestCompanionTcpSettings:
+    def test_valid_bounds_and_defaults(self):
+        assert DEFAULT_COMPANION_TCP_PORT == 5000
+        assert DEFAULT_COMPANION_TCP_TIMEOUT_SEC == 8 * 60 * 60
+        assert validate_companion_tcp_port(1) == 1
+        assert validate_companion_tcp_port(65_535) == 65_535
+        assert validate_companion_tcp_timeout(0) == 0
+        assert validate_companion_tcp_timeout(DEFAULT_COMPANION_TCP_TIMEOUT_SEC) == (
+            DEFAULT_COMPANION_TCP_TIMEOUT_SEC
+        )
+
+    @pytest.mark.parametrize("value", [True, "5000", 0, 65_536, None])
+    def test_invalid_port_type_or_range(self, value):
+        with pytest.raises(ValueError, match="tcp_port"):
+            validate_companion_tcp_port(value)
+
+    @pytest.mark.parametrize("value", [True, "120", -1, 2_147_483_648, None])
+    def test_invalid_timeout_type_or_range(self, value):
+        with pytest.raises(ValueError, match="tcp_timeout"):
+            validate_companion_tcp_timeout(value)
+
+    @pytest.mark.parametrize("value", [1, 0, "true", "false", None])
+    def test_policy_boolean_rejects_coercion(self, value):
+        with pytest.raises(ValueError, match="rf_reception_events"):
+            validate_companion_boolean_setting(value, "rf_reception_events")
+
+    def test_policy_boolean_accepts_only_real_booleans(self):
+        assert validate_companion_boolean_setting(
+            True, "trim_contacts_on_overflow"
+        ) is True
+        assert validate_companion_boolean_setting(
+            False, "trim_contacts_on_overflow"
+        ) is False
+
+    @pytest.mark.parametrize(
+        "value",
+        ["127.0.0.1", "0.0.0.0", "::1", "::", "localhost", "radio.local"],
+    )
+    def test_valid_bind_addresses(self, value):
+        assert validate_companion_bind_address(value) == value
+
+    @pytest.mark.parametrize(
+        "value",
+        [None, 123, "", "   ", "bad host", "bad\nhost", "\ud800"],
+    )
+    def test_invalid_bind_addresses(self, value):
+        with pytest.raises(ValueError, match="bind_address"):
+            validate_companion_bind_address(value)
+
+    def test_node_name_rejects_lone_unicode_surrogate(self):
+        with pytest.raises(ValueError, match="valid UTF-8"):
+            validate_companion_node_name("\ud800")
+
+    def test_listener_ports_are_unique_across_companions_and_http(self):
+        validate_companion_listener_config(
+            [
+                {"name": "phone", "settings": {"tcp_port": 5000}},
+                {"name": "tablet", "settings": {"tcp_port": 5001}},
+            ],
+            {"enabled": True, "port": 8000},
+        )
+
+        with pytest.raises(ValueError, match="tablet.*companion 'phone'"):
+            validate_companion_listener_config(
+                [
+                    {"name": "phone"},
+                    {"name": "tablet"},
+                ],
+                {"enabled": False, "port": 5000},
+            )
+
+        with pytest.raises(ValueError, match="Repeater HTTP API"):
+            validate_companion_listener_config(
+                [{"name": "phone", "settings": {"tcp_port": 8000}}],
+                {"enabled": True, "port": 8000},
+            )
+
+    def test_disabled_http_port_is_not_reserved(self):
+        validate_companion_listener_config(
+            [{"name": "phone", "settings": {"tcp_port": 8000}}],
+            {"enabled": "false", "port": 8000},
+        )
 
 
 class TestParseCompanionBridgeKwargs:
@@ -51,6 +163,22 @@ class TestParseCompanionBridgeKwargs:
         assert parse_companion_bridge_kwargs(
             {"max_contacts": 2000, "offline_queue_size": 1024}
         ) == {"max_contacts": 2000, "offline_queue_size": 1024}
+
+    @pytest.mark.parametrize(
+        ("field", "value", "maximum"),
+        [
+            ("max_contacts", 2001, 2000),
+            ("offline_queue_size", 4097, 4096),
+        ],
+    )
+    def test_rejects_values_above_bounded_memory_limits(
+        self,
+        field,
+        value,
+        maximum,
+    ):
+        with pytest.raises(ValueError, match=rf"{field} must be <= {maximum}"):
+            parse_companion_bridge_kwargs({field: value})
 
     def test_ignored_keys_warn(self, caplog):
         caplog.set_level(logging.WARNING)
@@ -151,6 +279,67 @@ class TestMergeCompanionSettingsUpdate:
     def test_unknown_key_raises(self):
         with pytest.raises(ValueError, match="Unknown companion setting"):
             merge_companion_settings_update({}, {"max_channels": 64})
+
+    def test_validates_tcp_settings_without_coercion(self):
+        assert merge_companion_settings_update(
+            {},
+            {"tcp_port": 6000, "tcp_timeout": 0},
+        ) == {"tcp_port": 6000, "tcp_timeout": 0}
+        with pytest.raises(ValueError, match="tcp_port"):
+            merge_companion_settings_update({}, {"tcp_port": "6000"})
+
+    def test_validates_display_name_and_policy_booleans(self):
+        assert merge_companion_settings_update(
+            {},
+            {
+                "node_name": "Human Name",
+                "adopt_legacy_namespace": False,
+                "trim_contacts_on_overflow": False,
+                "rf_reception_events": True,
+            },
+        ) == {
+            "node_name": "Human Name",
+            "adopt_legacy_namespace": False,
+            "trim_contacts_on_overflow": False,
+            "rf_reception_events": True,
+        }
+        with pytest.raises(ValueError, match="node_name"):
+            merge_companion_settings_update({}, {"node_name": "bad\nname"})
+        with pytest.raises(ValueError, match="trim_contacts_on_overflow"):
+            merge_companion_settings_update(
+                {},
+                {"trim_contacts_on_overflow": "false"},
+            )
+        with pytest.raises(ValueError, match="rf_reception_events"):
+            merge_companion_settings_update({}, {"rf_reception_events": 1})
+        with pytest.raises(ValueError, match="adopt_legacy_namespace"):
+            merge_companion_settings_update(
+                {},
+                {"adopt_legacy_namespace": "true"},
+            )
+
+    def test_legacy_adoption_requires_a_real_boolean(self):
+        assert validate_companion_legacy_adoption(True) is True
+        assert "adopt_legacy_namespace" in COMPANION_SETTINGS_ALLOWLIST
+        for value in (1, 0, "true", None):
+            with pytest.raises(ValueError, match="adopt_legacy_namespace"):
+                validate_companion_legacy_adoption(value)
+
+
+class TestRfReceptionEventsSetting:
+    """Design doc §9 write gate: default off, per-companion opt-in."""
+
+    def test_allowlist_includes_the_key(self):
+        assert "rf_reception_events" in COMPANION_SETTINGS_ALLOWLIST
+
+    def test_accepted_by_settings_merge(self):
+        merged = merge_companion_settings_update({}, {"rf_reception_events": True})
+        assert merged == {"rf_reception_events": True}
+
+    def test_default_is_false_when_absent(self):
+        assert validate_companion_boolean_setting(
+            False, "rf_reception_events"
+        ) is False
 
 
 class TestValidateCompanionConfigCapacity:
@@ -413,7 +602,8 @@ class TestSenderPrefixPersistence:
             "DELETE FROM migrations "
             "WHERE migration_name IN ("
             "'add_sender_prefix_to_companion_messages', "
-            "'add_signal_and_channel_data_to_companion_messages')"
+            "'add_signal_and_channel_data_to_companion_messages', "
+            "'add_companion_event_journal')"
         )
         conn.execute("ALTER TABLE companion_messages RENAME TO companion_messages_old")
         conn.execute(
@@ -454,6 +644,10 @@ class TestSenderPrefixPersistence:
 
         fs = CompanionFrameServer.__new__(CompanionFrameServer)
         fs.sqlite_handler = MagicMock()
+        fs.sqlite_handler.companion_store_inbound_message.return_value = {
+            "inserted": True,
+            "message_id": 1,
+        }
         fs.companion_hash = "0x01"
         fs.sqlite_handler.companion_pop_message.return_value = {
             "sender_key": b"\x01" * 32,
@@ -484,38 +678,94 @@ class TestTrimContactsOnOverflowPolicy:
         merged = merge_companion_settings_update({}, {"trim_contacts_on_overflow": True})
         assert merged == {"trim_contacts_on_overflow": True}
 
-    def test_trim_helper_persists_kept_set(self):
+    def test_trim_helper_persists_removals_with_events(self):
         sqlite = MagicMock()
         sqlite.companion_load_contacts.return_value = self._contacts(5)
-        sqlite.companion_save_contacts.return_value = True
         removed = trim_companion_contacts_to_fit(sqlite, "0x01", 3)
         assert removed == 2
-        saved_hash, saved_contacts = sqlite.companion_save_contacts.call_args[0]
+        saved_hash, changes = sqlite.companion_apply_contact_changes.call_args.args
         assert saved_hash == "0x01"
-        assert len(saved_contacts) == 3
+        assert [change["change"] for change in changes] == ["remove", "remove"]
 
     def test_trim_helper_noop_when_under_limit(self):
         sqlite = MagicMock()
         sqlite.companion_load_contacts.return_value = self._contacts(2)
         assert trim_companion_contacts_to_fit(sqlite, "0x01", 5) == 0
-        sqlite.companion_save_contacts.assert_not_called()
+        sqlite.companion_apply_contact_changes.assert_not_called()
 
     def test_enforce_guards_by_default(self):
         sqlite = MagicMock()
         sqlite.companion_count_contacts.return_value = 600
         with pytest.raises(CompanionContactCapacityError):
             enforce_companion_contact_capacity("0x01", 500, sqlite)
-        sqlite.companion_save_contacts.assert_not_called()
+        sqlite.companion_apply_contact_changes.assert_not_called()
 
     def test_enforce_trims_when_policy_enabled(self):
         sqlite = MagicMock()
         sqlite.companion_load_contacts.return_value = self._contacts(600)
-        sqlite.companion_save_contacts.return_value = True
         removed = enforce_companion_contact_capacity("0x01", 500, sqlite, trim=True)
         assert removed == 100
 
+    def test_restart_trim_advances_cursor_with_normalized_remove_events(self, tmp_path):
+        handler = SQLiteHandler(tmp_path)
+        companion_hash = "0x41"
+        contacts = [
+            {
+                "pubkey": bytes([i]) * 32,
+                "name": f"c{i}",
+                "flags": 0,
+                "lastmod": i,
+            }
+            for i in range(1, 5)
+        ]
+        assert handler.companion_save_contacts(companion_hash, contacts)
+        before = handler.companion_sync_state(companion_hash)
 
-class TestPersistSkipWhenOff:
+        assert trim_companion_contacts_to_fit(handler, companion_hash, 2) == 2
+
+        page = handler.companion_sync_page(
+            companion_hash,
+            before["epoch"],
+            before["head"],
+            10,
+        )
+        events = [CompanionsV1._event_to_wire(row) for row in page["events"]]
+        assert [event["data"]["change"] for event in events] == [
+            "remove",
+            "remove",
+        ]
+        assert all("public_key" in event["data"] for event in events)
+        assert all("pubkey" not in event["data"] for event in events)
+        assert len(handler.companion_load_contacts_strict(companion_hash)) == 2
+
+    def test_trim_failure_rolls_back_rows_and_events(self, tmp_path, monkeypatch):
+        handler = SQLiteHandler(tmp_path)
+        companion_hash = "0x42"
+        contacts = [
+            {
+                "pubkey": bytes([i]) * 32,
+                "name": f"c{i}",
+                "flags": 0,
+                "lastmod": i,
+            }
+            for i in range(1, 4)
+        ]
+        assert handler.companion_save_contacts(companion_hash, contacts)
+        before = handler.companion_sync_state(companion_hash)
+        monkeypatch.setattr(
+            handler,
+            "_companion_append_event_row",
+            MagicMock(side_effect=RuntimeError("journal unavailable")),
+        )
+
+        with pytest.raises(CompanionStorageError):
+            trim_companion_contacts_to_fit(handler, companion_hash, 1)
+
+        assert len(handler.companion_load_contacts_strict(companion_hash)) == 3
+        assert handler.companion_sync_state(companion_hash)["head"] == before["head"]
+
+
+class TestFrameMessagePersistence:
     @staticmethod
     def _frame_server(max_size):
         from repeater.companion.frame_server import CompanionFrameServer
@@ -523,34 +773,57 @@ class TestPersistSkipWhenOff:
         fs = CompanionFrameServer.__new__(CompanionFrameServer)
         fs.sqlite_handler = MagicMock()
         fs.companion_hash = "0x01"
+        fs.journal = None
         bridge = MagicMock()
         bridge.message_queue.max_size = max_size
         fs.bridge = bridge
         return fs
 
-    def test_skips_persistence_when_retention_zero(self):
+    def test_retention_zero_keeps_history_but_not_frame_pending(self):
         import asyncio
 
         entry = object()
         fs = self._frame_server(0)
-        asyncio.run(fs._persist_companion_message({"text": "x"}, entry))
-        fs.sqlite_handler.companion_push_message.assert_not_called()
-        fs.bridge.message_queue.remove.assert_called_once_with(entry)
+        queue_entry = object()
+        asyncio.run(fs._persist_companion_message({"text": "x"}, queue_entry))
+        fs.sqlite_handler.companion_store_inbound_message.assert_called_once_with(
+            "0x01", {"text": "x"}, 0
+        )
+        fs.bridge.message_queue.remove.assert_called_once_with(queue_entry)
 
     def test_persists_with_retention(self):
         import asyncio
 
         fs = self._frame_server(7)
-        asyncio.run(fs._persist_companion_message({"text": "x"}))
-        fs.sqlite_handler.companion_push_message.assert_called_once_with("0x01", {"text": "x"}, 7)
+        queue_entry = object()
+        asyncio.run(fs._persist_companion_message({"text": "x"}, queue_entry))
+        fs.sqlite_handler.companion_store_inbound_message.assert_called_once_with(
+            "0x01", {"text": "x"}, 7
+        )
+        fs.bridge.message_queue.remove.assert_called_once_with(queue_entry)
 
-    def test_keeps_memory_message_when_sqlite_rejects_it(self):
+    def test_deduplicated_message_is_removed_from_memory(self):
         import asyncio
 
         fs = self._frame_server(7)
-        fs.sqlite_handler.companion_push_message.return_value = False
-        asyncio.run(fs._persist_companion_message({"text": "x"}))
-        fs.bridge.message_queue.pop_last.assert_not_called()
+        fs.sqlite_handler.companion_store_inbound_message.return_value = {
+            "inserted": False,
+            "message_id": 1,
+        }
+        queue_entry = object()
+        asyncio.run(fs._persist_companion_message({"text": "x"}, queue_entry))
+        fs.bridge.message_queue.remove.assert_called_once_with(queue_entry)
+
+    def test_storage_failure_keeps_memory_message(self):
+        import asyncio
+
+        fs = self._frame_server(7)
+        fs.sqlite_handler.companion_store_inbound_message.side_effect = RuntimeError(
+            "disk failed"
+        )
+        with pytest.raises(RuntimeError, match="disk failed"):
+            asyncio.run(fs._persist_companion_message({"text": "x"}, object()))
+        fs.bridge.message_queue.remove.assert_not_called()
 
 
 class TestImportRepeaterContactsCap:
@@ -593,7 +866,7 @@ class TestImportRepeaterContactsCap:
     def _contact(pk_int, *, flags=0, lastmod=0):
         # Pre-existing contacts use a pubkey range disjoint from seeded adverts.
         return {
-            "pubkey": (1_000_000 + pk_int).to_bytes(8, "big"),
+            "pubkey": (1_000_000 + pk_int).to_bytes(32, "big"),
             "name": f"pre-{pk_int}",
             "adv_type": 2,
             "flags": flags,
@@ -605,12 +878,30 @@ class TestImportRepeaterContactsCap:
     def _endpoint(cls, handler, bridge, body):
         from repeater.web.companion_endpoints import CompanionAPIEndpoints
 
+        rows = handler.companion_load_contacts(cls._HASH) or []
+        if rows and bridge.contacts.get_count() == 0:
+            records = []
+            for row in rows:
+                record = dict(row)
+                record["public_key"] = record.pop("pubkey")
+                records.append(record)
+            bridge.contacts.load_from_dicts(records)
+
+        async def _persist(changes):
+            handler.companion_apply_contact_changes(cls._HASH, changes)
+
+        async def _notify(*_args):
+            return None
+
+        bridge._persist_contact_changes = _persist
+        bridge._notify_observers = _notify
         ep = CompanionAPIEndpoints.__new__(CompanionAPIEndpoints)
         ep._require_post = lambda: None
         ep._get_json_body = lambda: body
         ep._resolve_bridge_params = lambda b: {}
         ep._get_bridge = lambda **kw: bridge
         ep._get_sqlite_handler = lambda: handler
+        ep._run_async = lambda coro, timeout=30.0: asyncio.run(coro)
         return ep
 
     @staticmethod
@@ -622,9 +913,16 @@ class TestImportRepeaterContactsCap:
 
     @classmethod
     def _bridge(cls, max_contacts):
-        contacts = SimpleNamespace(max_contacts=max_contacts, loaded=None)
-        contacts.load_from_dicts = lambda records: setattr(contacts, "loaded", list(records))
-        return SimpleNamespace(_companion_hash=cls._HASH, contacts=contacts)
+        from openhop_core.companion.contact_store import ContactStore
+        from repeater.companion.bridge import RepeaterCompanionBridge
+
+        return SimpleNamespace(
+            _companion_hash=cls._HASH,
+            contacts=ContactStore(max_contacts=max_contacts),
+            state_mutation_lock=asyncio.Lock(),
+            _contact_storage_dict=RepeaterCompanionBridge._contact_storage_dict,
+            _contact_changes=RepeaterCompanionBridge._contact_changes,
+        )
 
     def test_import_over_cap_trims_to_fit(self, tmp_path):
         h = self._handler(tmp_path)
@@ -635,8 +933,14 @@ class TestImportRepeaterContactsCap:
         resp = self._invoke(ep)
 
         assert h.companion_count_contacts(self._HASH) == 50
-        assert resp["data"] == {"imported": 60, "removed": 10}
-        assert len(bridge.contacts.loaded) == 50
+        assert resp["data"] == {
+            "imported": 60,
+            "added": 50,
+            "updated": 0,
+            "retained": 0,
+            "removed": 10,
+        }
+        assert bridge.contacts.get_count() == 50
 
     def test_pre_existing_plus_import_accumulation(self, tmp_path):
         h = self._handler(tmp_path)
@@ -672,38 +976,39 @@ class TestImportRepeaterContactsCap:
         for fav in favourites:
             assert fav["pubkey"] in kept
 
-    def test_favourites_exceed_cap_returns_409(self, tmp_path):
-        import cherrypy
-
+    def test_full_favourite_store_rejects_import_without_eviction(self, tmp_path):
         h = self._handler(tmp_path)
-        self._save_contacts(h, [self._contact(i, flags=1, lastmod=i) for i in range(51)])
+        favourites = [self._contact(i, flags=1, lastmod=i) for i in range(50)]
+        self._save_contacts(h, favourites)
         self._seed_adverts(h, 1)
         bridge = self._bridge(max_contacts=50)
         ep = self._endpoint(h, bridge, {"companion_name": "c"})
 
-        with pytest.raises(cherrypy.HTTPError) as exc_info:
-            self._invoke(ep)
-        assert exc_info.value.code == 409
+        response = self._invoke(ep)
+
+        assert response["data"] == {
+            "imported": 1,
+            "added": 0,
+            "updated": 0,
+            "retained": 0,
+            "removed": 1,
+        }
+        kept = {row["pubkey"] for row in h.companion_load_contacts(self._HASH)}
+        assert kept == {contact["pubkey"] for contact in favourites}
 
     def test_cap_source_is_contacts_not_default(self, tmp_path):
         # A companion configured above the 1000 default must not be silently clamped.
         h = self._handler(tmp_path)
-        captured = {}
-        real_import = h.companion_import_repeater_contacts
-
-        def _spy(companion_hash, **kwargs):
-            captured["limit"] = kwargs.get("limit")
-            return real_import(companion_hash, **kwargs)
-
-        h.companion_import_repeater_contacts = _spy
+        self._seed_adverts(h, 1101)
         bridge = self._bridge(max_contacts=1200)
         ep = self._endpoint(h, bridge, {"companion_name": "c", "limit": 1100})
 
-        self._invoke(ep)
+        response = self._invoke(ep)
 
         # min(limit=1100, max_contacts=1200) -> 1100, proving the cap came from
         # bridge.contacts.max_contacts (1200), not the old 1000 fallback.
-        assert captured["limit"] == 1100
+        assert response["data"]["imported"] == 1100
+        assert bridge.contacts.get_count() == 1100
 
     def test_under_cap_import_is_noop_trim(self, tmp_path):
         # Happy path: an import that fits leaves everything and trims nothing.
@@ -715,8 +1020,14 @@ class TestImportRepeaterContactsCap:
         resp = self._invoke(ep)
 
         assert h.companion_count_contacts(self._HASH) == 10
-        assert resp["data"] == {"imported": 10, "removed": 0}
-        assert len(bridge.contacts.loaded) == 10
+        assert resp["data"] == {
+            "imported": 10,
+            "added": 10,
+            "updated": 0,
+            "retained": 0,
+            "removed": 0,
+        }
+        assert bridge.contacts.get_count() == 10
 
     def test_incident_scale_default_cap(self, tmp_path):
         # Reproduces the reported incident: an oversized import at the real 1000
@@ -729,8 +1040,14 @@ class TestImportRepeaterContactsCap:
         resp = self._invoke(ep)
 
         assert h.companion_count_contacts(self._HASH) == _DEFAULT_MAX_CONTACTS
-        assert resp["data"] == {"imported": 1062, "removed": 62}
-        assert len(bridge.contacts.loaded) == _DEFAULT_MAX_CONTACTS
+        assert resp["data"] == {
+            "imported": 1062,
+            "added": 1000,
+            "updated": 0,
+            "retained": 0,
+            "removed": 62,
+        }
+        assert bridge.contacts.get_count() == _DEFAULT_MAX_CONTACTS
 
     def test_repeated_import_stays_within_cap(self, tmp_path):
         # Repeated imports (a plausible cause of the original overflow) must never

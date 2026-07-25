@@ -408,14 +408,17 @@ class TraceHelper:
         Returns:
             asyncio.Event that will be set when response is received
         """
+        key = int(tag) & 0xFFFFFFFF
+        if key in self.pending_pings:
+            raise ValueError(f"trace tag 0x{key:08X} is already pending")
         event = asyncio.Event()
-        self.pending_pings[tag] = {
+        self.pending_pings[key] = {
             "event": event,
             "result": None,
             "target": target_hash,
             "sent_at": time.time(),
         }
-        logger.debug(f"Registered ping with tag {tag} for target 0x{target_hash:02x}")
+        logger.debug(f"Registered ping with tag {key} for target 0x{target_hash:02x}")
         return event
 
     def cleanup_stale_pings(self, max_age_seconds: int = 30):
