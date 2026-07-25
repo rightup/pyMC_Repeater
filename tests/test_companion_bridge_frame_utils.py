@@ -1898,6 +1898,56 @@ async def test_frame_trace_rejects_repeater_owned_tag_before_radio_send():
 
 
 @pytest.mark.asyncio
+async def test_companion_api_ping_awaits_its_correlated_trace_response():
+    bridge = RepeaterCompanionBridge(
+        LocalIdentity(),
+        AsyncMock(return_value=True),
+        companion_hash="0x01",
+        trace_tag_conflict=lambda _bridge, _tag: False,
+    )
+    public_key = b"\xAA" * 32
+    bridge.add_update_contact(
+        Contact(public_key=public_key, name="Repeater", adv_type=2)
+    )
+    bridge.send_trace_path_raw = AsyncMock(
+        return_value=SentResult(
+            success=True,
+            is_flood=False,
+            expected_ack=1,
+            timeout_ms=1000,
+        )
+    )
+
+    ping = asyncio.create_task(bridge.ping_contact(public_key))
+    await asyncio.sleep(0)
+    tag, waiter = next(iter(bridge._trace_waiters.items()))
+    packet = SimpleNamespace(rssi=-80, get_snr=lambda: 3.5)
+
+    assert bridge.resolve_trace_ping(
+        packet,
+        {
+            "tag": tag,
+            "auth_code": waiter["auth_code"],
+            "flags": waiter["flags"],
+            "trace_path_bytes": waiter["path"],
+        },
+    )
+    result = await ping
+
+    assert result["success"] is True
+    assert result["snr_db"] == 3.5
+    assert result["rssi"] == -80
+    assert result["hop_count"] == 1
+    assert bridge._trace_waiters == {}
+    bridge.send_trace_path_raw.assert_awaited_once_with(
+        tag,
+        waiter["auth_code"],
+        waiter["flags"],
+        waiter["path"],
+    )
+
+
+@pytest.mark.asyncio
 async def test_frame_trace_fails_closed_when_tag_ownership_check_errors(caplog):
     tag = 0x12345678
     request = tag.to_bytes(4, "little") + b"\x00" * 4 + b"\x00\xAA"

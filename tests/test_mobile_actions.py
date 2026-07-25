@@ -3,7 +3,7 @@
 Covers POST /api/v1/companions/{name}/messages (send DM/channel, the
 Idempotency-Key contract of design doc §6) and the
 /contacts/{pubkey}/{action} handlers (login, connection, logout,
-status_request, telemetry_request, reset_path) of §7.3, plus _cp_dispatch routing for both
+status_request, telemetry_request, ping, reset_path) of §7.3, plus _cp_dispatch routing for both
 URL shapes and GET/POST method gating on the shared /messages resource.
 
 Handlers are invoked directly through ``__wrapped__`` (require_auth uses
@@ -68,6 +68,7 @@ class _FakeBridge:
         self.login_connections = set()
         self.status_requests = []
         self.telemetry_requests = []
+        self.ping_requests = []
         self.reset_paths = []
         self.adverts = []
         # Configurable results
@@ -134,6 +135,18 @@ class _FakeBridge:
             (pub_key, want_base, want_location, want_environment, timeout)
         )
         return {"success": True, "sensors": {}}
+
+    async def ping_contact(self, pub_key, timeout=15.0):
+        self.ping_requests.append((pub_key, timeout))
+        return {
+            "success": True,
+            "snr_db": 3.5,
+            "rssi": -80,
+            "rtt_ms": 125,
+            "hop_count": 1,
+            "trace_hop_count": 1,
+            "trace_hash_size": 1,
+        }
 
     async def advertise(self, flood=True):
         self.adverts.append(flood)
@@ -1493,6 +1506,29 @@ class TestContactActions:
         assert pub_key == bytes.fromhex(_PUBKEY_HEX)
         assert (want_base, want_location, want_environment) == (True, True, True)
 
+    def test_ping_dispatches_through_selected_companion(self, endpoints, bridge):
+        cherrypy.serving.request.method = "POST"
+        bridge.contacts.get_by_key(bytes.fromhex(_PUBKEY_HEX)).adv_type = 2
+
+        result = endpoints.ping.__wrapped__(
+            endpoints, companion_name=_NAME, contact_pubkey=_PUBKEY_HEX
+        )
+
+        assert result["data"]["success"] is True
+        assert result["data"]["snr_db"] == 3.5
+        assert bridge.ping_requests == [(bytes.fromhex(_PUBKEY_HEX), 15.0)]
+
+    def test_ping_rejects_non_repeater_before_radio_send(self, endpoints, bridge):
+        cherrypy.serving.request.method = "POST"
+
+        with pytest.raises(cherrypy.HTTPError) as exc:
+            endpoints.ping.__wrapped__(
+                endpoints, companion_name=_NAME, contact_pubkey=_PUBKEY_HEX
+            )
+
+        assert exc.value.status == 400
+        assert bridge.ping_requests == []
+
     def test_reset_path_dispatch(self, endpoints, bridge):
         cherrypy.serving.request.method = "POST"
         result = endpoints.reset_path.__wrapped__(
@@ -1781,6 +1817,7 @@ class TestDispatchRouting:
             "logout",
             "status_request",
             "telemetry_request",
+            "ping",
             "reset_path",
         ):
             cherrypy.request.params = {}

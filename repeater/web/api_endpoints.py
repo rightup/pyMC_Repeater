@@ -5236,7 +5236,26 @@ class APIEndpoints:
                 raise RuntimeError(
                     "Could not verify trace response tag ownership"
                 ) from exc
-            if not conflict:
+            companion_has_owner = getattr(
+                self.daemon_instance,
+                "_companion_has_trace_owner",
+                None,
+            )
+            try:
+                companion_conflict = bool(
+                    callable(companion_has_owner)
+                    and companion_has_owner(tag)
+                )
+            except Exception as exc:
+                logger.error(
+                    "Could not verify Companion API trace tag ownership: %s",
+                    exc,
+                    exc_info=True,
+                )
+                raise RuntimeError(
+                    "Could not verify Companion API trace tag ownership"
+                ) from exc
+            if not conflict and not companion_conflict:
                 return tag
         logger.error(
             "Could not allocate a unique trace response tag after %d attempts",

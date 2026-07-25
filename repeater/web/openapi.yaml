@@ -7319,6 +7319,90 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponseV1'
 
+  /v1/companions/{name}/contacts/{pubkey}/ping:
+    post:
+      tags: [Mobile Companion API v1]
+      summary: Ping a repeater contact directly
+      description: |
+        Sends a direct TRACE from the selected companion identity to a
+        repeater contact and waits up to 15 seconds for the correlated
+        response. Clients should offer this action only for known zero-hop
+        contacts. No fields; omit the body or send `{}`. This shares the same
+        RF admission budget as sends and login.
+
+        A `200` response can contain `success: false` when no matching TRACE
+        response arrives. The HTTP request itself still completed normally.
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/CompanionRegistrationName'
+        - name: pubkey
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: '^[0-9a-fA-F]{64}$'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+      responses:
+        '200':
+          description: Ping completed or timed out
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessResponse'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/MobilePingResult'
+        '400':
+          description: Invalid public key or the contact is not a repeater.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponseV1'
+        '401':
+          description: Missing/invalid JWT or API token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponseV1'
+        '404':
+          description: Companion or contact not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponseV1'
+        '429':
+          description: RF admission limit exceeded. Includes `Retry-After`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponseV1'
+        '500':
+          $ref: '#/components/responses/OperationFailedV1'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaTypeV1'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailableV1'
+        '504':
+          description: Timed out waiting for the companion event loop.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponseV1'
+
   /v1/companions/{name}/contacts/{pubkey}/status_request:
     post:
       tags: [Mobile Companion API v1]
@@ -9251,6 +9335,31 @@ components:
         endpoints (login/status_request/telemetry_request). Exact fields
         depend on the companion bridge library version; no later result-event
         schema is promised.
+
+    MobilePingResult:
+      type: object
+      required: [success]
+      properties:
+        success:
+          type: boolean
+        error:
+          type: string
+        snr_db:
+          type: number
+        rssi:
+          type: integer
+        rtt_ms:
+          type: integer
+          minimum: 0
+        hop_count:
+          type: integer
+          minimum: 0
+        trace_hop_count:
+          type: integer
+          minimum: 0
+        trace_hash_size:
+          type: integer
+          minimum: 1
 
     ResolvedPathElement:
       type: object

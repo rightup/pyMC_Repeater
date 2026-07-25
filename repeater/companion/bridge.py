@@ -13,6 +13,8 @@ import copy
 import dataclasses
 import logging
 import math
+import secrets
+import time
 from collections import OrderedDict
 from collections.abc import Mapping
 from contextvars import ContextVar
@@ -44,6 +46,7 @@ from repeater.companion.inbound_history import (
 logger = logging.getLogger("RepeaterCompanionBridge")
 
 _AMBIGUOUS_ACK_TOKEN = -1
+_TRACE_TAG_ATTEMPTS = 64
 
 # Separate from ``outbound_send_capture``: the public REST capture belongs to
 # its caller, while this bridge-owned capture lets every send surface one
@@ -312,6 +315,7 @@ class RepeaterCompanionBridge(CompanionBridge):
         on_prefs_saved: Optional[Callable[[str], None]] = None,
         journal=None,
         tracker=None,
+        trace_tag_conflict: Optional[Callable[[object, int], bool]] = None,
     ) -> None:
         self._sqlite_handler = sqlite_handler
         self._companion_hash = companion_hash
@@ -324,6 +328,8 @@ class RepeaterCompanionBridge(CompanionBridge):
         # outbound send so a later heard-repeat can be journaled as
         # message_send_state. Optional/None when correlation isn't wired up.
         self._tracker = tracker
+        self._trace_tag_conflict = trace_tag_conflict
+        self._trace_waiters: dict[int, dict[str, Any]] = {}
         # Host observers are intentionally separate from openhop-core's
         # connection callbacks. FrameServer clears/rebuilds its callbacks on
         # each reconnect; durable repeater observers must survive that cycle.
@@ -706,6 +712,105 @@ class RepeaterCompanionBridge(CompanionBridge):
             auth_code,
             flags=flags,
         )
+
+    def owns_trace_tag(self, tag: int) -> bool:
+        return (int(tag) & 0xFFFFFFFF) in self._trace_waiters
+
+    def _allocate_trace_tag(self) -> int:
+        for _ in range(_TRACE_TAG_ATTEMPTS):
+            tag = secrets.randbits(32)
+            if self.owns_trace_tag(tag):
+                continue
+            conflict = self._trace_tag_conflict
+            try:
+                if callable(conflict) and conflict(self, tag):
+                    continue
+            except Exception as exc:
+                raise RuntimeError("Could not verify TRACE tag ownership") from exc
+            return tag
+        raise RuntimeError("No unique TRACE tag is available")
+
+    async def ping_contact(
+        self,
+        pub_key: bytes,
+        timeout: float = 15.0,
+    ) -> dict[str, Any]:
+        """Send one direct TRACE and await its correlated response."""
+
+        await self.await_committed_state()
+        contact = self.contacts.get_by_key(pub_key)
+        if contact is None:
+            return {"success": False, "error": "Contact not found"}
+
+        path_hash_size = int(getattr(self.prefs, "path_hash_mode", 0)) + 1
+        trace_hash_size = 4 if path_hash_size == 3 else path_hash_size
+        flags = {1: 0, 2: 1, 4: 2}.get(trace_hash_size)
+        if flags is None or len(pub_key) < trace_hash_size:
+            return {"success": False, "error": "Unsupported TRACE hash size"}
+
+        tag = self._allocate_trace_tag()
+        auth_code = secrets.randbits(32)
+        path = bytes(pub_key[:trace_hash_size])
+        future = asyncio.get_running_loop().create_future()
+        waiter = {
+            "future": future,
+            "auth_code": auth_code,
+            "flags": flags,
+            "path": path,
+            "started_at": time.monotonic(),
+            "trace_hash_size": trace_hash_size,
+        }
+        self._trace_waiters[tag] = waiter
+
+        try:
+            sent = await self.send_trace_path_raw(tag, auth_code, flags, path)
+            if not sent.success:
+                return {"success": False, "error": sent.error or "TRACE send failed"}
+            try:
+                return await asyncio.wait_for(future, timeout=max(0.1, float(timeout)))
+            except asyncio.TimeoutError:
+                return {"success": False, "error": "Ping timed out"}
+        finally:
+            if self._trace_waiters.get(tag) is waiter:
+                self._trace_waiters.pop(tag, None)
+
+    def resolve_trace_ping(self, packet, parsed_data: dict) -> bool:
+        """Resolve a pending API ping; return whether this bridge owns the tag."""
+
+        tag = int(parsed_data.get("tag", 0)) & 0xFFFFFFFF
+        waiter = self._trace_waiters.get(tag)
+        if waiter is None:
+            return False
+
+        if (
+            int(parsed_data.get("auth_code", -1)) != waiter["auth_code"]
+            or int(parsed_data.get("flags", -1)) != waiter["flags"]
+            or bytes(parsed_data.get("trace_path_bytes") or b"") != waiter["path"]
+        ):
+            return True
+
+        rssi = int(getattr(packet, "rssi", 0) or 0)
+        if rssi == 0:
+            return True
+
+        future = waiter["future"]
+        if not future.done():
+            future.set_result(
+                {
+                    "success": True,
+                    "snr_db": float(packet.get_snr()),
+                    "rssi": rssi,
+                    "rtt_ms": max(
+                        0,
+                        round((time.monotonic() - waiter["started_at"]) * 1000),
+                    ),
+                    "hop_count": 1,
+                    "trace_hop_count": len(waiter["path"])
+                    // waiter["trace_hash_size"],
+                    "trace_hash_size": waiter["trace_hash_size"],
+                }
+            )
+        return True
 
     async def send_logout(self, pub_key: bytes) -> bool:
         """Serialize logout with any login sharing Core's destination slot."""

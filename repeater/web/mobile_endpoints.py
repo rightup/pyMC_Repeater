@@ -23,6 +23,7 @@ docs/architecture/mobile-companion-api.md §7:
 - ``POST /api/v1/companions/{name}/contacts/{pubkey}/logout`` — remote logout
 - ``POST /api/v1/companions/{name}/contacts/{pubkey}/status_request`` (§7.3)
 - ``POST /api/v1/companions/{name}/contacts/{pubkey}/telemetry_request`` (§7.3)
+- ``POST /api/v1/companions/{name}/contacts/{pubkey}/ping`` — direct TRACE
 - ``POST /api/v1/companions/{name}/contacts/{pubkey}/reset_path`` (§7.3)
 
 Cursor semantics (§5.3): clients hold an opaque ``epoch:sequence`` cursor;
@@ -61,6 +62,7 @@ import cherrypy
 from openhop_core.companion.constants import (
     ADV_TYPE_CHAT,
     ADV_TYPE_NONE,
+    ADV_TYPE_REPEATER,
     CHANNEL_NAME_SIZE,
     CONTACT_NAME_SIZE,
 )
@@ -553,6 +555,7 @@ class CompanionsV1:
         "logout",
         "status_request",
         "telemetry_request",
+        "ping",
         "reset_path",
     )
     # GET-only sub-resource actions on the same /contacts/{pubkey}/{action}
@@ -2941,6 +2944,30 @@ class CompanionsV1:
                 want_environment=True,
                 timeout=timeout,
             ),
+            timeout=timeout + 5.0,
+        )
+        return self._success(_to_json_safe(result))
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    @require_auth
+    def ping(self, companion_name=None, contact_pubkey=None, **kwargs):
+        """POST .../contacts/{pubkey}/ping — direct TRACE from this companion."""
+
+        self._require_post()
+        bridge, _companion_hash = self._resolve(companion_name)
+        pub_key = self._pub_key_from_hex(contact_pubkey)
+        reject_unknown_fields(self._get_json_body(), set())
+        contact = bridge.contacts.get_by_key(pub_key)
+        if contact is None:
+            raise cherrypy.HTTPError(404, "Contact not found")
+        if (int(getattr(contact, "adv_type", ADV_TYPE_NONE)) & 0x0F) != ADV_TYPE_REPEATER:
+            raise cherrypy.HTTPError(400, "Ping is only available for repeaters")
+
+        self._admit_rf()
+        timeout = 15.0
+        result = self._run_async(
+            bridge.ping_contact(pub_key, timeout=timeout),
             timeout=timeout + 5.0,
         )
         return self._success(_to_json_safe(result))

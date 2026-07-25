@@ -1075,6 +1075,7 @@ class RepeaterDaemon:
                     on_prefs_saved=_on_companion_prefs_saved,
                     journal=journal,
                     tracker=self.correlation_tracker,
+                    trace_tag_conflict=self._companion_trace_tag_conflict,
                     **bridge_kwargs,
                 )
                 self._wire_companion_history_observers(bridge, journal)
@@ -1806,6 +1807,7 @@ class RepeaterDaemon:
                 on_prefs_saved=_on_companion_prefs_saved,
                 journal=journal,
                 tracker=self.correlation_tracker,
+                trace_tag_conflict=self._companion_trace_tag_conflict,
                 **bridge_kwargs,
             )
             self._wire_companion_history_observers(bridge, journal)
@@ -2346,6 +2348,8 @@ class RepeaterDaemon:
         key = int(tag) & 0xFFFFFFFF
         if self._repeater_owns_response_tag(kind, key):
             return True
+        if kind == "trace" and self._companion_has_trace_owner(key):
+            return True
         for frame_server in tuple(
             getattr(self, "companion_frame_servers", ())
         ):
@@ -2355,6 +2359,24 @@ class RepeaterDaemon:
             if callable(owns) and owns(kind, key):
                 return True
         return False
+
+    def _companion_has_trace_owner(self, tag: int, exclude=None) -> bool:
+        key = int(tag) & 0xFFFFFFFF
+        for bridge in tuple(getattr(self, "companion_bridges", {}).values()):
+            if bridge is exclude:
+                continue
+            owns = getattr(bridge, "owns_trace_tag", None)
+            if callable(owns) and owns(key):
+                return True
+        return False
+
+    def _companion_trace_tag_conflict(self, requesting_bridge, tag: int) -> bool:
+        key = int(tag) & 0xFFFFFFFF
+        return (
+            self._repeater_owns_response_tag("trace", key)
+            or self._frame_has_response_owner("trace", key)
+            or self._companion_has_trace_owner(key, exclude=requesting_bridge)
+        )
 
     def _repeater_owns_response_tag(self, kind: str, tag: int) -> bool:
         """Return whether the parallel Repeater API already owns this tag."""
@@ -2420,6 +2442,10 @@ class RepeaterDaemon:
             return
         tag = parsed_data.get("tag", 0)
         auth_code = parsed_data.get("auth_code", 0)
+        for bridge in tuple(getattr(self, "companion_bridges", {}).values()):
+            resolve = getattr(bridge, "resolve_trace_ping", None)
+            if callable(resolve) and resolve(packet, parsed_data):
+                return
         servers = self._frame_response_owners("trace", tag)
         if not servers:
             return

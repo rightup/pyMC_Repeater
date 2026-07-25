@@ -359,22 +359,25 @@ def test_concurrent_discovery_allocations_are_serial_on_the_daemon_loop(
     }
 
 
-def test_trace_tag_retries_pending_and_frame_owned_values():
+def test_trace_tag_retries_pending_frame_and_companion_owned_values():
     api = _make_api()
     trace_helper = SimpleNamespace(pending_pings={0x11: {}})
     frame_has_owner = MagicMock(side_effect=lambda _kind, tag: tag == 0x22)
+    companion_has_owner = MagicMock(side_effect=lambda tag: tag == 0x33)
     api.daemon_instance = SimpleNamespace(
         _frame_has_response_owner=frame_has_owner,
+        _companion_has_trace_owner=companion_has_owner,
     )
 
     with patch(
         "repeater.web.api_endpoints.secrets.randbits",
-        side_effect=[0x11, 0x22, 0x33],
+        side_effect=[0x11, 0x22, 0x33, 0x44],
     ):
         tag = api._allocate_trace_tag(trace_helper)
 
-    assert tag == 0x33
+    assert tag == 0x44
     frame_has_owner.assert_any_call("trace", 0x22)
+    companion_has_owner.assert_any_call(0x33)
 
 
 def test_trace_tag_exhaustion_fails_before_radio_injection(cherrypy_ctx):

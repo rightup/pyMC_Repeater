@@ -151,6 +151,7 @@ when they reuse the same `Idempotency-Key`.
 | `POST .../logout` | Close the local remote session and best-effort RF logout |
 | `POST .../status_request` | Synchronous remote status request |
 | `POST .../telemetry_request` | Synchronous remote telemetry request |
+| `POST .../ping` | Direct TRACE from the selected companion to a repeater |
 | `POST .../reset_path` | Local learned-path reset |
 | `GET .../messages/{id}/receptions` | RF copies correlated to one message |
 | `GET .../contacts/{pubkey}/paths` | Bounded incoming-path aggregation |
@@ -459,15 +460,16 @@ All REST RF actions share a small per-principal and process-wide token bucket.
 Defaults are documented in `config.yaml.example`. The radio queue and duty
 cycle remain authoritative after API admission.
 
-Login/status/telemetry are synchronous RF actions without idempotency keys.
+Login/status/telemetry/ping are synchronous RF actions without idempotency keys.
 Login passwords are at most 15 UTF-8 bytes and cannot contain NUL, matching
 MeshCore's NUL-terminated credential wire format.
-Treat their timeout as unknown and do not blindly retry. `logout` also has no
-idempotency key: it orders itself after an in-flight Frame or REST login for
-the same destination, clears the local remote-session record, and attempts one
-best-effort RF send. Its response keeps those outcomes explicit as
-`{logged_out, sent}`. `connection` and `reset_path` are local state operations
-and do not consume the RF budget.
+Treat their timeout as unknown and do not blindly retry. Ping uses a direct
+TRACE owned by the selected companion identity and accepts only repeater
+contacts. `logout` also has no idempotency key: it orders itself after an
+in-flight Frame or REST login for the same destination, clears the local
+remote-session record, and attempts one best-effort RF send. Its response
+keeps those outcomes explicit as `{logged_out, sent}`. `connection` and
+`reset_path` are local state operations and do not consume the RF budget.
 
 ## 8. Contacts and channels
 

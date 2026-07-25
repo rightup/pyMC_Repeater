@@ -370,6 +370,30 @@ async def test_trace_complete_for_companions_requires_valid_lengths():
 
 
 @pytest.mark.asyncio
+async def test_trace_complete_prefers_companion_api_owner_over_frame():
+    daemon = RepeaterDaemon(_base_config(), radio=object())
+    bridge = SimpleNamespace(resolve_trace_ping=MagicMock(return_value=True))
+    frame = SimpleNamespace(
+        owns_response_tag=lambda kind, tag: kind == "trace" and tag == 1,
+        push_trace_data_async=AsyncMock(),
+    )
+    daemon.companion_bridges = {1: bridge}
+    daemon.companion_frame_servers = [frame]
+    packet = SimpleNamespace(path=bytearray([1]), get_snr=lambda: 2.0)
+    parsed = {
+        "trace_path_bytes": b"\xaa",
+        "flags": 0,
+        "tag": 1,
+        "auth_code": 2,
+    }
+
+    await daemon._on_trace_complete_for_companions(packet, parsed)
+
+    bridge.resolve_trace_ping.assert_called_once_with(packet, parsed)
+    frame.push_trace_data_async.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_register_identity_everywhere_calls_helpers_and_respects_collision():
     daemon = RepeaterDaemon(_base_config(), radio=object())
     identity = _FakeIdentity(b"Q" * 32)
