@@ -5892,7 +5892,7 @@ class APIEndpoints:
                     from openhop_core import LocalIdentity
 
                     candidate = LocalIdentity(seed=key_bytes)
-                    conflict = registration_error(name, candidate)
+                    conflict = registration_error(name, candidate, identity_type)
                     if conflict:
                         return self._bad_request(conflict)
 
@@ -5973,6 +5973,7 @@ class APIEndpoints:
                     conflict = registration_error(
                         name,
                         LocalIdentity(seed=room_key_bytes),
+                        identity_type,
                     )
                     if conflict:
                         return self._bad_request(conflict)

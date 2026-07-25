@@ -3467,6 +3467,35 @@ def test_generated_identity_key_never_enters_logs_or_response(
     assert private_key[:8].hex() not in logged
 
 
+def test_create_companion_passes_identity_type_to_conflict_validation(cherrypy_ctx):
+    request, _response = cherrypy_ctx
+    request.method = "POST"
+    request.json = {
+        "name": "typed-companion",
+        "type": "companion",
+        "identity_key": "ae" * 32,
+        "settings": {"frame_enabled": False},
+    }
+    api = _make_api({"identities": {"room_servers": [], "companions": []}})
+    api.config_manager.save_to_file.return_value = True
+    registration_error = MagicMock(return_value=None)
+    api.daemon_instance = SimpleNamespace(
+        identity_manager=SimpleNamespace(registration_error=registration_error),
+        add_companion_from_config=MagicMock(),
+    )
+    api.event_loop = object()
+
+    with patch(
+        "asyncio.run_coroutine_threadsafe",
+        return_value=SimpleNamespace(result=lambda timeout: True),
+    ):
+        result = api.create_identity()
+
+    assert result["success"] is True
+    assert registration_error.call_args.args[0] == "typed-companion"
+    assert registration_error.call_args.args[2] == "companion"
+
+
 def test_create_companion_reports_durable_namespace_collision(cherrypy_ctx):
     from repeater.data_acquisition.sqlite_handler import (
         CompanionNamespaceCollisionError,
