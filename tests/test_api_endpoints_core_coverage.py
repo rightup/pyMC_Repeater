@@ -3233,7 +3233,7 @@ def test_identity_endpoints_paths(cherrypy_ctx):
         "settings": {
             "node_name": "N",
             "tcp_port": 5001,
-            "max_contacts": 1200,
+            "max_contacts": 100_000,
             "offline_queue_size": 0,
             "trim_contacts_on_overflow": True,
             "rf_reception_events": True,
@@ -3254,7 +3254,7 @@ def test_identity_endpoints_paths(cherrypy_ctx):
         for companion in api.config["identities"]["companions"]
         if companion["name"] == "new-comp"
     )
-    assert created_settings["max_contacts"] == 1200
+    assert created_settings["max_contacts"] == 100_000
     assert created_settings["offline_queue_size"] == 0
     assert created_settings["frame_enabled"] is True
     assert created_settings["trim_contacts_on_overflow"] is True

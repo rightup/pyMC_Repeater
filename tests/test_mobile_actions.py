@@ -69,6 +69,8 @@ class _FakeBridge:
         self.status_requests = []
         self.telemetry_requests = []
         self.ping_requests = []
+        self.anonymous_requests = []
+        self.path_discoveries = []
         self.reset_paths = []
         self.adverts = []
         # Configurable results
@@ -146,6 +148,36 @@ class _FakeBridge:
             "hop_count": 1,
             "trace_hop_count": 1,
             "trace_hash_size": 1,
+        }
+
+    async def request_anonymous(self, pub_key, data, timeout=15.0):
+        self.anonymous_requests.append((pub_key, data, timeout))
+        return {
+            "success": True,
+            "response": {
+                "type": "owner",
+                "clock": 123,
+                "node_name": "Nearby",
+                "owner_info": "Test owner",
+            },
+        }
+
+    async def discover_path(self, pub_key, timeout=15.0):
+        self.path_discoveries.append((pub_key, timeout))
+        return {
+            "success": True,
+            "outbound": {
+                "encoded_length": 2,
+                "hop_count": 2,
+                "hash_size": 1,
+                "hops": ["11", "22"],
+            },
+            "inbound": {
+                "encoded_length": 1,
+                "hop_count": 1,
+                "hash_size": 1,
+                "hops": ["33"],
+            },
         }
 
     async def advertise(self, flood=True):
@@ -1493,6 +1525,42 @@ class TestContactActions:
         assert exc.value.status == 400
         assert bridge.adverts == []
 
+    def test_anonymous_request_dispatches_by_full_public_key(self, endpoints, bridge):
+        _post(
+            endpoints,
+            {"public_key": _PUBKEY_HEX, "request": "owner"},
+            idempotency_key=None,
+        )
+
+        result = endpoints.anonymous_request.__wrapped__(
+            endpoints,
+            companion_name=_NAME,
+        )
+
+        assert result["data"]["success"] is True
+        assert result["data"]["public_key"] == _PUBKEY_HEX
+        assert result["data"]["request"] == "owner"
+        assert result["data"]["response"]["node_name"] == "Nearby"
+        assert bridge.anonymous_requests == [
+            (bytes.fromhex(_PUBKEY_HEX), b"\x02", 15.0)
+        ]
+
+    def test_anonymous_request_rejects_unknown_kind(self, endpoints, bridge):
+        _post(
+            endpoints,
+            {"public_key": _PUBKEY_HEX, "request": "private"},
+            idempotency_key=None,
+        )
+
+        with pytest.raises(cherrypy.HTTPError) as exc:
+            endpoints.anonymous_request.__wrapped__(
+                endpoints,
+                companion_name=_NAME,
+            )
+
+        assert exc.value.status == 400
+        assert bridge.anonymous_requests == []
+
     def test_telemetry_request_dispatch(self, endpoints, bridge):
         cherrypy.serving.request.method = "POST"
         result = endpoints.telemetry_request.__wrapped__(
@@ -1524,6 +1592,20 @@ class TestContactActions:
 
         assert exc.value.status == 400
         assert bridge.ping_requests == []
+
+    def test_path_discovery_dispatches_through_selected_companion(self, endpoints, bridge):
+        cherrypy.serving.request.method = "POST"
+
+        result = endpoints.path_discovery.__wrapped__(
+            endpoints,
+            companion_name=_NAME,
+            contact_pubkey=_PUBKEY_HEX,
+        )
+
+        assert result["data"]["success"] is True
+        assert result["data"]["public_key"] == _PUBKEY_HEX
+        assert result["data"]["outbound"]["hops"] == ["11", "22"]
+        assert bridge.path_discoveries == [(bytes.fromhex(_PUBKEY_HEX), 15.0)]
 
     def test_reset_path_dispatch(self, endpoints, bridge):
         cherrypy.serving.request.method = "POST"
@@ -1799,6 +1881,12 @@ class TestDispatchRouting:
         assert handler_fn == endpoints.advert
         assert cherrypy.request.params["companion_name"] == _NAME
 
+    def test_anonymous_request_route_len2(self, endpoints):
+        vpath = [_NAME, "anonymous_request"]
+        handler_fn = endpoints._cp_dispatch(vpath)
+        assert handler_fn == endpoints.anonymous_request
+        assert cherrypy.request.params["companion_name"] == _NAME
+
     def test_contacts_action_route_len4(self, endpoints):
         vpath = [_NAME, "contacts", _PUBKEY_HEX, "login"]
         handler_fn = endpoints._cp_dispatch(vpath)
@@ -1814,6 +1902,7 @@ class TestDispatchRouting:
             "status_request",
             "telemetry_request",
             "ping",
+            "path_discovery",
             "reset_path",
         ):
             cherrypy.request.params = {}

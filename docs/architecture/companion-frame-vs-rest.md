@@ -150,9 +150,10 @@ while making join possible.
 | `LOGOUT` | `POST .../contacts/{pubkey}/logout` | ✅ | One best-effort RF send; no idempotency key. |
 | `SEND_STATUS_REQ` | `POST .../status_request` | ✅ | None. |
 | `SEND_TELEMETRY_REQ` | `POST .../telemetry_request` | ✅ | None. |
-| `SEND_BINARY_REQ` / `SEND_ANON_REQ` | — | ❌ | Not needed for chat. |
-| `SEND_PATH_DISCOVERY_REQ` | `GET .../contacts/{pubkey}/paths` (read) | ⚠️ | Low priority — triggering discovery is a diagnostic. |
-| `SEND_TRACE_PATH` | — | ❌ | Not needed for chat; diagnostic. |
+| `SEND_BINARY_REQ` | — | ❌ | Keep arbitrary binary requests on the trusted Frame/operator surface. |
+| `SEND_ANON_REQ` | `POST .../anonymous_request` | ✅ public query | Supports v13 owner, region, and basic-capability requests without adding a contact. |
+| `SEND_PATH_DISCOVERY_REQ` | `POST .../contacts/{pubkey}/path_discovery` | ✅ | Returns the correlated outbound and return paths; historical observations remain available from `GET .../paths`. |
+| `SEND_TRACE_PATH` | `POST .../contacts/{pubkey}/ping` | ✅ focused | Exposes the safe repeater-ping use case rather than arbitrary TRACE construction. |
 | `SEND_CONTROL_DATA` | — | ❌ | Not needed for chat. |
 
 ### Synchronous action contract

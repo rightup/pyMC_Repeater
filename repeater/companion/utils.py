@@ -34,10 +34,6 @@ DEFAULT_COMPANION_TCP_TIMEOUT_SEC = 8 * 60 * 60
 MAX_COMPANION_TCP_TIMEOUT_SEC = 2_147_483_647
 MAX_COMPANION_PUSH_MIN_INTERVAL_SEC = 86_400.0
 MAX_COMPANION_PUSH_REQUEST_TIMEOUT_SEC = 300.0
-# The upstream Frame transport has a fixed 2048-response writer queue. A
-# 2000-contact cap leaves room for the dump's framing responses without making
-# a power-user setting capable of silently overflowing that queue.
-MAX_COMPANION_CONTACTS = 2_000
 # Each pending entry carries a bounded protocol message. Keep this tunable but
 # prevent a config typo from creating an effectively unbounded memory queue.
 MAX_COMPANION_OFFLINE_QUEUE_SIZE = 4_096
@@ -385,7 +381,6 @@ def parse_companion_bridge_kwargs(settings: dict) -> Dict[str, int]:
         max_contacts = parse_positive_int(
             settings["max_contacts"],
             "max_contacts",
-            maximum=MAX_COMPANION_CONTACTS,
         )
         kwargs["max_contacts"] = max_contacts
     if "offline_queue_size" in settings:

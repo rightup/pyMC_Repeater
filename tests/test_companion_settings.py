@@ -155,26 +155,14 @@ class TestParseCompanionBridgeKwargs:
     def test_empty_settings(self):
         assert parse_companion_bridge_kwargs({}) == {}
 
-    def test_max_contacts_and_offline_queue(self):
+    def test_accepts_large_max_contacts(self):
         assert parse_companion_bridge_kwargs(
-            {"max_contacts": 2000, "offline_queue_size": 1024}
-        ) == {"max_contacts": 2000, "offline_queue_size": 1024}
+            {"max_contacts": 100_000, "offline_queue_size": 1024}
+        ) == {"max_contacts": 100_000, "offline_queue_size": 1024}
 
-    @pytest.mark.parametrize(
-        ("field", "value", "maximum"),
-        [
-            ("max_contacts", 2001, 2000),
-            ("offline_queue_size", 4097, 4096),
-        ],
-    )
-    def test_rejects_values_above_bounded_memory_limits(
-        self,
-        field,
-        value,
-        maximum,
-    ):
-        with pytest.raises(ValueError, match=rf"{field} must be <= {maximum}"):
-            parse_companion_bridge_kwargs({field: value})
+    def test_rejects_offline_queue_above_bounded_memory_limit(self):
+        with pytest.raises(ValueError, match="offline_queue_size must be <= 4096"):
+            parse_companion_bridge_kwargs({"offline_queue_size": 4097})
 
     def test_ignored_keys_warn(self, caplog):
         caplog.set_level(logging.WARNING)

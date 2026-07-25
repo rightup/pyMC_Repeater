@@ -2619,7 +2619,6 @@ paths:
                     max_contacts:
                       type: integer
                       minimum: 1
-                      maximum: 2000
                       default: 1000
                       description: Maximum durable contacts for this companion.
                     offline_queue_size:
@@ -2945,7 +2944,6 @@ paths:
                     max_contacts:
                       type: integer
                       minimum: 1
-                      maximum: 2000
                       default: 1000
                       description: Maximum durable contacts for this companion.
                     offline_queue_size:
@@ -7319,6 +7317,98 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponseV1'
 
+  /v1/companions/{name}/anonymous_request:
+    post:
+      tags: [Mobile Companion API v1]
+      summary: Query public metadata from a nearby node
+      description: |
+        Sends a protocol-v13 anonymous request to a full public key and waits
+        up to 15 seconds for the correlated response. The target is transient:
+        this operation does not add it to the companion's contact list.
+
+        `owner` returns the public node and owner strings, `regions` returns
+        advertised region names, and `basic` returns bridge/forwarding
+        capabilities. A `200` response can contain `success: false` when no
+        matching response arrives.
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/CompanionRegistrationName'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [public_key, request]
+              additionalProperties: false
+              properties:
+                public_key:
+                  type: string
+                  pattern: '^[0-9a-fA-F]{64}$'
+                request:
+                  type: string
+                  enum: [regions, owner, basic]
+      responses:
+        '200':
+          description: Anonymous request completed or timed out.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessResponse'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/MobileAnonymousRequestResult'
+        '400':
+          description: Invalid public key, request kind, or JSON fields.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponseV1'
+        '401':
+          description: Missing/invalid JWT or API token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponseV1'
+        '404':
+          description: Companion not found or outside the caller's token scope.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponseV1'
+        '405':
+          description: Method not allowed (POST only).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponseV1'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaTypeV1'
+        '429':
+          description: RF admission limit exceeded. Includes `Retry-After`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponseV1'
+        '500':
+          $ref: '#/components/responses/OperationFailedV1'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailableV1'
+        '504':
+          description: Timed out waiting for the companion event loop.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponseV1'
+
   /v1/companions/{name}/contacts/{pubkey}/ping:
     post:
       tags: [Mobile Companion API v1]
@@ -7394,6 +7484,95 @@ paths:
           $ref: '#/components/responses/OperationFailedV1'
         '415':
           $ref: '#/components/responses/UnsupportedMediaTypeV1'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailableV1'
+        '504':
+          description: Timed out waiting for the companion event loop.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponseV1'
+
+  /v1/companions/{name}/contacts/{pubkey}/path_discovery:
+    post:
+      tags: [Mobile Companion API v1]
+      summary: Discover a contact's active route
+      description: |
+        Sends a flood path-discovery request from the selected companion and
+        waits up to 15 seconds for the correlated response. The response
+        preserves MeshCore's encoded path lengths and also separates each
+        route hash into a display-ready element.
+
+        No fields; omit the body or send `{}`. A `200` response can contain
+        `success: false` when no matching response arrives.
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/CompanionRegistrationName'
+        - name: pubkey
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: '^[0-9a-fA-F]{64}$'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+      responses:
+        '200':
+          description: Route discovery completed or timed out.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessResponse'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/MobilePathDiscoveryResult'
+        '400':
+          description: Invalid public key or JSON fields.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponseV1'
+        '401':
+          description: Missing/invalid JWT or API token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponseV1'
+        '404':
+          description: Companion or contact not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponseV1'
+        '405':
+          description: Method not allowed (POST only).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponseV1'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaTypeV1'
+        '429':
+          description: RF admission limit exceeded. Includes `Retry-After`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponseV1'
+        '500':
+          $ref: '#/components/responses/OperationFailedV1'
         '503':
           $ref: '#/components/responses/ServiceUnavailableV1'
         '504':
@@ -8800,7 +8979,6 @@ components:
             max_contacts:
               type: integer
               minimum: 1
-              maximum: 2000
               default: 1000
               description: Maximum durable contacts for this companion.
             offline_queue_size:
@@ -9335,6 +9513,101 @@ components:
         endpoints (login/status_request/telemetry_request). Exact fields
         depend on the companion bridge library version; no later result-event
         schema is promised.
+
+    MobileAnonymousRequestResult:
+      type: object
+      required: [success]
+      additionalProperties: false
+      properties:
+        success:
+          type: boolean
+        error:
+          type: string
+        public_key:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+        request:
+          type: string
+          enum: [regions, owner, basic]
+        response:
+          type: object
+          additionalProperties: false
+          properties:
+            type:
+              type: string
+              enum: [regions, owner, basic]
+            clock:
+              type: integer
+              minimum: 0
+              maximum: 4294967295
+            regions:
+              type: array
+              items:
+                type: string
+            node_name:
+              type: string
+            owner_info:
+              type: string
+            features:
+              type: integer
+              minimum: 0
+              maximum: 255
+            is_bridge:
+              type: boolean
+            bridge_type:
+              type: integer
+              minimum: 0
+              maximum: 3
+            is_disabled:
+              type: boolean
+            raw_hex:
+              type: string
+              pattern: '^[0-9a-f]*$'
+            anon_sub_type:
+              type: integer
+              minimum: 0
+              maximum: 255
+
+    MobileDiscoveredRoute:
+      type: object
+      required: [encoded_length, hop_count, hash_size, hops]
+      additionalProperties: false
+      properties:
+        encoded_length:
+          type: integer
+          minimum: 0
+          maximum: 191
+        hop_count:
+          type: integer
+          minimum: 0
+          maximum: 63
+        hash_size:
+          type: integer
+          minimum: 1
+          maximum: 3
+        hops:
+          type: array
+          maxItems: 63
+          items:
+            type: string
+            pattern: '^(?:[0-9a-f]{2}|[0-9a-f]{4}|[0-9a-f]{6})$'
+
+    MobilePathDiscoveryResult:
+      type: object
+      required: [success]
+      additionalProperties: false
+      properties:
+        success:
+          type: boolean
+        error:
+          type: string
+        public_key:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+        outbound:
+          $ref: '#/components/schemas/MobileDiscoveredRoute'
+        inbound:
+          $ref: '#/components/schemas/MobileDiscoveredRoute'
 
     MobilePingResult:
       type: object

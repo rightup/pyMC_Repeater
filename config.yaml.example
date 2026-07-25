@@ -410,7 +410,7 @@ identities:
     #     # an older build after verifying they belong to this full identity.
     #     # Remove it after one successful activation. It never overrides a binding.
     #     adopt_legacy_namespace: false
-    #     max_contacts: 1000  # 1..2000; upstream default is 1000
+    #     max_contacts: 1000  # positive integer; upstream default is 1000
     #     offline_queue_size: 512  # 0..4096; default 512
     #     # This bounds pending Frame delivery only; REST history remains durable.
     #     # If stored contacts exceed max_contacts at startup, remove the oldest

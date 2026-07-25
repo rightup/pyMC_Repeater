@@ -19,7 +19,7 @@ from collections import OrderedDict
 from collections.abc import Mapping
 from contextvars import ContextVar
 from enum import Enum
-from typing import Any, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional
 from weakref import WeakValueDictionary
 
 from openhop_core.companion import CompanionBridge
@@ -32,6 +32,7 @@ from openhop_core.companion.constants import (
 )
 from openhop_core.node.events import MeshEvents
 from openhop_core.protocol.constants import MAX_TEXT_LEN, PAYLOAD_TYPE_PATH
+from openhop_core.protocol.packet_utils import PathUtils
 from openhop_core.util.callbacks import invoke_maybe_awaitable
 
 from repeater.companion.correlation import (
@@ -643,6 +644,137 @@ class RepeaterCompanionBridge(CompanionBridge):
     async def send_path_discovery_req(self, pub_key: bytes):
         await self.await_committed_state()
         return await super().send_path_discovery_req(pub_key)
+
+    @staticmethod
+    def _response_tag(value: Any) -> int:
+        if isinstance(value, (bytes, bytearray)):
+            return int.from_bytes(value, "little")
+        return int(value)
+
+    async def _send_and_wait_for_response(
+        self,
+        event_name: str,
+        send: Callable[[], Awaitable[Any]],
+        *,
+        timeout: float,
+    ) -> tuple[Any, Optional[tuple[Any, ...]]]:
+        """Send one tagged request and await its matching Core response event."""
+
+        responses: asyncio.Queue[tuple[Any, ...]] = asyncio.Queue()
+
+        def capture(*args: Any) -> None:
+            responses.put_nowait(args)
+
+        self.add_observer(event_name, capture)
+        try:
+            sent = await send()
+            expected_tag = getattr(sent, "expected_ack", None)
+            if not getattr(sent, "success", False) or expected_tag is None:
+                return sent, None
+
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + max(0.1, float(timeout))
+            while True:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    return sent, None
+                try:
+                    response = await asyncio.wait_for(responses.get(), remaining)
+                except asyncio.TimeoutError:
+                    return sent, None
+                if response and self._response_tag(response[0]) == int(expected_tag):
+                    return sent, response
+        finally:
+            self.remove_observer(event_name, capture)
+
+    async def request_anonymous(
+        self,
+        pub_key: bytes,
+        data: bytes,
+        *,
+        timeout: float = 15.0,
+    ) -> dict[str, Any]:
+        """Request public metadata without adding the target as a contact."""
+
+        sent, response = await self._send_and_wait_for_response(
+            "binary_response",
+            lambda: self.send_anon_req(pub_key, data, timeout_seconds=timeout),
+            timeout=timeout,
+        )
+        if not getattr(sent, "success", False):
+            return {
+                "success": False,
+                "error": getattr(sent, "error", None) or "Anonymous request could not be sent",
+            }
+        if response is None:
+            return {"success": False, "error": "Anonymous request timed out"}
+
+        raw_data = bytes(response[1]) if len(response) > 1 else b""
+        parsed = response[2] if len(response) > 2 else None
+        if not isinstance(parsed, dict):
+            parsed = {"raw_hex": raw_data.hex()}
+        return {"success": True, "response": parsed}
+
+    @staticmethod
+    def _discovered_route(path_len: int, path: bytes) -> dict[str, Any]:
+        encoded_length = int(path_len)
+        if not PathUtils.is_valid_path_len(encoded_length):
+            raise ValueError("Invalid path length in discovery response")
+
+        hash_size = PathUtils.get_path_hash_size(encoded_length)
+        hop_count = PathUtils.get_path_hash_count(encoded_length)
+        raw_path = bytes(path)
+        expected_bytes = hash_size * hop_count
+        if len(raw_path) != expected_bytes:
+            raise ValueError("Invalid path data in discovery response")
+
+        return {
+            "encoded_length": encoded_length,
+            "hop_count": hop_count,
+            "hash_size": hash_size,
+            "hops": [
+                raw_path[offset : offset + hash_size].hex()
+                for offset in range(0, expected_bytes, hash_size)
+            ],
+        }
+
+    async def discover_path(
+        self,
+        pub_key: bytes,
+        *,
+        timeout: float = 15.0,
+    ) -> dict[str, Any]:
+        """Actively discover the outbound and return paths for one contact."""
+
+        sent, response = await self._send_and_wait_for_response(
+            "path_discovery_response",
+            lambda: self.send_path_discovery_req(pub_key),
+            timeout=timeout,
+        )
+        if not getattr(sent, "success", False):
+            error = getattr(sent, "error", None)
+            return {
+                "success": False,
+                "error": (
+                    "Contact not found"
+                    if error == "not_found"
+                    else error or "Route discovery failed"
+                ),
+            }
+        if response is None:
+            return {"success": False, "error": "Route discovery timed out"}
+
+        try:
+            response_key = bytes(response[1])
+            if response_key != bytes(pub_key):
+                return {"success": False, "error": "Route discovery target did not match"}
+            return {
+                "success": True,
+                "outbound": self._discovered_route(response[2], response[3]),
+                "inbound": self._discovered_route(response[4], response[5]),
+            }
+        except (IndexError, TypeError, ValueError) as exc:
+            return {"success": False, "error": str(exc)}
 
     async def send_channel_data(
         self,

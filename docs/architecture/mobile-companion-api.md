@@ -144,6 +144,7 @@ when they reuse the same `Idempotency-Key`.
 | `GET /companions/{name}/events` | Resumable SSE over the same journal |
 | `GET /companions/{name}/messages` | Newest-first durable history |
 | `POST /companions/{name}/messages` | Idempotent DM or channel send |
+| `POST /companions/{name}/anonymous_request` | Query public v13 node metadata by full key |
 | `POST\|DELETE /companions/{name}/contacts/{pubkey}` | Contact mutation |
 | `PUT\|DELETE /companions/{name}/channels/{index}` | Channel mutation |
 | `POST .../login` | Synchronous remote login |
@@ -152,6 +153,7 @@ when they reuse the same `Idempotency-Key`.
 | `POST .../status_request` | Synchronous remote status request |
 | `POST .../telemetry_request` | Synchronous remote telemetry request |
 | `POST .../ping` | Direct TRACE from the selected companion to a repeater |
+| `POST .../path_discovery` | Active outbound and return route discovery |
 | `POST .../reset_path` | Local learned-path reset |
 | `GET .../messages/{id}/receptions` | RF copies correlated to one message |
 | `GET .../contacts/{pubkey}/paths` | Bounded incoming-path aggregation |
@@ -460,7 +462,8 @@ All REST RF actions share a small per-principal and process-wide token bucket.
 Defaults are documented in `config.yaml.example`. The radio queue and duty
 cycle remain authoritative after API admission.
 
-Login/status/telemetry/ping are synchronous RF actions without idempotency keys.
+Login/status/telemetry/ping, anonymous metadata queries, and path discovery are
+synchronous RF actions without idempotency keys.
 Login passwords are at most 15 UTF-8 bytes and cannot contain NUL, matching
 MeshCore's NUL-terminated credential wire format.
 Treat their timeout as unknown and do not blindly retry. Ping uses a direct
@@ -470,6 +473,12 @@ in-flight Frame or REST login for the same destination, clears the local
 remote-session record, and attempts one best-effort RF send. Its response
 keeps those outcomes explicit as `{logged_out, sent}`. `connection` and
 `reset_path` are local state operations and do not consume the RF budget.
+
+`anonymous_request` accepts a full 32-byte public key and one public request
+kind (`owner`, `regions`, or `basic`). On protocol v13-capable Core versions,
+the target is transient and is not added to the companion's contact list.
+`path_discovery` requires an existing contact and returns the correlated
+outbound and return paths as encoded lengths plus individual hash elements.
 
 ## 8. Contacts and channels
 

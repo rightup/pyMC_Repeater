@@ -176,7 +176,13 @@ def test_mobile_cursor_bounds_and_empty_action_bodies_match_runtime():
     assert event_seq["minimum"] == 1
     assert event_seq["maximum"] == (1 << 63) - 1
 
-    for operation_name in ("status_request", "telemetry_request", "ping", "reset_path"):
+    for operation_name in (
+        "status_request",
+        "telemetry_request",
+        "ping",
+        "path_discovery",
+        "reset_path",
+    ):
         operation = spec["paths"][f"/v1/companions/{{name}}/contacts/{{pubkey}}/{operation_name}"][
             "post"
         ]
@@ -186,6 +192,12 @@ def test_mobile_cursor_bounds_and_empty_action_bodies_match_runtime():
             "type": "object",
             "additionalProperties": False,
         }
+
+    anonymous = spec["paths"]["/v1/companions/{name}/anonymous_request"]["post"]
+    anonymous_body = anonymous["requestBody"]["content"]["application/json"]["schema"]
+    assert anonymous_body["required"] == ["public_key", "request"]
+    assert anonymous_body["additionalProperties"] is False
+    assert anonymous_body["properties"]["request"]["enum"] == ["regions", "owner", "basic"]
 
     sync_cursor = next(
         parameter

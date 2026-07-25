@@ -973,6 +973,93 @@ async def test_durable_observer_cancellation_is_propagated_after_other_observers
 
 
 @pytest.mark.asyncio
+async def test_anonymous_request_correlates_response_that_arrives_during_send():
+    async def _inject(_packet, **_kwargs):
+        return True
+
+    bridge = RepeaterCompanionBridge(LocalIdentity(), _inject)
+    tag = 0x10203040
+
+    async def _send(_pub_key, _data, timeout_seconds):
+        assert timeout_seconds == 1.0
+        await bridge._fire_callbacks(
+            "binary_response",
+            tag.to_bytes(4, "little"),
+            b"raw",
+            {"type": "owner", "node_name": "Nearby"},
+            7,
+        )
+        return SentResult(success=True, expected_ack=tag)
+
+    bridge.send_anon_req = _send
+    result = await bridge.request_anonymous(b"\xaa" * 32, b"\x02", timeout=1.0)
+
+    assert result == {
+        "success": True,
+        "response": {"type": "owner", "node_name": "Nearby"},
+    }
+    assert "binary_response" not in bridge._observers
+
+
+@pytest.mark.asyncio
+async def test_path_discovery_decodes_multi_byte_hops_and_removes_observer():
+    async def _inject(_packet, **_kwargs):
+        return True
+
+    bridge = RepeaterCompanionBridge(LocalIdentity(), _inject)
+    pub_key = b"\xbb" * 32
+    tag = 0x55667788
+
+    async def _send(_pub_key):
+        await bridge._fire_callbacks(
+            "path_discovery_response",
+            tag.to_bytes(4, "little"),
+            pub_key,
+            0x42,
+            b"\x11\x22\x33\x44",
+            0x01,
+            b"\x55",
+        )
+        return SentResult(success=True, expected_ack=tag)
+
+    bridge.send_path_discovery_req = _send
+    result = await bridge.discover_path(pub_key, timeout=1.0)
+
+    assert result == {
+        "success": True,
+        "outbound": {
+            "encoded_length": 0x42,
+            "hop_count": 2,
+            "hash_size": 2,
+            "hops": ["1122", "3344"],
+        },
+        "inbound": {
+            "encoded_length": 0x01,
+            "hop_count": 1,
+            "hash_size": 1,
+            "hops": ["55"],
+        },
+    }
+    assert "path_discovery_response" not in bridge._observers
+
+
+@pytest.mark.asyncio
+async def test_path_discovery_timeout_removes_observer():
+    async def _inject(_packet, **_kwargs):
+        return True
+
+    bridge = RepeaterCompanionBridge(LocalIdentity(), _inject)
+    bridge.send_path_discovery_req = AsyncMock(
+        return_value=SentResult(success=True, expected_ack=7)
+    )
+
+    result = await bridge.discover_path(b"\xcc" * 32, timeout=0.001)
+
+    assert result == {"success": False, "error": "Route discovery timed out"}
+    assert "path_discovery_response" not in bridge._observers
+
+
+@pytest.mark.asyncio
 async def test_contact_observers_preserve_commit_order_while_callback_yields():
     async def _inject(_packet, **_kwargs):
         return True

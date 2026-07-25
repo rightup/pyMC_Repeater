@@ -17,6 +17,7 @@ docs/architecture/mobile-companion-api.md §7:
 - ``GET /api/v1/companions/{name}/messages?before_id=&limit=`` — history page
 - ``POST /api/v1/companions/{name}/messages`` — send DM/channel message (§7.3)
 - ``POST /api/v1/companions/{name}/advert`` — send the selected companion's advert
+- ``POST /api/v1/companions/{name}/anonymous_request`` — public v13 node query
 - ``GET /api/v1/companions/{name}/events`` — resumable SSE live stream (§8)
 - ``POST /api/v1/companions/{name}/contacts/{pubkey}/login`` — room login (§7.3)
 - ``GET /api/v1/companions/{name}/contacts/{pubkey}/connection`` — login state
@@ -24,6 +25,7 @@ docs/architecture/mobile-companion-api.md §7:
 - ``POST /api/v1/companions/{name}/contacts/{pubkey}/status_request`` (§7.3)
 - ``POST /api/v1/companions/{name}/contacts/{pubkey}/telemetry_request`` (§7.3)
 - ``POST /api/v1/companions/{name}/contacts/{pubkey}/ping`` — direct TRACE
+- ``POST /api/v1/companions/{name}/contacts/{pubkey}/path_discovery`` — route query
 - ``POST /api/v1/companions/{name}/contacts/{pubkey}/reset_path`` (§7.3)
 
 Cursor semantics (§5.3): clients hold an opaque ``epoch:sequence`` cursor;
@@ -63,6 +65,9 @@ from openhop_core.companion.constants import (
     ADV_TYPE_CHAT,
     ADV_TYPE_NONE,
     ADV_TYPE_REPEATER,
+    ANON_REQ_TYPE_BASIC,
+    ANON_REQ_TYPE_OWNER,
+    ANON_REQ_TYPE_REGIONS,
     CHANNEL_NAME_SIZE,
     CONTACT_NAME_SIZE,
 )
@@ -544,7 +549,14 @@ class MobileAPIEndpoints:
 class CompanionsV1:
     """``/api/v1/companions`` collection and per-companion sync/action resources."""
 
-    _ACTIONS = ("snapshot", "sync", "messages", "advert", "events")
+    _ACTIONS = (
+        "snapshot",
+        "sync",
+        "messages",
+        "advert",
+        "anonymous_request",
+        "events",
+    )
     # Sub-resource actions under /companions/{name}/contacts/{pubkey}/{action}
     # (§7.3). POST actions have no idempotency requirement.
     # Login/status/telemetry transmit RF and synchronously return their
@@ -556,6 +568,7 @@ class CompanionsV1:
         "status_request",
         "telemetry_request",
         "ping",
+        "path_discovery",
         "reset_path",
     )
     # GET-only sub-resource actions on the same /contacts/{pubkey}/{action}
@@ -1969,6 +1982,47 @@ class CompanionsV1:
         sent = self._run_async(bridge.advertise(flood=mode == "flood"))
         return self._success({"sent": bool(sent), "mode": mode})
 
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    @require_auth
+    def anonymous_request(self, companion_name=None, **kwargs):
+        """POST .../anonymous_request — query public metadata by full key."""
+
+        self._require_post()
+        bridge, _companion_hash = self._resolve(companion_name)
+        body = self._get_json_body()
+        reject_unknown_fields(body, {"public_key", "request"})
+        pub_key = self._pub_key_from_hex(body.get("public_key"))
+        request_name = body.get("request")
+        request_types = {
+            "regions": ANON_REQ_TYPE_REGIONS,
+            "owner": ANON_REQ_TYPE_OWNER,
+            "basic": ANON_REQ_TYPE_BASIC,
+        }
+        if not isinstance(request_name, str) or request_name not in request_types:
+            raise cherrypy.HTTPError(
+                400,
+                "request must be 'regions', 'owner', or 'basic'",
+            )
+
+        self._admit_rf()
+        timeout = 15.0
+        result = self._run_async(
+            bridge.request_anonymous(
+                pub_key,
+                bytes([request_types[request_name]]),
+                timeout=timeout,
+            ),
+            timeout=timeout + 5.0,
+        )
+        if result.get("success"):
+            result = {
+                **result,
+                "public_key": pub_key.hex(),
+                "request": request_name,
+            }
+        return self._success(_to_json_safe(result))
+
     def _message_history(self, companion_name, before_id, limit):
         _bridge, companion_hash = self._resolve(companion_name)
         handler = self._get_sqlite_handler()
@@ -2968,6 +3022,30 @@ class CompanionsV1:
             bridge.ping_contact(pub_key, timeout=timeout),
             timeout=timeout + 5.0,
         )
+        return self._success(_to_json_safe(result))
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    @require_auth
+    def path_discovery(self, companion_name=None, contact_pubkey=None, **kwargs):
+        """POST .../contacts/{pubkey}/path_discovery — actively query its route."""
+
+        self._require_post()
+        bridge, _companion_hash = self._resolve(companion_name)
+        pub_key = self._pub_key_from_hex(contact_pubkey)
+        reject_unknown_fields(self._get_json_body(), set())
+        contact = bridge.contacts.get_by_key(pub_key)
+        if contact is None or getattr(contact, "adv_type", ADV_TYPE_NONE) == ADV_TYPE_NONE:
+            raise cherrypy.HTTPError(404, "Contact not found")
+
+        self._admit_rf()
+        timeout = 15.0
+        result = self._run_async(
+            bridge.discover_path(pub_key, timeout=timeout),
+            timeout=timeout + 5.0,
+        )
+        if result.get("success"):
+            result = {**result, "public_key": pub_key.hex()}
         return self._success(_to_json_safe(result))
 
     @cherrypy.expose
