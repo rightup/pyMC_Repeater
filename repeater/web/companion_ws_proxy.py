@@ -220,6 +220,10 @@ class CompanionFrameWebSocket(WebSocket):
         tcp = getattr(self, "_tcp", None)
         if tcp:
             try:
+                tcp.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
                 tcp.close()
             except Exception as exc:
                 logger.debug(f"WS proxy TCP close failed for {name!r}: {exc}")

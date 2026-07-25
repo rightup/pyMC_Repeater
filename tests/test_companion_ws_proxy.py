@@ -184,5 +184,6 @@ def test_tcp_to_ws_and_teardown():
         ws2, proxy.CompanionFrameWebSocket
     )
     ws2._teardown()
+    tcp_ref.shutdown.assert_called_once_with(proxy.socket.SHUT_RDWR)
     tcp_ref.close.assert_called_once()
     ws2.close.assert_called_once()
