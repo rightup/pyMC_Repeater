@@ -458,17 +458,9 @@ docker compose up -d
 ```
 
 The Docker image bundles the optional PyMC Console frontend at
-`/opt/pymc_console/web/html`. Local and release builds fail closed unless both
-external build artifacts are pinned and verified. Set an exact
-`PYMC_CONSOLE_VERSION`, its `PYMC_CONSOLE_SHA256_*` value, and the matching
-`YQ_SHA256_*` value for each target architecture in `.env`; the names and
-comments are listed in `.env.example`. Published-image builds take the same
-pins from the `PYMC_CONSOLE_VERSION`, `PYMC_CONSOLE_SHA256`, `YQ_VERSION`,
-`YQ_SHA256_AMD64`, and `YQ_SHA256_ARM64` repository variables.
-
-`PYMC_CONSOLE_VERSION=latest` is accepted only when
-`PYMC_CONSOLE_ALLOW_LATEST=1` is explicitly set for a development build. It
-still requires a matching SHA-256 and fails when the upstream asset changes.
+`/opt/pymc_console/web/html`. Local builds with `docker-compose.build.yml`
+download the newest PyMC Console release by default. Set `PYMC_CONSOLE_VERSION`
+in `.env` to pin a release tag such as `v0.9.329`.
 
 After the container starts, open Web Settings and choose `PyMC Console` as the
 web frontend if you want the repeater to serve that UI. The existing
