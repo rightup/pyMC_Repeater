@@ -161,6 +161,26 @@ def test_mqtt_published_packet_carries_semtech_duration_end_to_end():
     assert payload_dict["route"] == "F"  # route=1 -> "F" (flood)
 
 
+def test_publish_self_heals_disconnected_enabled_broker(monkeypatch):
+    """Traffic must kick a broker out of a silent disconnected state."""
+    config = _make_config(format_value="mqtt")
+    identity = _FakeIdentity("EF" * 32)
+    pusher = MeshCoreToMqttPusher(local_identity=identity, config=config)
+    conn = pusher.connections[0]
+    conn._running = False
+    reasons = []
+    monkeypatch.setattr(
+        conn,
+        "ensure_reconnect_scheduled",
+        lambda reason="disconnected state detected": reasons.append(reason) or True,
+    )
+
+    results = pusher.publish("packets", {"type": 1, "raw": "00"})
+
+    assert results == []
+    assert reasons == ["publish to packets detected disconnected broker"]
+
+
 def test_mqtt_published_packet_topic_uses_mc2mqtt_structure_for_waev_format():
     """The waev format flavor must publish on the same MC2MQTT topic structure
     as letsmesh. Locks the contract that all MC2MQTT family formats share

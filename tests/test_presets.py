@@ -351,20 +351,48 @@ def test_schedule_reconnect_uses_exponential_backoff_and_cap(monkeypatch):
     assert captured["delay"] == conn._max_reconnect_delay
 
 
-def test_on_disconnect_duplicate_callback_does_not_schedule_reconnect(monkeypatch):
+def test_on_disconnect_without_running_flag_still_schedules_reconnect(monkeypatch):
     conn = _make_broker_connection("letsmesh")
     conn._running = False
 
     called = {"count": 0}
 
-    def _fake_schedule(reason="connection lost"):
+    def _fake_ensure(reason="connection lost"):
         called["count"] += 1
 
-    monkeypatch.setattr(conn, "_schedule_reconnect", _fake_schedule)
+    monkeypatch.setattr(conn, "ensure_reconnect_scheduled", _fake_ensure)
 
-    # Unexpected disconnect while already disconnected = duplicate callback.
+    # A callback can race with state clearing. Recovery must not depend on
+    # _running still being true when the callback arrives.
     conn._on_disconnect(client=None, userdata=None, rc=1)
-    assert called["count"] == 0
+    assert called["count"] == 1
+
+
+def test_clean_broker_disconnect_schedules_reconnect(monkeypatch):
+    conn = _make_broker_connection("mqtt")
+    conn._running = True
+    called = []
+
+    monkeypatch.setattr(
+        conn,
+        "ensure_reconnect_scheduled",
+        lambda reason="connection lost": called.append(reason),
+    )
+
+    conn._on_disconnect(client=None, userdata=None, rc=0)
+
+    assert called == ["broker closed connection"]
+
+
+def test_intentional_disconnect_sets_shutdown_guard(monkeypatch):
+    conn = _make_broker_connection("mqtt")
+    conn._running = True
+    monkeypatch.setattr(conn.client, "loop_stop", lambda: None)
+    monkeypatch.setattr(conn.client, "disconnect", lambda: None)
+
+    conn.disconnect()
+
+    assert conn._shutdown_requested is True
 
 
 def test_attempt_reconnect_failure_reschedules(monkeypatch):

@@ -191,6 +191,7 @@ class _BrokerConnection:
         self._running = False
         self._reconnect_attempts = 0
         self._reconnect_timer = None
+        self._reconnect_lock = threading.RLock()
         self._max_reconnect_delay = 300  # 5 minutes max
         self._keepalive = broker.get(
             "keepalive", 30
@@ -331,9 +332,10 @@ class _BrokerConnection:
             self._running = True
             self._reconnect_attempts = 0  # Reset counter on success
             # Successful connect can race with a previously scheduled timer; cancel it.
-            if self._reconnect_timer:
-                self._reconnect_timer.cancel()
-                self._reconnect_timer = None
+            with self._reconnect_lock:
+                if self._reconnect_timer:
+                    self._reconnect_timer.cancel()
+                    self._reconnect_timer = None
             if self.use_jwt_auth:
                 self._schedule_jwt_refresh()  # Schedule proactive JWT refresh
             if self._on_connect_callback:
@@ -378,32 +380,49 @@ class _BrokerConnection:
                     f"Duplicate disconnect callback from {self.broker['name']} while already disconnected "
                     f"(rc={rc_value}): {error_msg}"
                 )
-            if was_running:  # Only reconnect if we were intentionally connected
-                self._schedule_reconnect(reason=error_msg)
+            self.ensure_reconnect_scheduled(reason=error_msg)
         else:
             logger.info(f"Clean disconnect from {self.broker['name']}")
+            self.ensure_reconnect_scheduled(reason="broker closed connection")
 
         if self._on_disconnect_callback:
             self._on_disconnect_callback(self.broker["name"])
 
     def _schedule_reconnect(self, reason: str = "connection lost"):
         """Schedule reconnection with exponential backoff"""
-        if self._shutdown_requested:
-            return
+        with self._reconnect_lock:
+            if self._shutdown_requested:
+                return
 
-        if self._reconnect_timer:
-            self._reconnect_timer.cancel()
+            if self._reconnect_timer:
+                self._reconnect_timer.cancel()
 
-        # Exponential backoff: 5s, 10s, 20s, 40s, 80s, up to max
-        delay = min(5 * (2**self._reconnect_attempts), self._max_reconnect_delay)
-        self._reconnect_attempts += 1
+            # Exponential backoff: 5s, 10s, 20s, 40s, 80s, up to max
+            delay = min(5 * (2**self._reconnect_attempts), self._max_reconnect_delay)
+            self._reconnect_attempts += 1
 
-        logger.info(
-            f"Scheduling reconnect to {self.broker['name']} in {delay}s (attempt {self._reconnect_attempts}, reason: {reason})"
-        )
-        self._reconnect_timer = threading.Timer(delay, lambda: self._attempt_reconnect(reason))
-        self._reconnect_timer.daemon = True
-        self._reconnect_timer.start()
+            logger.info(
+                f"Scheduling reconnect to {self.broker['name']} in {delay}s (attempt {self._reconnect_attempts}, reason: {reason})"
+            )
+            self._reconnect_timer = threading.Timer(delay, lambda: self._attempt_reconnect(reason))
+            self._reconnect_timer.daemon = True
+            self._reconnect_timer.start()
+
+    def ensure_reconnect_scheduled(self, reason: str = "disconnected state detected") -> bool:
+        """Ensure an enabled broker cannot remain disconnected without recovery."""
+        with self._reconnect_lock:
+            if (
+                self._shutdown_requested
+                or not self.enabled
+                or self._running
+                or (
+                    self._reconnect_timer is not None
+                    and self._reconnect_timer.is_alive()
+                )
+            ):
+                return False
+            self._schedule_reconnect(reason)
+            return True
 
     def _attempt_reconnect(self, reason: str = "connection lost"):
         """Attempt to reconnect to broker with fresh JWT"""
@@ -411,7 +430,8 @@ class _BrokerConnection:
             return
 
         # Timer has fired; clear handle so state reflects reality.
-        self._reconnect_timer = None
+        with self._reconnect_lock:
+            self._reconnect_timer = None
 
         if self._running:
             logger.debug(f"Skipping reconnect to {self.broker['name']} - already connected")
@@ -508,7 +528,7 @@ class _BrokerConnection:
 
     def disconnect(self):
         """Disconnect from broker"""
-        self._shutdown_requested = False
+        self._shutdown_requested = True
         self._running = False
         self._loop_running = False
 
@@ -559,7 +579,8 @@ class _BrokerConnection:
 
     def has_pending_reconnect(self) -> bool:
         """Check if a reconnection is scheduled"""
-        return self._reconnect_timer is not None and self._reconnect_timer.is_alive()
+        with self._reconnect_lock:
+            return self._reconnect_timer is not None and self._reconnect_timer.is_alive()
 
     def should_reconnect_for_token_expiry(self) -> bool:
         """Check if connection should be reconnected due to JWT expiry (at 80% of lifetime)"""
@@ -1010,6 +1031,10 @@ class MeshCoreToMqttPusher:
                     _trace(f"Published to {conn.broker['name']} -- {subtopic}")
                 elif not conn.enabled:
                     results.append((conn.broker["name"], "Skipped due to being disabled"))
+                else:
+                    conn.ensure_reconnect_scheduled(
+                        reason=f"publish to {subtopic} detected disconnected broker"
+                    )
 
         if not results:
             logger.warning(f"No active broker connections for publishing to {subtopic}")
@@ -1050,6 +1075,10 @@ class MeshCoreToMqttPusher:
                     )
                 elif not conn.enabled:
                     results.append((conn.broker["name"], "Skipped due to being disabled"))
+                else:
+                    conn.ensure_reconnect_scheduled(
+                        reason=f"publish to {subtopic} detected disconnected broker"
+                    )
 
         if not results:
             logger.warning(f"No active broker connections for publishing to {subtopic}")
