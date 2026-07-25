@@ -1941,10 +1941,11 @@ async def test_companion_api_ping_awaits_its_correlated_trace_response():
     assert bridge._trace_waiters == {}
     bridge.send_trace_path_raw.assert_awaited_once_with(
         tag,
-        waiter["auth_code"],
+        0,
         waiter["flags"],
         waiter["path"],
     )
+    assert waiter["auth_code"] == 0
 
 
 @pytest.mark.asyncio

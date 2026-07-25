@@ -749,7 +749,10 @@ class RepeaterCompanionBridge(CompanionBridge):
             return {"success": False, "error": "Unsupported TRACE hash size"}
 
         tag = self._allocate_trace_tag()
-        auth_code = secrets.randbits(32)
+        # Match the Companion TRACE command used by existing clients and
+        # deployed MeshCore repeaters. The field is reflected in the response;
+        # it is not a per-request authentication mechanism.
+        auth_code = 0
         path = bytes(pub_key[:trace_hash_size])
         future = asyncio.get_running_loop().create_future()
         waiter = {
