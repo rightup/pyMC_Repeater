@@ -475,6 +475,60 @@ def test_discovery_auto_add_skips_local_node_and_persists_remote():
     storage.record_advert.assert_called_once()
 
 
+def test_discovery_auto_add_persists_through_the_storage_actually_wired_in():
+    """MeshCLI is constructed with the SQLiteHandler, not the StorageCollector.
+
+    See repeater/main.py:516 -> TextHelper(sqlite_handler=...storage.sqlite_handler)
+    -> MeshCLI(storage_handler=self.sqlite_handler). SQLiteHandler exposes
+    store_advert but no record_advert, so a persistence path that only looked for
+    record_advert made `discover.neighbors` silently record nothing in production
+    while passing tests that injected a hand-rolled double. Spec'ing the mock off
+    the real class is what keeps this honest.
+    """
+    from repeater.data_acquisition.sqlite_handler import SQLiteHandler
+
+    identity = SimpleNamespace(get_public_key=lambda: bytes.fromhex("11" * 32))
+    storage = MagicMock(spec=SQLiteHandler)
+    cli = MeshCLI(
+        "/tmp/cfg.yaml", _base_config(), _cfg_mgr(), identity=identity, storage_handler=storage
+    )
+
+    result = cli._auto_add_discovery_result(
+        {
+            "pub_key": "22" * 32,
+            "node_name": "Remote Repeater",
+            "node_type": 2,
+            "rssi": -70,
+            "response_snr": 4.25,
+        }
+    )
+
+    assert result["auto_added"] is True
+    storage.store_advert.assert_called_once()
+    record = storage.store_advert.call_args.args[0]
+    assert record["pubkey"] == "22" * 32
+    assert record["is_repeater"] is True
+    assert record["zero_hop"] is True
+    assert record["snr"] == 4.25
+    assert record["rssi"] == -70
+
+
+def test_discovery_auto_add_prefers_record_advert_when_the_collector_is_wired_in():
+    """StorageCollector.record_advert also publishes the advert; prefer it."""
+    from repeater.data_acquisition.storage_collector import StorageCollector
+
+    identity = SimpleNamespace(get_public_key=lambda: bytes.fromhex("11" * 32))
+    storage = MagicMock(spec=StorageCollector)
+    cli = MeshCLI(
+        "/tmp/cfg.yaml", _base_config(), _cfg_mgr(), identity=identity, storage_handler=storage
+    )
+
+    result = cli._auto_add_discovery_result({"pub_key": "22" * 32, "node_type": 2})
+
+    assert result["auto_added"] is True
+    storage.record_advert.assert_called_once()
+
+
 def test_cmd_set_save_failure_reports_error_and_skips_live_update():
     mgr = _cfg_mgr(save_ok=False)
     cli = MeshCLI("/tmp/cfg.yaml", _base_config(), mgr)

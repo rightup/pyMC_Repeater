@@ -129,41 +129,11 @@ class MeshCLI:
         if not self.storage_handler:
             return enriched
 
-        record_advert = getattr(self.storage_handler, "record_advert", None)
-        if not callable(record_advert):
-            return enriched
+        from repeater.handler_helpers.discovery import persist_discovery_result
 
-        try:
-            import time
-
-            node_type = int(enriched.get("node_type", 0) or 0)
-            contact_type = {
-                1: "Chat Node",
-                2: "Repeater",
-                3: "Room Server",
-            }.get(node_type, "Unknown")
-
-            rssi = enriched.get("rssi")
-            snr = enriched.get("response_snr", enriched.get("snr"))
-            advert_record = {
-                "timestamp": time.time(),
-                "pubkey": pub_key,
-                "node_name": enriched.get("node_name"),
-                "is_repeater": node_type == 2,
-                "route_type": 2,
-                "contact_type": contact_type,
-                "latitude": None,
-                "longitude": None,
-                "rssi": int(rssi) if rssi is not None else None,
-                "snr": float(snr) if snr is not None else None,
-                "is_new_neighbor": True,
-                "zero_hop": True,
-            }
-            record_advert(advert_record)
+        if persist_discovery_result(self.storage_handler, enriched):
             enriched["known_neighbor"] = True
             enriched["auto_added"] = True
-        except Exception as exc:
-            logger.debug("Auto-add discovery result failed for %s: %s", pub_key, exc)
 
         return enriched
 

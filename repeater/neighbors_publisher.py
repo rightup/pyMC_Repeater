@@ -25,6 +25,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 
+from repeater.handler_helpers.discovery import persist_discovery_result
 from repeater.handler_helpers.neighbor_scopes import (
     STATUS_RESPONDED,
     STATUS_TIMEOUT,
@@ -431,36 +432,7 @@ class NeighborsPublisher:
                 "snr": float(snr_raw) if snr_raw is not None else 0.0,
             }
 
-        storage = self._storage()
-        record_advert = getattr(storage, "record_advert", None) if storage else None
-        if not callable(record_advert):
-            return result
-
-        node_type = int(result.get("node_type", 0) or 0)
-        rssi = result.get("rssi")
-        snr = result.get("response_snr", result.get("snr"))
-        try:
-            record_advert(
-                {
-                    "timestamp": time.time(),
-                    "pubkey": pubkey,
-                    "node_name": result.get("node_name"),
-                    "is_repeater": node_type == 2,
-                    "route_type": 2,
-                    "contact_type": {1: "Chat Node", 2: "Repeater", 3: "Room Server"}.get(
-                        node_type, "Unknown"
-                    ),
-                    "latitude": None,
-                    "longitude": None,
-                    "rssi": int(rssi) if rssi is not None else None,
-                    "snr": float(snr) if snr is not None else None,
-                    "is_new_neighbor": True,
-                    "zero_hop": True,
-                }
-            )
-        except Exception as e:
-            logger.debug(f"Could not persist discovery result for {pubkey[:8]}: {e}")
-
+        persist_discovery_result(self._storage(), result)
         return result
 
     def _snapshot_neighbors(self) -> List[NeighborSnapshot]:
