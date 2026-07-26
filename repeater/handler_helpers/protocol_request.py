@@ -23,6 +23,8 @@ from openhop_core.protocol.cayenne_lpp import (
     encode_relative_humidity,
     encode_temperature,
     encode_voltage,
+    encode_current,
+    encode_power
 )
 from openhop_core.protocol.constants import TELEM_PERM_ENVIRONMENT
 
@@ -327,7 +329,32 @@ class ProtocolRequestHelper:
                 except (TypeError, ValueError):
                     continue
         return 0.0
-    
+    def _battery_current(readings) -> float:
+        """First configured sensor's current, else 0.000A."""
+        for reading in readings:
+            if not reading.get("ok"):
+                continue
+            data = reading.get("data") or {}
+            current = data.get("current_ma")
+            if current is not None:
+                try:
+                    return float(current)
+                except (TypeError, ValueError):
+                    continue
+        return 0.000
+    def _battery_power(readings) -> int:
+        """First configured sensor's power, else 0W."""
+        for reading in readings:
+            if not reading.get("ok"):
+                continue
+            data = reading.get("data") or {}
+            power = data.get("power_mw")/1000
+            if power is not None:
+                try:
+                    return int(power)
+                except (TypeError, ValueError):
+                    continue
+        return 0
 
     @staticmethod
     def _encode_environment_reading(channel: int, reading) -> bytes:
