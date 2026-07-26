@@ -247,6 +247,8 @@ class MeshCLI:
             return self._cmd_neighbors()
         elif command.startswith("neighbor.remove "):
             return self._cmd_neighbor_remove(command)
+        elif command.startswith("discover.scopes"):
+            return self._cmd_discover_scopes(command)
         elif command.startswith("discover.neighbors"):
             return self._cmd_discover_neighbors(command)
 
@@ -326,6 +328,7 @@ class MeshCLI:
             "  neighbors           List neighbors",
             "  neighbor.remove <key>  Remove neighbor by pubkey",
             "  discover.neighbors  Send zero-hop neighbor discovery",
+            "  discover.scopes     Discover neighbor scopes, publish to MQTT",
             "  tempradio <freq> <bw> <sf> <cr> <timeout_mins>",
             "  setperm <pubkey> <perm>  Set ACL permissions",
             "  log start|stop|erase    Logging control",
@@ -380,6 +383,12 @@ class MeshCLI:
             ),
             "neighbors": "List known neighbor nodes from the routing table.",
             "discover.neighbors": "Send a neighbor discovery request.",
+            "discover.scopes": (
+                "discover.scopes\n"
+                "  Refresh the zero-hop neighbor table, query each neighbor for its\n"
+                "  region scopes, then publish the table to the MQTT neighbors topic.\n"
+                "  Requires a broker configured with neighbors: true."
+            ),
             "setperm": "setperm <pubkey_hex> <permission_int> \u2014 Set ACL permissions for a node.",
             "log": "log start|stop|erase \u2014 Control logging.",
         }
@@ -1293,6 +1302,50 @@ class MeshCLI:
             return "OK - Discover sent"
         except Exception as e:
             logger.error(f"discover.neighbors failed: {e}", exc_info=True)
+            return f"Error: {e}"
+
+    def _cmd_discover_scopes(self, command: str) -> str:
+        """Refresh the neighbour table, query each neighbour's scopes, publish once.
+
+        Manual trigger for the periodic MQTT neighbors cycle (firmware
+        ``discover.scopes``). The cycle takes minutes -- a node-discovery window
+        plus one serialized scope query per neighbour -- so this schedules it and
+        returns immediately rather than holding the CLI reply open.
+        """
+        sub = command[15:]
+        if sub.strip():
+            return "Err - discover.scopes has no options"
+
+        daemon_instance = getattr(self.config_manager, "daemon", None)
+        publisher = getattr(daemon_instance, "neighbors_publisher", None)
+        if not publisher:
+            return "Error: Neighbors publisher not available"
+
+        if not publisher.enabled():
+            return "Err - neighbors publishing is disabled (no broker opted in)"
+
+        if publisher.status().get("phase") == "active":
+            return "Err - neighbors cycle already active"
+
+        import asyncio
+
+        loop = self._event_loop
+        if loop is None:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+
+        if loop is None or not loop.is_running():
+            return "Error: Event loop not available"
+
+        try:
+            loop.call_soon_threadsafe(
+                lambda: asyncio.create_task(publisher.run_cycle(trigger="manual"))
+            )
+            return "OK - neighbor scope discovery started"
+        except Exception as e:
+            logger.error(f"discover.scopes failed: {e}", exc_info=True)
             return f"Error: {e}"
 
     # ==================== Temporary Radio Commands ====================

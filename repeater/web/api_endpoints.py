@@ -2258,13 +2258,25 @@ class APIEndpoints:
                                 "reconnecting": conn.has_pending_reconnect(),
                             },
                             "format": conn.format,
+                            "neighbors": getattr(conn, "neighbors_enabled", False),
                         }
                     )
+
+            # Schedule summary for the neighbors topic, the openhop equivalent of
+            # the firmware's trailing "nbr: <next>/<last>" in `get mqtt.status`.
+            neighbors_status = None
+            publisher = getattr(self.daemon_instance, "neighbors_publisher", None)
+            if publisher:
+                try:
+                    neighbors_status = publisher.status()
+                except Exception as exc:
+                    logger.debug(f"mqtt_status could not read neighbors publisher: {exc}")
 
             return self._success(
                 {
                     "handler_active": handler is not None,
                     "brokers": connected_brokers,
+                    "neighbors": neighbors_status,
                 }
             )
         except Exception as e:
@@ -2325,6 +2337,79 @@ class APIEndpoints:
             logger.error(f"Error listing broker presets: {e}")
             return self._error(str(e))
 
+    @staticmethod
+    def _validate_neighbors_settings(raw):
+        """Validate the ``mqtt_brokers.neighbors`` block.
+
+        Returns ``(settings, error)``; ``error`` is None on success. The interval
+        is rejected rather than clamped when out of range, matching the firmware's
+        ``set mqtt.neighbors.interval`` behavior.
+        """
+        from repeater.neighbors_publisher import (
+            DEFAULT_INTERVAL_HOURS,
+            MAX_INTERVAL_HOURS,
+            MIN_INTERVAL_HOURS,
+        )
+
+        if not isinstance(raw, dict):
+            return None, "neighbors must be an object"
+
+        settings = {}
+
+        if "enabled" in raw:
+            settings["enabled"] = bool(raw["enabled"])
+
+        if "interval_hours" in raw:
+            try:
+                interval = int(raw["interval_hours"])
+            except (TypeError, ValueError):
+                return None, "neighbors.interval_hours must be a number"
+            if interval < MIN_INTERVAL_HOURS or interval > MAX_INTERVAL_HOURS:
+                return (
+                    None,
+                    f"neighbors.interval_hours must be between {MIN_INTERVAL_HOURS} "
+                    f"and {MAX_INTERVAL_HOURS} (default {DEFAULT_INTERVAL_HOURS})",
+                )
+            settings["interval_hours"] = interval
+
+        if "discovery_timeout_seconds" in raw:
+            try:
+                timeout = float(raw["discovery_timeout_seconds"])
+            except (TypeError, ValueError):
+                return None, "neighbors.discovery_timeout_seconds must be a number"
+            if timeout < 5 or timeout > 300:
+                return None, "neighbors.discovery_timeout_seconds must be between 5 and 300"
+            settings["discovery_timeout_seconds"] = timeout
+
+        if "scope_response_timeout_seconds" in raw:
+            try:
+                scope_timeout = float(raw["scope_response_timeout_seconds"])
+            except (TypeError, ValueError):
+                return None, "neighbors.scope_response_timeout_seconds must be a number"
+            if scope_timeout < 0 or scope_timeout > 300:
+                return None, "neighbors.scope_response_timeout_seconds must be between 0 and 300"
+            settings["scope_response_timeout_seconds"] = scope_timeout
+
+        if "max_neighbors" in raw:
+            try:
+                max_neighbors = int(raw["max_neighbors"])
+            except (TypeError, ValueError):
+                return None, "neighbors.max_neighbors must be a number"
+            if max_neighbors < 1 or max_neighbors > 255:
+                return None, "neighbors.max_neighbors must be between 1 and 255"
+            settings["max_neighbors"] = max_neighbors
+
+        if "max_neighbor_age_seconds" in raw:
+            try:
+                max_age = float(raw["max_neighbor_age_seconds"])
+            except (TypeError, ValueError):
+                return None, "neighbors.max_neighbor_age_seconds must be a number"
+            if max_age < 60:
+                return None, "neighbors.max_neighbor_age_seconds must be at least 60"
+            settings["max_neighbor_age_seconds"] = max_age
+
+        return settings, None
+
     @cherrypy.expose
     @cherrypy.tools.json_out()
     @cherrypy.tools.json_in()
@@ -2365,6 +2450,17 @@ class APIEndpoints:
                 mqtt_updates["owner"] = str(data["owner"]).strip()
             if "email" in data:
                 mqtt_updates["email"] = str(data["email"]).strip()
+            if "neighbors" in data:
+                neighbors_settings, error = self._validate_neighbors_settings(data["neighbors"])
+                if error:
+                    return self._error(error)
+                # update_and_save replaces a section's key outright, so merge onto
+                # the stored block instead of letting a partial POST drop the
+                # settings it did not mention.
+                existing_neighbors = (self.config.get("mqtt_brokers", {}) or {}).get(
+                    "neighbors", {}
+                ) or {}
+                mqtt_updates["neighbors"] = {**existing_neighbors, **neighbors_settings}
             # if "disallowed_packet_types" in data:
             #     mqtt_updates["disallowed_packet_types"] = list(data["disallowed_packet_types"])
             if "brokers" in data:
@@ -2402,6 +2498,9 @@ class APIEndpoints:
                         "format": str(b["format"]).strip(),
                         "disallowed_packet_types": list(b.get("disallowed_packet_types", [])),
                         "retain_status": bool(b.get("retain_status", False)),
+                        # Opt-in per broker; brokers that do not expect the
+                        # neighbors topic can reject it and drop the connection.
+                        "neighbors": bool(b.get("neighbors", False)),
                         "tls": {
                             "enabled": bool(
                                 b.get("tls", {}).get("enabled", True if port == 443 else False)

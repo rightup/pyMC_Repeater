@@ -545,6 +545,26 @@ mqtt_brokers:
   email: ""
   brokers: []
 
+  # Periodic neighbours publication (the "neighbors" topic).
+  #
+  # Each cycle runs a zero-hop node-discovery broadcast to refresh the neighbour
+  # table, then asks each zero-hop repeater for its region scopes with an
+  # anonymous regions request, then publishes the assembled table. Scope queries
+  # are issued ONE AT A TIME - firing them as a burst makes the responses collide.
+  #
+  # Off unless a broker opts in below with `neighbors: true`; `enabled` here is a
+  # master kill switch for the whole feature.
+  # neighbors:
+  #   enabled: true                     # master on/off (default true)
+  #   interval_hours: 24                # 12-336, how often a cycle runs
+  #   discovery_timeout_seconds: 60     # node-discovery collection window
+  #   scope_response_timeout_seconds: 0 # 0 = size the window from radio settings
+  #   max_neighbors: 32                 # cap on neighbours queried per cycle
+  #   max_neighbor_age_seconds: 86400   # ignore zero-hop rows older than this
+  #   max_sweep_seconds: 900            # give up on a cycle after this long
+  #
+  # `discover.scopes` over the mesh CLI runs one cycle immediately.
+
   # Below is the broker object schema:
   # enabled: true|false # Enable this specific mqtt broker
   # name: "" # Internal name for this broker
@@ -560,6 +580,7 @@ mqtt_brokers:
   #   letsmesh, waev - MC2MQTT family flavors (same topic structure, network-specific identity)
   #   mqtt           - legacy openhop-repeater local-broker convention (custom topic, singular 'packet')
   # retain_status: true|false # Sets MQTT "retain" on status messages so they remain on the broker when disconnected. Also enforces a QOS of 1 (guaranteed delivery)
+  # neighbors: true|false # Publish the periodic neighbours table to this broker's "neighbors" topic (default false). Only enable for brokers that expect the topic - some reject unknown topics and close the connection.
   # tls:
   #   enabled: true|false # Enable TLS. If the endpoint's certificate is self-signed, the Root CA should be added to the OS's certificate store. 
   #   insecure: true|false # Validate TLS certificates
