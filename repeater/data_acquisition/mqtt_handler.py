@@ -1058,11 +1058,22 @@ class MeshCoreToMqttPusher:
                     )
                     continue
                 result = conn.publish("neighbors", message, retain=False, qos=1)
+                # This is by far the largest payload the node emits and it is not
+                # size-capped, so an oversized or queue-full rejection is a real
+                # outcome. Check paho's rc rather than reporting a publish that
+                # never left the client as a success.
+                rc = getattr(result, "rc", None)
+                if result is None or (rc is not None and rc != mqtt.MQTT_ERR_SUCCESS):
+                    logger.warning(
+                        f"Neighbors publish rejected by {conn.broker['name']} "
+                        f"(rc={rc}, bytes={len(message.encode('utf-8'))})"
+                    )
+                    continue
                 results.append((conn.broker["name"], result))
                 _trace(f"Published to {conn.broker['name']} -- neighbors")
 
         if not results:
-            logger.warning("No connected broker opted into the neighbors topic")
+            logger.warning("Neighbors table was not published to any broker")
 
         return results
 

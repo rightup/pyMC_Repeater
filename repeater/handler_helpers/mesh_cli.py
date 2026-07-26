@@ -1,3 +1,4 @@
+import concurrent.futures
 import logging
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
@@ -1324,9 +1325,6 @@ class MeshCLI:
         if not publisher.enabled():
             return "Err - neighbors publishing is disabled (no broker opted in)"
 
-        if publisher.status().get("phase") == "active":
-            return "Err - neighbors cycle already active"
-
         import asyncio
 
         loop = self._event_loop
@@ -1340,10 +1338,21 @@ class MeshCLI:
             return "Error: Event loop not available"
 
         try:
-            loop.call_soon_threadsafe(
-                lambda: asyncio.create_task(publisher.run_cycle(trigger="manual"))
-            )
-            return "OK - neighbor scope discovery started"
+            # trigger_cycle owns the "already running" check and tracks the task
+            # so shutdown can cancel it. Doing it here instead would race: this
+            # runs on the CLI thread, the cycle starts on the event loop.
+            started = concurrent.futures.Future()
+
+            def _start():
+                try:
+                    started.set_result(publisher.trigger_cycle())
+                except Exception as exc:  # pragma: no cover - defensive
+                    started.set_exception(exc)
+
+            loop.call_soon_threadsafe(_start)
+            if started.result(timeout=5):
+                return "OK - neighbor scope discovery started"
+            return "Err - neighbors cycle already active"
         except Exception as e:
             logger.error(f"discover.scopes failed: {e}", exc_info=True)
             return f"Error: {e}"

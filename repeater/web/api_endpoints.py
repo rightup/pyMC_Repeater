@@ -2354,16 +2354,36 @@ class APIEndpoints:
         if not isinstance(raw, dict):
             return None, "neighbors must be an object"
 
+        # Reject unknown keys rather than accepting them silently: a typo would
+        # otherwise return success while changing nothing the runtime reads.
+        known_keys = {
+            "enabled",
+            "interval_hours",
+            "discovery_timeout_seconds",
+            "scope_response_timeout_seconds",
+            "max_sweep_seconds",
+            "duty_cycle_abort_seconds",
+            "max_neighbors",
+            "max_neighbor_age_seconds",
+        }
+        unknown = sorted(set(raw) - known_keys)
+        if unknown:
+            return None, f"Unknown neighbors settings: {', '.join(unknown)}"
+
         settings = {}
 
         if "enabled" in raw:
-            settings["enabled"] = bool(raw["enabled"])
+            if not isinstance(raw["enabled"], bool):
+                return None, "neighbors.enabled must be true or false"
+            settings["enabled"] = raw["enabled"]
 
         if "interval_hours" in raw:
-            try:
-                interval = int(raw["interval_hours"])
-            except (TypeError, ValueError):
+            interval = raw["interval_hours"]
+            if isinstance(interval, bool) or not isinstance(interval, (int, float)):
                 return None, "neighbors.interval_hours must be a number"
+            if float(interval) != int(interval):
+                return None, "neighbors.interval_hours must be a whole number of hours"
+            interval = int(interval)
             if interval < MIN_INTERVAL_HOURS or interval > MAX_INTERVAL_HOURS:
                 return (
                     None,
@@ -2407,6 +2427,24 @@ class APIEndpoints:
             if max_age < 60:
                 return None, "neighbors.max_neighbor_age_seconds must be at least 60"
             settings["max_neighbor_age_seconds"] = max_age
+
+        if "max_sweep_seconds" in raw:
+            try:
+                max_sweep = float(raw["max_sweep_seconds"])
+            except (TypeError, ValueError):
+                return None, "neighbors.max_sweep_seconds must be a number"
+            if max_sweep < 30 or max_sweep > 7200:
+                return None, "neighbors.max_sweep_seconds must be between 30 and 7200"
+            settings["max_sweep_seconds"] = max_sweep
+
+        if "duty_cycle_abort_seconds" in raw:
+            try:
+                abort_after = float(raw["duty_cycle_abort_seconds"])
+            except (TypeError, ValueError):
+                return None, "neighbors.duty_cycle_abort_seconds must be a number"
+            if abort_after < 0 or abort_after > 600:
+                return None, "neighbors.duty_cycle_abort_seconds must be between 0 and 600"
+            settings["duty_cycle_abort_seconds"] = abort_after
 
         return settings, None
 
@@ -2467,6 +2505,18 @@ class APIEndpoints:
                 brokers = data["brokers"]
                 if not isinstance(brokers, list):
                     return self._error("brokers must be a list")
+
+                # The rebuild below is a strict field whitelist, so any key a
+                # client omits is reset to its default. For neighbors that would
+                # silently switch the feature off whenever a UI that predates it
+                # saves an unrelated MQTT setting, so fall back to the stored
+                # value per broker name instead of to False.
+                stored_neighbors_by_name = {
+                    str(existing.get("name")): bool(existing.get("neighbors", False))
+                    for existing in (self.config.get("mqtt_brokers", {}) or {}).get("brokers", [])
+                    if isinstance(existing, dict) and existing.get("name")
+                }
+
                 validated = []
                 for i, b in enumerate(brokers):
                     if not isinstance(b, dict):
@@ -2500,7 +2550,11 @@ class APIEndpoints:
                         "retain_status": bool(b.get("retain_status", False)),
                         # Opt-in per broker; brokers that do not expect the
                         # neighbors topic can reject it and drop the connection.
-                        "neighbors": bool(b.get("neighbors", False)),
+                        "neighbors": bool(
+                            b["neighbors"]
+                            if "neighbors" in b
+                            else stored_neighbors_by_name.get(str(b["name"]).strip(), False)
+                        ),
                         "tls": {
                             "enabled": bool(
                                 b.get("tls", {}).get("enabled", True if port == 443 else False)

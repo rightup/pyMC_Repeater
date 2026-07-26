@@ -127,6 +127,9 @@ class NeighborScopeHelper:
         self.local_identity = local_identity
         self.packet_injector = packet_injector
         self.airtime_manager = airtime_manager
+        # Held by reference so a live config update is visible; re-read at the
+        # start of every sweep rather than cached at construction.
+        self.config = config if config is not None else {}
 
         self._pending: Optional[_PendingQuery] = None
         self._sweep_lock = asyncio.Lock()
@@ -135,13 +138,17 @@ class NeighborScopeHelper:
         self._max_sweep_seconds = DEFAULT_MAX_SWEEP_SECONDS
         self._duty_cycle_abort_seconds = DEFAULT_DUTY_CYCLE_ABORT_SECONDS
         self._direct_tx_delay_factor = 0.5
-        self.refresh_config(config or {})
+        self.refresh_config(self.config)
 
     # ------------------------------------------------------------------
     # Configuration
     # ------------------------------------------------------------------
-    def refresh_config(self, config: dict) -> None:
-        """Re-read the tunables so a live config update takes effect next sweep."""
+    def refresh_config(self, config: Optional[dict] = None) -> None:
+        """Re-read the tunables. Called at construction and before each sweep."""
+        if config is None:
+            config = self.config
+        else:
+            self.config = config
         neighbors_cfg = (config.get("mqtt_brokers", {}) or {}).get("neighbors", {}) or {}
 
         self._response_timeout_override = _as_float(
@@ -216,6 +223,9 @@ class NeighborScopeHelper:
             raise RuntimeError("neighbor scope sweep already active")
 
         async with self._sweep_lock:
+            # Pick up live config edits (the mesh CLI can change
+            # delays.direct_tx_delay_factor, which sizes the response window).
+            self.refresh_config(self.config)
             deadline = time.monotonic() + self._max_sweep_seconds
             timeout = self.response_timeout()
             logger.info(
@@ -276,30 +286,35 @@ class NeighborScopeHelper:
         )
         self._pending = pending
 
+        # One finally for the whole method: the injector await spends most of its
+        # wall time in the engine TX path, so a shutdown cancel lands there. A
+        # CancelledError escaping with _pending still set would leave a dead query
+        # matching (and hiding from the companion bridges) every later RESPONSE.
         try:
-            # Resolves only once the packet is actually on air (or has failed):
-            # the engine awaits dispatcher.send_packet under its TX lock and
-            # defers local TX until the duty cycle allows. This is the firmware's
-            # logTx / logTxFail boundary, which is where the response deadline is
-            # armed -- hence the wait_for below, and not a moment earlier.
-            sent = await self.packet_injector(packet, wait_for_ack=False)
-        except Exception as e:
-            self._pending = None
-            logger.warning(f"Scope request send failed for {target.pubkey[:8]}: {e}")
-            return ScopeResult(STATUS_SEND_FAILED)
+            try:
+                # Resolves only once the packet is actually on air (or has failed):
+                # the engine awaits dispatcher.send_packet under its TX lock and
+                # defers local TX until the duty cycle allows. This is the firmware's
+                # logTx / logTxFail boundary, which is where the response deadline is
+                # armed -- hence the wait_for below, and not a moment earlier.
+                sent = await self.packet_injector(packet, wait_for_ack=False)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning(f"Scope request send failed for {target.pubkey[:8]}: {e}")
+                return ScopeResult(STATUS_SEND_FAILED)
 
-        if not sent:
-            self._pending = None
-            logger.debug(f"Scope request not transmitted for {target.pubkey[:8]}")
-            return ScopeResult(STATUS_SEND_FAILED)
+            if not sent:
+                logger.debug(f"Scope request not transmitted for {target.pubkey[:8]}")
+                return ScopeResult(STATUS_SEND_FAILED)
 
-        try:
-            scopes = await asyncio.wait_for(pending.future, timeout)
+            try:
+                scopes = await asyncio.wait_for(pending.future, timeout)
+            except asyncio.TimeoutError:
+                logger.debug(f"Scope query timed out for {target.pubkey[:8]}")
+                return ScopeResult(STATUS_TIMEOUT)
             logger.debug(f"Scope response from {target.pubkey[:8]}: '{scopes}'")
             return ScopeResult(STATUS_RESPONDED, scopes)
-        except asyncio.TimeoutError:
-            logger.debug(f"Scope query timed out for {target.pubkey[:8]}")
-            return ScopeResult(STATUS_TIMEOUT)
         finally:
             self._pending = None
 
@@ -384,7 +399,11 @@ class NeighborScopeHelper:
             if int.from_bytes(plaintext[:4], "little") != pending.tag:
                 return False
 
-            scopes = bytes(plaintext[8:]).decode("utf-8", errors="replace").rstrip("\x00").strip()
+            # The responder builds this field as a C string and the block cipher
+            # zero-pads the tail, so stop at the first NUL exactly as the firmware
+            # reader does -- rstrip alone would let "DEN\x00junk" through.
+            raw_scopes = bytes(plaintext[8:]).split(b"\x00", 1)[0]
+            scopes = raw_scopes.decode("utf-8", errors="replace").strip()
             if not pending.future.done():
                 pending.future.set_result(scopes)
             return True

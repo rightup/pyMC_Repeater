@@ -42,6 +42,11 @@ from repeater.neighbors_publisher import (
 class _FakePacket:
     """Minimal Packet stand-in for the response-matching path."""
 
+    do_not_retransmit = False
+
+    def mark_do_not_retransmit(self):
+        self.do_not_retransmit = True
+
     def __init__(self, payload: bytes):
         self.payload = bytearray(payload)
 
@@ -352,6 +357,215 @@ async def test_response_with_no_query_pending_is_ignored():
     assert await helper.process_response_packet(packet) is False
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"",
+        b"\x01",
+        b"\x01\x02",  # header only, no ciphertext
+        b"\x01\x02\x03\x04\x05",  # too short to carry a MAC + block
+        bytes(64),  # right shape, garbage contents
+    ],
+)
+async def test_malformed_response_never_raises_or_matches(payload):
+    local = LocalIdentity()
+    peer = LocalIdentity()
+    target = NeighborSnapshot(pubkey=peer.get_public_key().hex(), last_seen=time.time())
+
+    async def injector(packet, wait_for_ack=False):
+        # Truncated/garbage payloads must be rejected quietly, not blow up the
+        # router thread that offers every RESPONSE to this matcher.
+        malformed = _FakePacket(payload)
+        assert await helper.process_response_packet(malformed) is False
+        return True
+
+    helper = _helper_with_injector(
+        local,
+        injector,
+        config={"mqtt_brokers": {"neighbors": {"scope_response_timeout_seconds": 0.05}}},
+    )
+    results = await helper.sweep([target])
+
+    assert results[target.pubkey].status == STATUS_TIMEOUT
+
+
+@pytest.mark.asyncio
+async def test_scopes_are_truncated_at_the_first_nul():
+    """The responder builds a C string; the cipher zero-pads the tail."""
+    local = LocalIdentity()
+    peer = LocalIdentity()
+    target = NeighborSnapshot(pubkey=peer.get_public_key().hex(), last_seen=time.time())
+
+    async def injector(packet, wait_for_ack=False):
+        response = _make_response_packet(peer, local, helper._pending.tag, "DEN\x00junk")
+        asyncio.get_running_loop().call_soon(
+            lambda: asyncio.ensure_future(helper.process_response_packet(response))
+        )
+        return True
+
+    helper = _helper_with_injector(local, injector)
+    results = await helper.sweep([target])
+
+    assert results[target.pubkey].scopes == "DEN"
+
+
+@pytest.mark.asyncio
+async def test_cancelling_a_sweep_mid_send_clears_the_pending_query():
+    """A leaked pending query would keep hiding RESPONSE packets from companions.
+
+    The injector await is where a shutdown cancel lands: it covers the engine's
+    TX-delay and duty-cycle deferral, which is most of a query's wall time.
+    """
+    local = LocalIdentity()
+    peer = LocalIdentity()
+    target = NeighborSnapshot(pubkey=peer.get_public_key().hex(), last_seen=time.time())
+
+    async def injector(packet, wait_for_ack=False):
+        await asyncio.sleep(30)  # still "transmitting" when the cancel arrives
+        return True
+
+    helper = _helper_with_injector(local, injector)
+    task = asyncio.create_task(helper.sweep([target]))
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert helper._pending is None
+    assert helper.active is False
+
+    # A response arriving afterwards must not be consumed by the dead query.
+    stale = _make_response_packet(peer, local, 1, "DEN")
+    assert await helper.process_response_packet(stale) is False
+
+
+@pytest.mark.asyncio
+async def test_concurrent_sweep_is_rejected():
+    local = LocalIdentity()
+    peer = LocalIdentity()
+    target = NeighborSnapshot(pubkey=peer.get_public_key().hex(), last_seen=time.time())
+
+    async def injector(packet, wait_for_ack=False):
+        await asyncio.sleep(0.2)
+        return True
+
+    helper = _helper_with_injector(local, injector)
+    first = asyncio.create_task(helper.sweep([target]))
+    await asyncio.sleep(0.05)
+
+    with pytest.raises(RuntimeError):
+        await helper.sweep([target])
+
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+
+
+@pytest.mark.asyncio
+async def test_sweep_rereads_live_config():
+    """delays.direct_tx_delay_factor is live-updatable and sizes the window."""
+    local = LocalIdentity()
+    config = {"mqtt_brokers": {"neighbors": {"scope_response_timeout_seconds": 5}}}
+    helper = _helper_with_injector(local, None, config=config)
+    assert helper.response_timeout() == 5
+
+    config["mqtt_brokers"]["neighbors"]["scope_response_timeout_seconds"] = 11
+    await helper.sweep([NeighborSnapshot(pubkey="aa" * 32, last_seen=time.time())])
+
+    assert helper.response_timeout() == 11
+
+
+# ====================================================================
+# Router integration
+# ====================================================================
+class _StubRouter:
+    """Exercises the real PacketRouter RESPONSE branch against a stub daemon."""
+
+    def __init__(self, scope_helper):
+        self.fanned_out = []
+        self.recorded = []
+        self.daemon = SimpleNamespace(
+            neighbor_scope_helper=scope_helper,
+            local_hash=0x11,
+            repeater_handler=None,
+        )
+
+    async def _fan_out_to_bridges(self, packet, bridges, context=""):
+        self.fanned_out.append((packet, dict(bridges), context))
+        return (bool(bridges), False)
+
+    def _companion_bridges_for_packet(self, packet, metadata):
+        return {0x11: object()}
+
+    def _record_for_ui(self, packet, metadata):
+        self.recorded.append(packet)
+
+
+async def _route_response(router_stub, packet):
+    from repeater.packet_router import PacketRouter
+
+    return await PacketRouter._route_packet(router_stub, packet)
+
+
+@pytest.mark.asyncio
+async def test_router_consumes_only_a_matching_scope_response():
+    local = LocalIdentity()
+    peer = LocalIdentity()
+    target = NeighborSnapshot(pubkey=peer.get_public_key().hex(), last_seen=time.time())
+    routed = {}
+
+    async def injector(packet, wait_for_ack=False):
+        response = _make_response_packet(peer, local, helper._pending.tag, "DEN")
+        stub = _StubRouter(helper)
+        await _route_response(stub, response)
+        routed["consumed"] = stub
+        return True
+
+    helper = _helper_with_injector(local, injector)
+    results = await helper.sweep([target])
+
+    stub = routed["consumed"]
+    assert results[target.pubkey].status == STATUS_RESPONDED
+    # Consumed: not retransmitted, recorded, and never offered to a bridge.
+    assert stub.fanned_out == []
+    assert stub.recorded
+
+
+@pytest.mark.asyncio
+async def test_router_still_delivers_unrelated_responses_to_companions():
+    """A companion's login reply must not be swallowed by an active sweep.
+
+    Same 1-byte dest hash, same instant, different sender: the matcher must
+    decline it so the companion bridge still sees it.
+    """
+    local = LocalIdentity()
+    peer = LocalIdentity()
+    stranger = LocalIdentity()
+    target = NeighborSnapshot(pubkey=peer.get_public_key().hex(), last_seen=time.time())
+    routed = {}
+
+    async def injector(packet, wait_for_ack=False):
+        foreign = _make_response_packet(stranger, local, helper._pending.tag, "NOPE")
+        foreign.payload[0] = 0x11  # collide with the companion's dest hash
+        stub = _StubRouter(helper)
+        await _route_response(stub, foreign)
+        routed["stub"] = stub
+        return True
+
+    helper = _helper_with_injector(
+        local,
+        injector,
+        config={"mqtt_brokers": {"neighbors": {"scope_response_timeout_seconds": 0.05}}},
+    )
+    results = await helper.sweep([target])
+
+    stub = routed["stub"]
+    assert results[target.pubkey].status == STATUS_TIMEOUT
+    assert len(stub.fanned_out) == 1
+    assert stub.fanned_out[0][2] == "RESPONSE"
+
+
 # ====================================================================
 # Publish gating
 # ====================================================================
@@ -624,3 +838,180 @@ async def test_cycle_rejects_reentry_while_active():
     result = await publisher.run_cycle()
 
     assert result["success"] is False
+
+
+@pytest.mark.asyncio
+async def test_failed_publish_retries_sooner_than_a_full_interval():
+    """A rejected payload must not cost a whole 24h interval."""
+    from repeater.neighbors_publisher import RETRY_DELAY_SECONDS
+
+    handler = SimpleNamespace(
+        has_neighbors_brokers=lambda: True,
+        has_connected_neighbors_brokers=lambda: True,
+        publish_neighbors=lambda payload: [],  # nothing reached a broker
+        node_name="n",
+        public_key="AB" * 32,
+    )
+    publisher = _publisher({"mqtt_brokers": {}}, handler=handler, storage=None)
+
+    result = await publisher.run_cycle(trigger="test")
+
+    assert result["published"] is False
+    assert "publish failed" in publisher._last_result
+    assert publisher.status()["secs_until_next"] <= RETRY_DELAY_SECONDS
+
+
+def test_enricher_records_only_full_key_repeaters_and_never_self():
+    local = LocalIdentity()
+    publisher = _publisher({"mqtt_brokers": {}}, local_identity=local)
+    publisher._discovery_seen = {}
+
+    publisher._enrich_discovery_result({"pub_key": "aa" * 32, "node_type": 2, "response_snr": 7.5})
+    publisher._enrich_discovery_result({"pub_key": "bb" * 32, "node_type": 1})  # chat node
+    publisher._enrich_discovery_result({"pub_key": "cc", "node_type": 2})  # prefix only
+    publisher._enrich_discovery_result(
+        {"pub_key": local.get_public_key().hex(), "node_type": 2}
+    )  # self
+
+    assert set(publisher._discovery_seen) == {"aa" * 32}
+    assert publisher._discovery_seen["aa" * 32]["snr"] == 7.5
+
+
+def test_enricher_persists_discovery_results_to_storage():
+    storage = SimpleNamespace(record_advert=MagicMock(), get_neighbors=lambda: {})
+    publisher = _publisher({"mqtt_brokers": {}}, storage=storage)
+    publisher._discovery_seen = {}
+
+    publisher._enrich_discovery_result(
+        {"pub_key": "aa" * 32, "node_type": 2, "response_snr": 3.0, "rssi": -90}
+    )
+
+    record = storage.record_advert.call_args.args[0]
+    assert record["pubkey"] == "aa" * 32
+    assert record["is_repeater"] is True
+    assert record["zero_hop"] is True
+    assert record["snr"] == 3.0
+
+
+# ====================================================================
+# Config validation
+# ====================================================================
+def _validate(raw):
+    from repeater.web.api_endpoints import APIEndpoints
+
+    return APIEndpoints._validate_neighbors_settings(raw)
+
+
+@pytest.mark.parametrize(
+    "raw,expect_error",
+    [
+        ({"interval_hours": 24}, False),
+        ({"interval_hours": MIN_INTERVAL_HOURS}, False),
+        ({"interval_hours": MAX_INTERVAL_HOURS}, False),
+        ({"interval_hours": MIN_INTERVAL_HOURS - 1}, True),
+        ({"interval_hours": MAX_INTERVAL_HOURS + 1}, True),
+        ({"interval_hours": 12.5}, True),  # silently truncating would be worse
+        ({"interval_hours": "24"}, True),
+        ({"enabled": True}, False),
+        ({"enabled": "false"}, True),  # would coerce to True
+        ({"discovery_timeout_seconds": 60}, False),
+        ({"discovery_timeout_seconds": 1}, True),
+        ({"scope_response_timeout_seconds": 0}, False),
+        ({"max_neighbors": 0}, True),
+        ({"max_neighbor_age_seconds": 10}, True),
+        ({"max_sweep_seconds": 900}, False),
+        ({"duty_cycle_abort_seconds": 30}, False),
+        ({"max_sweep_secondz": 5}, True),  # typo must not report success
+        ("not a dict", True),
+    ],
+)
+def test_neighbors_settings_validation(raw, expect_error):
+    settings, error = _validate(raw)
+    assert (error is not None) is expect_error
+    if not expect_error:
+        assert settings
+
+
+def _api_with_stored_brokers(monkeypatch, brokers, neighbors_block=None):
+    import cherrypy
+
+    from repeater.web.api_endpoints import APIEndpoints
+
+    request = SimpleNamespace(method="POST", params={}, json={})
+    response = SimpleNamespace(headers={}, status=200)
+    monkeypatch.setattr(cherrypy, "request", request, raising=False)
+    monkeypatch.setattr(cherrypy, "response", response, raising=False)
+
+    api = APIEndpoints.__new__(APIEndpoints)
+    api.config = {"mqtt_brokers": {"brokers": brokers, "neighbors": neighbors_block or {}}}
+    api.daemon_instance = None
+    api.send_advert_func = None
+    api.event_loop = None
+    api.stats_getter = None
+    api._config_path = "/tmp/test-config.yaml"
+    api.config_manager = MagicMock()
+    api.config_manager.update_and_save.return_value = {"success": True, "saved": True}
+    return api, request
+
+
+def test_broker_neighbors_flag_survives_a_save_that_omits_it(monkeypatch):
+    """A UI that predates the feature must not silently disable it.
+
+    The broker rebuild is a strict field whitelist, so a client that never learned
+    about `neighbors` would otherwise reset every broker to False on any unrelated
+    MQTT save — turning the feature off with no error.
+    """
+    api, request = _api_with_stored_brokers(
+        monkeypatch,
+        [{"name": "keeper", "neighbors": True}, {"name": "plain", "neighbors": False}],
+    )
+
+    request.json = {
+        "email": "someone@example.com",
+        "brokers": [
+            {"name": "keeper", "host": "h", "port": 1883, "format": "letsmesh"},
+            {"name": "plain", "host": "h", "port": 1883, "format": "letsmesh"},
+        ],
+    }
+    assert api.update_mqtt_config()["success"] is True
+
+    saved = api.config_manager.update_and_save.call_args.kwargs["updates"]["mqtt_brokers"]
+    by_name = {b["name"]: b["neighbors"] for b in saved["brokers"]}
+    assert by_name == {"keeper": True, "plain": False}
+
+
+def test_broker_neighbors_flag_can_be_turned_off_explicitly(monkeypatch):
+    api, request = _api_with_stored_brokers(monkeypatch, [{"name": "keeper", "neighbors": True}])
+
+    request.json = {
+        "brokers": [
+            {"name": "keeper", "host": "h", "port": 1883, "format": "letsmesh", "neighbors": False}
+        ]
+    }
+    assert api.update_mqtt_config()["success"] is True
+
+    saved = api.config_manager.update_and_save.call_args.kwargs["updates"]["mqtt_brokers"]
+    assert saved["brokers"][0]["neighbors"] is False
+
+
+def test_partial_neighbors_post_keeps_unmentioned_settings(monkeypatch):
+    api, request = _api_with_stored_brokers(
+        monkeypatch, [], neighbors_block={"interval_hours": 48, "max_neighbors": 8}
+    )
+
+    request.json = {"neighbors": {"enabled": False}}
+    assert api.update_mqtt_config()["success"] is True
+
+    saved = api.config_manager.update_and_save.call_args.kwargs["updates"]["mqtt_brokers"]
+    assert saved["neighbors"] == {"interval_hours": 48, "max_neighbors": 8, "enabled": False}
+
+
+def test_invalid_neighbors_interval_is_rejected_by_the_endpoint(monkeypatch):
+    api, request = _api_with_stored_brokers(monkeypatch, [])
+
+    request.json = {"neighbors": {"interval_hours": 1}}
+    out = api.update_mqtt_config()
+
+    assert out["success"] is False
+    assert "between 12 and 336" in out["error"]
+    api.config_manager.update_and_save.assert_not_called()

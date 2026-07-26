@@ -53,6 +53,10 @@ DEFAULT_MAX_NEIGHBOR_AGE_SECONDS = 86400.0
 # How often the loop wakes to re-evaluate its schedule.
 _TICK_SECONDS = 30.0
 
+# Delay before retrying a cycle that failed or published nothing, instead of
+# waiting out the full interval.
+RETRY_DELAY_SECONDS = 900.0
+
 # Phases reported by status(), mirroring the firmware's NeighborsPhase.
 PHASE_DISABLED = "disabled"
 PHASE_SCHEDULED = "scheduled"
@@ -112,6 +116,7 @@ class NeighborsPublisher:
         self._self_scopes_fn = self_scopes_fn
 
         self._task: Optional[asyncio.Task] = None
+        self._manual_task: Optional[asyncio.Task] = None
         self._running = False
         self._active = False
         # Discovery responses collected during the current cycle, keyed by pubkey.
@@ -179,12 +184,39 @@ class NeighborsPublisher:
         self._task = asyncio.create_task(self._run_loop(), name="neighbors-publisher")
         logger.info("Neighbors publisher started (interval %.1fh)", self.interval_seconds / 3600.0)
 
+    def trigger_cycle(self) -> bool:
+        """Start a manual cycle, tracked so shutdown can cancel it.
+
+        A cycle runs for minutes (a discovery window plus one serialized scope
+        query per neighbour), so an untracked task would keep transmitting while
+        the daemon tears down. Returns False when a cycle is already running.
+        """
+        if self._active or (self._manual_task is not None and not self._manual_task.done()):
+            return False
+        self._manual_task = asyncio.create_task(
+            self.run_cycle(trigger="manual"), name="neighbors-manual-cycle"
+        )
+        self._manual_task.add_done_callback(self._on_manual_task_done)
+        return True
+
+    def _on_manual_task_done(self, task: asyncio.Task) -> None:
+        if self._manual_task is task:
+            self._manual_task = None
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.error(f"Manual neighbors cycle failed: {e}", exc_info=True)
+
     async def stop(self) -> None:
         self._running = False
-        task = self._task
+        tasks = [t for t in (self._task, self._manual_task) if t and not t.done()]
         self._task = None
-        if task and not task.done():
+        self._manual_task = None
+        for task in tasks:
             task.cancel()
+        for task in tasks:
             try:
                 await task
             except asyncio.CancelledError:
@@ -261,7 +293,7 @@ class NeighborsPublisher:
                 except Exception as e:
                     logger.error(f"Neighbors publisher cycle failed: {e}", exc_info=True)
                     self._last_result = f"error: {e}"
-                    self._reschedule()
+                    self._reschedule(retry=True)
                 await asyncio.sleep(_TICK_SECONDS)
         except asyncio.CancelledError:
             logger.debug("Neighbors publisher loop cancelled")
@@ -285,8 +317,16 @@ class NeighborsPublisher:
 
         await self.run_cycle(trigger="periodic")
 
-    def _reschedule(self) -> None:
-        self._next_publish_at = time.monotonic() + self.interval_seconds
+    def _reschedule(self, *, retry: bool = False) -> None:
+        """Arm the next cycle.
+
+        A cycle that produced no publish retries on a short delay instead of
+        burning the whole interval: the usual cause is a broker that was briefly
+        unreachable or rejected the payload, and waiting a day to find out
+        otherwise is not useful.
+        """
+        delay = min(RETRY_DELAY_SECONDS, self.interval_seconds) if retry else self.interval_seconds
+        self._next_publish_at = time.monotonic() + delay
 
     # ------------------------------------------------------------------
     # Cycle
@@ -299,6 +339,7 @@ class NeighborsPublisher:
         self._active = True
         started = time.monotonic()
         self._discovery_seen = {}
+        published = False
         try:
             await self._refresh_neighbor_table()
             targets = self._snapshot_neighbors()
@@ -316,15 +357,17 @@ class NeighborsPublisher:
             self._last_result = (
                 f"ok ({len(targets)} neighbours, {responded} with scopes)"
                 if published
-                else "publish failed (no connected broker)"
+                else "publish failed (broker unreachable or rejected the payload)"
             )
             self._last_publish_at = time.time()
             logger.info(
-                "Neighbors %s cycle finished in %.1fs: %d neighbour(s), %d with scopes",
+                "Neighbors %s cycle finished in %.1fs: %d neighbour(s), %d with scopes, "
+                "published=%s",
                 trigger,
                 time.monotonic() - started,
                 len(targets),
                 responded,
+                published,
             )
             return {
                 "success": True,
@@ -334,7 +377,7 @@ class NeighborsPublisher:
             }
         finally:
             self._active = False
-            self._reschedule()
+            self._reschedule(retry=not published)
 
     async def _refresh_neighbor_table(self) -> None:
         """Stage 1: zero-hop node discovery, awaited to completion.
