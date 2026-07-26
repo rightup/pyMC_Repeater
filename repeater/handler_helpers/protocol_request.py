@@ -287,10 +287,19 @@ class ProtocolRequestHelper:
         # else 0.0 V (voltage-only floor, mirroring the companion self-telemetry).
         lpp = bytearray(encode_voltage(TELEM_CHANNEL_SELF, self._battery_voltage(readings)))
 
-        # Environment sensors: each gets the next channel starting at 2, in the
-        # order they are configured (firmware querySensors channel assignment).
+        # INA219 power telemetry and environment sensors: the power telemetry
+        # channels are emitted first, then environment sensors continue on the
+        # next available channel.
         if perm_mask & TELEM_PERM_ENVIRONMENT:
             channel = TELEM_CHANNEL_SELF + 1
+            if self._has_sensor_data(readings, "bus_voltage_v"):
+                lpp.extend(encode_voltage(channel, self._battery_voltage(readings)))
+            if self._has_sensor_data(readings, "current_ma"):
+                lpp.extend(encode_current(channel, self._battery_current(readings)))
+            if self._has_sensor_data(readings, "power_mw"):
+                lpp.extend(encode_power(channel, self._battery_power(readings)))
+                channel += 1
+
             for reading in readings:
                 entry = self._encode_environment_reading(channel, reading)
                 if entry:
@@ -329,8 +338,21 @@ class ProtocolRequestHelper:
                 except (TypeError, ValueError):
                     continue
         return 0.0
+
+    @staticmethod
+    def _has_sensor_data(readings, key: str) -> bool:
+        """Return True when any reading exposes the requested sensor field."""
+        for reading in readings:
+            if not reading.get("ok"):
+                continue
+            data = reading.get("data") or {}
+            if data.get(key) is not None:
+                return True
+        return False
+
+    @staticmethod
     def _battery_current(readings) -> float:
-        """First configured sensor's current, else 0.000A."""
+        """First configured sensor's current in amps, else 0.000A."""
         for reading in readings:
             if not reading.get("ok"):
                 continue
@@ -338,20 +360,22 @@ class ProtocolRequestHelper:
             current = data.get("current_ma")
             if current is not None:
                 try:
-                    return float(current)
+                    return float(current) / 1000.0
                 except (TypeError, ValueError):
                     continue
         return 0.000
+
+    @staticmethod
     def _battery_power(readings) -> int:
-        """First configured sensor's power, else 0W."""
+        """First configured sensor's power in watts, else 0W."""
         for reading in readings:
             if not reading.get("ok"):
                 continue
             data = reading.get("data") or {}
-            power = data.get("power_mw")/1000
+            power = data.get("power_mw")
             if power is not None:
                 try:
-                    return int(power)
+                    return int(float(power) / 1000.0)
                 except (TypeError, ValueError):
                     continue
         return 0
