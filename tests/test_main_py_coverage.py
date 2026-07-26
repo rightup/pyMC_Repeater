@@ -1,14 +1,10 @@
+import asyncio
 import logging
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
-
-from repeater.companion.constants import STATS_TYPE_CORE, STATS_TYPE_PACKETS, STATS_TYPE_RADIO
-from repeater.exceptions import ConfigurationError
-from repeater.identity_manager import IdentityConfigurationError
-from repeater.main import RepeaterDaemon
-from repeater.main import main as repeater_main
 from openhop_core.node.dispatcher import Dispatcher
 from openhop_core.protocol import PacketBuilder
 from openhop_core.protocol.constants import (
@@ -17,6 +13,12 @@ from openhop_core.protocol.constants import (
     ROUTE_TYPE_TRANSPORT_DIRECT,
     ROUTE_TYPE_TRANSPORT_FLOOD,
 )
+
+from repeater.companion.constants import STATS_TYPE_CORE, STATS_TYPE_PACKETS, STATS_TYPE_RADIO
+from repeater.exceptions import ConfigurationError
+from repeater.identity_manager import IdentityConfigurationError
+from repeater.main import RepeaterDaemon
+from repeater.main import main as repeater_main
 
 
 class _FakeIdentity:
@@ -467,9 +469,25 @@ def test_update_repeater_location_from_gps_branches():
     assert daemon._update_repeater_location_from_gps({"latitude": 6.5, "longitude": 7.5}) is True
 
 
-def test_signal_shutdown_idempotence_and_task_cancel():
+def test_signal_shutdown_unwinds_run_cooperatively():
+    """The handler must not cancel run(): it stops the dispatcher instead.
+
+    Cancelling run() made its ``finally`` await _shutdown() from inside an
+    already-cancelled task, so the first await raised CancelledError and no
+    cleanup ran at all -- on SIGTERM the companion listen sockets stayed bound,
+    the serial port stayed held, and the process then hung in interpreter
+    finalization. Stopping the dispatcher lets run_forever() return so cleanup
+    runs in a task that is not being cancelled.
+    """
     daemon = RepeaterDaemon(_base_config(), radio=object())
-    loop = SimpleNamespace(create_task=MagicMock(side_effect=lambda coro: coro.close()))
+    created = []
+
+    def _fake_create_task(coro):
+        created.append(coro)
+        coro.close()  # never scheduled in this unit test
+        return SimpleNamespace(done=lambda: False)
+
+    loop = SimpleNamespace(create_task=MagicMock(side_effect=_fake_create_task))
     sig = SimpleNamespace(name="SIGTERM")
 
     daemon._shutdown_started = True
@@ -477,10 +495,92 @@ def test_signal_shutdown_idempotence_and_task_cancel():
     loop.create_task.assert_not_called()
 
     daemon._shutdown_started = False
+    daemon.dispatcher = SimpleNamespace(stop=AsyncMock())
     daemon._main_task = SimpleNamespace(done=lambda: False, cancel=MagicMock())
     daemon._signal_shutdown(sig, loop)
+
     loop.create_task.assert_called_once()
+    daemon._main_task.cancel.assert_not_called()
+    assert daemon._stop_requested is True
+
+    # A second signal is ignored while the first is still unwinding.
+    daemon._signal_shutdown(sig, loop)
+    loop.create_task.assert_called_once()
+
+
+def test_signal_shutdown_falls_back_to_cancel_without_a_dispatcher():
+    """A failure before startup finished leaves nothing to stop cooperatively."""
+    daemon = RepeaterDaemon(_base_config(), radio=object())
+    loop = SimpleNamespace(create_task=MagicMock())
+    daemon.dispatcher = None
+    daemon._main_task = SimpleNamespace(done=lambda: False, cancel=MagicMock())
+
+    daemon._signal_shutdown(SimpleNamespace(name="SIGINT"), loop)
+
+    loop.create_task.assert_not_called()
     daemon._main_task.cancel.assert_called_once()
+
+
+def test_lingering_non_daemon_threads_are_named():
+    """The report names what will block interpreter exit, so it is fixable."""
+    import threading as _threading
+
+    release = _threading.Event()
+    victim = _threading.Thread(target=release.wait, name="stuck-nondaemon", daemon=False)
+    victim.start()
+    try:
+        with patch("repeater.main.logger") as log:
+            RepeaterDaemon._report_lingering_threads()
+        warned = " ".join(str(c) for c in log.warning.call_args_list)
+        assert "stuck-nondaemon" in warned
+    finally:
+        release.set()
+        victim.join(timeout=2)
+
+    # Nothing to report once it exits.
+    with patch("repeater.main.logger") as log:
+        RepeaterDaemon._report_lingering_threads()
+    assert "stuck-nondaemon" not in " ".join(str(c) for c in log.warning.call_args_list)
+
+
+def test_asyncio_executor_threads_are_not_reported_as_blockers():
+    """asyncio.run() joins its own executor workers, so they must not warn.
+
+    They are non-daemon and alive at this point on every healthy shutdown;
+    warning about them would bury the thread that actually blocks exit.
+    """
+    import threading as _threading
+
+    release = _threading.Event()
+    worker = _threading.Thread(target=release.wait, name="asyncio_0", daemon=False)
+    worker.start()
+    try:
+        with patch("repeater.main.logger") as log:
+            RepeaterDaemon._report_lingering_threads()
+        log.warning.assert_not_called()
+        assert "asyncio_0" in " ".join(str(c) for c in log.debug.call_args_list)
+    finally:
+        release.set()
+        worker.join(timeout=2)
+
+
+def test_exit_watchdog_is_a_daemon_timer_that_forces_exit():
+    """It must never itself hold the process open, and must exit hard."""
+    import threading as _threading
+
+    daemon_obj = RepeaterDaemon(_base_config(), radio=object())
+    daemon_obj.SHUTDOWN_EXIT_GRACE_S = 0.05
+    with patch("repeater.main.os._exit") as force_exit, patch("repeater.main.logging.shutdown"):
+        daemon_obj._arm_exit_watchdog()
+        timer = next(
+            (t for t in _threading.enumerate() if t.name == "shutdown-watchdog"),
+            None,
+        )
+        assert timer is not None and timer.daemon is True
+        deadline = time.monotonic() + 3
+        while not force_exit.called and time.monotonic() < deadline:
+            time.sleep(0.02)
+        force_exit.assert_called_once_with(0)
 
 
 @pytest.mark.asyncio
@@ -498,11 +598,45 @@ async def test_shutdown_stops_components_and_handles_errors():
     daemon.sensor_manager = SimpleNamespace(stop=MagicMock())
     daemon.gps_service = SimpleNamespace(stop=MagicMock())
     daemon.repeater_handler = SimpleNamespace(storage=SimpleNamespace(close=MagicMock()))
+    daemon.dispatcher = SimpleNamespace(stop=AsyncMock())
 
-    await daemon._shutdown()
+    with patch.object(daemon, "_arm_exit_watchdog") as watchdog:
+        await daemon._shutdown()
 
+    # RX is stopped before the radio it depends on is released.
+    daemon.dispatcher.stop.assert_awaited_once()
     frame_server.stop.assert_awaited_once()
     bridge.stop.assert_awaited_once()
+    daemon.router.stop.assert_awaited_once()
+    daemon.radio.cleanup.assert_called_once()
+    # The process is guaranteed to exit even if a thread lingers.
+    watchdog.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_continues_past_a_step_that_hangs():
+    """One stuck step must not strand the rest of the sequence.
+
+    A hang here used to leave the companion listen sockets bound and the serial
+    port held, so a restart could not reopen the radio.
+    """
+    daemon = RepeaterDaemon(_base_config(), radio=SimpleNamespace(cleanup=MagicMock()))
+    daemon.config["radio_type"] = "none"
+    daemon.SHUTDOWN_STEP_TIMEOUT_S = 0.05
+
+    hang_forever = asyncio.Event()
+
+    async def _never_returns():
+        await hang_forever.wait()
+
+    daemon.companion_frame_servers = [SimpleNamespace(stop=_never_returns, port=5050)]
+    daemon.router = SimpleNamespace(stop=AsyncMock())
+    daemon.companion_bridges = {}
+
+    with patch.object(daemon, "_arm_exit_watchdog"):
+        await asyncio.wait_for(daemon._shutdown(), timeout=5)
+
+    # Everything after the wedged frame server still ran.
     daemon.router.stop.assert_awaited_once()
     daemon.radio.cleanup.assert_called_once()
 
