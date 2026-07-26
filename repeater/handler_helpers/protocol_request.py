@@ -20,11 +20,11 @@ from openhop_core.node.handlers.protocol_request import (
 )
 from openhop_core.protocol.cayenne_lpp import (
     TELEM_CHANNEL_SELF,
+    encode_current,
+    encode_power,
     encode_relative_humidity,
     encode_temperature,
     encode_voltage,
-    encode_current,
-    encode_power
 )
 from openhop_core.protocol.constants import TELEM_PERM_ENVIRONMENT
 
@@ -168,7 +168,7 @@ class ProtocolRequestHelper:
         # n_sent_flood, n_sent_direct, n_recv_flood, n_recv_direct,
         # uint16 err_events, int16 last_snr (×4), uint16 n_direct_dups, n_flood_dups,
         # uint32 total_rx_air_time_secs, n_recv_errors  → 56 bytes
-        
+
         # Battery Readings: uses first configured sensor that reports bus/pack voltage.
         readings = self._get_sensor_readings()
         batt = int(min(max(self._battery_voltage(readings) * 1000, 0), 0xFFFF))
@@ -294,8 +294,10 @@ class ProtocolRequestHelper:
             channel = TELEM_CHANNEL_SELF + 1
             if self._has_sensor_data(readings, "bus_voltage_v"):
                 lpp.extend(encode_voltage(channel, self._battery_voltage(readings)))
+                channel += 1
             if self._has_sensor_data(readings, "current_ma"):
                 lpp.extend(encode_current(channel, self._battery_current(readings)))
+                channel += 1
             if self._has_sensor_data(readings, "power_mw"):
                 lpp.extend(encode_power(channel, self._battery_power(readings)))
                 channel += 1
