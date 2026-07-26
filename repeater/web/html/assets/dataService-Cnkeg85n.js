@@ -1,0 +1,1 @@
+import{t as e}from"./dataService-DxRCWe1t.js";export{e as useDataService};
