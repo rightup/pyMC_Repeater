@@ -4189,15 +4189,34 @@ class APIEndpoints:
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
-    def noise_floor_history(self, hours: int = 24, limit: int = None):
+    def noise_floor_history(self, hours: int = 24, limit: int = None, offset: int = 0):
 
         try:
             storage = self._get_storage()
             hours = int(hours)
-            limit = int(limit) if limit else None
-            history = storage.get_noise_floor_history(hours=hours, limit=limit)
+            offset = max(0, int(offset))
+            # Keep enough points for high-frequency sampling across the selected window.
+            # This avoids falling back to legacy small defaults when query params are absent.
+            if limit is None:
+                normalized_limit = max(2000, min(1_000_000, hours * 300))
+            else:
+                normalized_limit = max(1, min(1_000_000, int(limit)))
 
-            return self._success({"history": history, "hours": hours, "count": len(history)})
+            history = storage.get_noise_floor_history(
+                hours=hours,
+                limit=normalized_limit,
+                offset=offset,
+            )
+
+            return self._success(
+                {
+                    "history": history,
+                    "hours": hours,
+                    "count": len(history),
+                    "limit": normalized_limit,
+                    "offset": offset,
+                }
+            )
         except Exception as e:
             logger.error(f"Error fetching noise floor history: {e}")
             return self._error(e)

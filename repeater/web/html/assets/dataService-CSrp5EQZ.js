@@ -1,0 +1,1 @@
+import{t as e}from"./dataService-DLD4OWK_.js";export{e as useDataService};
