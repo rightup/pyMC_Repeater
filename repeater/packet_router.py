@@ -265,12 +265,30 @@ class PacketRouter:
         return False
 
     def _companion_bridges_for_packet(self, packet, metadata: dict) -> dict:
-        """Return companion bridges unless policy drop pre-check blocks delivery."""
+        """Return companion bridges unless policy drop or origin exclusion blocks delivery.
+
+        This is the single choke point every companion fan-out reads, so the
+        "a node never hears its own transmission" rule is applied here once and
+        covers ADVERT, ACK, PATH, RESPONSE, GRP_TXT, GRP_DATA and the dest-hash
+        candidate paths — the same rule ``inject_packet`` already applies to the
+        0x88 raw-RX echo.
+        """
         companion_bridges = getattr(self.daemon, "companion_bridges", {})
         if not companion_bridges:
             return {}
         if self._policy_blocks_companion(packet, metadata):
             return {}
+        # Both isinstance checks are load-bearing, not defensive noise: bridges are
+        # keyed by the int hash byte (main.py:880) while origin_hash is the "0xHH"
+        # text form the frame servers compare against (main.py:787, :1167), and a
+        # non-int key would raise inside the f-string. Do not simplify either away.
+        origin_hash = getattr(packet, "_injected_origin_hash", None)
+        if isinstance(origin_hash, str):
+            companion_bridges = {
+                key: bridge
+                for key, bridge in companion_bridges.items()
+                if not (isinstance(key, int) and f"0x{key:02x}" == origin_hash)
+            }
         return companion_bridges
 
     async def _fan_out_to_bridges(self, packet, bridges, *, context: str) -> tuple:
@@ -385,6 +403,14 @@ class PacketRouter:
                 "timestamp": getattr(packet, "timestamp", 0),
             }
 
+            # Tag the originating companion before anything reaches the air: enqueue()
+            # is a bare queue.put, so the packet itself is the only carrier that
+            # survives to _route_packet, where the fan-out withholds it from that
+            # bridge — the same "a node never hears its own transmission" rule the
+            # 0x88 echo below applies.  Set ahead of the TX so a core without the
+            # matching Packet slot fails before transmitting rather than after.
+            packet._injected_origin_hash = origin_hash
+
             # Serialize injects so one local TX completes before the next runs
             # (avoids duty-cycle or dispatcher races where a later packet goes out first)
             async with self._inject_lock:
@@ -421,7 +447,10 @@ class PacketRouter:
                 except Exception as e:
                     logger.debug("Failed to echo injected TX to companions: %s", e)
 
-            # Enqueue so router can deliver to companion(s): TXT_MSG -> dest bridge, ACK -> all bridges (sender sees ACK)
+            # Enqueue so router can deliver to the *other* companion(s): TXT_MSG -> dest
+            # bridge, ACK/ADVERT/GRP_TXT/GRP_DATA -> every bridge except the origin.
+            # The originating companion never gets its own packet back: that exclusion
+            # is enforced once in _companion_bridges_for_packet via the tag set above.
             await self.enqueue(packet)
 
             if wait_for_ack:
@@ -572,8 +601,13 @@ class PacketRouter:
                 await deliver(snr, rssi, path_len, path_bytes, payload_bytes)
 
         elif payload_type == AdvertHandler.payload_type():
-            # Process advertisement packet for neighbor tracking
-            if self.daemon.advert_helper:
+            # Process advertisement packet for neighbor tracking. A locally injected
+            # advert is our own TX, never something heard off the air, so feeding it
+            # to the helper would record a phantom neighbour from the zeroed rssi/snr
+            # and burn a rate-limit token. AdvertHelper's own self-skip
+            # (handler_helpers/advert.py) only knows the repeater identity, not the
+            # co-hosted companions. Same _injected_for_tx idiom as the TRACE branches.
+            if self.daemon.advert_helper and not getattr(packet, "_injected_for_tx", False):
                 rssi = getattr(packet, "rssi", 0)
                 snr = getattr(packet, "snr", 0.0)
                 await self.daemon.advert_helper.process_advert_packet(packet, rssi, snr)
