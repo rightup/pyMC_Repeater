@@ -565,8 +565,8 @@ class StorageCollector:
     def cleanup_old_data(self, days: int = 7, companion_events_days: Optional[int] = None):
         self.sqlite_handler.cleanup_old_data(days, companion_events_days=companion_events_days)
 
-    def get_noise_floor_history(self, hours: int = 24, limit: int = None) -> list:
-        return self.sqlite_handler.get_noise_floor_history(hours, limit)
+    def get_noise_floor_history(self, hours: int = 24, limit: int = None, offset: int = 0) -> list:
+        return self.sqlite_handler.get_noise_floor_history(hours, limit, offset)
 
     def get_noise_floor_stats(self, hours: int = 24) -> dict:
         return self.sqlite_handler.get_noise_floor_stats(hours)

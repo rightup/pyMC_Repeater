@@ -2379,12 +2379,15 @@ class SQLiteHandler:
             logger.error(f"Failed to get neighbors: {e}")
             return {}
 
-    def get_noise_floor_history(self, hours: int = 24, limit: int = None) -> list:
+    def get_noise_floor_history(self, hours: int = 24, limit: int = None, offset: int = 0) -> list:
         try:
             cutoff = time.time() - (hours * 3600)
 
             if limit is None:
-                limit = 1000
+                limit = max(2000, min(1_000_000, int(hours) * 300))
+            else:
+                limit = max(1, min(1_000_000, int(limit)))
+            offset = max(0, int(offset))
 
             with self._connect() as conn:
                 conn.row_factory = sqlite3.Row
@@ -2395,9 +2398,10 @@ class SQLiteHandler:
                     WHERE timestamp > ?
                     ORDER BY timestamp DESC
                     LIMIT ?
+                    OFFSET ?
                 """
 
-                measurements = conn.execute(query, (cutoff, int(limit))).fetchall()
+                measurements = conn.execute(query, (cutoff, int(limit), offset)).fetchall()
 
                 # Reverse to get chronological order (oldest to newest)
                 result = [
