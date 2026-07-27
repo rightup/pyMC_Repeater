@@ -1,7 +1,7 @@
 """Storage utility classes and functions for data acquisition."""
 
 from dataclasses import asdict, dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 
@@ -57,7 +57,7 @@ class PacketRecord:
 
         # Extract timestamp and format date/time
         timestamp = packet_record.get("timestamp", 0)
-        dt = datetime.fromtimestamp(timestamp)
+        dt = datetime.fromtimestamp(timestamp, tz=timezone.utc)
 
         # Format route type (1=Flood->F, 2=Direct->D, etc)
         route_map = {1: "F", 2: "D"}

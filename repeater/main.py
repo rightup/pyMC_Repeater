@@ -1,5 +1,6 @@
 import asyncio
 import functools
+import inspect
 import logging
 import os
 import signal
@@ -9,6 +10,7 @@ import time
 
 from repeater.companion.utils import (
     CompanionContactCapacityError,
+    CompanionStateLoadError,
     effective_max_contacts,
     enforce_companion_contact_capacity,
     format_companion_bridge_limits,
@@ -33,9 +35,47 @@ from repeater.handler_helpers import (
 from repeater.identity_manager import IdentityManager
 from repeater.packet_router import PacketRouter
 from repeater.sensors import SensorManager
+from repeater.utils_packet import create_scoped_advert_packet
 from repeater.web.http_server import HTTPStatsServer, _log_buffer
 
 logger = logging.getLogger("RepeaterDaemon")
+
+_COMPANION_LOAD_RETRY_DELAY_SEC = 0.5
+
+
+async def _load_companion_rows_verified(
+    loader, counter, kind: str, companion_hash_str: str, name: str, **loader_kwargs
+):
+    """Load persisted companion rows, cross-checking empty results against the table.
+
+    A transient SQLite error at boot must not present as "no data" — the
+    companion would start with an empty store and later saves would overwrite
+    the persisted state. Retries once after a short delay when the load failed
+    (loader returned None) or returned empty while the table has rows for this
+    companion; raises CompanionStateLoadError if it still cannot load.
+
+    Returns (rows, stored_count).
+    """
+    stored = 0
+    for attempt in (1, 2):
+        rows = loader(companion_hash_str, **loader_kwargs)
+        stored = counter(companion_hash_str)
+        if rows is not None and (rows or stored == 0):
+            return rows, stored
+        if attempt == 1:
+            logger.warning(
+                "Companion %s ('%s'): %s load %s but table has %d row(s); retrying once",
+                companion_hash_str,
+                name,
+                kind,
+                "failed" if rows is None else "returned empty",
+                stored,
+            )
+            await asyncio.sleep(_COMPANION_LOAD_RETRY_DELAY_SEC)
+    raise CompanionStateLoadError(
+        f"Companion {companion_hash_str} ('{name}'): could not load persisted {kind} "
+        f"(table has {stored} row(s)); refusing to start with an empty store"
+    )
 
 
 class RepeaterDaemon:
@@ -143,10 +183,26 @@ class RepeaterDaemon:
                     cad_config = self.config.get("radio", {}).get("cad", {})
                     peak_threshold = cad_config.get("peak_threshold", 23)
                     min_threshold = cad_config.get("min_threshold", 11)
+                    symbol_num = cad_config.get("symbol_num", 2)
+                    try:
+                        symbol_num = int(symbol_num)
+                    except (TypeError, ValueError):
+                        symbol_num = 2
+                    if symbol_num not in {1, 2, 4, 8, 16}:
+                        logger.warning(
+                            "Invalid CAD symbol_num in config (%s); defaulting to 2",
+                            symbol_num,
+                        )
+                        symbol_num = 2
 
                     self.radio.set_custom_cad_thresholds(peak=peak_threshold, min_val=min_threshold)
+                    if hasattr(self.radio, "set_custom_cad_symbol_num"):
+                        self.radio.set_custom_cad_symbol_num(symbol_num)
                     logger.info(
-                        f"CAD thresholds set from config: peak={peak_threshold}, min={min_threshold}"
+                        "CAD settings set from config: peak=%s, min=%s, symbols=%s",
+                        peak_threshold,
+                        min_threshold,
+                        symbol_num,
                     )
                 else:
                     logger.warning("Radio does not support CAD configuration")
@@ -178,8 +234,12 @@ class RepeaterDaemon:
             from openhop_core import LocalIdentity
             from openhop_core.node.dispatcher import Dispatcher
 
-            self.dispatcher = Dispatcher(self.radio)
+            dedupe_enabled = bool(
+                self.config.get("repeater", {}).get("dispatcher_dedupe_enabled", False)
+            )
+            self.dispatcher = Dispatcher(self.radio, dedupe_enabled=dedupe_enabled)
             logger.info("Dispatcher initialized")
+            logger.info("Dispatcher dedupe enabled: %s", dedupe_enabled)
 
             # Initialize Identity Manager for additional identities (e.g., room servers)
             self.identity_manager = IdentityManager(self.config)
@@ -373,6 +433,11 @@ class RepeaterDaemon:
             self.path_helper = PathHelper(
                 acl_dict=self.login_helper.get_acl_dict(),  # Per-identity ACLs
                 log_fn=logger.info,
+                ack_received_callback=(
+                    self.dispatcher._register_ack_received
+                    if self.dispatcher and hasattr(self.dispatcher, "_register_ack_received")
+                    else None
+                ),
             )
             logger.info("PATH packet processing helper initialized")
 
@@ -403,9 +468,7 @@ class RepeaterDaemon:
                 n,
             )
 
-            # Subscribe to parsed packets (pre-dedup) so duplicate path variants
-            # still appear in the web UI even though the Dispatcher blocks them.
-            self.dispatcher.add_raw_packet_subscriber(self._on_raw_packet_for_dedup_logging)
+            self._register_duplicate_logging_hook(dedupe_enabled)
 
             # When trace reaches final node, push PUSH_CODE_TRACE_DATA (0x89) to companion clients (firmware onTraceRecv)
             self.trace_helper.on_trace_complete = self._on_trace_complete_for_companions
@@ -494,7 +557,6 @@ class RepeaterDaemon:
     async def _load_companion_identities(self) -> None:
         """Load companion identities from config and create CompanionBridge + frame server for each."""
         from openhop_core import LocalIdentity
-        from openhop_core.companion.models import Channel
 
         from repeater.companion import CompanionFrameServer, RepeaterCompanionBridge
 
@@ -613,60 +675,13 @@ class RepeaterDaemon:
                     **bridge_kwargs,
                 )
 
-                # Load contacts from SQLite
+                # Restore persisted state (contacts/channels/messages) from SQLite.
+                # Raises CompanionStateLoadError instead of continuing with an
+                # empty store when persisted rows exist but cannot be loaded.
                 if sqlite_handler:
-                    contact_rows = sqlite_handler.companion_load_contacts(companion_hash_str)
-                    if contact_rows:
-                        records = []
-                        for row in contact_rows:
-                            d = dict(row)
-                            d["public_key"] = d.pop("pubkey", d.get("public_key", b""))
-                            records.append(d)
-                        bridge.contacts.load_from_dicts(records)
-
-                    # Load channels from SQLite (normalize secret to 32 bytes to match
-                    # CompanionBase.set_channel and GroupTextHandler/PacketBuilder)
-                    channel_rows = sqlite_handler.companion_load_channels(companion_hash_str)
-                    for row in channel_rows:
-                        s = row.get("secret", b"")
-                        if isinstance(s, bytes):
-                            raw = s
-                        elif isinstance(s, (bytearray, memoryview)):
-                            raw = bytes(s)
-                        elif s:
-                            raw = bytes.fromhex(s if isinstance(s, str) else str(s))
-                        else:
-                            raw = b""
-                        if len(raw) < 32:
-                            raw = raw + b"\x00" * (32 - len(raw))
-                        elif len(raw) > 32:
-                            raw = raw[:32]
-                        ch = Channel(name=row.get("name", ""), secret=raw)
-                        bridge.channels.set(row.get("channel_idx", 0), ch)
-
-                    # Preload queued messages from SQLite into bridge, bounded by
-                    # offline_queue_size (0 disables offline storage entirely).
-                    retention = getattr(bridge.message_queue, "_max_size", None)
-                    if retention != 0:
-                        for msg_dict in sqlite_handler.companion_load_messages(
-                            companion_hash_str, limit=retention or 100
-                        ):
-                            from openhop_core.companion.models import QueuedMessage
-
-                            sk = msg_dict.get("sender_key", b"")
-                            if isinstance(sk, str):
-                                sk = bytes.fromhex(sk)
-                            bridge.message_queue.push(
-                                QueuedMessage(
-                                    sender_key=sk,
-                                    txt_type=msg_dict.get("txt_type", 0),
-                                    timestamp=msg_dict.get("timestamp", 0),
-                                    text=msg_dict.get("text", ""),
-                                    is_channel=bool(msg_dict.get("is_channel", False)),
-                                    channel_idx=msg_dict.get("channel_idx", 0),
-                                    path_len=msg_dict.get("path_len", 0),
-                                )
-                            )
+                    await self._restore_companion_state(
+                        sqlite_handler, bridge, companion_hash_str, name
+                    )
 
                 # Ensure public channel (0) exists with default key for new companions
                 from repeater.companion.constants import DEFAULT_PUBLIC_CHANNEL_SECRET
@@ -708,8 +723,131 @@ class RepeaterDaemon:
 
             except CompanionContactCapacityError as e:
                 logger.error("%s", e)
+            except CompanionStateLoadError as e:
+                logger.error("Companion init aborted: %s", e)
             except Exception as e:
                 logger.error(f"Failed to load companion '{name}': {e}", exc_info=True)
+
+    async def _restore_companion_state(
+        self, sqlite_handler, bridge, companion_hash_str: str, name: str
+    ) -> None:
+        """Restore persisted contacts/channels/messages from SQLite into a bridge.
+
+        Each load is cross-checked against the table's row count for this
+        companion and retried once on mismatch; raises CompanionStateLoadError
+        when persisted rows exist but cannot be loaded, so the companion fails
+        init loudly instead of starting with an empty store.
+        """
+        from openhop_core.companion.models import Channel, QueuedMessage
+
+        contact_rows, contact_count = await _load_companion_rows_verified(
+            sqlite_handler.companion_load_contacts,
+            sqlite_handler.companion_count_contacts,
+            "contacts",
+            companion_hash_str,
+            name,
+        )
+        if contact_rows:
+            records = []
+            for row in contact_rows:
+                d = dict(row)
+                d["public_key"] = d.pop("pubkey", d.get("public_key", b""))
+                records.append(d)
+            bridge.contacts.load_from_dicts(records)
+
+        # Load channels (normalize secret to 32 bytes to match
+        # CompanionBase.set_channel and GroupTextHandler/PacketBuilder)
+        channel_rows, channel_count = await _load_companion_rows_verified(
+            sqlite_handler.companion_load_channels,
+            sqlite_handler.companion_count_channels,
+            "channels",
+            companion_hash_str,
+            name,
+        )
+        for row in channel_rows:
+            s = row.get("secret", b"")
+            if isinstance(s, bytes):
+                raw = s
+            elif isinstance(s, (bytearray, memoryview)):
+                raw = bytes(s)
+            elif s:
+                raw = bytes.fromhex(s if isinstance(s, str) else str(s))
+            else:
+                raw = b""
+            if len(raw) < 32:
+                raw = raw + b"\x00" * (32 - len(raw))
+            elif len(raw) > 32:
+                raw = raw[:32]
+            idx = row.get("channel_idx", 0)
+            ch = Channel(name=row.get("name", ""), secret=raw)
+            if not bridge.channels.set(idx, ch):
+                logger.error(
+                    "Companion %s ('%s'): channel store rejected persisted channel "
+                    "idx=%r name=%r (index out of range?)",
+                    companion_hash_str,
+                    name,
+                    idx,
+                    row.get("name", ""),
+                )
+
+        # Preload queued messages, bounded by offline_queue_size (0 disables
+        # offline storage entirely).
+        loaded_messages = 0
+        message_count = 0
+        retention = getattr(bridge.message_queue, "max_size", None)
+        if retention != 0:
+            message_rows, message_count = await _load_companion_rows_verified(
+                sqlite_handler.companion_load_messages,
+                sqlite_handler.companion_count_messages,
+                "messages",
+                companion_hash_str,
+                name,
+                limit=retention or 100,
+            )
+            loaded_messages = len(message_rows)
+            # openhop_core < the sender_prefix change (paired with fd43d86) has no
+            # QueuedMessage.sender_prefix; drop the prefix there instead of failing init.
+            supports_sender_prefix = "sender_prefix" in inspect.signature(QueuedMessage).parameters
+            if message_rows and not supports_sender_prefix:
+                logger.warning(
+                    "Companion %s ('%s'): installed openhop_core QueuedMessage has no "
+                    "sender_prefix field; persisted sender prefixes will be dropped "
+                    "(update openhop_core to restore signed room-post authors)",
+                    companion_hash_str,
+                    name,
+                )
+            for msg_dict in message_rows:
+                sk = msg_dict.get("sender_key", b"")
+                if isinstance(sk, str):
+                    sk = bytes.fromhex(sk)
+                sp = msg_dict.get("sender_prefix", b"")
+                if isinstance(sp, str):
+                    sp = bytes.fromhex(sp) if sp else b""
+                msg_kwargs = dict(
+                    sender_key=sk,
+                    txt_type=msg_dict.get("txt_type", 0),
+                    timestamp=msg_dict.get("timestamp", 0),
+                    text=msg_dict.get("text", ""),
+                    is_channel=bool(msg_dict.get("is_channel", False)),
+                    channel_idx=msg_dict.get("channel_idx", 0),
+                    path_len=msg_dict.get("path_len", 0),
+                )
+                if supports_sender_prefix:
+                    msg_kwargs["sender_prefix"] = sp
+                bridge.message_queue.push(QueuedMessage(**msg_kwargs))
+
+        logger.info(
+            "Companion %s ('%s'): restored %d/%d contact(s), %d/%d channel(s), "
+            "%d/%d message(s) from SQLite",
+            companion_hash_str,
+            name,
+            len(contact_rows),
+            contact_count,
+            len(channel_rows),
+            channel_count,
+            loaded_messages,
+            message_count,
+        )
 
     async def add_companion_from_config(self, comp_config: dict) -> None:
         """
@@ -718,7 +856,6 @@ class RepeaterDaemon:
         and registers with identity_manager. Raises on error.
         """
         from openhop_core import LocalIdentity
-        from openhop_core.companion.models import Channel
 
         from repeater.companion import CompanionFrameServer, RepeaterCompanionBridge
         from repeater.companion.constants import DEFAULT_PUBLIC_CHANNEL_SECRET
@@ -804,55 +941,10 @@ class RepeaterDaemon:
             **bridge_kwargs,
         )
 
+        # Restore persisted state; raises CompanionStateLoadError when persisted
+        # rows exist but cannot be loaded (hot-reload callers surface the error).
         if sqlite_handler:
-            contact_rows = sqlite_handler.companion_load_contacts(companion_hash_str)
-            if contact_rows:
-                records = []
-                for row in contact_rows:
-                    d = dict(row)
-                    d["public_key"] = d.pop("pubkey", d.get("public_key", b""))
-                    records.append(d)
-                bridge.contacts.load_from_dicts(records)
-
-            channel_rows = sqlite_handler.companion_load_channels(companion_hash_str)
-            for row in channel_rows:
-                s = row.get("secret", b"")
-                if isinstance(s, bytes):
-                    raw = s
-                elif isinstance(s, (bytearray, memoryview)):
-                    raw = bytes(s)
-                elif s:
-                    raw = bytes.fromhex(s if isinstance(s, str) else str(s))
-                else:
-                    raw = b""
-                if len(raw) < 32:
-                    raw = raw + b"\x00" * (32 - len(raw))
-                elif len(raw) > 32:
-                    raw = raw[:32]
-                ch = Channel(name=row.get("name", ""), secret=raw)
-                bridge.channels.set(row.get("channel_idx", 0), ch)
-
-            retention = getattr(bridge.message_queue, "_max_size", None)
-            if retention != 0:
-                for msg_dict in sqlite_handler.companion_load_messages(
-                    companion_hash_str, limit=retention or 100
-                ):
-                    from openhop_core.companion.models import QueuedMessage
-
-                    sk = msg_dict.get("sender_key", b"")
-                    if isinstance(sk, str):
-                        sk = bytes.fromhex(sk)
-                    bridge.message_queue.push(
-                        QueuedMessage(
-                            sender_key=sk,
-                            txt_type=msg_dict.get("txt_type", 0),
-                            timestamp=msg_dict.get("timestamp", 0),
-                            text=msg_dict.get("text", ""),
-                            is_channel=bool(msg_dict.get("is_channel", False)),
-                            channel_idx=msg_dict.get("channel_idx", 0),
-                            path_len=msg_dict.get("path_len", 0),
-                        )
-                    )
+            await self._restore_companion_state(sqlite_handler, bridge, companion_hash_str, name)
 
         if bridge.get_channel(0) is None:
             bridge.set_channel(0, "Public", DEFAULT_PUBLIC_CHANNEL_SECRET)
@@ -908,6 +1000,14 @@ class RepeaterDaemon:
                 fs.push_rx_raw(snr, rssi, data)
             except Exception as e:
                 logger.debug("Push RX raw to companion: %s", e)
+
+    def _register_duplicate_logging_hook(self, dedupe_enabled: bool) -> None:
+        """Register pre-dedup duplicate logging only when dispatcher dedupe is active."""
+        if not self.dispatcher or not dedupe_enabled:
+            return
+        # When dispatcher dedupe is disabled, duplicates still flow through
+        # router -> repeater_handler and are already recorded there.
+        self.dispatcher.add_raw_packet_subscriber(self._on_raw_packet_for_dedup_logging)
 
     def _on_raw_packet_for_dedup_logging(self, pkt, data: bytes, analysis: dict) -> None:
         """Record duplicate packets for UI visibility.
@@ -1139,7 +1239,6 @@ class RepeaterDaemon:
             return False
 
         try:
-            from openhop_core.protocol import PacketBuilder
             from openhop_core.protocol.constants import (
                 ADVERT_FLAG_HAS_NAME,
                 ADVERT_FLAG_IS_REPEATER,
@@ -1160,15 +1259,16 @@ class RepeaterDaemon:
 
             flags = ADVERT_FLAG_IS_REPEATER | ADVERT_FLAG_HAS_NAME
 
-            packet = PacketBuilder.create_advert(
+            mesh_config = self.config.get("mesh", {})
+            default_region = mesh_config.get("default_region")
+            packet, scoped_region_name = create_scoped_advert_packet(
                 local_identity=self.local_identity,
-                name=node_name,
-                lat=latitude,
-                lon=longitude,
-                feature1=0,
-                feature2=0,
+                node_name=node_name,
+                latitude=latitude,
+                longitude=longitude,
                 flags=flags,
-                route_type="flood",
+                default_region=default_region,
+                scope_label="advert",
             )
 
             # Send via dispatcher
@@ -1187,6 +1287,8 @@ class RepeaterDaemon:
                 longitude,
                 location_source,
             )
+            if scoped_region_name:
+                logger.info("Advert scoped to default region '%s'", scoped_region_name)
             return True
 
         except Exception as e:
@@ -1378,8 +1480,19 @@ class RepeaterDaemon:
             await self.initialize()
 
             # Start HTTP stats server
-            http_port = self.config.get("http", {}).get("port", 8000)
-            http_host = self.config.get("http", {}).get("host", "0.0.0.0")  # nosec B104
+            http_config = self.config.get("http", {})
+            http_port = http_config.get("port", 8000)
+            http_host = http_config.get("host", "0.0.0.0")  # nosec B104
+            http_enabled_raw = http_config.get("enabled", True)
+            if isinstance(http_enabled_raw, str):
+                http_enabled = http_enabled_raw.strip().lower() in (
+                    "1",
+                    "true",
+                    "yes",
+                    "on",
+                )
+            else:
+                http_enabled = bool(http_enabled_raw)
 
             node_name = self.config.get("repeater", {}).get("node_name", "Repeater")
 
@@ -1408,10 +1521,13 @@ class RepeaterDaemon:
                 config_path=getattr(self, "config_path", "/etc/openhop_repeater/config.yaml"),
             )
 
-            try:
-                self.http_server.start()
-            except Exception as e:
-                logger.error(f"Failed to start HTTP server: {e}")
+            if http_enabled:
+                try:
+                    self.http_server.start()
+                except Exception as e:
+                    logger.error(f"Failed to start HTTP server: {e}")
+            else:
+                logger.info("HTTP server startup skipped (http.enabled=false)")
 
             # Run dispatcher (handles RX/TX via openhop_core)
             try:

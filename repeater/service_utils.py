@@ -188,3 +188,57 @@ def restart_service() -> Tuple[bool, str]:
     except Exception as e:
         logger.error(f"Error executing sudo restart: {e}")
         return False, f"Restart command failed: {str(e)}"
+
+
+def _is_cherrypy_engine_running() -> Optional[bool]:
+    """Return CherryPy engine running state when available."""
+    try:
+        import cherrypy
+        from cherrypy.process import wspbus
+
+        state = cherrypy.engine.state
+        return state in (wspbus.states.STARTING, wspbus.states.STARTED)
+    except Exception:
+        return None
+
+
+def stop_http_server(daemon_instance) -> Tuple[bool, str]:
+    """Stop the in-process HTTP stats server."""
+    if not daemon_instance:
+        return False, "Daemon instance not available"
+
+    http_server = getattr(daemon_instance, "http_server", None)
+    if not http_server:
+        return False, "HTTP server not initialized"
+
+    running = _is_cherrypy_engine_running()
+    if running is False:
+        return True, "HTTP server already stopped"
+
+    try:
+        http_server.stop()
+        return True, "HTTP server stopped"
+    except Exception as exc:
+        logger.error(f"Failed to stop HTTP server: {exc}", exc_info=True)
+        return False, f"Failed to stop HTTP server: {exc}"
+
+
+def start_http_server(daemon_instance) -> Tuple[bool, str]:
+    """Start the in-process HTTP stats server."""
+    if not daemon_instance:
+        return False, "Daemon instance not available"
+
+    http_server = getattr(daemon_instance, "http_server", None)
+    if not http_server:
+        return False, "HTTP server not initialized"
+
+    running = _is_cherrypy_engine_running()
+    if running is True:
+        return True, "HTTP server already running"
+
+    try:
+        http_server.start()
+        return True, "HTTP server started"
+    except Exception as exc:
+        logger.error(f"Failed to start HTTP server: {exc}", exc_info=True)
+        return False, f"Failed to start HTTP server: {exc}"

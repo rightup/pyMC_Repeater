@@ -1571,13 +1571,15 @@ class TestPacketInjectionRouting:
 
     async def test_direct_for_other_node_is_dropped(self, handler):
         pkt = _inject_from_wire(_make_direct_packet(payload=b"\xaa\xbb", path=b"\xfe\x44"))
+        metadata = {"snr": 2.0, "rssi": -90}
 
         with patch("repeater.engine.asyncio.sleep", new_callable=AsyncMock):
-            await handler(pkt, {"snr": 2.0, "rssi": -90}, local_transmission=False)
+            await handler(pkt, metadata, local_transmission=False)
 
         assert handler.dispatcher.send_packet.call_count == 0
         assert handler.dropped_count == 1
         assert "not for us" in (handler.recent_packets[-1]["drop_reason"] or "")
+        assert "not for us" in ((metadata.get("_repeater_drop_reason") or "").lower())
 
     async def test_duplicate_wire_packet_not_retransmitted(self, handler):
         self._prepare_fast_tx(handler)

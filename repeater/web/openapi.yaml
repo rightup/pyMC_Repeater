@@ -862,6 +862,21 @@ paths:
         '200':
           description: Packet details
 
+  /packet_by_id:
+    get:
+      tags: [Packets]
+      summary: Get packet by ID
+      parameters:
+        - name: packet_id
+          in: query
+          required: true
+          schema:
+            type: integer
+          description: Packet database ID to lookup
+      responses:
+        '200':
+          description: Packet details
+
   /packet_type_stats:
     get:
       tags: [Packets]
@@ -1117,6 +1132,66 @@ paths:
                               items:
                                 type: number
 
+  /lbt_diagnostics:
+    get:
+      tags: [Charts]
+      summary: Get LBT diagnostics aligned with RF metrics
+      description: |
+        Returns aggregated Listen Before Talk (LBT) diagnostics for transmission-path
+        packets, aligned to RF health buckets for correlation analysis.
+
+        Notes:
+        - LBT total attempts are derived as `lbt_attempts + 1` from stored packet metadata.
+        - Buckets are bounded and aggregated server-side for efficient dashboard refresh.
+      parameters:
+        - name: hours
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 168
+            default: 24
+          description: Fallback range in hours when explicit timestamps are not provided.
+        - name: start_timestamp
+          in: query
+          schema:
+            type: number
+            format: float
+          description: Inclusive start timestamp (Unix epoch seconds).
+        - name: end_timestamp
+          in: query
+          schema:
+            type: number
+            format: float
+          description: Inclusive end timestamp (Unix epoch seconds).
+        - name: bucket_seconds
+          in: query
+          schema:
+            type: integer
+            minimum: 60
+            maximum: 3600
+          description: Bucket width in seconds. If omitted, server auto-selects based on range.
+        - name: severe_attempt_threshold
+          in: query
+          schema:
+            type: integer
+            minimum: 2
+            maximum: 16
+            default: 4
+          description: Attempt threshold used to classify severe contention events.
+      responses:
+        '200':
+          description: LBT diagnostics response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  data:
+                    $ref: '#/components/schemas/LbtDiagnosticsResponse'
+
   /noise_floor_history:
     get:
       tags: [Noise Floor]
@@ -1258,6 +1333,91 @@ paths:
               schema:
                 $ref: '#/components/schemas/SuccessResponse'
 
+  /cad_manual_check:
+    post:
+      tags: [CAD Calibration]
+      summary: Run manual CAD check
+      description: Execute one or more immediate CAD checks and return aggregated detection metrics.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                samples:
+                  type: integer
+                  minimum: 1
+                  maximum: 32
+                  default: 1
+                  description: Number of CAD checks to perform.
+                det_peak:
+                  type: integer
+                  minimum: 0
+                  maximum: 255
+                  description: Temporary CAD peak threshold.
+                det_min:
+                  type: integer
+                  minimum: 0
+                  maximum: 255
+                  description: Temporary CAD minimum threshold.
+                cad_symbol_num:
+                  type: integer
+                  enum: [1, 2, 4, 8, 16]
+                  default: 2
+                  description: CAD symbol count used by the radio.
+                cad_timeout_ms:
+                  type: integer
+                  minimum: 50
+                  maximum: 5000
+                  default: 500
+                  description: Timeout per CAD check in milliseconds.
+                apply_live:
+                  type: boolean
+                  default: false
+                  description: Apply det_peak and det_min to live radio thresholds before checks.
+      responses:
+        '200':
+          description: Manual CAD check result.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  data:
+                    type: object
+                    properties:
+                      det_peak:
+                        type: integer
+                      det_min:
+                        type: integer
+                      cad_symbol_num:
+                        type: integer
+                      cad_timeout_ms:
+                        type: integer
+                      apply_live:
+                        type: boolean
+                      samples:
+                        type: integer
+                      attempts:
+                        type: integer
+                      detections:
+                        type: integer
+                      non_detections:
+                        type: integer
+                      timeouts:
+                        type: integer
+                      errors:
+                        type: integer
+                      cad_done_count:
+                        type: integer
+                      detection_rate:
+                        type: number
+                      detected:
+                        type: boolean
+
   /save_cad_settings:
     post:
       tags: [CAD Calibration]
@@ -1286,6 +1446,11 @@ paths:
                   maximum: 255
                   description: CAD minimum value
                   example: 64
+                cad_symbol_num:
+                  type: integer
+                  enum: [1, 2, 4, 8, 16]
+                  default: 2
+                  description: CAD symbol count to persist for runtime CAD detections.
       responses:
         '200':
           description: Settings saved
@@ -1526,6 +1691,61 @@ paths:
               schema:
                 $ref: '#/components/schemas/SuccessResponse'
 
+  /default_region:
+    get:
+      tags: [Network Policy]
+      summary: Get default region
+      description: Get current mesh default region used for locally-originated flood adverts.
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      responses:
+        '200':
+          description: Current default region
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  data:
+                    type: object
+                    properties:
+                      default_region:
+                        type: string
+                        nullable: true
+                  message:
+                    type: string
+                  error:
+                    type: string
+    post:
+      tags: [Network Policy]
+      summary: Update default region
+      description: Set or clear mesh default region. Pass null to clear.
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [default_region]
+              properties:
+                default_region:
+                  type: string
+                  nullable: true
+                  description: Region name to set, or null to clear.
+      responses:
+        '200':
+          description: Default region updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+
   /ping_neighbor:
     post:
       tags: [Network Policy]
@@ -1580,6 +1800,163 @@ paths:
                         type: integer
                       path_hash_mode:
                         type: integer
+                  message:
+                    type: string
+                  error:
+                    type: string
+
+  /discover_neighbors_start:
+    post:
+      tags: [Network Policy]
+      summary: Start neighbor discovery session
+      description: Start a short-lived discovery broadcast session and return a session ID for SSE streaming.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                timeout:
+                  type: number
+                  minimum: 1
+                  maximum: 60
+                  default: 5
+                filter_mask:
+                  type: integer
+                  minimum: 0
+                  maximum: 255
+                  default: 4
+                since:
+                  type: integer
+                  minimum: 0
+                  default: 0
+                prefix_only:
+                  type: boolean
+                  default: false
+      responses:
+        '200':
+          description: Discovery session started
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  data:
+                    type: object
+                    properties:
+                      session_id:
+                        type: string
+                      tag:
+                        type: integer
+                      status:
+                        type: string
+                      timeout:
+                        type: number
+                      filter_mask:
+                        type: integer
+                      since:
+                        type: integer
+                      prefix_only:
+                        type: boolean
+                      created_at:
+                        type: number
+                      started_at:
+                        type: number
+                        nullable: true
+                      completed_at:
+                        type: number
+                        nullable: true
+                      count:
+                        type: integer
+                      error:
+                        type: string
+                        nullable: true
+                  message:
+                    type: string
+                  error:
+                    type: string
+
+  /discover_neighbors_stream:
+    get:
+      tags: [Network Policy]
+      summary: Stream discovery events
+      description: Stream live neighbor discovery session events via Server-Sent Events (SSE).
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      parameters:
+        - name: session_id
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: last_event_id
+          in: query
+          required: false
+          schema:
+            type: integer
+        - name: token
+          in: query
+          required: false
+          schema:
+            type: string
+          description: JWT token for EventSource clients that cannot send Authorization headers.
+      responses:
+        '200':
+          description: SSE event stream
+          content:
+            text/event-stream:
+              schema:
+                type: string
+
+  /add_discovered_neighbor:
+    post:
+      tags: [Network Policy]
+      summary: Add discovered node as neighbor
+      description: Persist a discovered node into the adverts/neighbors store for future management.
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [pub_key]
+              properties:
+                pub_key:
+                  type: string
+                  description: Hex pubkey (8-byte or 32-byte form).
+                node_name:
+                  type: string
+                  nullable: true
+                node_type:
+                  type: integer
+                rssi:
+                  type: integer
+                  nullable: true
+                response_snr:
+                  type: number
+                  nullable: true
+                snr:
+                  type: number
+                  nullable: true
+      responses:
+        '200':
+          description: Node added
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  data:
+                    type: object
                   message:
                     type: string
                   error:
@@ -3930,6 +4307,381 @@ components:
         error:
           type: string
           description: Error message
+
+    LbtDiagnosticsResponse:
+      type: object
+      required: [start_time, end_time, bucket_seconds, severe_attempt_threshold, summary, buckets, packet_types, packet_type_buckets, correlations, limitations]
+      properties:
+        start_time:
+          type: integer
+          description: Selected range start timestamp (Unix epoch seconds)
+        end_time:
+          type: integer
+          description: Selected range end timestamp (Unix epoch seconds)
+        bucket_seconds:
+          type: integer
+          minimum: 60
+          maximum: 3600
+          description: Aggregation interval in seconds
+        severe_attempt_threshold:
+          type: integer
+          minimum: 2
+          maximum: 16
+          description: Attempt count threshold used for severe contention classification
+        summary:
+          $ref: '#/components/schemas/LbtSummary'
+        buckets:
+          type: array
+          items:
+            $ref: '#/components/schemas/LbtBucket'
+        packet_types:
+          type: array
+          description: Packet types present in the selected range, sorted by transmission volume.
+          items:
+            $ref: '#/components/schemas/LbtPacketTypeSummary'
+        packet_type_buckets:
+          type: array
+          description: Sparse per-packet-type bucket diagnostics (only combinations with transmissions).
+          items:
+            $ref: '#/components/schemas/LbtPacketTypeBucket'
+        correlations:
+          $ref: '#/components/schemas/LbtCorrelationSet'
+        limitations:
+          type: array
+          items:
+            type: string
+
+    LbtPacketTypeSummary:
+      type: object
+      required: [packet_type, packet_type_label, transmissions, retry_packets]
+      properties:
+        packet_type:
+          type: integer
+          description: Raw packet type code from packet records.
+        packet_type_label:
+          type: string
+          description: Human-readable packet type label.
+        transmissions:
+          type: integer
+          minimum: 0
+        retry_packets:
+          type: integer
+          minimum: 0
+        retry_rate_pct:
+          type: number
+          format: float
+          nullable: true
+
+    LbtPacketTypeBucket:
+      type: object
+      required: [timestamp, packet_type, packet_type_label, transmissions, total_attempts, first_attempt_success, retry_packets, attempts_1, attempts_2, attempts_3, attempts_4_plus, attempts_3_plus, max_attempts, failed_transmissions, severe_contention_count, rf]
+      properties:
+        timestamp:
+          type: integer
+          description: Bucket timestamp (Unix epoch seconds)
+        packet_type:
+          type: integer
+          description: Raw packet type code from packet records.
+        packet_type_label:
+          type: string
+          description: Human-readable packet type label.
+        transmissions:
+          type: integer
+          minimum: 0
+        total_attempts:
+          type: integer
+          minimum: 0
+        first_attempt_success:
+          type: integer
+          minimum: 0
+        retry_packets:
+          type: integer
+          minimum: 0
+        retry_rate_pct:
+          type: number
+          format: float
+          nullable: true
+        first_attempt_success_rate_pct:
+          type: number
+          format: float
+          nullable: true
+        avg_attempts:
+          type: number
+          format: float
+          nullable: true
+        attempts_1:
+          type: integer
+          minimum: 0
+        attempts_2:
+          type: integer
+          minimum: 0
+        attempts_3:
+          type: integer
+          minimum: 0
+        attempts_4_plus:
+          type: integer
+          minimum: 0
+        attempts_3_plus:
+          type: integer
+          minimum: 0
+        attempts_3_plus_pct:
+          type: number
+          format: float
+          nullable: true
+        max_attempts:
+          type: integer
+          minimum: 0
+        failed_transmissions:
+          type: integer
+          minimum: 0
+        severe_contention_count:
+          type: integer
+          minimum: 0
+        rf:
+          $ref: '#/components/schemas/LbtRfBucket'
+
+    LbtSummary:
+      type: object
+      required: [total_transmissions, total_attempts, first_attempt_success, retry_packets, max_attempts, attempts_1, attempts_2, attempts_3, attempts_4_plus, attempts_3_plus, failed_transmissions, busy_channel_events, severe_contention_count, severe_attempt_threshold, has_lbt_data]
+      properties:
+        total_transmissions:
+          type: integer
+          minimum: 0
+        total_attempts:
+          type: integer
+          minimum: 0
+        first_attempt_success:
+          type: integer
+          minimum: 0
+        retry_packets:
+          type: integer
+          minimum: 0
+        retry_rate_pct:
+          type: number
+          format: float
+          nullable: true
+        first_attempt_success_rate_pct:
+          type: number
+          format: float
+          nullable: true
+        avg_attempts:
+          type: number
+          format: float
+          nullable: true
+        median_attempts:
+          type: number
+          format: float
+          nullable: true
+        p95_attempts:
+          type: number
+          format: float
+          nullable: true
+        max_attempts:
+          type: integer
+          minimum: 0
+        attempts_1:
+          type: integer
+          minimum: 0
+        attempts_2:
+          type: integer
+          minimum: 0
+        attempts_3:
+          type: integer
+          minimum: 0
+        attempts_4_plus:
+          type: integer
+          minimum: 0
+        attempts_3_plus:
+          type: integer
+          minimum: 0
+        attempts_3_plus_pct:
+          type: number
+          format: float
+          nullable: true
+        attempts_4_plus_pct:
+          type: number
+          format: float
+          nullable: true
+        failed_transmissions:
+          type: integer
+          minimum: 0
+        busy_channel_events:
+          type: integer
+          minimum: 0
+        severe_contention_count:
+          type: integer
+          minimum: 0
+        severe_contention_pct:
+          type: number
+          format: float
+          nullable: true
+        severe_attempt_threshold:
+          type: integer
+          minimum: 2
+          maximum: 16
+        has_lbt_data:
+          type: boolean
+        worst_bucket:
+          $ref: '#/components/schemas/LbtWorstBucket'
+          nullable: true
+
+    LbtWorstBucket:
+      type: object
+      required: [timestamp, retry_rate_pct, attempts_3_plus_pct, max_attempts, transmissions]
+      properties:
+        timestamp:
+          type: integer
+        retry_rate_pct:
+          type: number
+          format: float
+        attempts_3_plus_pct:
+          type: number
+          format: float
+        max_attempts:
+          type: integer
+          minimum: 0
+        transmissions:
+          type: integer
+          minimum: 0
+
+    LbtBucket:
+      type: object
+      required: [timestamp, transmissions, total_attempts, first_attempt_success, retry_packets, max_attempts, attempts_1, attempts_2, attempts_3, attempts_4_plus, attempts_3_plus, failed_transmissions, busy_channel_events, severe_contention_count, rf]
+      properties:
+        timestamp:
+          type: integer
+          description: Bucket timestamp (Unix epoch seconds)
+        transmissions:
+          type: integer
+          minimum: 0
+        total_attempts:
+          type: integer
+          minimum: 0
+        first_attempt_success:
+          type: integer
+          minimum: 0
+        retry_packets:
+          type: integer
+          minimum: 0
+        retry_rate_pct:
+          type: number
+          format: float
+          nullable: true
+        first_attempt_success_rate_pct:
+          type: number
+          format: float
+          nullable: true
+        avg_attempts:
+          type: number
+          format: float
+          nullable: true
+        median_attempts:
+          type: number
+          format: float
+          nullable: true
+        p95_attempts:
+          type: number
+          format: float
+          nullable: true
+        max_attempts:
+          type: integer
+          minimum: 0
+        attempts_1:
+          type: integer
+          minimum: 0
+        attempts_2:
+          type: integer
+          minimum: 0
+        attempts_3:
+          type: integer
+          minimum: 0
+        attempts_4_plus:
+          type: integer
+          minimum: 0
+        attempts_3_plus:
+          type: integer
+          minimum: 0
+        attempts_3_plus_pct:
+          type: number
+          format: float
+          nullable: true
+        attempts_4_plus_pct:
+          type: number
+          format: float
+          nullable: true
+        failed_transmissions:
+          type: integer
+          minimum: 0
+        busy_channel_events:
+          type: integer
+          minimum: 0
+        severe_contention_count:
+          type: integer
+          minimum: 0
+        severe_contention_pct:
+          type: number
+          format: float
+          nullable: true
+        rf:
+          $ref: '#/components/schemas/LbtRfBucket'
+
+    LbtRfBucket:
+      type: object
+      required: [traffic_volume, rx_count, tx_count, drop_count]
+      properties:
+        avg_rssi:
+          type: number
+          format: float
+          nullable: true
+        avg_snr:
+          type: number
+          format: float
+          nullable: true
+        packet_loss_rate_pct:
+          type: number
+          format: float
+          nullable: true
+        traffic_volume:
+          type: integer
+          minimum: 0
+        rx_count:
+          type: integer
+          minimum: 0
+        tx_count:
+          type: integer
+          minimum: 0
+        drop_count:
+          type: integer
+          minimum: 0
+
+    LbtCorrelationSet:
+      type: object
+      required: [retry_rate_vs_avg_snr, retry_rate_vs_avg_rssi, retry_rate_vs_packet_loss_rate, retry_rate_vs_traffic_volume]
+      properties:
+        retry_rate_vs_avg_snr:
+          $ref: '#/components/schemas/LbtCorrelationValue'
+        retry_rate_vs_avg_rssi:
+          $ref: '#/components/schemas/LbtCorrelationValue'
+        retry_rate_vs_packet_loss_rate:
+          $ref: '#/components/schemas/LbtCorrelationValue'
+        retry_rate_vs_traffic_volume:
+          $ref: '#/components/schemas/LbtCorrelationValue'
+
+    LbtCorrelationValue:
+      type: object
+      required: [coefficient, sample_count]
+      properties:
+        coefficient:
+          type: number
+          format: float
+          nullable: true
+          description: Pearson coefficient in range [-1, 1] when enough samples exist
+        sample_count:
+          type: integer
+          minimum: 0
+        note:
+          type: string
+          nullable: true
 
     RoomMessage:
       type: object

@@ -61,13 +61,18 @@ class CompanionFrameServer(_BaseFrameServer):
     async def _persist_companion_message(self, msg_dict: dict) -> None:
         """Persist message to SQLite and pop from bridge queue.
 
-        The bridge's ``offline_queue_size`` (``message_queue._max_size``) doubles
+        The bridge's ``offline_queue_size`` (``message_queue.max_size``) doubles
         as the SQLite retention limit: 0 disables offline storage entirely, so the
         message is dropped instead of persisted.
         """
         if not self.sqlite_handler:
             return
-        retention = getattr(self.bridge.message_queue, "_max_size", None)
+        # Older cores predate the public max_size property.
+        retention = getattr(
+            self.bridge.message_queue,
+            "max_size",
+            getattr(self.bridge.message_queue, "_max_size", None),
+        )
         if retention == 0:
             self.bridge.message_queue.pop_last()
             return
@@ -86,6 +91,9 @@ class CompanionFrameServer(_BaseFrameServer):
         msg_dict = self.sqlite_handler.companion_pop_message(self.companion_hash)
         if not msg_dict:
             return None
+        sender_prefix = msg_dict.get("sender_prefix", b"")
+        if isinstance(sender_prefix, str):
+            sender_prefix = bytes.fromhex(sender_prefix) if sender_prefix else b""
         return QueuedMessage(
             sender_key=msg_dict.get("sender_key", b""),
             txt_type=msg_dict.get("txt_type", 0),
@@ -94,6 +102,7 @@ class CompanionFrameServer(_BaseFrameServer):
             is_channel=bool(msg_dict.get("is_channel", False)),
             channel_idx=msg_dict.get("channel_idx", 0),
             path_len=msg_dict.get("path_len", 0),
+            sender_prefix=sender_prefix,
         )
 
     # -----------------------------------------------------------------

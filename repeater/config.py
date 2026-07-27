@@ -230,6 +230,13 @@ def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
     if "mesh" not in config:
         config["mesh"] = {}
 
+    if "http" not in config:
+        config["http"] = {
+            "enabled": True,
+            "host": "0.0.0.0",
+            "port": 8000,
+        }
+
     if "glass" not in config:
         config["glass"] = {
             "enabled": False,
@@ -422,8 +429,11 @@ def _load_or_create_identity_key(path: Optional[str] = None) -> bytes:
         except Exception as e:
             logger.warning(f"Failed to load identity key: {e}")
 
-    # Generate new random key
-    key = os.urandom(32)
+    # Generate new key via MeshCore-compatible keygen; store 32-byte private scalar.
+    from repeater.keygen import generate_meshcore_keypair
+
+    _, private_key = generate_meshcore_keypair()
+    key = private_key[:32]
 
     # Save it
     try:

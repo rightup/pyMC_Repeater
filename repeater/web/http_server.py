@@ -1,9 +1,11 @@
 import json
 import logging
+import mimetypes
 import os
 import queue
 import re
 import secrets
+import sys
 import threading
 from collections import deque
 from datetime import datetime
@@ -27,6 +29,7 @@ try:
     from repeater.data_acquisition.websocket_handler import (
         PacketWebSocket,
         init_websocket,
+        shutdown_websocket,
     )
 
     from .companion_ws_proxy import CompanionFrameWebSocket
@@ -39,6 +42,35 @@ except ImportError:
     logger.warning("ws4py not available - WebSocket support disabled")
 
 logger = logging.getLogger("HTTPServer")
+_ORIGINAL_UNRAISABLEHOOK = sys.unraisablehook
+_CHEROOT_UNRAISABLE_HOOK_INSTALLED = False
+
+
+def _looks_like_cheroot_makefile_context(unraisable: object) -> bool:
+    context = (
+        f"{getattr(unraisable, 'object', '')!r} {getattr(unraisable, 'err_msg', '')!r}".lower()
+    )
+    return "cheroot" in context and "makefile" in context
+
+
+def _install_cheroot_bad_fd_unraisable_filter() -> None:
+    global _CHEROOT_UNRAISABLE_HOOK_INSTALLED
+    if _CHEROOT_UNRAISABLE_HOOK_INSTALLED:
+        return
+
+    def _filtered_unraisablehook(unraisable):
+        exc = getattr(unraisable, "exc_value", None)
+        if (
+            isinstance(exc, OSError)
+            and getattr(exc, "errno", None) == 9
+            and "bad file descriptor" in str(exc).lower()
+            and _looks_like_cheroot_makefile_context(unraisable)
+        ):
+            return
+        _ORIGINAL_UNRAISABLEHOOK(unraisable)
+
+    sys.unraisablehook = _filtered_unraisablehook
+    _CHEROOT_UNRAISABLE_HOOK_INSTALLED = True
 
 
 # In-memory log buffer
@@ -204,12 +236,14 @@ class StatsApp:
         self.pub_key = pub_key
         self.dashboard_template = None
         self.config = config or {}
+        self.default_html_dir = os.path.join(os.path.dirname(__file__), "html")
 
         # Path to the compiled Vue.js application
         # Use web_path from config if provided, otherwise use default
-        default_html_dir = os.path.join(os.path.dirname(__file__), "html")
         web_path = self.config.get("web", {}).get("web_path")
-        self.html_dir = web_path if web_path is not None else default_html_dir
+        self.html_dir = (
+            web_path if web_path is not None and os.path.isdir(web_path) else self.default_html_dir
+        )
 
         # Create nested API object for routing
         self.api = APIEndpoints(
@@ -219,9 +253,34 @@ class StatsApp:
         # Create doc endpoint for API documentation
         self.doc = DocEndpoint(self.api)
 
+    def _resolve_html_dir(self) -> str:
+        web_path = self.config.get("web", {}).get("web_path")
+        candidate = (
+            web_path if web_path is not None and os.path.isdir(web_path) else self.default_html_dir
+        )
+        self.html_dir = candidate
+        return candidate
+
+    def apply_web_config(self) -> bool:
+        previous = self.html_dir
+        current = self._resolve_html_dir()
+        return previous != current
+
+    def _serve_static_file(self, root_dir: str, relative_parts: tuple[str, ...]):
+        if not relative_parts:
+            raise cherrypy.NotFound()
+        root = Path(root_dir).resolve()
+        target = (root.joinpath(*relative_parts)).resolve()
+        if not str(target).startswith(str(root)) or not target.is_file():
+            raise cherrypy.NotFound()
+        guessed_type, _ = mimetypes.guess_type(str(target))
+        cherrypy.response.headers["Content-Type"] = guessed_type or "application/octet-stream"
+        return target.read_bytes()
+
     @cherrypy.expose
     def index(self, **kwargs):
         """Serve the Vue.js application index.html."""
+        self._resolve_html_dir()
         index_path = os.path.join(self.html_dir, "index.html")
         try:
             with open(index_path, "r", encoding="utf-8") as f:
@@ -235,6 +294,7 @@ class StatsApp:
     @cherrypy.expose
     def default(self, *args, **kwargs):
         """Handle client-side routing - serve index.html for all non-API routes."""
+        self._resolve_html_dir()
         # Handle OPTIONS requests for any path
         if cherrypy.request.method == "OPTIONS":
             return ""
@@ -252,6 +312,15 @@ class StatsApp:
         ):
             # WebSocket tool will intercept this
             return ""
+        # Serve frontend static assets dynamically from active html_dir
+        if args and args[0] == "assets":
+            return self._serve_static_file(os.path.join(self.html_dir, "assets"), tuple(args[1:]))
+
+        if args and args[0] == "_next":
+            return self._serve_static_file(os.path.join(self.html_dir, "_next"), tuple(args[1:]))
+
+        if args and args[0] == "favicon.ico":
+            return self._serve_static_file(self.html_dir, ("favicon.ico",))
 
         # For all other routes, serve the Vue.js app (client-side routing)
         return self.index()
@@ -371,17 +440,13 @@ class HTTPStatsServer:
     def start(self):
 
         try:
+            _install_cheroot_bad_fd_unraisable_filter()
             register_require_auth_tool()
 
             if self._cors_enabled:
                 self._setup_server_cors()
 
-            default_html_dir = os.path.join(os.path.dirname(__file__), "html")
-            web_path = self.config.get("web", {}).get("web_path")
-            html_dir = web_path if web_path is not None else default_html_dir
-
-            assets_dir = os.path.join(html_dir, "assets")
-            next_dir = os.path.join(html_dir, "_next")
+            self.app.apply_web_config()
 
             # Build config with conditional CORS settings
             config = {
@@ -434,9 +499,8 @@ class HTTPStatsServer:
                 "/api/setup_wizard": {
                     "tools.require_auth.on": False,
                 },
-                "/favicon.ico": {
-                    "tools.staticfile.on": True,
-                    "tools.staticfile.filename": os.path.join(html_dir, "favicon.ico"),
+                "/api/config_import": {
+                    "tools.require_auth.on": False,
                 },
             }
 
@@ -488,40 +552,6 @@ class HTTPStatsServer:
                 # Apply CORS to paths
                 config["/"].update(cors_config)
                 config["/api"].update(cors_config)
-
-            # Add Vue.js assets support only if assets directory exists
-            if os.path.isdir(assets_dir):
-                config["/assets"] = {
-                    "tools.staticdir.on": True,
-                    "tools.staticdir.dir": assets_dir,
-                    # Set proper content types for assets
-                    "tools.staticdir.content_types": {
-                        "js": "application/javascript",
-                        "css": "text/css",
-                        "map": "application/json",
-                    },
-                }
-
-            # Add Next.js support only if _next directory exists
-            if os.path.isdir(next_dir):
-                config["/_next"] = {
-                    "tools.staticdir.on": True,
-                    "tools.staticdir.dir": next_dir,
-                    # Set proper content types for Next.js assets
-                    "tools.staticdir.content_types": {
-                        "js": "application/javascript",
-                        "css": "text/css",
-                        "map": "application/json",
-                    },
-                }
-
-            # Only add CORS to static assets if CORS is enabled
-            if self._cors_enabled:
-                if "/assets" in config:
-                    config["/assets"]["cors.expose.on"] = True
-                if "/_next" in config:
-                    config["/_next"]["cors.expose.on"] = True
-                config["/favicon.ico"]["cors.expose.on"] = True
 
             http_cfg = self.config.get("http", {}) if isinstance(self.config, dict) else {}
             thread_pool = max(2, int(http_cfg.get("thread_pool", 8)))
@@ -636,6 +666,11 @@ class HTTPStatsServer:
 
     def stop(self):
         try:
+            if WEBSOCKET_AVAILABLE:
+                try:
+                    shutdown_websocket()
+                except Exception as e:
+                    logger.debug(f"WebSocket shutdown skipped/failed: {e}")
             cherrypy.engine.exit()
             logger.info("HTTP stats server stopped")
         except Exception as e:

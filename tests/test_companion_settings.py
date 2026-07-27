@@ -196,6 +196,117 @@ class TestSqliteRetentionTrim:
         assert len(h.companion_load_messages("0x02")) == 3
 
 
+class TestSenderPrefixPersistence:
+    """sender_prefix (signed room-post author prefix) survives the SQLite round-trip."""
+
+    PREFIX = b"\xaa\xbb\xcc\xdd"
+
+    @staticmethod
+    def _handler(tmp_path):
+        from repeater.data_acquisition.sqlite_handler import SQLiteHandler
+
+        return SQLiteHandler(tmp_path)
+
+    def _push(self, h, sender_prefix=PREFIX):
+        return h.companion_push_message(
+            "0x01",
+            {
+                "sender_key": b"\x01" * 32,
+                "txt_type": 2,
+                "timestamp": 42,
+                "text": "signed post",
+                "sender_prefix": sender_prefix,
+                "packet_hash": "ph-1",
+            },
+        )
+
+    def test_push_pop_round_trip(self, tmp_path):
+        h = self._handler(tmp_path)
+        assert self._push(h)
+        msg = h.companion_pop_message("0x01")
+        assert msg["sender_prefix"] == self.PREFIX
+        assert msg["text"] == "signed post"
+
+    def test_load_messages_returns_prefix_bytes(self, tmp_path):
+        h = self._handler(tmp_path)
+        assert self._push(h)
+        msgs = h.companion_load_messages("0x01")
+        assert len(msgs) == 1
+        assert msgs[0]["sender_prefix"] == self.PREFIX
+
+    def test_missing_prefix_defaults_empty(self, tmp_path):
+        h = self._handler(tmp_path)
+        assert h.companion_push_message(
+            "0x01", {"text": "plain", "timestamp": 1, "packet_hash": "ph-2"}
+        )
+        msg = h.companion_pop_message("0x01")
+        assert msg["sender_prefix"] == b""
+
+    def test_migration_adds_column_to_existing_db(self, tmp_path):
+        import sqlite3
+
+        # Build a current DB, then rewind companion_messages to the
+        # pre-sender_prefix schema and drop the migration marker.
+        h = self._handler(tmp_path)
+        conn = sqlite3.connect(str(h.sqlite_path))
+        conn.execute(
+            "DELETE FROM migrations "
+            "WHERE migration_name = 'add_sender_prefix_to_companion_messages'"
+        )
+        conn.execute("ALTER TABLE companion_messages RENAME TO companion_messages_old")
+        conn.execute(
+            """
+            CREATE TABLE companion_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                companion_hash TEXT NOT NULL,
+                sender_key BLOB NOT NULL,
+                txt_type INTEGER NOT NULL DEFAULT 0,
+                timestamp INTEGER NOT NULL DEFAULT 0,
+                text TEXT NOT NULL,
+                is_channel INTEGER NOT NULL DEFAULT 0,
+                channel_idx INTEGER NOT NULL DEFAULT 0,
+                path_len INTEGER NOT NULL DEFAULT 0,
+                packet_hash TEXT,
+                created_at REAL NOT NULL
+            )
+            """
+        )
+        conn.execute("DROP TABLE companion_messages_old")
+        conn.execute(
+            "INSERT INTO companion_messages "
+            "(companion_hash, sender_key, text, created_at) VALUES ('0x01', X'01', 'old', 1.0)"
+        )
+        conn.commit()
+        conn.close()
+
+        h2 = self._handler(tmp_path)  # re-runs migrations
+        # Pre-migration row decodes with an empty prefix.
+        old = h2.companion_pop_message("0x01")
+        assert old["sender_prefix"] == b""
+        # New rows round-trip through the migrated column.
+        assert self._push(h2)
+        assert h2.companion_pop_message("0x01")["sender_prefix"] == self.PREFIX
+
+    def test_sync_next_from_persistence_rebuilds_prefix(self):
+        from repeater.companion.frame_server import CompanionFrameServer
+
+        fs = CompanionFrameServer.__new__(CompanionFrameServer)
+        fs.sqlite_handler = MagicMock()
+        fs.companion_hash = "0x01"
+        fs.sqlite_handler.companion_pop_message.return_value = {
+            "sender_key": b"\x01" * 32,
+            "txt_type": 2,
+            "timestamp": 42,
+            "text": "signed post",
+            "is_channel": 0,
+            "channel_idx": 0,
+            "path_len": 0,
+            "sender_prefix": self.PREFIX,
+        }
+        msg = fs._sync_next_from_persistence()
+        assert msg.sender_prefix == self.PREFIX
+
+
 class TestTrimContactsOnOverflowPolicy:
     @staticmethod
     def _contacts(n, favourites=0):
@@ -251,7 +362,7 @@ class TestPersistSkipWhenOff:
         fs.sqlite_handler = MagicMock()
         fs.companion_hash = "0x01"
         bridge = MagicMock()
-        bridge.message_queue._max_size = max_size
+        bridge.message_queue.max_size = max_size
         fs.bridge = bridge
         return fs
 

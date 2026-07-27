@@ -39,11 +39,15 @@ class StorageCollector:
         self.sqlite_handler = SQLiteHandler(self.storage_dir)
         self.rrd_handler = RRDToolHandler(self.storage_dir)
 
-        # Initialize MQTT handler if configured
+        # Initialize MQTT handler only when at least one broker is configured
         self.mqtt_handler = None
-        if (
-            config.get("mqtt_brokers", {}) or config.get("letsmesh", {}) or config.get("mqtt", {})
-        ) and local_identity:
+        mqtt_brokers_config = config.get("mqtt_brokers", {}) or {}
+        letsmesh_config = config.get("letsmesh", {}) or {}
+        mqtt_config = config.get("mqtt", {}) or {}
+        has_brokers_configured = (
+            bool(mqtt_brokers_config.get("brokers")) or bool(letsmesh_config) or bool(mqtt_config)
+        )
+        if has_brokers_configured and local_identity:
             try:
                 # Pass local_identity directly (supports both standard and firmware keys)
                 self.mqtt_handler = MeshCoreToMqttPusher(
@@ -58,6 +62,8 @@ class StorageCollector:
             except Exception as e:
                 logger.error(f"Failed to initialize MQTT handler: {e}")
                 self.mqtt_handler = None
+        else:
+            logger.info("MQTT handler disabled - no brokers configured")
 
         # Initialize hardware stats collector
         from .hardware_stats import HardwareStatsCollector
@@ -209,7 +215,9 @@ class StorageCollector:
 
     def _record_packet_blocking(self, packet_record: dict, skip_mqtt: bool):
         """Store, aggregate, update metrics, and publish one packet (writer thread)."""
-        self.sqlite_handler.store_packet(packet_record)
+        packet_id = self.sqlite_handler.store_packet(packet_record)
+        if packet_id is not None:
+            packet_record["id"] = packet_id
         cumulative_counts = self.sqlite_handler.get_cumulative_counts()
         self.rrd_handler.update_packet_metrics(packet_record, cumulative_counts)
         self._publish_packet_sync(packet_record, skip_mqtt)
@@ -372,6 +380,20 @@ class StorageCollector:
             bucket_seconds=bucket_seconds,
         )
 
+    def get_lbt_diagnostics(
+        self,
+        start_timestamp: float,
+        end_timestamp: float,
+        bucket_seconds: int = 300,
+        severe_attempt_threshold: int = 4,
+    ) -> dict:
+        return self.sqlite_handler.get_lbt_diagnostics(
+            start_timestamp=start_timestamp,
+            end_timestamp=end_timestamp,
+            bucket_seconds=bucket_seconds,
+            severe_attempt_threshold=severe_attempt_threshold,
+        )
+
     def get_packet_stats(self, hours: int = 24) -> dict:
         return self.sqlite_handler.get_packet_stats(hours)
 
@@ -415,6 +437,9 @@ class StorageCollector:
 
     def get_packet_by_hash(self, packet_hash: str) -> Optional[dict]:
         return self.sqlite_handler.get_packet_by_hash(packet_hash)
+
+    def get_packet_by_id(self, packet_id: int) -> Optional[dict]:
+        return self.sqlite_handler.get_packet_by_id(packet_id)
 
     def get_rrd_data(
         self,
@@ -539,6 +564,9 @@ class StorageCollector:
 
     def delete_advert(self, advert_id: int) -> bool:
         return self.sqlite_handler.delete_advert(advert_id)
+
+    def delete_neighbors_by_pubkey_prefix(self, pubkey_prefix: str | None) -> int:
+        return self.sqlite_handler.delete_neighbors_by_pubkey_prefix(pubkey_prefix)
 
     def get_hardware_stats(self) -> Optional[dict]:
         """Get current hardware statistics"""

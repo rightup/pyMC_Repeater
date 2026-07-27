@@ -4,8 +4,8 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-
 from openhop_core.protocol.constants import PAYLOAD_TYPE_ANON_REQ, ROUTE_TYPE_DIRECT
+
 from repeater.handler_helpers.discovery import DiscoveryHelper
 from repeater.handler_helpers.login import LoginHelper
 from repeater.handler_helpers.trace import TraceHelper
@@ -252,6 +252,120 @@ async def test_discovery_response_jitter_disabled_does_not_sleep():
 
     sleep_mock.assert_not_called()
     injector.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_discovery_session_collects_and_completes():
+    injector = AsyncMock(return_value=True)
+    helper = DiscoveryHelper(
+        local_identity=FakeIdentity(0x42),
+        packet_injector=injector,
+        response_jitter_ms=0,
+    )
+
+    session = helper.create_session(timeout=0.01, filter_mask=0x04)
+    session_id = session["session_id"]
+
+    execute_task = asyncio.create_task(helper.execute_session(session_id))
+    await asyncio.sleep(0)
+
+    tag = helper.get_session_snapshot(session_id)["tag"]
+    callback = helper.control_handler._response_callbacks[tag]
+    callback(
+        {
+            "tag": tag,
+            "node_type": 2,
+            "inbound_snr": 1.0,
+            "response_snr": 2.0,
+            "rssi": -70,
+            "pub_key": "aa" * 32,
+            "timestamp": 123.0,
+            "valid": True,
+        }
+    )
+
+    await execute_task
+
+    snapshot = helper.get_session_snapshot(session_id)
+    assert snapshot["status"] == "completed"
+    assert snapshot["count"] == 1
+
+    event_state = helper.get_events_since(session_id)
+    event_names = [event["event"] for event in event_state["events"]]
+    assert "started" in event_names
+    assert "discovery_result" in event_names
+    assert "completed" in event_names
+
+
+@pytest.mark.asyncio
+async def test_discovery_session_deduplicates_by_pubkey():
+    helper = DiscoveryHelper(
+        local_identity=FakeIdentity(0x42),
+        packet_injector=AsyncMock(return_value=True),
+        response_jitter_ms=0,
+    )
+    session = helper.create_session(timeout=1, filter_mask=0x04)
+    session_id = session["session_id"]
+
+    helper._record_response(
+        session_id,
+        {
+            "tag": session["tag"],
+            "node_type": 2,
+            "inbound_snr": 1.0,
+            "response_snr": 2.0,
+            "rssi": -70,
+            "pub_key": "bb" * 32,
+            "timestamp": 1.0,
+        },
+    )
+    helper._record_response(
+        session_id,
+        {
+            "tag": session["tag"],
+            "node_type": 2,
+            "inbound_snr": 1.5,
+            "response_snr": 2.5,
+            "rssi": -60,
+            "pub_key": "bb" * 32,
+            "timestamp": 2.0,
+        },
+    )
+
+    snapshot = helper.get_session_snapshot(session_id)
+    assert snapshot["count"] == 0  # session not running yet, responses ignored
+
+    helper._get_session(session_id)["status"] = "running"
+    helper._record_response(
+        session_id,
+        {
+            "tag": session["tag"],
+            "node_type": 2,
+            "inbound_snr": 1.0,
+            "response_snr": 2.0,
+            "rssi": -70,
+            "pub_key": "cc" * 32,
+            "timestamp": 1.0,
+        },
+    )
+    helper._record_response(
+        session_id,
+        {
+            "tag": session["tag"],
+            "node_type": 2,
+            "inbound_snr": 1.5,
+            "response_snr": 2.5,
+            "rssi": -60,
+            "pub_key": "cc" * 32,
+            "timestamp": 2.0,
+        },
+    )
+
+    snapshot = helper.get_session_snapshot(session_id)
+    assert snapshot["count"] == 1
+    latest_events = helper.get_events_since(session_id)["events"]
+    result_events = [event for event in latest_events if event["event"] == "discovery_result"]
+    assert result_events[-1]["data"]["is_update"] is True
 
 
 def test_discovery_send_response_without_injector_is_safe():

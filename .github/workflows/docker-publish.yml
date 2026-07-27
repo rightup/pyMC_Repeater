@@ -11,6 +11,10 @@ on:
         description: "Docker image repository to publish to"
         required: false
         default: ""
+      pymc_console_version:
+        description: "PyMC Console release to bundle (latest or a tag such as v0.9.333)"
+        required: false
+        default: "latest"
 
 jobs:
   docker:
@@ -67,6 +71,28 @@ jobs:
           echo "Using image repository: ${image_repository}"
           echo "image_repository=${image_repository}" >> "$GITHUB_OUTPUT"
 
+      - name: Resolve bundled Console release
+        id: console_release
+        shell: bash
+        env:
+          REQUESTED_CONSOLE_VERSION: ${{ inputs.pymc_console_version || 'latest' }}
+        run: |
+          set -euo pipefail
+
+          if [ "${REQUESTED_CONSOLE_VERSION}" = "latest" ]; then
+            release_json="$(curl -fsSL https://api.github.com/repos/Treehouse-00/pymc_console-dist/releases/latest)"
+            tag="$(jq -r '.tag_name' <<<"${release_json}")"
+            published_at="$(jq -r '.published_at' <<<"${release_json}")"
+            cache_bust="${tag}@${published_at}"
+          else
+            tag="${REQUESTED_CONSOLE_VERSION}"
+            cache_bust="${REQUESTED_CONSOLE_VERSION}"
+          fi
+
+          echo "Bundling PyMC Console ${tag}"
+          echo "version=${REQUESTED_CONSOLE_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "cache_bust=${cache_bust}" >> "$GITHUB_OUTPUT"
+
       - name: Extract Docker metadata
         id: meta
         uses: docker/metadata-action@v5
@@ -86,6 +112,8 @@ jobs:
           push: true
           build-args: |
             PACKAGE_VERSION=${{ steps.package_version.outputs.version }}
+            PYMC_CONSOLE_VERSION=${{ steps.console_release.outputs.version }}
+            PYMC_CONSOLE_CACHE_BUST=${{ steps.console_release.outputs.cache_bust }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha

@@ -6,8 +6,9 @@ import pytest
 
 from repeater.handler_helpers.room_server import (
     MAX_UNSYNCED_POSTS,
-    RoomServer,
     TXT_TYPE_PLAIN,
+    TXT_TYPE_SIGNED_PLAIN,
+    RoomServer,
 )
 
 
@@ -132,10 +133,6 @@ async def test_room_server_push_post_to_client_success_direct_route_sets_path_an
     packet = SimpleNamespace(path=bytearray(), path_len=0)
     with (
         patch(
-            "repeater.handler_helpers.room_server.PacketBuilder._pack_timestamp_data",
-            return_value=b"pk",
-        ),
-        patch(
             "repeater.handler_helpers.room_server.CryptoUtils.sha256",
             return_value=b"\x01\x02\x03\x04abcd",
         ),
@@ -149,11 +146,97 @@ async def test_room_server_push_post_to_client_success_direct_route_sets_path_an
     assert ok is True
     assert bytes(packet.path) == b"\xaa\xbb"
     assert packet.path_len == 2
-    injector.assert_awaited_once_with(packet, wait_for_ack=True)
+    injector.assert_awaited_once_with(
+        packet,
+        wait_for_ack=True,
+        expected_crc=67305985,
+        ack_timeout_s=10.0,
+    )
     rs._handle_ack_received.assert_awaited_once_with(
         client.id.get_public_key(), post["post_timestamp"]
     )
     rs.global_limiter.release.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_room_server_push_expected_ack_matches_firmware_signed_ack():
+    """The pending ACK CRC must match what a signed-plain receiver sends back.
+
+    Firmware clients (BaseChatMesh::onPeerDataRecv) and openhop_core's text
+    handler ack TXT_TYPE_SIGNED_PLAIN with
+    ``sha256(decrypted[0 : 9 + strlen(text)] || client_pubkey)[:4]``.
+    Regression test for the room server expecting a plain-DM style hash
+    (timestamp + attempt + text) instead: every push timed out and posts were
+    re-pushed forever (issue #286).
+    """
+    from openhop_core import LocalIdentity
+    from openhop_core.protocol import CryptoUtils, Identity
+
+    room_id = LocalIdentity()
+    client_id = LocalIdentity()
+    client_pk = client_id.get_public_key()
+    shared = Identity(client_pk).calc_shared_secret(room_id.get_private_key())
+
+    db = _FakeDB()
+    sent = []
+    injector_kwargs = []
+
+    async def injector(packet, wait_for_ack=False, **kwargs):
+        sent.append(packet)
+        injector_kwargs.append(kwargs)
+        return False  # no ACK: leaves the pending upsert as the only db write
+
+    rs = RoomServer(
+        room_hash=room_id.get_public_key()[0],
+        room_name="parity",
+        local_identity=room_id,
+        sqlite_handler=db,
+        packet_injector=injector,
+        acl=_FakeACL(),
+    )
+    rs.global_limiter = SimpleNamespace(acquire=AsyncMock(), release=MagicMock())
+
+    author = LocalIdentity().get_public_key()
+    client = _FakeClient(pubkey=client_pk, shared_secret=shared, out_path=b"\x01", out_path_len=1)
+    post = {
+        "author_pubkey": author.hex(),
+        "message_text": "parity check",
+        "post_timestamp": 1234.5,
+    }
+
+    ok = await rs.push_post_to_client(client, post)
+    assert ok is False
+    assert len(sent) == 1
+
+    upserts = [
+        c.kwargs for c in db.upsert_client_sync.call_args_list if "pending_ack_crc" in c.kwargs
+    ]
+    assert len(upserts) == 1
+    expected_ack_crc = upserts[0]["pending_ack_crc"]
+
+    # The injector must be told the crypto CRC (and the computed timeout) so
+    # dispatcher.wait_for_ack matches the client's actual ACK.
+    assert injector_kwargs[0]["expected_crc"] == expected_ack_crc
+    assert injector_kwargs[0]["ack_timeout_s"] > 0
+
+    # Decrypt the pushed datagram and verify the signed-plain layout.
+    pkt = sent[0]
+    encrypted = bytes(pkt.payload[2 : pkt.payload_len])
+    decrypted = CryptoUtils.mac_then_decrypt(shared[:16], shared, encrypted)
+    assert decrypted is not None
+    flags = decrypted[4]
+    assert (flags >> 2) & 0x3F == TXT_TYPE_SIGNED_PLAIN
+    assert bytes(decrypted[5:9]) == author[:4]
+    body = bytes(decrypted[9:])
+    nul = body.find(b"\x00")
+    text_len = nul if nul >= 0 else len(body)
+    assert body[:text_len] == b"parity check"
+
+    # Recompute the ACK exactly as the receiving client does.
+    client_ack_crc = int.from_bytes(
+        CryptoUtils.sha256(bytes(decrypted[: 9 + text_len]) + client_pk)[:4], "little"
+    )
+    assert client_ack_crc == expected_ack_crc
 
 
 @pytest.mark.asyncio

@@ -1,7 +1,8 @@
 import logging
 import os
+from typing import Any, Dict, List, Optional
+
 import yaml
-from typing import Optional, Dict, Any, List
 
 logger = logging.getLogger("ConfigManager")
 
@@ -145,6 +146,52 @@ class ConfigManager:
             logger.error(f"Failed to apply live radio config: {e}", exc_info=True)
             return False
 
+    @staticmethod
+    def _parse_bool(value: Any, default: bool = True) -> bool:
+        if value is None:
+            return default
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
+
+    def _apply_live_http_config(self) -> bool:
+        if not self.daemon:
+            logger.warning("Daemon not available for HTTP live update")
+            return False
+
+        http_server = getattr(self.daemon, "http_server", None)
+        if http_server is None:
+            # Early in daemon lifecycle, there is nothing to control yet.
+            logger.info("HTTP server not initialized yet; skipping live HTTP update")
+            return True
+
+        http_cfg = self.config.get("http", {}) if isinstance(self.config, dict) else {}
+        enabled = self._parse_bool(http_cfg.get("enabled", True), default=True)
+        host = str(http_cfg.get("host", "0.0.0.0") or "0.0.0.0")
+
+        try:
+            port = int(http_cfg.get("port", 8000))
+        except (TypeError, ValueError):
+            logger.warning("Invalid http.port=%r, falling back to 8000", http_cfg.get("port"))
+            port = 8000
+
+        # Keep runtime server settings aligned with config before start/restart.
+        http_server.host = host
+        http_server.port = port
+
+        from repeater.service_utils import start_http_server, stop_http_server
+
+        if enabled:
+            success, message = start_http_server(self.daemon)
+        else:
+            success, message = stop_http_server(self.daemon)
+
+        if success:
+            logger.info("Applied live HTTP config: %s", message)
+        else:
+            logger.warning("Failed live HTTP config apply: %s", message)
+        return success
+
     def save_to_file(self) -> bool:
         """
         Save current config to YAML file.
@@ -193,7 +240,7 @@ class ConfigManager:
 
             # Default sections to update if not specified
             if sections is None:
-                sections = ["repeater", "delays", "radio", "acl", "identities", "glass"]
+                sections = ["repeater", "delays", "radio", "acl", "identities", "glass", "http"]
 
             # Update each section
             for section in sections:
@@ -246,6 +293,9 @@ class ConfigManager:
 
             if "radio" in sections:
                 live_update_ok = self._apply_live_radio_config() and live_update_ok
+
+            if "http" in sections:
+                live_update_ok = self._apply_live_http_config() and live_update_ok
 
             return live_update_ok
 

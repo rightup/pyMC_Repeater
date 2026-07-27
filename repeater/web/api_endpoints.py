@@ -28,6 +28,7 @@ from repeater.companion.utils import (
 from repeater.config import resolve_storage_dir
 from repeater.policy_engine import PolicyEngine
 from repeater.service_utils import get_buildroot_image_info
+from repeater.utils_packet import create_scoped_advert_packet
 
 from .auth.middleware import require_auth
 from .auth_endpoints import AuthAPIEndpoints
@@ -122,6 +123,9 @@ POLICY_GROUP_KINDS = {
 # GET    /api/unscoped_flood_policy - Get unscoped flood policy
 # POST   /api/unscoped_flood_policy - Update unscoped flood policy
 # POST   /api/ping_neighbor - Ping a neighbor node
+# POST   /api/discover_neighbors_start - Start a live repeater discovery session
+# GET    /api/discover_neighbors_stream?session_id=X - Stream repeater discovery results over SSE
+# POST   /api/add_discovered_neighbor - Persist a discovered node into the neighbors/adverts table
 
 # Identity Management
 # GET    /api/identities - List all identities
@@ -303,6 +307,129 @@ class APIEndpoints:
         end_time = int(time.time())
         return end_time - (hours * 3600), end_time
 
+    def _encode_sse_event(
+        self, payload, event_name: Optional[str] = None, event_id: Optional[int] = None
+    ) -> str:
+        lines = []
+        if event_name:
+            lines.append(f"event: {event_name}")
+        if event_id is not None:
+            lines.append(f"id: {event_id}")
+        lines.append(f"data: {json.dumps(payload, default=str)}")
+        return "\n".join(lines) + "\n\n"
+
+    @staticmethod
+    def _normalize_discovery_node_name(value) -> Optional[str]:
+        """Normalize placeholder discovery names to None.
+
+        Some peers explicitly advertise "Unknown"-style placeholder names.
+        Treat those as missing so callers can fall back to hash/prefix labels.
+        """
+        text = str(value or "").strip()
+        if not text:
+            return None
+
+        normalized = text.lower()
+        if normalized in {"unknown", "unknown node"}:
+            return None
+
+        return text
+
+    def _enrich_discovery_result(self, result: dict) -> dict:
+        enriched = dict(result)
+        enriched["node_name"] = self._normalize_discovery_node_name(enriched.get("node_name"))
+        pub_key = str(enriched.get("pub_key") or "").lower()
+        if not pub_key:
+            return enriched
+
+        enriched["is_self"] = self._is_local_discovery_pubkey(pub_key)
+
+        try:
+            enriched["node_hash"] = self._fmt_hash(bytes.fromhex(pub_key))
+        except ValueError:
+            enriched["node_hash"] = None
+
+        try:
+            storage = self._get_storage()
+        except Exception:
+            storage = None
+
+        if not storage:
+            enriched["known_neighbor"] = False
+            return enriched
+
+        neighbor_info = {}
+        try:
+            if hasattr(storage, "get_neighbors"):
+                neighbor_info = storage.get_neighbors().get(pub_key, {}) or {}
+        except Exception as exc:
+            logger.debug("Discovery enrichment could not load neighbors: %s", exc)
+
+        if not neighbor_info:
+            try:
+                node_name = storage.get_node_name_by_pubkey(pub_key)
+            except Exception:
+                node_name = None
+            node_name = self._normalize_discovery_node_name(node_name)
+            enriched["known_neighbor"] = bool(node_name)
+            if node_name:
+                enriched["node_name"] = node_name
+            return enriched
+
+        enriched["known_neighbor"] = True
+        enriched["node_name"] = self._normalize_discovery_node_name(neighbor_info.get("node_name"))
+        enriched["contact_type"] = neighbor_info.get("contact_type")
+        enriched["zero_hop"] = neighbor_info.get("zero_hop")
+        enriched["last_seen"] = neighbor_info.get("last_seen")
+        enriched["advert_count"] = neighbor_info.get("advert_count")
+        return enriched
+
+    def _get_local_pubkey_hex(self) -> Optional[str]:
+        """Return local node public key in hex when available."""
+        daemon = getattr(self, "daemon_instance", None)
+        identity = getattr(daemon, "local_identity", None)
+
+        try:
+            if identity and hasattr(identity, "get_public_key"):
+                pubkey = identity.get_public_key()
+                if isinstance(pubkey, (bytes, bytearray)):
+                    return bytes(pubkey).hex().lower()
+                if isinstance(pubkey, str):
+                    normalized = pubkey.strip().lower()
+                    if normalized.startswith("0x"):
+                        normalized = normalized[2:]
+                    if normalized:
+                        return normalized
+        except Exception as exc:
+            logger.debug("Unable to read local identity pubkey: %s", exc)
+
+        repeater_cfg = self.config.get("repeater", {}) if isinstance(self.config, dict) else {}
+        key = repeater_cfg.get("identity_key")
+        if isinstance(key, (bytes, bytearray)):
+            return bytes(key).hex().lower()
+        if isinstance(key, str):
+            normalized = key.strip().lower()
+            if normalized.startswith("0x"):
+                normalized = normalized[2:]
+            if normalized and all(ch in "0123456789abcdef" for ch in normalized):
+                return normalized
+
+        return None
+
+    def _is_local_discovery_pubkey(self, pub_key: str) -> bool:
+        """Return True if discovery pub_key matches the local node key (including prefix form)."""
+        candidate = str(pub_key or "").strip().lower()
+        if not candidate:
+            return False
+        if candidate.startswith("0x"):
+            candidate = candidate[2:]
+
+        local_pubkey = self._get_local_pubkey_hex()
+        if not local_pubkey:
+            return False
+
+        return local_pubkey.startswith(candidate) or candidate.startswith(local_pubkey)
+
     def _process_counter_data(self, data_points, timestamps_ms):
         rates = []
         prev_value = None
@@ -319,6 +446,131 @@ class APIEndpoints:
     def _process_gauge_data(self, data_points, timestamps_ms):
         values = [v if v is not None else 0 for v in data_points]
         return [[timestamps_ms[i], values[i]] for i in range(min(len(values), len(timestamps_ms)))]
+
+    @staticmethod
+    def _pearson_correlation(left: list[float], right: list[float]) -> Optional[float]:
+        if len(left) != len(right) or len(left) < 5:
+            return None
+
+        mean_left = sum(left) / len(left)
+        mean_right = sum(right) / len(right)
+
+        numerator = 0.0
+        left_variance = 0.0
+        right_variance = 0.0
+        for i in range(len(left)):
+            dx = left[i] - mean_left
+            dy = right[i] - mean_right
+            numerator += dx * dy
+            left_variance += dx * dx
+            right_variance += dy * dy
+
+        denominator = (left_variance * right_variance) ** 0.5
+        if denominator <= 0:
+            return None
+        return numerator / denominator
+
+    @staticmethod
+    def _auto_bucket_seconds(range_seconds: int) -> int:
+        if range_seconds <= 0:
+            return 60
+        target = max(60, int(range_seconds / 120))
+        rounded = ((target + 59) // 60) * 60
+        return max(60, min(rounded, 3600))
+
+    def _build_rrd_bucket_metrics(self, rrd_data: Optional[dict], bucket_seconds: int) -> dict:
+        if not rrd_data:
+            return {}
+
+        timestamps = rrd_data.get("timestamps") or []
+        metrics = rrd_data.get("metrics") or {}
+        if not isinstance(timestamps, list) or not isinstance(metrics, dict):
+            return {}
+
+        def _counter_delta(values: list) -> list[float]:
+            output = []
+            previous = None
+            for item in values:
+                if item is None:
+                    output.append(0.0)
+                elif previous is None:
+                    output.append(0.0)
+                    previous = item
+                else:
+                    output.append(float(max(0, item - previous)))
+                    previous = item
+            return output
+
+        rx_values = _counter_delta(metrics.get("rx_count", []))
+        tx_values = _counter_delta(metrics.get("tx_count", []))
+        drop_values = _counter_delta(metrics.get("drop_count", []))
+        rssi_values = metrics.get("avg_rssi", []) or []
+        snr_values = metrics.get("avg_snr", []) or []
+
+        bucket_map: dict = {}
+
+        max_len = len(timestamps)
+        for i in range(max_len):
+            ts = int(timestamps[i])
+            bucket_ts = int(ts / bucket_seconds) * bucket_seconds
+            bucket = bucket_map.setdefault(
+                bucket_ts,
+                {
+                    "rx_count": 0.0,
+                    "tx_count": 0.0,
+                    "drop_count": 0.0,
+                    "avg_rssi_sum": 0.0,
+                    "avg_rssi_samples": 0,
+                    "avg_snr_sum": 0.0,
+                    "avg_snr_samples": 0,
+                },
+            )
+
+            if i < len(rx_values):
+                bucket["rx_count"] += float(rx_values[i] or 0.0)
+            if i < len(tx_values):
+                bucket["tx_count"] += float(tx_values[i] or 0.0)
+            if i < len(drop_values):
+                bucket["drop_count"] += float(drop_values[i] or 0.0)
+
+            if i < len(rssi_values) and rssi_values[i] is not None:
+                bucket["avg_rssi_sum"] += float(rssi_values[i])
+                bucket["avg_rssi_samples"] += 1
+
+            if i < len(snr_values) and snr_values[i] is not None:
+                bucket["avg_snr_sum"] += float(snr_values[i])
+                bucket["avg_snr_samples"] += 1
+
+        finalized: dict = {}
+        for bucket_ts, raw in bucket_map.items():
+            rx_count = float(raw["rx_count"])
+            tx_count = float(raw["tx_count"])
+            drop_count = float(raw["drop_count"])
+            tx_drop_total = tx_count + drop_count
+
+            avg_rssi = None
+            if raw["avg_rssi_samples"] > 0:
+                avg_rssi = raw["avg_rssi_sum"] / raw["avg_rssi_samples"]
+
+            avg_snr = None
+            if raw["avg_snr_samples"] > 0:
+                avg_snr = raw["avg_snr_sum"] / raw["avg_snr_samples"]
+
+            packet_loss_rate_pct = None
+            if tx_drop_total > 0:
+                packet_loss_rate_pct = (drop_count * 100.0) / tx_drop_total
+
+            finalized[bucket_ts] = {
+                "rx_count": int(round(rx_count)),
+                "tx_count": int(round(tx_count)),
+                "drop_count": int(round(drop_count)),
+                "traffic_volume": int(round(rx_count + tx_count)),
+                "packet_loss_rate_pct": packet_loss_rate_pct,
+                "avg_rssi": avg_rssi,
+                "avg_snr": avg_snr,
+            }
+
+        return finalized
 
     def _setup_status_from_config(self, config: dict) -> tuple[bool, dict]:
         """Return whether first-run setup should still be available."""
@@ -1929,15 +2181,35 @@ class APIEndpoints:
                 return self._error("No configuration updates provided")
 
             # Use ConfigManager to update and save configuration
-            # Web changes (CORS, web_path) don't require live update
+            # Persist web changes first, then apply to running HTTP server.
             result = self.config_manager.update_and_save(updates=updates, live_update=False)
 
             if result.get("success"):
+                live_applied = False
+                frontend_switched = False
+                app = (
+                    getattr(getattr(self.daemon_instance, "http_server", None), "app", None)
+                    if self.daemon_instance
+                    else None
+                )
+                if app and hasattr(app, "apply_web_config"):
+                    try:
+                        frontend_switched = bool(app.apply_web_config())
+                        live_applied = True
+                    except Exception as exc:
+                        logger.warning("Failed to apply web config live: %s", exc)
                 logger.info(f"Web configuration updated: {list(updates.keys())}")
                 return self._success(
                     {
                         "persisted": result.get("saved", False),
-                        "message": "Web configuration saved successfully. Restart required for changes to take effect.",
+                        "live_applied": live_applied,
+                        "frontend_switched": frontend_switched,
+                        "restart_required": not live_applied,
+                        "message": (
+                            "Web configuration applied immediately."
+                            if live_applied
+                            else "Web configuration saved. Restart required for changes to take effect."
+                        ),
                     }
                 )
             else:
@@ -2964,6 +3236,18 @@ class APIEndpoints:
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
+    def packet_by_id(self, packet_id=None):
+        try:
+            if packet_id is None:
+                return self._error("packet_id parameter required")
+            packet = self._get_storage().get_packet_by_id(int(packet_id))
+            return self._success(packet) if packet else self._error("Packet not found")
+        except Exception as e:
+            logger.error(f"Error getting packet by id: {e}")
+            return self._error(e)
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
     def rrd_data(self):
         try:
             params = self._get_params(
@@ -3131,6 +3415,171 @@ class APIEndpoints:
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
+    def lbt_diagnostics(
+        self,
+        hours=24,
+        start_timestamp=None,
+        end_timestamp=None,
+        bucket_seconds=None,
+        severe_attempt_threshold=4,
+    ):
+        """Return aggregated LBT diagnostics aligned to RF-health buckets."""
+        try:
+            max_hours = 168
+            hours_int = max(1, min(int(hours), max_hours))
+
+            now = time.time()
+            if start_timestamp is not None or end_timestamp is not None:
+                if start_timestamp is None and end_timestamp is not None:
+                    end_ts = float(end_timestamp)
+                    start_ts = end_ts - (hours_int * 3600)
+                elif end_timestamp is None and start_timestamp is not None:
+                    start_ts = float(start_timestamp)
+                    end_ts = now
+                else:
+                    start_ts = float(start_timestamp)
+                    end_ts = float(end_timestamp)
+            else:
+                start_ts, end_ts = self._get_time_range(hours_int)
+                start_ts = float(start_ts)
+                end_ts = float(end_ts)
+
+            if end_ts < start_ts:
+                start_ts, end_ts = end_ts, start_ts
+
+            range_seconds = int(end_ts - start_ts)
+            if range_seconds <= 0:
+                return self._error("Invalid time range")
+
+            if range_seconds > max_hours * 3600:
+                return self._error(f"Time range too large. Max range is {max_hours} hours")
+
+            if bucket_seconds is None:
+                bucket_s = self._auto_bucket_seconds(range_seconds)
+            else:
+                bucket_s = max(60, min(int(bucket_seconds), 3600))
+
+            severe_threshold = max(2, min(int(severe_attempt_threshold), 16))
+
+            storage = self._get_storage()
+            lbt = storage.get_lbt_diagnostics(
+                start_timestamp=start_ts,
+                end_timestamp=end_ts,
+                bucket_seconds=bucket_s,
+                severe_attempt_threshold=severe_threshold,
+            )
+
+            rrd_data = storage.get_rrd_data(
+                start_time=int(start_ts),
+                end_time=int(end_ts),
+                resolution="average",
+            )
+            rf_by_bucket = self._build_rrd_bucket_metrics(rrd_data, bucket_s)
+
+            merged_buckets = []
+            for bucket in lbt.get("buckets", []):
+                bucket_ts = int(bucket.get("timestamp", 0))
+                rf = rf_by_bucket.get(bucket_ts, {})
+                merged_buckets.append(
+                    {
+                        **bucket,
+                        "rf": {
+                            "avg_rssi": rf.get("avg_rssi"),
+                            "avg_snr": rf.get("avg_snr"),
+                            "packet_loss_rate_pct": rf.get("packet_loss_rate_pct"),
+                            "traffic_volume": rf.get("traffic_volume", 0),
+                            "rx_count": rf.get("rx_count", 0),
+                            "tx_count": rf.get("tx_count", 0),
+                            "drop_count": rf.get("drop_count", 0),
+                        },
+                    }
+                )
+
+            merged_packet_type_buckets = []
+            for bucket in lbt.get("packet_type_buckets", []):
+                bucket_ts = int(bucket.get("timestamp", 0))
+                rf = rf_by_bucket.get(bucket_ts, {})
+                merged_packet_type_buckets.append(
+                    {
+                        **bucket,
+                        "rf": {
+                            "avg_rssi": rf.get("avg_rssi"),
+                            "avg_snr": rf.get("avg_snr"),
+                            "packet_loss_rate_pct": rf.get("packet_loss_rate_pct"),
+                            "traffic_volume": rf.get("traffic_volume", 0),
+                            "rx_count": rf.get("rx_count", 0),
+                            "tx_count": rf.get("tx_count", 0),
+                            "drop_count": rf.get("drop_count", 0),
+                        },
+                    }
+                )
+
+            def _build_correlation(metric_getter):
+                left = []
+                right = []
+                for item in merged_buckets:
+                    retry_rate = item.get("retry_rate_pct")
+                    metric_value = metric_getter(item)
+                    if retry_rate is None or metric_value is None:
+                        continue
+                    left.append(float(retry_rate))
+                    right.append(float(metric_value))
+
+                coeff = self._pearson_correlation(left, right)
+                if coeff is None:
+                    return {
+                        "coefficient": None,
+                        "sample_count": len(left),
+                        "note": "Insufficient or non-varying samples",
+                    }
+                return {
+                    "coefficient": coeff,
+                    "sample_count": len(left),
+                    "note": None,
+                }
+
+            correlations = {
+                "retry_rate_vs_avg_snr": _build_correlation(
+                    lambda item: item.get("rf", {}).get("avg_snr")
+                ),
+                "retry_rate_vs_avg_rssi": _build_correlation(
+                    lambda item: item.get("rf", {}).get("avg_rssi")
+                ),
+                "retry_rate_vs_packet_loss_rate": _build_correlation(
+                    lambda item: item.get("rf", {}).get("packet_loss_rate_pct")
+                ),
+                "retry_rate_vs_traffic_volume": _build_correlation(
+                    lambda item: item.get("rf", {}).get("traffic_volume")
+                ),
+            }
+
+            diagnostics = {
+                "start_time": int(start_ts),
+                "end_time": int(end_ts),
+                "bucket_seconds": int(bucket_s),
+                "severe_attempt_threshold": severe_threshold,
+                "summary": lbt.get("summary", {}),
+                "buckets": merged_buckets,
+                "packet_types": lbt.get("packet_types", []),
+                "packet_type_buckets": merged_packet_type_buckets,
+                "correlations": correlations,
+                "limitations": [
+                    "LBT attempts are derived from stored per-packet retry counts (lbt_attempts + 1).",
+                    "Per-attempt RSSI/SNR and channel frequency are not recorded for each LBT attempt.",
+                    "Airtime utilisation is not available in the current RRD metric set for direct alignment.",
+                ],
+            }
+
+            return self._success(diagnostics)
+
+        except ValueError as e:
+            return self._error(f"Invalid parameter format: {e}")
+        except Exception as e:
+            logger.error(f"Error getting LBT diagnostics: {e}")
+            return self._error(e)
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
     @cherrypy.tools.json_in()
     def cad_calibration_start(self):
 
@@ -3139,6 +3588,28 @@ class APIEndpoints:
             data = cherrypy.request.json or {}
             samples = data.get("samples", 8)
             delay = data.get("delay", 100)
+            known_signal_present = data.get("known_signal_present", False)
+            radio = getattr(self.daemon_instance, "radio", None) if self.daemon_instance else None
+            default_cad_symbol_num = (
+                self.config.get("radio", {}).get("cad", {}).get("symbol_num", 2)
+            )
+            radio_symbol_num = getattr(radio, "_custom_cad_symbol_num", None) if radio else None
+            if radio_symbol_num in {1, 2, 4, 8, 16}:
+                default_cad_symbol_num = radio_symbol_num
+            try:
+                default_cad_symbol_num = int(default_cad_symbol_num)
+            except (TypeError, ValueError):
+                default_cad_symbol_num = 2
+            if default_cad_symbol_num not in {1, 2, 4, 8, 16}:
+                default_cad_symbol_num = 2
+
+            cad_symbol_num = data.get("cad_symbol_num", default_cad_symbol_num)
+            cad_timeout_ms = data.get("cad_timeout_ms", 500)
+            self.cad_calibration.session_config = {
+                "known_signal_present": known_signal_present,
+                "cad_symbol_num": cad_symbol_num,
+                "cad_timeout_ms": cad_timeout_ms,
+            }
             if self.cad_calibration.start_calibration(samples, delay):
                 return self._success("Calibration started")
             else:
@@ -3168,6 +3639,136 @@ class APIEndpoints:
     @cherrypy.expose
     @cherrypy.tools.json_out()
     @cherrypy.tools.json_in()
+    def cad_manual_check(self):
+
+        try:
+            import asyncio
+
+            self._require_post()
+            data = cherrypy.request.json or {}
+
+            radio = getattr(self.daemon_instance, "radio", None) if self.daemon_instance else None
+            if not radio or not hasattr(radio, "perform_cad"):
+                return self._error("Radio CAD support is not available")
+            if self.event_loop is None:
+                return self._error("Event loop not available")
+            default_cad_symbol_num = getattr(
+                radio, "_custom_cad_symbol_num", None
+            ) or self.config.get("radio", {}).get("cad", {}).get("symbol_num", 2)
+            try:
+                default_cad_symbol_num = int(default_cad_symbol_num)
+            except (TypeError, ValueError):
+                default_cad_symbol_num = 2
+            if default_cad_symbol_num not in {1, 2, 4, 8, 16}:
+                default_cad_symbol_num = 2
+
+            samples = self.cad_calibration._normalize_int(
+                data.get("samples", 1), default=1, minimum=1, maximum=32
+            )
+            det_peak = self.cad_calibration._normalize_int(
+                data.get("det_peak", getattr(radio, "_custom_cad_peak", 22) or 22),
+                default=22,
+                minimum=0,
+                maximum=255,
+            )
+            det_min = self.cad_calibration._normalize_int(
+                data.get("det_min", getattr(radio, "_custom_cad_min", 10) or 10),
+                default=10,
+                minimum=0,
+                maximum=255,
+            )
+            cad_symbol_num = self.cad_calibration._normalize_int(
+                data.get("cad_symbol_num", default_cad_symbol_num),
+                default=default_cad_symbol_num,
+                minimum=1,
+                maximum=16,
+            )
+            if cad_symbol_num not in {1, 2, 4, 8, 16}:
+                cad_symbol_num = default_cad_symbol_num
+            cad_timeout_ms = self.cad_calibration._normalize_int(
+                data.get("cad_timeout_ms", 500), default=500, minimum=50, maximum=5000
+            )
+            cad_timeout_seconds = cad_timeout_ms / 1000.0
+            apply_live = self.cad_calibration._normalize_bool(
+                data.get("apply_live", False), default=False
+            )
+
+            if apply_live and hasattr(radio, "set_custom_cad_thresholds"):
+                try:
+                    radio.set_custom_cad_thresholds(peak=det_peak, min_val=det_min)
+                except Exception as exc:
+                    logger.warning("Failed to live-apply CAD thresholds: %s", exc)
+
+            async def run_manual_checks():
+                detections = 0
+                non_detections = 0
+                timeouts = 0
+                errors = 0
+                cad_done_count = 0
+
+                for _ in range(samples):
+                    try:
+                        result = await radio.perform_cad(
+                            det_peak=det_peak,
+                            det_min=det_min,
+                            timeout=cad_timeout_seconds,
+                            calibration=True,
+                            cad_symbol_num=cad_symbol_num,
+                        )
+                    except Exception as exc:
+                        logger.debug("Manual CAD check exception: %s", exc, exc_info=True)
+                        errors += 1
+                        continue
+
+                    if not isinstance(result, dict):
+                        result = {"detected": bool(result), "cad_done": True}
+
+                    if result.get("error"):
+                        errors += 1
+                    elif result.get("timeout"):
+                        timeouts += 1
+                    else:
+                        if bool(result.get("cad_done", False)):
+                            cad_done_count += 1
+                        if bool(result.get("detected", False)):
+                            detections += 1
+                        else:
+                            non_detections += 1
+
+                attempts = detections + non_detections + timeouts + errors
+                return {
+                    "det_peak": det_peak,
+                    "det_min": det_min,
+                    "cad_symbol_num": cad_symbol_num,
+                    "cad_timeout_ms": cad_timeout_ms,
+                    "apply_live": apply_live,
+                    "samples": samples,
+                    "attempts": attempts,
+                    "detections": detections,
+                    "non_detections": non_detections,
+                    "timeouts": timeouts,
+                    "errors": errors,
+                    "cad_done_count": cad_done_count,
+                    "detection_rate": (detections / attempts) * 100 if attempts > 0 else 0.0,
+                    "detected": detections > 0,
+                }
+
+            future = asyncio.run_coroutine_threadsafe(run_manual_checks(), self.event_loop)
+            timeout_seconds = max(2.0, (cad_timeout_seconds * samples) + 2.0)
+            payload = future.result(timeout=timeout_seconds)
+            return self._success(payload)
+        except FutureTimeoutError:
+            logger.error("Manual CAD check timed out")
+            return self._error("Manual CAD check timed out")
+        except cherrypy.HTTPError:
+            raise
+        except Exception as e:
+            logger.error(f"Error running manual CAD check: {e}", exc_info=True)
+            return self._error(e)
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    @cherrypy.tools.json_in()
     def save_cad_settings(self):
 
         try:
@@ -3175,10 +3776,29 @@ class APIEndpoints:
             data = cherrypy.request.json or {}
             peak = data.get("peak")
             min_val = data.get("min_val")
+            cad_symbol_num = data.get("cad_symbol_num")
             detection_rate = data.get("detection_rate", 0)
 
             if peak is None or min_val is None:
                 return self._error("Missing peak or min_val parameters")
+
+            try:
+                peak = int(peak)
+                min_val = int(min_val)
+            except (TypeError, ValueError):
+                return self._error("peak and min_val must be integers")
+
+            if cad_symbol_num is None:
+                cad_symbol_num = self.config.get("radio", {}).get("cad", {}).get("symbol_num", 2)
+            try:
+                cad_symbol_num = int(cad_symbol_num)
+            except (TypeError, ValueError):
+                return self._error("cad_symbol_num must be an integer")
+
+            if not (0 <= peak <= 255) or not (0 <= min_val <= 255):
+                return self._error("CAD thresholds must be between 0 and 255")
+            if cad_symbol_num not in {1, 2, 4, 8, 16}:
+                return self._error("cad_symbol_num must be one of: 1, 2, 4, 8, 16")
 
             if (
                 self.daemon_instance
@@ -3187,7 +3807,14 @@ class APIEndpoints:
             ):
                 if hasattr(self.daemon_instance.radio, "set_custom_cad_thresholds"):
                     self.daemon_instance.radio.set_custom_cad_thresholds(peak=peak, min_val=min_val)
-                    logger.info(f"Applied CAD settings to radio: peak={peak}, min={min_val}")
+                if hasattr(self.daemon_instance.radio, "set_custom_cad_symbol_num"):
+                    self.daemon_instance.radio.set_custom_cad_symbol_num(cad_symbol_num)
+                logger.info(
+                    "Applied CAD settings to radio: peak=%s, min=%s, symbols=%s",
+                    peak,
+                    min_val,
+                    cad_symbol_num,
+                )
 
             if "radio" not in self.config:
                 self.config["radio"] = {}
@@ -3196,18 +3823,30 @@ class APIEndpoints:
 
             self.config["radio"]["cad"]["peak_threshold"] = peak
             self.config["radio"]["cad"]["min_threshold"] = min_val
+            self.config["radio"]["cad"]["symbol_num"] = cad_symbol_num
 
             saved = self.config_manager.save_to_file()
             if not saved:
                 return self._error("Failed to save configuration to file")
 
             logger.info(
-                f"Saved CAD settings to config: peak={peak}, min={min_val}, rate={detection_rate:.1f}%"
+                "Saved CAD settings to config: peak=%s, min=%s, symbols=%s, rate=%.1f%%",
+                peak,
+                min_val,
+                cad_symbol_num,
+                detection_rate,
             )
             return {
                 "success": True,
-                "message": f"CAD settings saved: peak={peak}, min={min_val}",
-                "settings": {"peak": peak, "min_val": min_val, "detection_rate": detection_rate},
+                "message": (
+                    f"CAD settings saved: peak={peak}, min={min_val}, symbols={cad_symbol_num}"
+                ),
+                "settings": {
+                    "peak": peak,
+                    "min_val": min_val,
+                    "cad_symbol_num": cad_symbol_num,
+                    "detection_rate": detection_rate,
+                },
             }
         except cherrypy.HTTPError:
             # Re-raise HTTP errors (like 405 Method Not Allowed) without logging
@@ -3233,10 +3872,11 @@ class APIEndpoints:
             "direct_tx_delay_factor": 0.5,  # Direct TX delay (0.0-5.0)
             "rx_delay_base": 0.0,        # RX delay base (>= 0)
             "node_name": "MyNode",       # Node name
+            "owner_info": "Owner text",   # Owner info text
             "latitude": 0.0,             # Latitude (-90 to 90)
             "longitude": 0.0,            # Longitude (-180 to 180)
             "max_flood_hops": 64,         # Max flood hops (0-64)
-            "flood_advert_interval_hours": 10,  # Flood advert interval (0 or 3-48)
+            "flood_advert_interval_hours": 10,  # Flood advert interval (0 or 3-168)
             "advert_interval_minutes": 120      # Local advert interval (0 or 1-10080)
         }
 
@@ -3344,6 +3984,11 @@ class APIEndpoints:
                 self.config["repeater"]["node_name"] = name
                 applied.append(f"name={name}")
 
+            if "owner_info" in data:
+                owner_info = str(data["owner_info"]).replace("|", "\n")
+                self.config["repeater"]["owner_info"] = owner_info
+                applied.append("owner.info")
+
             # Update latitude
             if "latitude" in data:
                 lat = float(data["latitude"])
@@ -3371,8 +4016,8 @@ class APIEndpoints:
             # Update flood advert interval (hours)
             if "flood_advert_interval_hours" in data:
                 hours = int(data["flood_advert_interval_hours"])
-                if hours != 0 and (hours < 3 or hours > 48):
-                    return self._error("Flood advert interval must be 0 (off) or 3-48 hours")
+                if hours != 0 and (hours < 3 or hours > 168):
+                    return self._error("Flood advert interval must be 0 (off) or 3-168 hours")
                 self.config["repeater"]["send_advert_interval_hours"] = hours
                 applied.append(f"flood.advert.interval={hours}h")
 
@@ -3541,12 +4186,26 @@ class APIEndpoints:
                 yield f"data: {json.dumps({'type': 'connected', 'message': 'Connected to CAD calibration stream'})}\n\n"
 
                 if self.cad_calibration.running:
-                    config = getattr(self.cad_calibration.daemon_instance, "config", {})
-                    radio_config = config.get("radio", {})
-                    sf = radio_config.get("spreading_factor", 8)
-
-                    peak_range, min_range = self.cad_calibration.get_test_ranges(sf)
+                    radio = getattr(self.cad_calibration.daemon_instance, "radio", None)
+                    if radio:
+                        runtime = self.cad_calibration._get_radio_runtime_config(radio)
+                        sf = runtime.get("spreading_factor", 8)
+                        peak_range, min_range = self.cad_calibration.get_test_ranges(
+                            sf,
+                            runtime.get("current_cad_peak"),
+                            runtime.get("current_cad_min"),
+                        )
+                    else:
+                        sf = 8
+                        runtime = {
+                            "bandwidth": None,
+                            "frequency": None,
+                            "current_cad_peak": None,
+                            "current_cad_min": None,
+                        }
+                        peak_range, min_range = self.cad_calibration.get_test_ranges(sf, 22, 10)
                     total_tests = len(peak_range) * len(min_range)
+                    session_cfg = getattr(self.cad_calibration, "session_config", {}) or {}
 
                     status_message = {
                         "type": "status",
@@ -3557,6 +4216,14 @@ class APIEndpoints:
                             "min_min": min(min_range),
                             "min_max": max(min_range),
                             "spreading_factor": sf,
+                            "bandwidth": runtime.get("bandwidth"),
+                            "frequency": runtime.get("frequency"),
+                            "current_peak": runtime.get("current_cad_peak"),
+                            "current_min": runtime.get("current_cad_min"),
+                            "cad_symbol_num": session_cfg.get("cad_symbol_num", 2),
+                            "known_signal_present": bool(
+                                session_cfg.get("known_signal_present", False)
+                            ),
                             "total_tests": total_tests,
                         },
                     }
@@ -3863,6 +4530,90 @@ class APIEndpoints:
     @cherrypy.expose
     @cherrypy.tools.json_out()
     @cherrypy.tools.json_in()
+    def default_region(self):
+        """
+        Get or update mesh default region configuration.
+
+        GET  /default_region
+        POST /default_region
+        Body: {"default_region": "region-name" | null}
+        """
+        if cherrypy.request.method == "GET":
+            try:
+                mesh_cfg = self.config.get("mesh", {}) if isinstance(self.config, dict) else {}
+                default_region = mesh_cfg.get("default_region")
+                value = str(default_region).strip() if default_region not in (None, "") else None
+                return self._success({"default_region": value})
+            except Exception as e:
+                logger.error(f"Error getting default region: {e}")
+                return self._error(e)
+
+        if cherrypy.request.method == "POST":
+            try:
+                data = cherrypy.request.json or {}
+                if "default_region" not in data:
+                    return self._error("Missing required field: default_region")
+
+                raw_value = data.get("default_region")
+                default_region = None
+                if raw_value is not None:
+                    text = str(raw_value).strip()
+                    if text and text != "<null>":
+                        default_region = text
+
+                if "mesh" not in self.config:
+                    self.config["mesh"] = {}
+
+                # Keep region table compatible with firmware "region default": if non-null
+                # and missing, auto-create region and ensure flood allow.
+                if default_region:
+                    storage = self._get_storage()
+                    records = storage.get_transport_keys() or []
+
+                    existing = None
+                    needle = default_region.lower()
+                    for rec in records:
+                        name = str(rec.get("name") or "").strip()
+                        display = name[1:] if name.startswith("#") else name
+                        if display.lower() == needle:
+                            existing = rec
+                            break
+
+                    if existing:
+                        key_id = existing.get("id")
+                        if key_id is not None:
+                            storage.update_transport_key(int(key_id), flood_policy="allow")
+                    else:
+                        storage.create_transport_key(
+                            default_region, "allow", None, None, time.time()
+                        )
+
+                self.config["mesh"]["default_region"] = default_region
+
+                saved = self.config_manager.save_to_file()
+                if not saved:
+                    return self._error("Failed to save configuration to file")
+
+                if hasattr(self.config_manager, "live_update_daemon"):
+                    self.config_manager.live_update_daemon(["mesh"])
+
+                return self._success(
+                    {"default_region": default_region},
+                    message=(
+                        "Default region cleared"
+                        if default_region is None
+                        else f"Default region set to {default_region}"
+                    ),
+                )
+            except Exception as e:
+                logger.error(f"Error updating default region: {e}")
+                return self._error(e)
+
+        return self._error("Method not supported")
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    @cherrypy.tools.json_in()
     def advert(self, advert_id):
         # Enable CORS for this endpoint only if configured
         self._set_cors_headers()
@@ -4030,6 +4781,235 @@ class APIEndpoints:
             raise
         except Exception as e:
             logger.error(f"Error pinging neighbor: {e}", exc_info=True)
+            return self._error(str(e))
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    @cherrypy.tools.json_in()
+    def discover_neighbors_start(self):
+
+        self._set_cors_headers()
+
+        if cherrypy.request.method == "OPTIONS":
+            return ""
+
+        try:
+            self._require_post()
+            data = cherrypy.request.json or {}
+            timeout = float(data.get("timeout", 5))
+            filter_mask = int(data.get("filter_mask", 1 << 2))
+            since = int(data.get("since", 0))
+            prefix_only = bool(data.get("prefix_only", False))
+
+            if timeout < 1 or timeout > 60:
+                return self._error("timeout must be between 1 and 60 seconds")
+            if filter_mask < 0 or filter_mask > 0xFF:
+                return self._error("filter_mask must be between 0x00 and 0xFF")
+            if since < 0:
+                return self._error("since must be non-negative")
+
+            if self.event_loop is None:
+                return self._error("Event loop not available")
+
+            discovery_helper = getattr(self.daemon_instance, "discovery_helper", None)
+            if not discovery_helper:
+                return self._error("Discovery helper not available")
+
+            discovery_helper.cleanup_sessions()
+            session = discovery_helper.create_session(
+                timeout=timeout,
+                filter_mask=filter_mask,
+                since=since,
+                prefix_only=prefix_only,
+                result_enricher=self._enrich_discovery_result,
+            )
+
+            self.event_loop.call_soon_threadsafe(
+                discovery_helper.start_session_task, session["session_id"]
+            )
+
+            return self._success(
+                session,
+                message="Discovery session started",
+            )
+        except cherrypy.HTTPError:
+            raise
+        except Exception as e:
+            logger.error("Error starting discovery session: %s", e, exc_info=True)
+            return self._error(str(e))
+
+    @cherrypy.expose
+    def discover_neighbors_stream(self, session_id=None, last_event_id: Optional[str] = None):
+        self._set_cors_headers()
+        cherrypy.response.headers["Content-Type"] = "text/event-stream"
+        cherrypy.response.headers["Cache-Control"] = "no-cache"
+        cherrypy.response.headers["Connection"] = "keep-alive"
+        cherrypy.response.headers["X-Accel-Buffering"] = "no"
+
+        discovery_helper = getattr(self.daemon_instance, "discovery_helper", None)
+
+        try:
+            cursor = int(last_event_id) if last_event_id is not None else 0
+        except (TypeError, ValueError):
+            cursor = 0
+
+        def generate():
+            if not session_id:
+                yield self._encode_sse_event(
+                    {"type": "error", "error": "Missing session_id"},
+                    event_name="error",
+                )
+                return
+
+            if not discovery_helper:
+                yield self._encode_sse_event(
+                    {"type": "error", "error": "Discovery helper not available"},
+                    event_name="error",
+                )
+                return
+
+            snapshot = discovery_helper.get_session_snapshot(session_id)
+            if not snapshot:
+                yield self._encode_sse_event(
+                    {"type": "error", "error": f"Unknown discovery session: {session_id}"},
+                    event_name="error",
+                )
+                return
+
+            yield self._encode_sse_event(
+                {
+                    "type": "connected",
+                    "session": snapshot,
+                },
+                event_name="connected",
+            )
+
+            current_cursor = cursor
+            try:
+                while True:
+                    event_state = discovery_helper.get_events_since(session_id, current_cursor)
+                    if event_state is None:
+                        yield self._encode_sse_event(
+                            {
+                                "type": "error",
+                                "error": f"Unknown discovery session: {session_id}",
+                            },
+                            event_name="error",
+                        )
+                        return
+
+                    events = event_state.get("events", [])
+                    if events:
+                        for event in events:
+                            current_cursor = max(current_cursor, int(event.get("id", 0)))
+                            yield self._encode_sse_event(
+                                event.get("data", {}),
+                                event_name=event.get("event"),
+                                event_id=event.get("id"),
+                            )
+                        if event_state.get("completed"):
+                            return
+                    else:
+                        if event_state.get("completed"):
+                            return
+                        yield self._encode_sse_event(
+                            {"type": "keepalive", "session_id": session_id},
+                            event_name="keepalive",
+                            event_id=current_cursor if current_cursor > 0 else None,
+                        )
+
+                    time.sleep(0.5)
+            except GeneratorExit:
+                logger.debug("Discovery SSE stream closed by client for session %s", session_id)
+            except Exception as exc:
+                logger.error("Discovery SSE stream error: %s", exc, exc_info=True)
+                yield self._encode_sse_event(
+                    {"type": "error", "error": str(exc), "session_id": session_id},
+                    event_name="error",
+                    event_id=current_cursor if current_cursor > 0 else None,
+                )
+
+        return generate()
+
+    discover_neighbors_stream._cp_config = {"response.stream": True}
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    @cherrypy.tools.json_in()
+    @require_auth
+    def add_discovered_neighbor(self):
+
+        self._set_cors_headers()
+
+        if cherrypy.request.method == "OPTIONS":
+            return ""
+
+        try:
+            self._require_post()
+            data = cherrypy.request.json or {}
+            pub_key = str(data.get("pub_key") or "").strip().lower()
+            node_name = self._normalize_discovery_node_name(data.get("node_name"))
+            node_type = int(data.get("node_type", 0))
+            rssi = data.get("rssi")
+            snr = data.get("response_snr", data.get("snr"))
+
+            if not pub_key:
+                return self._error("pub_key is required")
+            if not re.fullmatch(r"[0-9a-f]{16}|[0-9a-f]{64}", pub_key):
+                return self._error("pub_key must be 8-byte or 32-byte hex")
+
+            if self._is_local_discovery_pubkey(pub_key):
+                enriched = self._enrich_discovery_result(
+                    {
+                        "pub_key": pub_key,
+                        "node_name": node_name,
+                        "node_type": node_type,
+                        "rssi": rssi,
+                        "response_snr": snr,
+                    }
+                )
+                enriched["is_self"] = True
+                return self._success(enriched, message="Skipped local node: not added to neighbors")
+
+            contact_type = {
+                1: "Chat Node",
+                2: "Repeater",
+                3: "Room Server",
+            }.get(node_type, "Unknown")
+
+            advert_record = {
+                "timestamp": time.time(),
+                "pubkey": pub_key,
+                "node_name": node_name,
+                "is_repeater": node_type == 2,
+                "route_type": 2,
+                "contact_type": contact_type,
+                "latitude": None,
+                "longitude": None,
+                "rssi": int(rssi) if rssi is not None else None,
+                "snr": float(snr) if snr is not None else None,
+                "is_new_neighbor": True,
+                "zero_hop": True,
+            }
+
+            storage = self._get_storage()
+            storage.record_advert(advert_record)
+
+            enriched = self._enrich_discovery_result(
+                {
+                    "pub_key": pub_key,
+                    "node_name": node_name,
+                    "node_type": node_type,
+                    "node_type_name": contact_type,
+                    "rssi": advert_record["rssi"],
+                    "response_snr": advert_record["snr"],
+                }
+            )
+            return self._success(enriched, message="Neighbor added to adverts database")
+        except cherrypy.HTTPError:
+            raise
+        except Exception as e:
+            logger.error("Error adding discovered neighbor: %s", e, exc_info=True)
             return self._error(str(e))
 
     # ========== Identity Management Endpoints ==========
@@ -4256,9 +5236,11 @@ class APIEndpoints:
             key_was_generated = False
             if not identity_key:
                 try:
-                    # Generate a new random 32-byte key (same method as config.py)
-                    random_key = os.urandom(32)
-                    identity_key = random_key.hex()
+                    # Use MeshCore-compatible keygen and store 32-byte private scalar hex.
+                    from repeater.keygen import generate_meshcore_keypair
+
+                    _, private_key = generate_meshcore_keypair()
+                    identity_key = private_key[:32].hex()
                     key_was_generated = True
                     logger.info(f"Auto-generated identity key for '{name}': {identity_key[:16]}...")
                 except Exception as gen_error:
@@ -4971,7 +5953,6 @@ class APIEndpoints:
     ):
         """Send advert for a room server identity"""
         try:
-            from openhop_core.protocol import PacketBuilder
             from openhop_core.protocol.constants import (
                 ADVERT_FLAG_HAS_NAME,
                 ADVERT_FLAG_IS_ROOM_SERVER,
@@ -4984,15 +5965,16 @@ class APIEndpoints:
             # Build flags - just use HAS_NAME for room servers
             flags = ADVERT_FLAG_IS_ROOM_SERVER | ADVERT_FLAG_HAS_NAME
 
-            packet = PacketBuilder.create_advert(
+            mesh_config = self.config.get("mesh", {}) if isinstance(self.config, dict) else {}
+            default_region = mesh_config.get("default_region")
+            packet, scoped_region_name = create_scoped_advert_packet(
                 local_identity=identity,
-                name=node_name,
-                lat=latitude,
-                lon=longitude,
-                feature1=0,
-                feature2=0,
+                node_name=node_name,
+                latitude=latitude,
+                longitude=longitude,
                 flags=flags,
-                route_type="flood",
+                default_region=default_region,
+                scope_label="room server advert",
             )
 
             # Send via dispatcher
@@ -5006,6 +5988,8 @@ class APIEndpoints:
             logger.info(
                 f"Sent flood advert for room server '{node_name}' at ({latitude:.6f}, {longitude:.6f})"
             )
+            if scoped_region_name:
+                logger.info("Room server advert scoped to default region '%s'", scoped_region_name)
             return True
 
         except Exception as e:
@@ -6207,6 +7191,33 @@ class APIEndpoints:
             return ""
         try:
             self._require_post()
+
+            # Allow unauthenticated config restore only during first-run setup.
+            # Authenticated users may import config at any time.
+            request_user = getattr(cherrypy.request, "user", None)
+            if not request_user:
+                try:
+                    current_config = self.config
+                    if self._config_path:
+                        with open(self._config_path, "r", encoding="utf-8") as f:
+                            current_config = yaml.safe_load(f) or {}
+                except Exception as exc:
+                    logger.debug(
+                        f"config_import could not read persisted config {self._config_path}: {exc}"
+                    )
+                    current_config = self.config
+
+                needs_setup, _ = self._setup_status_from_config(current_config or {})
+                if not needs_setup:
+                    cherrypy.response.status = 403
+                    return {
+                        "success": False,
+                        "error": (
+                            "Unauthorized restore. First-run setup is already complete; "
+                            "authenticate to import configuration."
+                        ),
+                    }
+
             data = cherrypy.request.json
             imported_config = data.get("config")
 
@@ -6223,6 +7234,8 @@ class APIEndpoints:
                 "kiss",
                 "pymc_usb",
                 "pymc_tcp",
+                "mqtt_brokers",
+                "mqtt",
                 "identities",
                 "delays",
                 "web",
@@ -6271,6 +7284,11 @@ class APIEndpoints:
                                 existing = cur_by_name.get(entry.get("name"), {})
                                 entry["identity_key"] = existing.get("identity_key", "")
 
+                if section == "mqtt" and isinstance(value, dict):
+                    # Backward compatibility: treat legacy "mqtt" section as
+                    # current "mqtt_brokers" during restore.
+                    section = "mqtt_brokers"
+
                 if section in {
                     "radio",
                     "sx1262",
@@ -6279,6 +7297,8 @@ class APIEndpoints:
                     "pymc_usb",
                     "pymc_tcp",
                     "radio_type",
+                    "mqtt_brokers",
+                    "letsmesh",
                 }:
                     restart_required = True
 

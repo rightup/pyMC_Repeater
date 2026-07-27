@@ -1,7 +1,8 @@
+import asyncio
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock, mock_open, patch
-from concurrent.futures import TimeoutError as FutureTimeoutError
+from unittest.mock import AsyncMock, MagicMock, mock_open, patch
 
 import cherrypy
 import pytest
@@ -23,6 +24,61 @@ def _make_api(config=None):
 
 def _attach_storage(api, storage):
     api.daemon_instance = SimpleNamespace(repeater_handler=SimpleNamespace(storage=storage))
+
+
+class _FakeDiscoveryHelper:
+    def __init__(self):
+        self.cleanup_called = False
+        self.started_sessions = []
+        self._session = {
+            "session_id": "sess-1",
+            "tag": 123,
+            "status": "created",
+            "timeout": 5.0,
+            "filter_mask": 0x04,
+            "since": 0,
+            "prefix_only": False,
+            "created_at": 1.0,
+            "started_at": None,
+            "completed_at": None,
+            "count": 0,
+            "error": None,
+        }
+        self._events = [
+            {"id": 1, "event": "started", "data": {"session_id": "sess-1"}},
+            {
+                "id": 2,
+                "event": "discovery_result",
+                "data": {"session_id": "sess-1", "result": {"pub_key": "aa" * 32}},
+            },
+            {"id": 3, "event": "completed", "data": {"session_id": "sess-1", "count": 1}},
+        ]
+
+    def cleanup_sessions(self):
+        self.cleanup_called = True
+
+    def create_session(self, **kwargs):
+        self._session.update(
+            {
+                "timeout": kwargs["timeout"],
+                "filter_mask": kwargs["filter_mask"],
+                "since": kwargs["since"],
+                "prefix_only": kwargs["prefix_only"],
+            }
+        )
+        return dict(self._session)
+
+    def start_session_task(self, session_id):
+        self.started_sessions.append(session_id)
+
+    def get_session_snapshot(self, session_id):
+        return dict(self._session) if session_id == self._session["session_id"] else None
+
+    def get_events_since(self, session_id, last_event_id=0):
+        if session_id != self._session["session_id"]:
+            return None
+        events = [event for event in self._events if event["id"] > last_event_id]
+        return {"events": events, "completed": True, "status": "completed", "latest_event_id": 3}
 
 
 @pytest.fixture
@@ -146,6 +202,171 @@ def test_success_and_error_helpers():
 
     assert ok == {"success": True, "data": [1, 2], "source": "unit"}
     assert err == {"success": False, "error": "boom"}
+
+
+def test_discover_neighbors_start_schedules_session(cherrypy_ctx):
+    request, _ = cherrypy_ctx
+    request.method = "POST"
+    request.json = {"timeout": 7, "filter_mask": 0x04, "since": 0, "prefix_only": False}
+
+    helper = _FakeDiscoveryHelper()
+    loop = MagicMock()
+    api = _make_api()
+    api.event_loop = loop
+    api.daemon_instance = SimpleNamespace(discovery_helper=helper)
+
+    result = api.discover_neighbors_start()
+
+    assert result["success"] is True
+    assert result["data"]["session_id"] == "sess-1"
+    assert helper.cleanup_called is True
+    loop.call_soon_threadsafe.assert_called_once()
+
+
+def test_discover_neighbors_stream_yields_session_events(cherrypy_ctx):
+    request, response = cherrypy_ctx
+    request.method = "GET"
+
+    helper = _FakeDiscoveryHelper()
+    api = _make_api()
+    api.daemon_instance = SimpleNamespace(discovery_helper=helper)
+
+    stream = api.discover_neighbors_stream(session_id="sess-1")
+    payload = "".join(list(stream))
+
+    assert response.headers["Content-Type"] == "text/event-stream"
+    assert "event: connected" in payload
+    assert "event: started" in payload
+    assert "event: discovery_result" in payload
+    assert "event: completed" in payload
+
+
+def test_add_discovered_neighbor_records_zero_hop_advert(cherrypy_ctx, monkeypatch):
+    request, _ = cherrypy_ctx
+    request.method = "POST"
+    request.headers = {"Authorization": "Bearer test-token"}
+    request.path_info = "/api/add_discovered_neighbor"
+    request.json = {
+        "pub_key": "aa" * 32,
+        "node_name": "Field Repeater",
+        "node_type": 2,
+        "rssi": -71,
+        "response_snr": 4.5,
+    }
+
+    jwt_handler = MagicMock()
+    jwt_handler.verify_jwt.return_value = {"sub": "tester", "client_id": "ui"}
+    token_manager = MagicMock()
+    monkeypatch.setattr(
+        cherrypy,
+        "config",
+        {"jwt_handler": jwt_handler, "token_manager": token_manager},
+        raising=False,
+    )
+
+    storage = MagicMock()
+    api = _make_api()
+    api._enrich_discovery_result = lambda result: {**result, "known_neighbor": True}
+    _attach_storage(api, storage)
+
+    result = api.add_discovered_neighbor()
+
+    assert result["success"] is True
+    storage.record_advert.assert_called_once()
+    advert_record = storage.record_advert.call_args.args[0]
+    assert advert_record["route_type"] == 2
+    assert advert_record["zero_hop"] is True
+    assert advert_record["contact_type"] == "Repeater"
+
+
+def test_add_discovered_neighbor_normalizes_unknown_name(cherrypy_ctx, monkeypatch):
+    request, _ = cherrypy_ctx
+    request.method = "POST"
+    request.headers = {"Authorization": "Bearer test-token"}
+    request.path_info = "/api/add_discovered_neighbor"
+    request.json = {
+        "pub_key": "bb" * 32,
+        "node_name": "Unknown Node",
+        "node_type": 2,
+    }
+
+    jwt_handler = MagicMock()
+    jwt_handler.verify_jwt.return_value = {"sub": "tester", "client_id": "ui"}
+    token_manager = MagicMock()
+    monkeypatch.setattr(
+        cherrypy,
+        "config",
+        {"jwt_handler": jwt_handler, "token_manager": token_manager},
+        raising=False,
+    )
+
+    storage = MagicMock()
+    api = _make_api()
+    api._enrich_discovery_result = lambda result: result
+    _attach_storage(api, storage)
+
+    result = api.add_discovered_neighbor()
+
+    assert result["success"] is True
+    advert_record = storage.record_advert.call_args.args[0]
+    assert advert_record["node_name"] is None
+
+
+def test_add_discovered_neighbor_skips_local_node(cherrypy_ctx, monkeypatch):
+    request, _ = cherrypy_ctx
+    request.method = "POST"
+    request.headers = {"Authorization": "Bearer test-token"}
+    request.path_info = "/api/add_discovered_neighbor"
+    request.json = {
+        "pub_key": "aa" * 32,
+        "node_name": "Self",
+        "node_type": 2,
+    }
+
+    jwt_handler = MagicMock()
+    jwt_handler.verify_jwt.return_value = {"sub": "tester", "client_id": "ui"}
+    token_manager = MagicMock()
+    monkeypatch.setattr(
+        cherrypy,
+        "config",
+        {"jwt_handler": jwt_handler, "token_manager": token_manager},
+        raising=False,
+    )
+
+    storage = MagicMock()
+    api = _make_api()
+    api._enrich_discovery_result = APIEndpoints._enrich_discovery_result.__get__(api, APIEndpoints)
+    _attach_storage(api, storage)
+    api.daemon_instance.local_identity = SimpleNamespace(
+        get_public_key=lambda: bytes.fromhex("aa" * 32)
+    )
+
+    result = api.add_discovered_neighbor()
+
+    assert result["success"] is True
+    assert "Skipped local node" in result["message"]
+    assert result["data"]["is_self"] is True
+    storage.record_advert.assert_not_called()
+
+
+def test_enrich_discovery_result_treats_placeholder_name_as_unknown():
+    api = _make_api()
+
+    storage = MagicMock()
+    storage.get_neighbors.return_value = {}
+    storage.get_node_name_by_pubkey.return_value = "Unknown"
+    _attach_storage(api, storage)
+
+    result = api._enrich_discovery_result(
+        {
+            "pub_key": "cc" * 32,
+            "node_name": "Unknown Node",
+            "node_type": 2,
+        }
+    )
+
+    assert result["known_neighbor"] is False
+    assert result["node_name"] is None
 
 
 def test_get_time_range_uses_current_time(monkeypatch):
@@ -1290,6 +1511,41 @@ def test_send_advert_paths(cherrypy_ctx):
     future_timeout.cancel.assert_called_once()
 
 
+def test_room_server_advert_applies_default_region_scope():
+    from openhop_core.protocol.constants import ROUTE_TYPE_FLOOD, ROUTE_TYPE_TRANSPORT_FLOOD
+
+    api = _make_api({"mesh": {"default_region": "alpha"}, "repeater": {}})
+    dispatcher = SimpleNamespace(send_packet=AsyncMock())
+    api.daemon_instance = SimpleNamespace(dispatcher=dispatcher, repeater_handler=None)
+
+    packet = SimpleNamespace(
+        header=ROUTE_TYPE_FLOOD,
+        transport_codes=[0, 0],
+        get_payload_type=lambda: 3,
+        get_payload=lambda: b"room_server_advert_payload",
+    )
+
+    with (
+        patch("openhop_core.protocol.PacketBuilder.create_advert", return_value=packet),
+        patch("openhop_core.protocol.transport_keys.get_auto_key_for", return_value=b"\x01" * 16),
+        patch("openhop_core.protocol.transport_keys.calc_transport_code", return_value=0xCAFE),
+    ):
+        result = asyncio.run(
+            api._send_room_server_advert_async(
+                identity=SimpleNamespace(),
+                node_name="RoomAlpha",
+                latitude=1.0,
+                longitude=2.0,
+                disable_fwd=False,
+            )
+        )
+
+    assert result is True
+    assert packet.transport_codes == [0xCAFE, 0]
+    assert (packet.header & 0x03) == ROUTE_TYPE_TRANSPORT_FLOOD
+    dispatcher.send_packet.assert_awaited_once_with(packet, wait_for_ack=False)
+
+
 def test_set_mode_and_set_duty_cycle_paths(cherrypy_ctx):
     request, _ = cherrypy_ctx
     api = _make_api({"repeater": {}, "duty_cycle": {}})
@@ -1487,6 +1743,178 @@ def test_metrics_graph_data_includes_policy_events(cherrypy_ctx):
     assert series_by_type["policy_events"]["data"] == [[100000, 1], [160000, 3], [220000, 2]]
 
 
+def test_lbt_diagnostics_aligns_with_rrd_and_returns_correlations(cherrypy_ctx):
+    del cherrypy_ctx
+    api = _make_api()
+
+    storage = SimpleNamespace(
+        get_lbt_diagnostics=MagicMock(
+            return_value={
+                "start_time": 60,
+                "end_time": 240,
+                "bucket_seconds": 60,
+                "summary": {
+                    "total_transmissions": 10,
+                    "total_attempts": 14,
+                    "first_attempt_success": 7,
+                    "retry_packets": 3,
+                    "retry_rate_pct": 30.0,
+                    "first_attempt_success_rate_pct": 70.0,
+                    "avg_attempts": 1.4,
+                    "median_attempts": 1.0,
+                    "p95_attempts": 3.0,
+                    "max_attempts": 4,
+                    "attempts_1": 7,
+                    "attempts_2": 2,
+                    "attempts_3": 1,
+                    "attempts_4_plus": 0,
+                    "attempts_3_plus": 1,
+                    "attempts_3_plus_pct": 10.0,
+                    "attempts_4_plus_pct": 0.0,
+                    "failed_transmissions": 0,
+                    "busy_channel_events": 3,
+                    "severe_contention_count": 0,
+                    "severe_contention_pct": 0.0,
+                    "severe_attempt_threshold": 4,
+                    "has_lbt_data": True,
+                    "worst_bucket": {
+                        "timestamp": 120,
+                        "retry_rate_pct": 50.0,
+                        "attempts_3_plus_pct": 20.0,
+                        "max_attempts": 3,
+                        "transmissions": 5,
+                    },
+                },
+                "buckets": [
+                    {
+                        "timestamp": 60,
+                        "transmissions": 3,
+                        "total_attempts": 3,
+                        "first_attempt_success": 3,
+                        "retry_packets": 0,
+                        "retry_rate_pct": 0.0,
+                        "first_attempt_success_rate_pct": 100.0,
+                        "avg_attempts": 1.0,
+                        "median_attempts": 1.0,
+                        "p95_attempts": 1.0,
+                        "max_attempts": 1,
+                        "attempts_1": 3,
+                        "attempts_2": 0,
+                        "attempts_3": 0,
+                        "attempts_4_plus": 0,
+                        "attempts_3_plus": 0,
+                        "attempts_3_plus_pct": 0.0,
+                        "attempts_4_plus_pct": 0.0,
+                        "failed_transmissions": 0,
+                        "busy_channel_events": 0,
+                        "severe_contention_count": 0,
+                        "severe_contention_pct": 0.0,
+                    },
+                    {
+                        "timestamp": 120,
+                        "transmissions": 5,
+                        "total_attempts": 8,
+                        "first_attempt_success": 2,
+                        "retry_packets": 3,
+                        "retry_rate_pct": 60.0,
+                        "first_attempt_success_rate_pct": 40.0,
+                        "avg_attempts": 1.6,
+                        "median_attempts": 2.0,
+                        "p95_attempts": 3.0,
+                        "max_attempts": 3,
+                        "attempts_1": 2,
+                        "attempts_2": 2,
+                        "attempts_3": 1,
+                        "attempts_4_plus": 0,
+                        "attempts_3_plus": 1,
+                        "attempts_3_plus_pct": 20.0,
+                        "attempts_4_plus_pct": 0.0,
+                        "failed_transmissions": 0,
+                        "busy_channel_events": 3,
+                        "severe_contention_count": 0,
+                        "severe_contention_pct": 0.0,
+                    },
+                ],
+                "packet_types": [
+                    {
+                        "packet_type": 1,
+                        "packet_type_label": "Response (RESPONSE)",
+                        "transmissions": 8,
+                        "retry_packets": 3,
+                        "retry_rate_pct": 37.5,
+                    }
+                ],
+                "packet_type_buckets": [
+                    {
+                        "timestamp": 120,
+                        "packet_type": 1,
+                        "packet_type_label": "Response (RESPONSE)",
+                        "transmissions": 5,
+                        "total_attempts": 8,
+                        "first_attempt_success": 2,
+                        "retry_packets": 3,
+                        "retry_rate_pct": 60.0,
+                        "first_attempt_success_rate_pct": 40.0,
+                        "avg_attempts": 1.6,
+                        "attempts_1": 2,
+                        "attempts_2": 2,
+                        "attempts_3": 1,
+                        "attempts_4_plus": 0,
+                        "attempts_3_plus": 1,
+                        "attempts_3_plus_pct": 20.0,
+                        "max_attempts": 3,
+                        "failed_transmissions": 0,
+                        "severe_contention_count": 0,
+                    }
+                ],
+            }
+        ),
+        get_rrd_data=MagicMock(
+            return_value={
+                "timestamps": [100, 160, 220],
+                "metrics": {
+                    "rx_count": [100, 110, 125],
+                    "tx_count": [50, 55, 70],
+                    "drop_count": [10, 11, 14],
+                    "avg_rssi": [-80.0, -90.0, -95.0],
+                    "avg_snr": [8.0, 2.0, -1.0],
+                },
+            }
+        ),
+    )
+    _attach_storage(api, storage)
+
+    out = api.lbt_diagnostics(hours="24", bucket_seconds="60", severe_attempt_threshold="4")
+    assert out["success"] is True
+    assert out["data"]["bucket_seconds"] == 60
+    assert out["data"]["severe_attempt_threshold"] == 4
+
+    buckets = out["data"]["buckets"]
+    assert len(buckets) == 2
+    assert "rf" in buckets[0]
+    assert buckets[0]["rf"]["traffic_volume"] >= 0
+    assert buckets[0]["rf"]["avg_snr"] is not None
+
+    correlations = out["data"]["correlations"]
+    assert "retry_rate_vs_avg_snr" in correlations
+    assert "retry_rate_vs_traffic_volume" in correlations
+    assert "sample_count" in correlations["retry_rate_vs_avg_snr"]
+
+    assert out["data"]["packet_types"][0]["packet_type"] == 1
+    assert out["data"]["packet_type_buckets"][0]["packet_type_label"] == "Response (RESPONSE)"
+    assert "rf" in out["data"]["packet_type_buckets"][0]
+
+
+def test_lbt_diagnostics_rejects_unbounded_large_time_range(cherrypy_ctx):
+    del cherrypy_ctx
+    api = _make_api()
+    _attach_storage(api, SimpleNamespace())
+
+    out = api.lbt_diagnostics(start_timestamp="0", end_timestamp=str(200 * 3600))
+    assert out["success"] is False
+    assert "Max range" in out["error"]
+
+
 def test_advert_contact_and_rate_limit_stats_endpoints(cherrypy_ctx):
     del cherrypy_ctx
     api = _make_api()
@@ -1574,18 +2002,70 @@ def test_transport_keys_and_transport_key_and_unscoped_policy(cherrypy_ctx):
     request.method = "GET"
     assert api.unscoped_flood_policy()["success"] is False
 
+    got_default = api.default_region()
+    assert got_default["success"] is True
+    assert got_default["data"]["default_region"] is None
+
     request.method = "POST"
     request.json = {}
     assert api.unscoped_flood_policy()["success"] is False
 
+    request.json = {}
+    assert api.default_region()["success"] is False
+
     request.json = {"unscoped_flood_allow": "yes"}
     assert api.unscoped_flood_policy()["success"] is False
+
+    request.json = {"default_region": "alpha"}
+    set_default = api.default_region()
+    assert set_default["success"] is True
+    assert api.config["mesh"]["default_region"] == "alpha"
+    assert any(
+        call.args and call.args[0] == "alpha" and call.args[1] == "allow"
+        for call in storage.create_transport_key.call_args_list
+    )
+
+    request.method = "GET"
+    got_default_after = api.default_region()
+    assert got_default_after["success"] is True
+    assert got_default_after["data"]["default_region"] == "alpha"
+
+    request.method = "POST"
+    request.json = {"default_region": None}
+    clear_default = api.default_region()
+    assert clear_default["success"] is True
+    assert api.config["mesh"]["default_region"] is None
 
     api.config_manager.save_to_file.return_value = True
     request.json = {"unscoped_flood_allow": True}
     ok = api.unscoped_flood_policy()
     assert ok["success"] is True
     assert api.config["mesh"]["unscoped_flood_allow"] is True
+
+
+def test_update_radio_config_owner_info_and_mesh_fields(cherrypy_ctx):
+    request, _ = cherrypy_ctx
+    request.method = "POST"
+    request.json = {
+        "owner_info": "Alice|Ops",
+        "path_hash_mode": 2,
+        "loop_detect": "strict",
+    }
+
+    api = _make_api({"repeater": {}, "mesh": {}, "radio": {}, "delays": {}})
+    api.config_manager.update_and_save.return_value = {
+        "success": True,
+        "saved": True,
+        "live_updated": True,
+    }
+
+    out = api.update_radio_config()
+
+    assert out["success"] is True
+    assert api.config["repeater"]["owner_info"] == "Alice\nOps"
+    assert api.config["mesh"]["path_hash_mode"] == 2
+    assert api.config["mesh"]["loop_detect"] == "strict"
+    assert "owner.info" in out["data"].get("applied", [])
 
 
 class _FakeIdentityObj:

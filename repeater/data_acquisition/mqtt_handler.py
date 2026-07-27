@@ -617,6 +617,7 @@ class MeshCoreToMqttPusher:
         jwt_expiry_minutes: int = 10,
         stats_provider: Optional[Callable[[], dict]] = None,
     ):
+        self.config = config
         # Store local identity and get public key
         self.local_identity = local_identity
         public_key = local_identity.get_public_key().hex().upper()
@@ -965,15 +966,19 @@ class MeshCoreToMqttPusher:
         else:
             live_stats = {"uptime_secs": 0, "packets_sent": 0, "packets_received": 0}
 
+        mode = str(self.config.get("repeater", {}).get("mode", "forward")).strip().lower()
+        repeat_state = "on" if mode == "forward" else "off"
+
         status = {
             "status": state,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "origin": origin or self.node_name,
             "origin_id": self.public_key,
-            "model": "PyMC-Repeater",
+            "model": "openHop-Repeater",
             "firmware_version": self.app_version,
             "radio": radio_config or self.radio_config,
             "client_version": f"openhop_repeater/{self.app_version}",
+            "repeat": repeat_state,
             "stats": {**live_stats, "errors": 0, "queue_len": 0, **(extra_stats or {})},
         }
 

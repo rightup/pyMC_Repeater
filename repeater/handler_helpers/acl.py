@@ -48,6 +48,30 @@ class ACL:
         self.allow_read_only = allow_read_only
         self.clients: Dict[bytes, ClientInfo] = {}
 
+    def _is_replay(self, client: ClientInfo, timestamp: int) -> bool:
+        if timestamp <= client.last_timestamp:
+            logger.warning(
+                f"Possible replay attack! timestamp={timestamp}, last={client.last_timestamp}"
+            )
+            return True
+        return False
+
+    def _touch_client_session(
+        self,
+        client: ClientInfo,
+        shared_secret: bytes,
+        timestamp: int,
+        sync_since: int = None,
+    ) -> None:
+        now = int(time.time())
+        client.last_timestamp = timestamp
+        client.last_activity = now
+        client.last_login_success = now
+        client.shared_secret = shared_secret
+        if sync_since is not None:
+            client.sync_since = sync_since
+            logger.debug(f"Stored sync_since={sync_since} for client")
+
     def authenticate_client(
         self,
         client_identity: Identity,
@@ -106,13 +130,23 @@ class ACL:
         if not password:
             client = self.clients.get(pub_key)
             if client is None:
-                if self.allow_read_only:
-                    logger.info("Blank password, allowing read-only guest access")
-                    return True, PERM_ACL_GUEST
-                else:
+                if not self.allow_read_only:
                     logger.info("Blank password, sender not in ACL and read-only disabled")
                     return False, 0
-            logger.info(f"ACL-based login for {pub_key[:6].hex()}...")
+                if len(self.clients) >= self.max_clients:
+                    logger.warning("ACL full, cannot add client")
+                    return False, 0
+                client = ClientInfo(client_identity, PERM_ACL_GUEST)
+                self.clients[pub_key] = client
+                logger.info("Blank password, allowing read-only guest access")
+            else:
+                logger.info(f"ACL-based login for {pub_key[:6].hex()}...")
+
+            if self._is_replay(client, timestamp):
+                return False, 0
+            self._touch_client_session(client, shared_secret, timestamp, sync_since=sync_since)
+            if (client.permissions & PERM_ACL_ROLE_MASK) == 0:
+                client.permissions |= PERM_ACL_GUEST
             return True, client.permissions
 
         permissions = 0
@@ -140,23 +174,11 @@ class ACL:
             self.clients[pub_key] = client
             logger.info(f"Added new client {pub_key[:6].hex()}...")
 
-        if timestamp <= client.last_timestamp:
-            logger.warning(
-                f"Possible replay attack! timestamp={timestamp}, last={client.last_timestamp}"
-            )
+        if self._is_replay(client, timestamp):
             return False, 0
-
-        client.last_timestamp = timestamp
-        client.last_activity = int(time.time())
-        client.last_login_success = int(time.time())
+        self._touch_client_session(client, shared_secret, timestamp, sync_since=sync_since)
         client.permissions &= ~PERM_ACL_ROLE_MASK
         client.permissions |= permissions
-        client.shared_secret = shared_secret
-
-        # Store sync_since for room server clients
-        if sync_since is not None:
-            client.sync_since = sync_since
-            logger.debug(f"Stored sync_since={sync_since} for client")
 
         logger.info(f"Login success! Permissions: {'ADMIN' if client.is_admin() else 'GUEST'}")
         return True, client.permissions

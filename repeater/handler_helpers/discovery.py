@@ -8,6 +8,10 @@ allowing other nodes to discover repeaters on the mesh network.
 import asyncio
 import logging
 import secrets
+import threading
+import time
+import uuid
+from typing import Any, Callable, Optional
 
 from openhop_core.node.handlers.control import ControlHandler
 
@@ -21,6 +25,15 @@ logger = logging.getLogger("DiscoveryHelper")
 # getRetransmitDelay*4). Safe to be generous: the requester's discovery window is
 # 60s (firmware pending_discover_until = futureMillis(60000)).
 DEFAULT_DISCOVERY_RESPONSE_JITTER_MS = 2000
+
+DEFAULT_DISCOVERY_TIMEOUT_SECONDS = 10.0
+DISCOVERY_EVENT_BACKLOG_LIMIT = 512
+
+NODE_TYPE_NAMES = {
+    1: "Chat Node",
+    2: "Repeater",
+    3: "Room Server",
+}
 
 
 class DiscoveryHelper:
@@ -60,10 +73,256 @@ class DiscoveryHelper:
             debug_log_fn=debug_log_fn,
         )
         self._pending_tasks = set()
+        self._sessions: dict[str, dict[str, Any]] = {}
+        self._sessions_lock = threading.Lock()
 
         # Set up the request callback
         self.control_handler.set_request_callback(self._on_discovery_request)
         logger.debug("Discovery handler initialized")
+
+    def create_session(
+        self,
+        *,
+        timeout: float = DEFAULT_DISCOVERY_TIMEOUT_SECONDS,
+        filter_mask: int,
+        since: int = 0,
+        prefix_only: bool = False,
+        result_enricher: Optional[Callable[[dict[str, Any]], dict[str, Any]]] = None,
+    ) -> dict[str, Any]:
+        """Create a new discovery session and return its public metadata."""
+        session_id = uuid.uuid4().hex
+        tag = secrets.randbits(32)
+        created_at = time.time()
+        session = {
+            "session_id": session_id,
+            "tag": tag,
+            "timeout": max(1.0, float(timeout)),
+            "filter_mask": int(filter_mask) & 0xFF,
+            "since": max(0, int(since)),
+            "prefix_only": bool(prefix_only),
+            "created_at": created_at,
+            "started_at": None,
+            "completed_at": None,
+            "status": "created",
+            "results": {},
+            "events": [],
+            "next_event_id": 1,
+            "error": None,
+            "result_enricher": result_enricher,
+        }
+        with self._sessions_lock:
+            self._sessions[session_id] = session
+        return self.get_session_snapshot(session_id) or {}
+
+    def get_session_snapshot(self, session_id: str) -> Optional[dict[str, Any]]:
+        """Return a public snapshot for a discovery session."""
+        with self._sessions_lock:
+            session = self._sessions.get(session_id)
+            if not session:
+                return None
+            return self._public_session_snapshot(session)
+
+    def get_events_since(self, session_id: str, last_event_id: int = 0) -> Optional[dict[str, Any]]:
+        """Return all session events newer than last_event_id."""
+        with self._sessions_lock:
+            session = self._sessions.get(session_id)
+            if not session:
+                return None
+            events = [event for event in session["events"] if event["id"] > last_event_id]
+            return {
+                "events": events,
+                "status": session["status"],
+                "completed": session["status"] in {"completed", "timed_out", "error", "cancelled"},
+                "latest_event_id": session["next_event_id"] - 1,
+            }
+
+    async def execute_session(self, session_id: str) -> None:
+        """Send a discovery request and stream responses into the session."""
+        session = self._get_session(session_id)
+        if not session:
+            raise ValueError(f"Unknown discovery session: {session_id}")
+
+        if session["status"] != "created":
+            return
+
+        session["started_at"] = time.time()
+        session["status"] = "running"
+        self._emit_event(
+            session_id,
+            "started",
+            {
+                "session_id": session_id,
+                "tag": session["tag"],
+                "timeout": session["timeout"],
+                "filter_mask": session["filter_mask"],
+                "since": session["since"],
+                "prefix_only": session["prefix_only"],
+                "started_at": session["started_at"],
+            },
+        )
+
+        try:
+            from openhop_core.protocol.packet_builder import PacketBuilder
+
+            packet = PacketBuilder.create_discovery_request(
+                tag=session["tag"],
+                filter_mask=session["filter_mask"],
+                since=session["since"],
+                prefix_only=session["prefix_only"],
+            )
+
+            def _response_callback(response_data: dict[str, Any]) -> None:
+                self._record_response(session_id, response_data)
+
+            self.control_handler.set_response_callback(session["tag"], _response_callback)
+
+            if not self.packet_injector:
+                raise RuntimeError("No packet injector available")
+
+            success = await self.packet_injector(packet, wait_for_ack=False)
+            if not success:
+                raise RuntimeError("Failed to send discovery request")
+
+            logger.info(
+                "Discovery request sent for session %s tag 0x%08X filter=0x%02X",
+                session_id,
+                session["tag"],
+                session["filter_mask"],
+            )
+
+            await asyncio.sleep(session["timeout"])
+            self._finish_session(session_id, "completed")
+        except asyncio.CancelledError:
+            self._finish_session(session_id, "cancelled")
+            raise
+        except Exception as e:
+            logger.error("Discovery session %s failed: %s", session_id, e, exc_info=True)
+            self._finish_session(session_id, "error", error=str(e))
+        finally:
+            self.control_handler.clear_response_callback(session["tag"])
+
+    def start_session_task(self, session_id: str) -> None:
+        """Schedule a discovery session on the current event loop."""
+        task = asyncio.create_task(self.execute_session(session_id))
+        self._track_task(task)
+
+    def cleanup_sessions(self, max_age_seconds: int = 120) -> None:
+        """Remove old completed sessions to keep memory bounded."""
+        cutoff = time.time() - max_age_seconds
+        with self._sessions_lock:
+            stale_ids = [
+                session_id
+                for session_id, session in self._sessions.items()
+                if session["status"] in {"completed", "timed_out", "error", "cancelled"}
+                and (session.get("completed_at") or session.get("created_at", 0)) < cutoff
+            ]
+            for session_id in stale_ids:
+                self._sessions.pop(session_id, None)
+
+    def _get_session(self, session_id: str) -> Optional[dict[str, Any]]:
+        with self._sessions_lock:
+            return self._sessions.get(session_id)
+
+    def _record_response(self, session_id: str, response_data: dict[str, Any]) -> None:
+        with self._sessions_lock:
+            session = self._sessions.get(session_id)
+            if not session or session["status"] != "running":
+                return
+
+            result = dict(response_data)
+            result["node_type_name"] = NODE_TYPE_NAMES.get(
+                result.get("node_type"), f"Unknown({result.get('node_type', 0)})"
+            )
+            result["discovered_at"] = time.time()
+
+            enricher = session.get("result_enricher")
+            if enricher:
+                try:
+                    result = enricher(result)
+                except Exception as e:
+                    logger.debug("Discovery result enrichment failed: %s", e)
+
+            result_key = str(result.get("pub_key") or "")
+            if not result_key:
+                return
+
+            existing = session["results"].get(result_key)
+            session["results"][result_key] = result
+            payload = {
+                "session_id": session_id,
+                "tag": session["tag"],
+                "result": result,
+                "is_update": existing is not None,
+                "count": len(session["results"]),
+            }
+            self._append_event_unlocked(session, "discovery_result", payload)
+
+    def _finish_session(self, session_id: str, status: str, error: Optional[str] = None) -> None:
+        with self._sessions_lock:
+            session = self._sessions.get(session_id)
+            if not session or session["status"] in {"completed", "timed_out", "error", "cancelled"}:
+                return
+
+            session["completed_at"] = time.time()
+            session["status"] = status
+            session["error"] = error
+            payload = {
+                "session_id": session_id,
+                "tag": session["tag"],
+                "status": status,
+                "error": error,
+                "count": len(session["results"]),
+                "duration_ms": round(
+                    (
+                        (session["completed_at"] or session["created_at"])
+                        - (session["started_at"] or session["created_at"])
+                    )
+                    * 1000,
+                    2,
+                ),
+                "completed_at": session["completed_at"],
+                "results": list(session["results"].values()),
+            }
+            event_type = "error" if status == "error" else "completed"
+            self._append_event_unlocked(session, event_type, payload)
+
+    def _emit_event(self, session_id: str, event_type: str, payload: dict[str, Any]) -> None:
+        with self._sessions_lock:
+            session = self._sessions.get(session_id)
+            if not session:
+                return
+            self._append_event_unlocked(session, event_type, payload)
+
+    def _append_event_unlocked(
+        self, session: dict[str, Any], event_type: str, payload: dict[str, Any]
+    ) -> None:
+        event_id = session["next_event_id"]
+        session["next_event_id"] += 1
+        session["events"].append(
+            {
+                "id": event_id,
+                "event": event_type,
+                "data": payload,
+            }
+        )
+        if len(session["events"]) > DISCOVERY_EVENT_BACKLOG_LIMIT:
+            session["events"] = session["events"][-DISCOVERY_EVENT_BACKLOG_LIMIT:]
+
+    def _public_session_snapshot(self, session: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "session_id": session["session_id"],
+            "tag": session["tag"],
+            "status": session["status"],
+            "timeout": session["timeout"],
+            "filter_mask": session["filter_mask"],
+            "since": session["since"],
+            "prefix_only": session["prefix_only"],
+            "created_at": session["created_at"],
+            "started_at": session["started_at"],
+            "completed_at": session["completed_at"],
+            "count": len(session["results"]),
+            "error": session["error"],
+        }
 
     def _track_task(self, task: asyncio.Task) -> None:
         self._pending_tasks.add(task)

@@ -39,6 +39,26 @@ def require_auth(func):
             else:
                 logger.warning("Invalid or expired JWT token")
 
+        request_params = getattr(cherrypy.request, "params", None)
+        if request_params is None:
+            request_params = {}
+
+        query_token = request_params.get("token")
+        if query_token:
+            payload = jwt_handler.verify_jwt(query_token)
+
+            if payload:
+                cherrypy.request.user = {
+                    "username": payload["sub"],
+                    "client_id": payload["client_id"],
+                    "auth_type": "jwt_query",
+                }
+                if hasattr(cherrypy.request, "params") and "token" in cherrypy.request.params:
+                    del cherrypy.request.params["token"]
+                return func(*args, **kwargs)
+            else:
+                logger.warning("Invalid or expired JWT query token")
+
         # Try API token authentication
         api_key = cherrypy.request.headers.get("X-API-Key", "")
         if api_key:

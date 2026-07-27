@@ -68,6 +68,74 @@ async def test_path_helper_updates_client_out_path_on_valid_decrypt():
 
 
 @pytest.mark.asyncio
+async def test_path_helper_registers_embedded_ack():
+    """Firmware path returns embed the delivery ACK after the path
+    (extra_type=PAYLOAD_TYPE_ACK + 4-byte CRC); it must reach ack_received_callback
+    so local waiters (e.g. room server pushes) resolve."""
+    client = _FakeClient(pubkey=bytes([0x22]) + b"x" * 31, shared_secret=b"k" * 32)
+    acl = _FakeACL([client])
+    ack_fn = AsyncMock()
+    helper = PathHelper(acl_dict={0x11: acl}, ack_received_callback=ack_fn)
+
+    packet = _PathPacket(payload=b"\x11\x22\xaa\xbb\xcc")
+    # path_len(2) + path + extra_type(PAYLOAD_TYPE_ACK=3) + crc(4, LE)
+    decrypted = b"\x02\x99\x88" + bytes([0x03]) + bytes.fromhex("4dabaf95")
+    with patch(
+        "openhop_core.protocol.crypto.CryptoUtils.mac_then_decrypt",
+        return_value=decrypted,
+    ):
+        await helper.process_path_packet(packet)
+
+    ack_fn.assert_awaited_once_with(0x95AFAB4D)
+    assert client.out_path_len == 2  # path update still applied
+
+
+@pytest.mark.asyncio
+async def test_path_helper_handles_encoded_path_len_with_embedded_ack():
+    """path_len in a path return is the ENCODED wire byte: with 3-byte hashes an
+    empty path is 0x80, not 0x00. Reading it as a raw count (128) made the
+    helper bail as 'truncated' before the embedded ACK was registered, so
+    room-server pushes to same-instance companions timed out forever.
+    Bytes below are a decrypted path return captured from a live mesh."""
+    client = _FakeClient(pubkey=bytes([0x22]) + b"x" * 31, shared_secret=b"k" * 32)
+    acl = _FakeACL([client])
+    ack_fn = AsyncMock()
+    helper = PathHelper(acl_dict={0x11: acl}, ack_received_callback=ack_fn)
+
+    packet = _PathPacket(payload=b"\x11\x22\xaa\xbb\xcc")
+    # path_len 0x80 (3-byte hashes, 0 hops) + extra_type ACK + crc + AES padding
+    decrypted = bytes.fromhex("80038d48208500000000000000000000")
+    with patch(
+        "openhop_core.protocol.crypto.CryptoUtils.mac_then_decrypt",
+        return_value=decrypted,
+    ):
+        await helper.process_path_packet(packet)
+
+    ack_fn.assert_awaited_once_with(0x8520488D)
+    assert client.out_path_len == 0x80  # encoded byte preserved
+    assert bytes(client.out_path) == b""
+
+
+@pytest.mark.asyncio
+async def test_path_helper_ignores_non_ack_extra():
+    client = _FakeClient(pubkey=bytes([0x22]) + b"x" * 31, shared_secret=b"k" * 32)
+    acl = _FakeACL([client])
+    ack_fn = AsyncMock()
+    helper = PathHelper(acl_dict={0x11: acl}, ack_received_callback=ack_fn)
+
+    packet = _PathPacket(payload=b"\x11\x22\xaa\xbb\xcc")
+    # extra_type 0x08 (PATH) instead of ACK: nothing to register
+    decrypted = b"\x02\x99\x88" + bytes([0x08]) + b"\x01\x02\x03\x04"
+    with patch(
+        "openhop_core.protocol.crypto.CryptoUtils.mac_then_decrypt",
+        return_value=decrypted,
+    ):
+        await helper.process_path_packet(packet)
+
+    ack_fn.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_path_helper_returns_false_for_non_matching_or_invalid_inputs():
     client = _FakeClient(pubkey=bytes([0x22]) + b"x" * 31, shared_secret=b"k" * 32)
     acl = _FakeACL([client])
@@ -244,6 +312,7 @@ def test_text_helper_cli_prefix_and_admin_permission_checks():
 
     assert helper._is_cli_command("get status") is True
     assert helper._is_cli_command("99|get status") is True
+    assert helper._is_cli_command("04|discover.neighbors") is True
     assert helper._is_cli_command("hello world") is False
 
     assert helper._check_admin_permission_for_identity(0x21, 0x41) is True

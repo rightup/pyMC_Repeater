@@ -1,6 +1,7 @@
 import base64
 import json
 import logging
+import math
 import secrets
 import sqlite3
 import threading
@@ -190,6 +191,14 @@ class SQLiteHandler:
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_packets_hash ON packets(packet_hash)")
                 conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_packets_transmitted ON packets(transmitted)"
+                )
+                # Covering index for the airtime/utilization charts. get_airtime_data
+                # and get_airtime_buckets range-scan and order by timestamp, selecting
+                # only these columns; keeping them all in the index lets SQLite serve
+                # the query index-only, avoiding a full scan of the (large) row heap.
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_packets_airtime "
+                    "ON packets(timestamp, length, payload_length, transmitted)"
                 )
                 conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_adverts_timestamp ON adverts(timestamp)"
@@ -426,6 +435,7 @@ class SQLiteHandler:
                                 is_channel INTEGER NOT NULL DEFAULT 0,
                                 channel_idx INTEGER NOT NULL DEFAULT 0,
                                 path_len INTEGER NOT NULL DEFAULT 0,
+                                sender_prefix TEXT NOT NULL DEFAULT '',
                                 packet_hash TEXT,
                                 created_at REAL NOT NULL
                             )
@@ -581,6 +591,30 @@ class SQLiteHandler:
                     )
                     logger.info(f"Migration '{migration_name}' applied successfully")
 
+                # Migration 10: Add sender_prefix column (hex text) to
+                # companion_messages.  TXT_TYPE_SIGNED_PLAIN room posts carry a
+                # 4-byte author pubkey prefix; without it, posts replayed from
+                # SQLite show a zero-padded author in the app frame.
+                migration_name = "add_sender_prefix_to_companion_messages"
+                existing = conn.execute(
+                    "SELECT migration_name FROM migrations WHERE migration_name = ?",
+                    (migration_name,),
+                ).fetchone()
+                if not existing:
+                    cursor = conn.execute("PRAGMA table_info(companion_messages)")
+                    columns = [column[1] for column in cursor.fetchall()]
+                    if "sender_prefix" not in columns:
+                        conn.execute(
+                            "ALTER TABLE companion_messages "
+                            "ADD COLUMN sender_prefix TEXT NOT NULL DEFAULT ''"
+                        )
+                        logger.info("Added sender_prefix column to companion_messages table")
+                    conn.execute(
+                        "INSERT INTO migrations (migration_name, applied_at) VALUES (?, ?)",
+                        (migration_name, time.time()),
+                    )
+                    logger.info(f"Migration '{migration_name}' applied successfully")
+
                 conn.commit()
 
         except Exception as e:
@@ -671,7 +705,7 @@ class SQLiteHandler:
                 except Exception:
                     fwd_path_val = str(fwd_path)
 
-                conn.execute(
+                cursor = conn.execute(
                     """
                     INSERT INTO packets (
                         timestamp, type, route, length, rssi, snr, score,
@@ -714,6 +748,7 @@ class SQLiteHandler:
                     ),
                 )
                 self._invalidate_hot_caches()
+                return cursor.lastrowid
 
         except Exception as e:
             logger.error(f"Failed to store packet in SQLite: {e}")
@@ -910,6 +945,524 @@ class SQLiteHandler:
             logger.error(f"Failed to get policy event counts: {e}")
             return []
 
+    def get_lbt_diagnostics(
+        self,
+        start_timestamp: float,
+        end_timestamp: float,
+        bucket_seconds: int = 300,
+        severe_attempt_threshold: int = 4,
+    ) -> dict:
+        """Return aggregated LBT diagnostics for TX-path packets.
+
+        LBT metadata in packets is persisted as "extra attempts/backoffs" where:
+          - lbt_attempts == 0 means first CAD/LBT check was clear
+          - total attempts/checks ~= lbt_attempts + 1
+
+        This method avoids returning raw packet rows and instead returns
+        bucketed aggregates + summary metrics for efficient dashboard refreshes.
+        """
+
+        def _weighted_percentile(attempt_counts: dict, q: float) -> Optional[float]:
+            total = sum(int(v) for v in attempt_counts.values())
+            if total <= 0:
+                return None
+
+            q = max(0.0, min(1.0, float(q)))
+            # Use nearest-rank percentile so p95 on sparse samples doesn't
+            # systematically under-report tail attempts.
+            rank = max(1, int(math.ceil(total * q)))
+            running = 0
+            for attempt in sorted(int(k) for k in attempt_counts.keys()):
+                running += int(attempt_counts.get(attempt, 0))
+                if running >= rank:
+                    return float(attempt)
+            return float(max(int(k) for k in attempt_counts.keys()))
+
+        def _packet_type_name(pkt_type: int) -> str:
+            try:
+                from openhop_core.protocol.utils import PAYLOAD_TYPES as _PT
+
+                labels = {
+                    "REQ": "Request",
+                    "RESPONSE": "Response",
+                    "TXT_MSG": "Plain Text Message",
+                    "ACK": "Acknowledgment",
+                    "ADVERT": "Node Advertisement",
+                    "GRP_TXT": "Group Text Message",
+                    "GRP_DATA": "Group Datagram",
+                    "ANON_REQ": "Anonymous Request",
+                    "PATH": "Returned Path",
+                    "TRACE": "Trace",
+                    "MULTIPART": "Multi-part Packet",
+                    "CONTROL": "Control",
+                    "RAW_CUSTOM": "Custom Packet",
+                }
+                code = _PT.get(pkt_type)
+                if not code:
+                    return (
+                        f"Reserved Type {pkt_type}" if 0 <= pkt_type <= 15 else f"Type {pkt_type}"
+                    )
+                return f"{labels.get(code, code.replace('_', ' ').title())} ({code})"
+            except Exception:
+                return f"Reserved Type {pkt_type}" if 0 <= pkt_type <= 15 else f"Type {pkt_type}"
+
+        try:
+            bucket_seconds = max(60, min(int(bucket_seconds), 3600))
+            severe_attempt_threshold = max(2, int(severe_attempt_threshold))
+
+            if end_timestamp < start_timestamp:
+                start_timestamp, end_timestamp = end_timestamp, start_timestamp
+
+            tx_filter = "(transmitted = 1 OR lbt_attempts > 0 OR drop_reason LIKE 'TX failed%')"
+
+            with self._connect() as conn:
+                conn.row_factory = sqlite3.Row
+
+                aggregate_rows = conn.execute(
+                    f"""
+                    WITH tx_packets AS (
+                        SELECT
+                            CAST(timestamp / ? AS INTEGER) * ? AS bucket_ts,
+                            CASE
+                                WHEN lbt_attempts IS NULL OR lbt_attempts < 0 THEN 1
+                                ELSE lbt_attempts + 1
+                            END AS attempts_total,
+                            CASE WHEN transmitted = 1 THEN 1 ELSE 0 END AS tx_success,
+                            CASE
+                                WHEN transmitted = 0 AND drop_reason LIKE 'TX failed%' THEN 1
+                                ELSE 0
+                            END AS failed_tx,
+                            CASE WHEN COALESCE(lbt_channel_busy, 0) = 1 THEN 1 ELSE 0 END AS busy
+                        FROM packets INDEXED BY idx_packets_timestamp
+                        WHERE timestamp >= ?
+                          AND timestamp <= ?
+                          AND {tx_filter}
+                    )
+                    SELECT
+                        bucket_ts,
+                        COUNT(*) AS transmissions,
+                        SUM(attempts_total) AS total_attempts,
+                        SUM(CASE WHEN attempts_total = 1 THEN 1 ELSE 0 END) AS attempts_1,
+                        SUM(CASE WHEN attempts_total = 2 THEN 1 ELSE 0 END) AS attempts_2,
+                        SUM(CASE WHEN attempts_total = 3 THEN 1 ELSE 0 END) AS attempts_3,
+                        SUM(CASE WHEN attempts_total >= 4 THEN 1 ELSE 0 END) AS attempts_4_plus,
+                        SUM(CASE WHEN attempts_total > 1 THEN 1 ELSE 0 END) AS retry_packets,
+                        SUM(CASE WHEN tx_success = 1 AND attempts_total = 1 THEN 1 ELSE 0 END) AS first_attempt_success,
+                        SUM(failed_tx) AS failed_transmissions,
+                        SUM(busy) AS busy_channel_events,
+                        SUM(CASE WHEN attempts_total >= ? THEN 1 ELSE 0 END) AS severe_contention_count,
+                        MAX(attempts_total) AS max_attempts
+                    FROM tx_packets
+                    GROUP BY bucket_ts
+                    ORDER BY bucket_ts ASC
+                    """,
+                    (
+                        bucket_seconds,
+                        bucket_seconds,
+                        float(start_timestamp),
+                        float(end_timestamp),
+                        severe_attempt_threshold,
+                    ),
+                ).fetchall()
+
+                dist_rows = conn.execute(
+                    f"""
+                    WITH tx_packets AS (
+                        SELECT
+                            CAST(timestamp / ? AS INTEGER) * ? AS bucket_ts,
+                            CASE
+                                WHEN lbt_attempts IS NULL OR lbt_attempts < 0 THEN 1
+                                ELSE lbt_attempts + 1
+                            END AS attempts_total
+                        FROM packets INDEXED BY idx_packets_timestamp
+                        WHERE timestamp >= ?
+                          AND timestamp <= ?
+                          AND {tx_filter}
+                    )
+                    SELECT bucket_ts, attempts_total, COUNT(*) AS cnt
+                    FROM tx_packets
+                    GROUP BY bucket_ts, attempts_total
+                    ORDER BY bucket_ts ASC, attempts_total ASC
+                    """,
+                    (
+                        bucket_seconds,
+                        bucket_seconds,
+                        float(start_timestamp),
+                        float(end_timestamp),
+                    ),
+                ).fetchall()
+
+                type_rows = conn.execute(
+                    f"""
+                    WITH tx_packets AS (
+                        SELECT
+                            CAST(timestamp / ? AS INTEGER) * ? AS bucket_ts,
+                            type AS packet_type,
+                            CASE
+                                WHEN lbt_attempts IS NULL OR lbt_attempts < 0 THEN 1
+                                ELSE lbt_attempts + 1
+                            END AS attempts_total,
+                            CASE WHEN transmitted = 1 THEN 1 ELSE 0 END AS tx_success,
+                            CASE
+                                WHEN transmitted = 0 AND drop_reason LIKE 'TX failed%' THEN 1
+                                ELSE 0
+                            END AS failed_tx
+                        FROM packets INDEXED BY idx_packets_timestamp
+                        WHERE timestamp >= ?
+                          AND timestamp <= ?
+                          AND {tx_filter}
+                    )
+                    SELECT
+                        bucket_ts,
+                        packet_type,
+                        COUNT(*) AS transmissions,
+                        SUM(attempts_total) AS total_attempts,
+                        SUM(CASE WHEN attempts_total = 1 THEN 1 ELSE 0 END) AS attempts_1,
+                        SUM(CASE WHEN attempts_total = 2 THEN 1 ELSE 0 END) AS attempts_2,
+                        SUM(CASE WHEN attempts_total = 3 THEN 1 ELSE 0 END) AS attempts_3,
+                        SUM(CASE WHEN attempts_total >= 4 THEN 1 ELSE 0 END) AS attempts_4_plus,
+                        SUM(CASE WHEN attempts_total > 1 THEN 1 ELSE 0 END) AS retry_packets,
+                        SUM(CASE WHEN tx_success = 1 AND attempts_total = 1 THEN 1 ELSE 0 END) AS first_attempt_success,
+                        SUM(failed_tx) AS failed_transmissions,
+                        SUM(CASE WHEN attempts_total >= ? THEN 1 ELSE 0 END) AS severe_contention_count,
+                        MAX(attempts_total) AS max_attempts
+                    FROM tx_packets
+                    GROUP BY bucket_ts, packet_type
+                    ORDER BY bucket_ts ASC, packet_type ASC
+                    """,
+                    (
+                        bucket_seconds,
+                        bucket_seconds,
+                        float(start_timestamp),
+                        float(end_timestamp),
+                        severe_attempt_threshold,
+                    ),
+                ).fetchall()
+
+            dist_by_bucket: dict = {}
+            overall_dist: dict = {}
+            for row in dist_rows:
+                bucket_ts = int(row["bucket_ts"])
+                attempt = int(row["attempts_total"])
+                count = int(row["cnt"])
+                bucket_dist = dist_by_bucket.setdefault(bucket_ts, {})
+                bucket_dist[attempt] = bucket_dist.get(attempt, 0) + count
+                overall_dist[attempt] = overall_dist.get(attempt, 0) + count
+
+            bucket_map: dict = {}
+            start_bucket = int(float(start_timestamp) // bucket_seconds) * bucket_seconds
+            end_bucket = int(float(end_timestamp) // bucket_seconds) * bucket_seconds
+            for bucket_ts in range(start_bucket, end_bucket + 1, bucket_seconds):
+                bucket_map[bucket_ts] = {
+                    "timestamp": bucket_ts,
+                    "transmissions": 0,
+                    "total_attempts": 0,
+                    "attempts_1": 0,
+                    "attempts_2": 0,
+                    "attempts_3": 0,
+                    "attempts_4_plus": 0,
+                    "retry_packets": 0,
+                    "first_attempt_success": 0,
+                    "failed_transmissions": 0,
+                    "busy_channel_events": 0,
+                    "severe_contention_count": 0,
+                    "max_attempts": 0,
+                }
+
+            for row in aggregate_rows:
+                bucket_ts = int(row["bucket_ts"])
+                if bucket_ts not in bucket_map:
+                    bucket_map[bucket_ts] = {
+                        "timestamp": bucket_ts,
+                        "transmissions": 0,
+                        "total_attempts": 0,
+                        "attempts_1": 0,
+                        "attempts_2": 0,
+                        "attempts_3": 0,
+                        "attempts_4_plus": 0,
+                        "retry_packets": 0,
+                        "first_attempt_success": 0,
+                        "failed_transmissions": 0,
+                        "busy_channel_events": 0,
+                        "severe_contention_count": 0,
+                        "max_attempts": 0,
+                    }
+                bucket_map[bucket_ts].update(
+                    {
+                        "transmissions": int(row["transmissions"] or 0),
+                        "total_attempts": int(row["total_attempts"] or 0),
+                        "attempts_1": int(row["attempts_1"] or 0),
+                        "attempts_2": int(row["attempts_2"] or 0),
+                        "attempts_3": int(row["attempts_3"] or 0),
+                        "attempts_4_plus": int(row["attempts_4_plus"] or 0),
+                        "retry_packets": int(row["retry_packets"] or 0),
+                        "first_attempt_success": int(row["first_attempt_success"] or 0),
+                        "failed_transmissions": int(row["failed_transmissions"] or 0),
+                        "busy_channel_events": int(row["busy_channel_events"] or 0),
+                        "severe_contention_count": int(row["severe_contention_count"] or 0),
+                        "max_attempts": int(row["max_attempts"] or 0),
+                    }
+                )
+
+            buckets = []
+            for bucket_ts in sorted(bucket_map.keys()):
+                bucket = bucket_map[bucket_ts]
+                transmissions = int(bucket["transmissions"])
+                total_attempts = int(bucket["total_attempts"])
+                attempts_3_plus = int(bucket["attempts_3"] + bucket["attempts_4_plus"])
+
+                median_attempts = _weighted_percentile(dist_by_bucket.get(bucket_ts, {}), 0.5)
+                p95_attempts = _weighted_percentile(dist_by_bucket.get(bucket_ts, {}), 0.95)
+
+                retry_rate_pct = None
+                first_attempt_success_rate_pct = None
+                avg_attempts = None
+                attempts_3_plus_pct = None
+                attempts_4_plus_pct = None
+                severe_contention_pct = None
+
+                if transmissions > 0:
+                    retry_rate_pct = (bucket["retry_packets"] * 100.0) / transmissions
+                    first_attempt_success_rate_pct = (
+                        bucket["first_attempt_success"] * 100.0
+                    ) / transmissions
+                    avg_attempts = total_attempts / transmissions
+                    attempts_3_plus_pct = (attempts_3_plus * 100.0) / transmissions
+                    attempts_4_plus_pct = (bucket["attempts_4_plus"] * 100.0) / transmissions
+                    severe_contention_pct = (
+                        bucket["severe_contention_count"] * 100.0
+                    ) / transmissions
+
+                buckets.append(
+                    {
+                        "timestamp": bucket_ts,
+                        "transmissions": transmissions,
+                        "total_attempts": total_attempts,
+                        "first_attempt_success": int(bucket["first_attempt_success"]),
+                        "retry_packets": int(bucket["retry_packets"]),
+                        "retry_rate_pct": retry_rate_pct,
+                        "first_attempt_success_rate_pct": first_attempt_success_rate_pct,
+                        "avg_attempts": avg_attempts,
+                        "median_attempts": median_attempts,
+                        "p95_attempts": p95_attempts,
+                        "max_attempts": int(bucket["max_attempts"]),
+                        "attempts_1": int(bucket["attempts_1"]),
+                        "attempts_2": int(bucket["attempts_2"]),
+                        "attempts_3": int(bucket["attempts_3"]),
+                        "attempts_4_plus": int(bucket["attempts_4_plus"]),
+                        "attempts_3_plus": int(attempts_3_plus),
+                        "attempts_3_plus_pct": attempts_3_plus_pct,
+                        "attempts_4_plus_pct": attempts_4_plus_pct,
+                        "failed_transmissions": int(bucket["failed_transmissions"]),
+                        "busy_channel_events": int(bucket["busy_channel_events"]),
+                        "severe_contention_count": int(bucket["severe_contention_count"]),
+                        "severe_contention_pct": severe_contention_pct,
+                    }
+                )
+
+            total_transmissions = int(sum(b["transmissions"] for b in buckets))
+            total_attempts = int(sum(b["total_attempts"] for b in buckets))
+            first_attempt_success = int(sum(b["first_attempt_success"] for b in buckets))
+            retry_packets = int(sum(b["retry_packets"] for b in buckets))
+            attempts_1 = int(sum(b["attempts_1"] for b in buckets))
+            attempts_2 = int(sum(b["attempts_2"] for b in buckets))
+            attempts_3 = int(sum(b["attempts_3"] for b in buckets))
+            attempts_4_plus = int(sum(b["attempts_4_plus"] for b in buckets))
+            attempts_3_plus = int(attempts_3 + attempts_4_plus)
+            failed_transmissions = int(sum(b["failed_transmissions"] for b in buckets))
+            busy_channel_events = int(sum(b["busy_channel_events"] for b in buckets))
+            severe_contention_count = int(sum(b["severe_contention_count"] for b in buckets))
+            max_attempts = int(max([b["max_attempts"] for b in buckets], default=0))
+
+            retry_rate_pct = None
+            first_attempt_success_rate_pct = None
+            avg_attempts = None
+            attempts_3_plus_pct = None
+            attempts_4_plus_pct = None
+            severe_contention_pct = None
+
+            if total_transmissions > 0:
+                retry_rate_pct = (retry_packets * 100.0) / total_transmissions
+                first_attempt_success_rate_pct = (
+                    first_attempt_success * 100.0
+                ) / total_transmissions
+                avg_attempts = total_attempts / total_transmissions
+                attempts_3_plus_pct = (attempts_3_plus * 100.0) / total_transmissions
+                attempts_4_plus_pct = (attempts_4_plus * 100.0) / total_transmissions
+                severe_contention_pct = (severe_contention_count * 100.0) / total_transmissions
+
+            worst_bucket = None
+            scored_buckets = [
+                b
+                for b in buckets
+                if int(b.get("transmissions", 0)) > 0 and b.get("retry_rate_pct") is not None
+            ]
+            if scored_buckets:
+                worst = max(
+                    scored_buckets, key=lambda item: float(item.get("retry_rate_pct") or 0.0)
+                )
+                worst_bucket = {
+                    "timestamp": int(worst["timestamp"]),
+                    "retry_rate_pct": float(worst.get("retry_rate_pct") or 0.0),
+                    "attempts_3_plus_pct": float(worst.get("attempts_3_plus_pct") or 0.0),
+                    "max_attempts": int(worst.get("max_attempts") or 0),
+                    "transmissions": int(worst.get("transmissions") or 0),
+                }
+
+            summary = {
+                "total_transmissions": total_transmissions,
+                "total_attempts": total_attempts,
+                "first_attempt_success": first_attempt_success,
+                "retry_packets": retry_packets,
+                "retry_rate_pct": retry_rate_pct,
+                "first_attempt_success_rate_pct": first_attempt_success_rate_pct,
+                "avg_attempts": avg_attempts,
+                "median_attempts": _weighted_percentile(overall_dist, 0.5),
+                "p95_attempts": _weighted_percentile(overall_dist, 0.95),
+                "max_attempts": max_attempts,
+                "attempts_1": attempts_1,
+                "attempts_2": attempts_2,
+                "attempts_3": attempts_3,
+                "attempts_4_plus": attempts_4_plus,
+                "attempts_3_plus": attempts_3_plus,
+                "attempts_3_plus_pct": attempts_3_plus_pct,
+                "attempts_4_plus_pct": attempts_4_plus_pct,
+                "failed_transmissions": failed_transmissions,
+                "busy_channel_events": busy_channel_events,
+                "severe_contention_count": severe_contention_count,
+                "severe_contention_pct": severe_contention_pct,
+                "severe_attempt_threshold": severe_attempt_threshold,
+                "has_lbt_data": total_transmissions > 0,
+                "worst_bucket": worst_bucket,
+            }
+
+            packet_type_totals: dict = {}
+            packet_type_buckets = []
+            for row in type_rows:
+                bucket_ts = int(row["bucket_ts"])
+                packet_type = int(row["packet_type"] if row["packet_type"] is not None else -1)
+                transmissions = int(row["transmissions"] or 0)
+                total_attempts_for_type = int(row["total_attempts"] or 0)
+                attempts_3_plus = int((row["attempts_3"] or 0) + (row["attempts_4_plus"] or 0))
+
+                retry_rate_pct_for_type = None
+                first_attempt_success_rate_pct_for_type = None
+                avg_attempts_for_type = None
+                attempts_3_plus_pct_for_type = None
+                if transmissions > 0:
+                    retry_rate_pct_for_type = (
+                        int(row["retry_packets"] or 0) * 100.0
+                    ) / transmissions
+                    first_attempt_success_rate_pct_for_type = (
+                        int(row["first_attempt_success"] or 0) * 100.0
+                    ) / transmissions
+                    avg_attempts_for_type = total_attempts_for_type / transmissions
+                    attempts_3_plus_pct_for_type = (attempts_3_plus * 100.0) / transmissions
+
+                packet_type_buckets.append(
+                    {
+                        "timestamp": bucket_ts,
+                        "packet_type": packet_type,
+                        "packet_type_label": _packet_type_name(packet_type),
+                        "transmissions": transmissions,
+                        "total_attempts": total_attempts_for_type,
+                        "first_attempt_success": int(row["first_attempt_success"] or 0),
+                        "retry_packets": int(row["retry_packets"] or 0),
+                        "retry_rate_pct": retry_rate_pct_for_type,
+                        "first_attempt_success_rate_pct": first_attempt_success_rate_pct_for_type,
+                        "avg_attempts": avg_attempts_for_type,
+                        "attempts_1": int(row["attempts_1"] or 0),
+                        "attempts_2": int(row["attempts_2"] or 0),
+                        "attempts_3": int(row["attempts_3"] or 0),
+                        "attempts_4_plus": int(row["attempts_4_plus"] or 0),
+                        "attempts_3_plus": attempts_3_plus,
+                        "attempts_3_plus_pct": attempts_3_plus_pct_for_type,
+                        "max_attempts": int(row["max_attempts"] or 0),
+                        "failed_transmissions": int(row["failed_transmissions"] or 0),
+                        "severe_contention_count": int(row["severe_contention_count"] or 0),
+                    }
+                )
+
+                total_entry = packet_type_totals.setdefault(
+                    packet_type,
+                    {
+                        "packet_type": packet_type,
+                        "packet_type_label": _packet_type_name(packet_type),
+                        "transmissions": 0,
+                        "retry_packets": 0,
+                    },
+                )
+                total_entry["transmissions"] += transmissions
+                total_entry["retry_packets"] += int(row["retry_packets"] or 0)
+
+            packet_types = []
+            for pkt_type in sorted(
+                packet_type_totals.keys(),
+                key=lambda key: packet_type_totals[key]["transmissions"],
+                reverse=True,
+            ):
+                entry = packet_type_totals[pkt_type]
+                transmissions = int(entry["transmissions"])
+                retry_rate_pct_for_type = None
+                if transmissions > 0:
+                    retry_rate_pct_for_type = (int(entry["retry_packets"]) * 100.0) / transmissions
+                packet_types.append(
+                    {
+                        "packet_type": int(entry["packet_type"]),
+                        "packet_type_label": str(entry["packet_type_label"]),
+                        "transmissions": transmissions,
+                        "retry_packets": int(entry["retry_packets"]),
+                        "retry_rate_pct": retry_rate_pct_for_type,
+                    }
+                )
+
+            return {
+                "start_time": int(start_timestamp),
+                "end_time": int(end_timestamp),
+                "bucket_seconds": bucket_seconds,
+                "summary": summary,
+                "buckets": buckets,
+                "packet_types": packet_types,
+                "packet_type_buckets": packet_type_buckets,
+            }
+
+        except Exception as e:
+            logger.error(f"Failed to get LBT diagnostics: {e}")
+            return {
+                "start_time": int(start_timestamp),
+                "end_time": int(end_timestamp),
+                "bucket_seconds": max(60, min(int(bucket_seconds), 3600)),
+                "summary": {
+                    "total_transmissions": 0,
+                    "total_attempts": 0,
+                    "first_attempt_success": 0,
+                    "retry_packets": 0,
+                    "retry_rate_pct": None,
+                    "first_attempt_success_rate_pct": None,
+                    "avg_attempts": None,
+                    "median_attempts": None,
+                    "p95_attempts": None,
+                    "max_attempts": 0,
+                    "attempts_1": 0,
+                    "attempts_2": 0,
+                    "attempts_3": 0,
+                    "attempts_4_plus": 0,
+                    "attempts_3_plus": 0,
+                    "attempts_3_plus_pct": None,
+                    "attempts_4_plus_pct": None,
+                    "failed_transmissions": 0,
+                    "busy_channel_events": 0,
+                    "severe_contention_count": 0,
+                    "severe_contention_pct": None,
+                    "severe_attempt_threshold": max(2, int(severe_attempt_threshold)),
+                    "has_lbt_data": False,
+                    "worst_bucket": None,
+                },
+                "buckets": [],
+                "packet_types": [],
+                "packet_type_buckets": [],
+            }
+
     def get_packet_stats(self, hours: int = 24) -> dict:
         try:
             now = time.time()
@@ -939,10 +1492,16 @@ class SQLiteHandler:
                     (cutoff,),
                 ).fetchone()
 
+                # INDEXED BY forces the timestamp range scan. Without it the
+                # planner picks idx_packets_type / idx_packets_transmitted to get
+                # grouping for free, then heap-checks the timestamp filter across
+                # the entire table — turning a bounded window into a full scan
+                # (~5s vs ~0.1s at 1.5M rows). A small temp b-tree over the
+                # windowed rows is far cheaper.
                 types = conn.execute(
                     """
                     SELECT type, COUNT(*) as count
-                    FROM packets
+                    FROM packets INDEXED BY idx_packets_timestamp
                     WHERE timestamp > ?
                     GROUP BY type
                     ORDER BY count DESC
@@ -953,7 +1512,7 @@ class SQLiteHandler:
                 drop_reasons = conn.execute(
                     """
                     SELECT drop_reason, COUNT(*) as count
-                    FROM packets
+                    FROM packets INDEXED BY idx_packets_timestamp
                     WHERE timestamp > ? AND transmitted = 0 AND drop_reason IS NOT NULL
                     GROUP BY drop_reason
                     ORDER BY count DESC
@@ -992,6 +1551,7 @@ class SQLiteHandler:
                 packets = conn.execute(
                     """
                     SELECT
+                        id,
                         timestamp, type, route, length, rssi, snr, score,
                         transmitted, is_duplicate, drop_reason, src_hash, dst_hash, path_hash,
                         transport_codes, payload, payload_length,
@@ -1044,6 +1604,7 @@ class SQLiteHandler:
 
                 base_query = """
                     SELECT
+                        id,
                         timestamp, type, route, length, rssi, snr, score,
                         transmitted, is_duplicate, drop_reason, src_hash, dst_hash, path_hash,
                         transport_codes, payload, payload_length,
@@ -1176,6 +1737,7 @@ class SQLiteHandler:
                 packet = conn.execute(
                     """
                     SELECT
+                        id,
                         timestamp, type, route, length, rssi, snr, score,
                         transmitted, is_duplicate, drop_reason, src_hash, dst_hash, path_hash,
                         header, transport_codes, payload, payload_length,
@@ -1191,6 +1753,32 @@ class SQLiteHandler:
 
         except Exception as e:
             logger.error(f"Failed to get packet by hash: {e}")
+            return None
+
+    def get_packet_by_id(self, packet_id: int) -> Optional[dict]:
+        try:
+            with self._connect() as conn:
+                conn.row_factory = sqlite3.Row
+
+                packet = conn.execute(
+                    """
+                    SELECT
+                        id,
+                        timestamp, type, route, length, rssi, snr, score,
+                        transmitted, is_duplicate, drop_reason, src_hash, dst_hash, path_hash,
+                        header, transport_codes, payload, payload_length,
+                        tx_delay_ms, packet_hash, original_path, forwarded_path, raw_packet,
+                        lbt_attempts, lbt_backoff_delays_ms, lbt_channel_busy
+                    FROM packets
+                    WHERE id = ?
+                """,
+                    (packet_id,),
+                ).fetchone()
+
+                return dict(packet) if packet else None
+
+        except Exception as e:
+            logger.error(f"Failed to get packet by id: {e}")
             return None
 
     def get_packet_type_stats(self, hours: int = 24) -> dict:
@@ -1251,10 +1839,12 @@ class SQLiteHandler:
             with self._connect() as conn:
                 conn.row_factory = sqlite3.Row
 
+                # See get_packet_stats: force the timestamp range scan so the
+                # windowed GROUP BY doesn't degrade into a full-table scan.
                 type_rows = conn.execute(
                     """
                     SELECT type, COUNT(*) as count
-                    FROM packets
+                    FROM packets INDEXED BY idx_packets_timestamp
                     WHERE timestamp > ?
                     GROUP BY type
                 """,
@@ -2072,10 +2662,28 @@ class SQLiteHandler:
         try:
             with self._connect() as conn:
                 cursor = conn.execute("DELETE FROM adverts WHERE id = ?", (advert_id,))
+                self._neighbors_cache = {"timestamp": 0.0, "value": None}
                 return cursor.rowcount > 0
         except Exception as e:
             logger.error(f"Failed to delete advert: {e}")
             return False
+
+    def delete_neighbors_by_pubkey_prefix(self, pubkey_prefix: Optional[str]) -> int:
+        """Delete neighbor adverts by pubkey prefix (or all when prefix is None)."""
+        try:
+            with self._connect() as conn:
+                if pubkey_prefix is None:
+                    cursor = conn.execute("DELETE FROM adverts")
+                else:
+                    cursor = conn.execute(
+                        "DELETE FROM adverts WHERE lower(pubkey) LIKE ?",
+                        (f"{pubkey_prefix.lower()}%",),
+                    )
+                self._neighbors_cache = {"timestamp": 0.0, "value": None}
+                return int(cursor.rowcount)
+        except Exception as e:
+            logger.error(f"Failed to delete neighbors by prefix: {e}")
+            raise
 
     # ------------------------------------------------------------------
     # Room Server Methods
@@ -2139,29 +2747,32 @@ class SQLiteHandler:
             return []
 
     def upsert_client_sync(self, room_hash: str, client_pubkey: str, **kwargs) -> bool:
-        """Insert or update client sync state using single upsert operation."""
+        """Insert or update client sync state without clobbering unspecified fields."""
         try:
             with self._connect() as conn:
                 now = time.time()
-                kwargs["updated_at"] = now
+                update_fields = dict(kwargs)
+                update_fields["updated_at"] = now
 
-                # Set defaults for insert path
-                kwargs.setdefault("sync_since", 0)
-                kwargs.setdefault("pending_ack_crc", 0)
-                kwargs.setdefault("push_post_timestamp", 0)
-                kwargs.setdefault("ack_timeout_time", 0)
-                kwargs.setdefault("push_failures", 0)
-                kwargs.setdefault("last_activity", now)
+                # INSERT must satisfy NOT NULL columns (last_activity), while
+                # ON CONFLICT updates should only touch supplied fields.
+                insert_fields = dict(update_fields)
+                if insert_fields.get("last_activity") is None:
+                    insert_fields["last_activity"] = now
 
-                columns = ["room_hash", "client_pubkey"] + list(kwargs.keys())
+                columns = ["room_hash", "client_pubkey"] + list(insert_fields.keys())
                 placeholders = ["?"] * len(columns)
-                values = [room_hash, client_pubkey] + list(kwargs.values())
+                values = [room_hash, client_pubkey] + list(insert_fields.values())
 
-                # Use INSERT OR REPLACE for single atomic upsert
+                # Update only supplied columns on conflict so partial updates don't
+                # reset counters/state such as push_failures.
+                update_set = ", ".join(f"{col}=excluded.{col}" for col in update_fields.keys())
                 conn.execute(
                     f"""
-                    INSERT OR REPLACE INTO room_client_sync ({", ".join(columns)})
+                    INSERT INTO room_client_sync ({", ".join(columns)})
                     VALUES ({", ".join(placeholders)})
+                    ON CONFLICT(room_hash, client_pubkey)
+                    DO UPDATE SET {update_set}
                 """,
                     values,
                 )
@@ -2367,8 +2978,12 @@ class SQLiteHandler:
             logger.error(f"Failed to count companion contacts: {e}")
             return 0
 
-    def companion_load_contacts(self, companion_hash: str) -> List[Dict]:
-        """Load contacts for a companion from storage."""
+    def companion_load_contacts(self, companion_hash: str) -> Optional[List[Dict]]:
+        """Load contacts for a companion from storage.
+
+        Returns [] when the companion has no persisted contacts, or None when
+        the load failed — callers must not treat a failed load as "no data".
+        """
         try:
             with self._connect() as conn:
                 conn.row_factory = sqlite3.Row
@@ -2382,8 +2997,8 @@ class SQLiteHandler:
                 )
                 return [dict(row) for row in cursor.fetchall()]
         except Exception as e:
-            logger.error(f"Failed to load companion contacts: {e}")
-            return []
+            logger.error(f"Failed to load companion contacts for {companion_hash}: {e}")
+            return None
 
     def companion_save_contacts(self, companion_hash: str, contacts: List[Dict]) -> bool:
         """Replace all contacts for a companion in storage using batch insert."""
@@ -2594,8 +3209,26 @@ class SQLiteHandler:
             logger.error(f"Failed to save companion prefs: {e}")
             return False
 
-    def companion_load_channels(self, companion_hash: str) -> List[Dict]:
-        """Load channels for a companion from storage."""
+    def companion_count_channels(self, companion_hash: str) -> int:
+        """Return the number of persisted channels for a companion."""
+        try:
+            with self._connect() as conn:
+                cursor = conn.execute(
+                    "SELECT COUNT(*) FROM companion_channels WHERE companion_hash = ?",
+                    (companion_hash,),
+                )
+                row = cursor.fetchone()
+                return int(row[0]) if row else 0
+        except Exception as e:
+            logger.error(f"Failed to count companion channels: {e}")
+            return 0
+
+    def companion_load_channels(self, companion_hash: str) -> Optional[List[Dict]]:
+        """Load channels for a companion from storage.
+
+        Returns [] when the companion has no persisted channels, or None when
+        the load failed — callers must not treat a failed load as "no data".
+        """
         try:
             with self._connect() as conn:
                 conn.row_factory = sqlite3.Row
@@ -2608,8 +3241,8 @@ class SQLiteHandler:
                 )
                 return [dict(row) for row in cursor.fetchall()]
         except Exception as e:
-            logger.error(f"Failed to load companion channels: {e}")
-            return []
+            logger.error(f"Failed to load companion channels for {companion_hash}: {e}")
+            return None
 
     def companion_save_channels(self, companion_hash: str, channels: List[Dict]) -> bool:
         """Replace all channels for a companion in storage using batch insert."""
@@ -2645,23 +3278,47 @@ class SQLiteHandler:
             logger.error(f"Failed to save companion channels: {e}")
             return False
 
-    def companion_load_messages(self, companion_hash: str, limit: int = 100) -> List[Dict]:
-        """Load queued messages for a companion (oldest first for queue order)."""
+    def companion_count_messages(self, companion_hash: str) -> int:
+        """Return the number of persisted queued messages for a companion."""
+        try:
+            with self._connect() as conn:
+                cursor = conn.execute(
+                    "SELECT COUNT(*) FROM companion_messages WHERE companion_hash = ?",
+                    (companion_hash,),
+                )
+                row = cursor.fetchone()
+                return int(row[0]) if row else 0
+        except Exception as e:
+            logger.error(f"Failed to count companion messages: {e}")
+            return 0
+
+    def companion_load_messages(
+        self, companion_hash: str, limit: int = 100
+    ) -> Optional[List[Dict]]:
+        """Load queued messages for a companion (oldest first for queue order).
+
+        Returns [] when the companion has no persisted messages, or None when
+        the load failed — callers must not treat a failed load as "no data".
+        """
         try:
             with self._connect() as conn:
                 conn.row_factory = sqlite3.Row
                 cursor = conn.execute(
                     """
-                    SELECT sender_key, txt_type, timestamp, text, is_channel, channel_idx, path_len
+                    SELECT sender_key, txt_type, timestamp, text, is_channel, channel_idx,
+                           path_len, sender_prefix
                     FROM companion_messages WHERE companion_hash = ?
                     ORDER BY created_at ASC LIMIT ?
                 """,
                     (companion_hash, limit),
                 )
-                return [dict(row) for row in cursor.fetchall()]
+                rows = [dict(row) for row in cursor.fetchall()]
+                for msg in rows:
+                    msg["sender_prefix"] = bytes.fromhex(msg.get("sender_prefix") or "")
+                return rows
         except Exception as e:
-            logger.error(f"Failed to load companion messages: {e}")
-            return []
+            logger.error(f"Failed to load companion messages for {companion_hash}: {e}")
+            return None
 
     def companion_push_message(
         self, companion_hash: str, msg: Dict, max_messages: Optional[int] = None
@@ -2683,13 +3340,16 @@ class SQLiteHandler:
             if isinstance(packet_hash, bytes):
                 packet_hash = packet_hash.decode("utf-8", errors="replace") if packet_hash else None
             sender_key = msg.get("sender_key", b"")
+            sender_prefix = msg.get("sender_prefix", b"")
+            if not isinstance(sender_prefix, str):
+                sender_prefix = bytes(sender_prefix or b"").hex()
             with self._connect() as conn:
                 cursor = conn.execute(
                     """
                     INSERT OR IGNORE INTO companion_messages
                     (companion_hash, sender_key, txt_type, timestamp, text,
-                     is_channel, channel_idx, path_len, packet_hash, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     is_channel, channel_idx, path_len, sender_prefix, packet_hash, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         companion_hash,
@@ -2700,6 +3360,7 @@ class SQLiteHandler:
                         int(msg.get("is_channel", False)),
                         msg.get("channel_idx", 0),
                         msg.get("path_len", 0),
+                        sender_prefix,
                         packet_hash,
                         time.time(),
                     ),
@@ -2732,7 +3393,8 @@ class SQLiteHandler:
                 conn.row_factory = sqlite3.Row
                 cursor = conn.execute(
                     """
-                    SELECT id, sender_key, txt_type, timestamp, text, is_channel, channel_idx, path_len
+                    SELECT id, sender_key, txt_type, timestamp, text, is_channel, channel_idx,
+                           path_len, sender_prefix
                     FROM companion_messages WHERE companion_hash = ?
                     ORDER BY created_at ASC LIMIT 1
                 """,
@@ -2742,6 +3404,7 @@ class SQLiteHandler:
                 if not row:
                     return None
                 msg = dict(row)
+                msg["sender_prefix"] = bytes.fromhex(msg.get("sender_prefix") or "")
                 conn.execute("DELETE FROM companion_messages WHERE id = ?", (msg["id"],))
                 conn.commit()
                 return {k: v for k, v in msg.items() if k != "id"}

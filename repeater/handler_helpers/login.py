@@ -122,7 +122,7 @@ class LoginHelper:
         def auth_callback_with_context(
             client_identity, shared_secret, password, timestamp, sync_since=None
         ):
-            return identity_acl.authenticate_client(
+            success, permissions = identity_acl.authenticate_client(
                 client_identity=client_identity,
                 shared_secret=shared_secret,
                 password=password,
@@ -132,6 +132,26 @@ class LoginHelper:
                 target_identity_name=name,
                 target_identity_config=config,
             )
+            if success and identity_type == "room_server" and self.sqlite_handler is not None:
+                try:
+                    sync_kwargs = {}
+                    if sync_since is not None:
+                        sync_kwargs["sync_since"] = sync_since
+                    self.sqlite_handler.upsert_client_sync(
+                        room_hash=f"0x{hash_byte:02X}",
+                        client_pubkey=client_identity.get_public_key().hex(),
+                        pending_ack_crc=0,
+                        push_post_timestamp=0,
+                        ack_timeout_time=0,
+                        push_failures=0,
+                        last_activity=time.time(),
+                        **sync_kwargs,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to reset room sync guard state after login for hash=0x{hash_byte:02X}: {e}"
+                    )
+            return success, permissions
 
         handler = LoginServerHandler(
             local_identity=identity,

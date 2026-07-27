@@ -311,6 +311,10 @@ mesh:
   # true = allow unscoped flooding, false = deny flooding globally
   unscoped_flood_allow: true
 
+  # Legacy alias for unscoped flood policy. Keep in sync with unscoped_flood_allow.
+  # true = allow unscoped flooding, false = deny
+  global_flood_allow: true
+
   # Path hash mode for flood packets (0-hop): per-hop hash size in path encoding
   # 0 = 1-byte hashes (legacy), 1 = 2-byte, 2 = 3-byte. Must match mesh convention.
   # Affects originated adverts and any other flood packets sent by the repeater.
@@ -319,6 +323,10 @@ mesh:
   # Flood loop detection mode
   # off = disabled, minimal = allow up to 3 self-hashes, moderate = allow up to 1, strict = allow 0
   loop_detect: minimal
+
+  # Default flood scope for locally-originated flood adverts.
+  # Use null or "<null>" via CLI command "region default <null>" to clear.
+  default_region: null
 
 # Multiple Identity Configuration (Optional)
 # Define additional identities for the repeater to manage
@@ -610,6 +618,28 @@ logging:
 
   # Log format
   format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+
+# HTTP server configuration (web UI + API)
+http:
+  # Enable/disable the embedded HTTP server at runtime.
+  # Changes are applied live via ConfigManager (no daemon restart required).
+  enabled: true
+
+  # Listen address and port for the web UI/API server.
+  host: "0.0.0.0"
+  port: 8000
+
+  # CherryPy worker/thread tuning.
+  # thread_pool is the initial worker count (minimum enforced by server: 2).
+  thread_pool: 8
+  # thread_pool_max is the max worker count (always >= thread_pool).
+  thread_pool_max: 16
+
+  # Socket tuning.
+  # socket_timeout closes idle sockets so worker threads can be reused (min: 15 seconds).
+  socket_timeout: 65
+  # socket_queue_size controls pending TCP connection backlog (min: 10).
+  socket_queue_size: 100
 
 # Web interface configuration
 web:

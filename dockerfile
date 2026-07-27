@@ -12,6 +12,7 @@ ARG TARGETARCH
 ARG YQ_VERSION=v4.40.5
 ARG PYMC_CONSOLE_REPO=Treehouse-00/pymc_console-dist
 ARG PYMC_CONSOLE_VERSION=latest
+ARG PYMC_CONSOLE_CACHE_BUST=default
 
 ENV INSTALL_DIR=/opt/openhop_repeater \
     CONFIG_DIR=/etc/openhop_repeater \
@@ -56,6 +57,7 @@ RUN arch="${TARGETARCH:-}" \
 # requiring a host bind mount. Use PYMC_CONSOLE_VERSION=latest to pull the
 # newest release at image build time, or pin a tag such as v0.9.329.
 RUN set -eux; \
+    echo "Bundling PyMC Console cache key: ${PYMC_CONSOLE_CACHE_BUST}"; \
     mkdir -p "${PYMC_CONSOLE_WEB_DIR}"; \
     if [ "${PYMC_CONSOLE_VERSION}" = "latest" ]; then \
         console_url="https://github.com/${PYMC_CONSOLE_REPO}/releases/latest/download/pymc-ui-latest.tar.gz"; \
