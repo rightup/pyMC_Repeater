@@ -735,10 +735,77 @@ class SQLiteHandler:
                     )
                     logger.info(f"Migration '{migration_name}' applied successfully")
 
+                # Migration 14: Small key/value store for daemon state that must
+                # outlive a restart. Added for the neighbours publisher, whose
+                # schedule otherwise resets on every boot and re-runs a discovery
+                # sweep; kept generic so the next such need does not add another
+                # table. Not for anything hot -- one row per writer, rewritten at
+                # whatever cadence that writer already has.
+                migration_name = "add_daemon_state"
+                existing = conn.execute(
+                    "SELECT migration_name FROM migrations WHERE migration_name = ?",
+                    (migration_name,),
+                ).fetchone()
+                if not existing:
+                    conn.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS daemon_state (
+                            key TEXT PRIMARY KEY,
+                            value_json TEXT NOT NULL,
+                            updated_at REAL NOT NULL
+                        )
+                        """
+                    )
+                    conn.execute(
+                        "INSERT INTO migrations (migration_name, applied_at) VALUES (?, ?)",
+                        (migration_name, time.time()),
+                    )
+                    logger.info(f"Migration '{migration_name}' applied successfully")
+
                 conn.commit()
 
         except Exception as e:
             logger.error(f"Failed to run migrations: {e}")
+
+    # Daemon state methods
+    def get_daemon_state(self, key: str) -> Optional[dict]:
+        """Read a persisted daemon-state blob, or None when absent/unreadable.
+
+        Never raises: every caller treats missing state as "no history", so a
+        corrupt row must degrade to that rather than break startup.
+        """
+        try:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT value_json FROM daemon_state WHERE key = ?", (key,)
+                ).fetchone()
+            if not row:
+                return None
+            value = json.loads(row[0])
+            return value if isinstance(value, dict) else None
+        except Exception as e:
+            logger.debug(f"Could not read daemon state '{key}': {e}")
+            return None
+
+    def set_daemon_state(self, key: str, value: dict) -> bool:
+        """Upsert a daemon-state blob. Returns whether it was written."""
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO daemon_state (key, value_json, updated_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(key) DO UPDATE SET
+                        value_json = excluded.value_json,
+                        updated_at = excluded.updated_at
+                    """,
+                    (key, json.dumps(value), time.time()),
+                )
+                conn.commit()
+            return True
+        except Exception as e:
+            logger.warning(f"Could not persist daemon state '{key}': {e}")
+            return False
 
     # API Token methods
     def create_api_token(self, name: str, token_hash: str) -> int:

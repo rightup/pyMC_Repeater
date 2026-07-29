@@ -21,6 +21,7 @@ from openhop_core.protocol import CryptoUtils, Identity, LocalIdentity
 from openhop_core.protocol.constants import PAYLOAD_TYPE_RESPONSE
 from repeater.data_acquisition.mqtt_handler import MeshCoreToMqttPusher
 from repeater.handler_helpers.neighbor_scopes import (
+    DEFAULT_MAX_SWEEP_SECONDS,
     STATUS_RESPONDED,
     STATUS_SEND_FAILED,
     STATUS_TIMEOUT,
@@ -28,8 +29,11 @@ from repeater.handler_helpers.neighbor_scopes import (
     NeighborSnapshot,
 )
 from repeater.neighbors_publisher import (
+    DEFAULT_INTERVAL_HOURS,
     MAX_INTERVAL_HOURS,
     MIN_INTERVAL_HOURS,
+    STARTUP_GRACE_SECONDS,
+    STATE_KEY,
     NeighborsPublisher,
     build_neighbors_payload,
     normalize_interval_hours,
@@ -100,7 +104,7 @@ def test_payload_orders_most_useful_first():
     )
 
     assert [e["pubkey"] for e in payload["neighbors"]] == ["bb", "aa", "cc"]
-    assert payload["self"] == {"scopes": "DEN,APRS"}
+    assert payload["self"] == {"scopes": "DEN,APRS", "default_scope": "*"}
     assert payload["origin_id"] == "AA" * 32
     assert payload["timestamp"]
 
@@ -823,7 +827,7 @@ async def test_cycle_publishes_table_with_unanswered_neighbors():
     assert result["responded"] == 1
 
     payload = published[0]
-    assert payload["self"] == {"scopes": "DEN,APRS"}
+    assert payload["self"] == {"scopes": "DEN,APRS", "default_scope": "*"}
     statuses = {e["pubkey"]: e["status"] for e in payload["neighbors"]}
     assert statuses == {"aa" * 32: STATUS_RESPONDED, "bb" * 32: STATUS_TIMEOUT}
     # A cycle always arms the next one, so a failure cannot wedge the schedule.
@@ -1015,3 +1019,576 @@ def test_invalid_neighbors_interval_is_rejected_by_the_endpoint(monkeypatch):
     assert out["success"] is False
     assert "between 12 and 336" in out["error"]
     api.config_manager.update_and_save.assert_not_called()
+
+
+# ====================================================================
+# Malformed config block
+# ====================================================================
+# `neighbors` is a settings block under mqtt_brokers but a boolean on each broker
+# entry, and config.yaml.example documents both, so `mqtt_brokers.neighbors: true`
+# is an easy hand-edit to make. Every reader used to call .get() on it directly.
+@pytest.mark.parametrize("bogus", [True, 24, "on", ["DEN"]])
+def test_scalar_neighbors_block_is_ignored_not_fatal(bogus):
+    """A truthy scalar took the daemon down: the scope helper reads it in __init__."""
+    config = {"mqtt_brokers": {"neighbors": bogus}}
+
+    helper = NeighborScopeHelper(
+        local_identity=LocalIdentity(), packet_injector=None, config=config
+    )
+    assert helper._max_sweep_seconds == DEFAULT_MAX_SWEEP_SECONDS
+
+    publisher = NeighborsPublisher(config=config)
+    assert publisher._neighbors_config == {}
+    assert publisher.master_enabled is True
+    assert publisher.interval_seconds == DEFAULT_INTERVAL_HOURS * 3600.0
+    assert publisher.enabled() is False  # no handler, so nothing is published
+
+
+@pytest.mark.parametrize("bogus", [True, 24, "on"])
+def test_scalar_neighbors_block_is_repaired_by_a_save(monkeypatch, bogus):
+    """The merge onto the stored block must not fail on a non-mapping."""
+    api, request = _api_with_stored_brokers(monkeypatch, [], neighbors_block=bogus)
+
+    request.json = {"neighbors": {"enabled": True, "interval_hours": 36}}
+    assert api.update_mqtt_config()["success"] is True
+
+    saved = api.config_manager.update_and_save.call_args.kwargs["updates"]["mqtt_brokers"]
+    assert saved["neighbors"] == {"enabled": True, "interval_hours": 36}
+
+
+def test_scalar_delays_block_does_not_break_the_response_window():
+    helper = NeighborScopeHelper(
+        local_identity=LocalIdentity(),
+        packet_injector=None,
+        config={"delays": True},
+    )
+    assert helper._direct_tx_delay_factor == 0.5
+
+
+# ====================================================================
+# Progress metadata (firmware total_neighbors / queried_neighbors)
+# ====================================================================
+def test_payload_reports_progress_metadata_in_firmware_key_order():
+    payload = build_neighbors_payload(
+        origin="node",
+        origin_id="AA" * 32,
+        self_scopes="DEN",
+        entries=[
+            {
+                "pubkey": "aa",
+                "snr": 1.0,
+                "heard_secs_ago": 5,
+                "scopes": "DEN",
+                "status": "responded",
+            }
+        ],
+        total_neighbors=4,
+        queried_neighbors=2,
+    )
+
+    assert payload["total_neighbors"] == 4
+    assert payload["queried_neighbors"] == 2
+    # Firmware's buildNeighborsMessageBase writes the counters between origin_id
+    # and self; keeping the order lets the two payloads diff cleanly.
+    assert list(payload) == [
+        "timestamp",
+        "origin",
+        "origin_id",
+        "total_neighbors",
+        "queried_neighbors",
+        "self",
+        "neighbors",
+    ]
+
+
+def test_payload_never_emits_the_firmware_truncated_field():
+    """It reports a fixed PSRAM buffer overflowing, which openhop cannot have."""
+    payload = build_neighbors_payload(
+        origin="node",
+        origin_id="AA" * 32,
+        self_scopes="",
+        entries=[],
+        total_neighbors=3,
+        queried_neighbors=1,
+    )
+
+    assert "truncated" not in payload
+
+
+def test_payload_omits_progress_metadata_when_counts_are_absent():
+    """Mirrors the firmware's `total_neighbors >= 0` guard."""
+    payload = build_neighbors_payload(
+        origin="node", origin_id="AA" * 32, self_scopes="", entries=[]
+    )
+
+    assert "total_neighbors" not in payload
+    assert "queried_neighbors" not in payload
+
+
+def test_queried_count_excludes_neighbors_never_put_on_air():
+    """`status` cannot carry this: an unreached target also reports `timeout`."""
+    from repeater.handler_helpers.neighbor_scopes import ScopeResult
+
+    targets = [
+        NeighborSnapshot(pubkey=f"{i:064x}", last_seen=time.time(), snr=1.0) for i in range(4)
+    ]
+    publisher = _publisher({"mqtt_brokers": {}})
+
+    payload = publisher._build_payload(
+        targets,
+        {
+            targets[0].pubkey: ScopeResult(STATUS_RESPONDED, "DEN", transmitted=True),
+            targets[1].pubkey: ScopeResult(STATUS_TIMEOUT, transmitted=True),
+            targets[2].pubkey: ScopeResult(STATUS_SEND_FAILED),  # never transmitted
+            targets[3].pubkey: ScopeResult(STATUS_TIMEOUT),  # sweep never reached it
+        },
+    )
+
+    assert payload["queried_neighbors"] == 2
+
+
+def test_total_neighbors_always_matches_the_published_row_count():
+    """Without `truncated` to flag a gap, the two must not diverge."""
+    publisher = _publisher({"mqtt_brokers": {}})
+    targets = [
+        NeighborSnapshot(pubkey=f"{i:064x}", last_seen=time.time(), snr=1.0) for i in range(3)
+    ]
+
+    payload = publisher._build_payload(targets, {})
+
+    assert payload["total_neighbors"] == len(payload["neighbors"]) == 3
+
+
+@pytest.mark.asyncio
+async def test_transmitted_flag_tracks_whether_the_request_reached_the_air():
+    local = LocalIdentity()
+    peer = LocalIdentity()
+    target = NeighborSnapshot(pubkey=peer.get_public_key().hex(), last_seen=time.time())
+
+    async def failed(packet, wait_for_ack=False):
+        return False
+
+    results = await _helper_with_injector(local, failed).sweep([target])
+    assert results[target.pubkey].transmitted is False
+
+    async def sent(packet, wait_for_ack=False):
+        return True
+
+    helper = _helper_with_injector(
+        local,
+        sent,
+        config={"mqtt_brokers": {"neighbors": {"scope_response_timeout_seconds": 0.05}}},
+    )
+    results = await helper.sweep([target])
+    assert results[target.pubkey].status == STATUS_TIMEOUT
+    assert results[target.pubkey].transmitted is True
+
+
+# ====================================================================
+# Manual trigger endpoint
+# ====================================================================
+def _api_with_publisher(monkeypatch, publisher, method="POST"):
+    import cherrypy
+
+    from repeater.web.api_endpoints import APIEndpoints
+
+    request = SimpleNamespace(method=method, params={}, json={})
+    response = SimpleNamespace(headers={}, status=200)
+    monkeypatch.setattr(cherrypy, "request", request, raising=False)
+    monkeypatch.setattr(cherrypy, "response", response, raising=False)
+
+    api = APIEndpoints.__new__(APIEndpoints)
+    api.config = {}
+    api.daemon_instance = SimpleNamespace(neighbors_publisher=publisher)
+    api.event_loop = asyncio.new_event_loop()
+    api.send_advert_func = None
+    api.stats_getter = None
+    api._config_path = "/tmp/test-config.yaml"
+    api.config_manager = MagicMock()
+    return api
+
+
+class _FakePublisher:
+    def __init__(self, *, is_enabled=True, starts=True):
+        self._enabled = is_enabled
+        self._starts = starts
+        self.triggered = 0
+
+    def enabled(self):
+        return self._enabled
+
+    def trigger_cycle(self):
+        self.triggered += 1
+        return self._starts
+
+
+def _run_endpoint(api):
+    """Drive the endpoint's run_coroutine_threadsafe against a real loop."""
+    import threading
+
+    loop = api.event_loop
+    thread = threading.Thread(target=loop.run_forever, daemon=True)
+    thread.start()
+    try:
+        return api.publish_neighbors()
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=5)
+        # Closing a loop whose thread has not finished unwinding can raise on its
+        # self-pipe descriptors; leak it rather than risk a flaky teardown.
+        if not thread.is_alive():
+            loop.close()
+
+
+def test_publish_neighbors_endpoint_starts_a_cycle(monkeypatch):
+    publisher = _FakePublisher()
+    api = _api_with_publisher(monkeypatch, publisher)
+
+    out = _run_endpoint(api)
+
+    assert out["success"] is True
+    assert publisher.triggered == 1
+
+
+def test_publish_neighbors_endpoint_reports_an_already_running_cycle(monkeypatch):
+    publisher = _FakePublisher(starts=False)
+    api = _api_with_publisher(monkeypatch, publisher)
+
+    out = _run_endpoint(api)
+
+    assert out["success"] is False
+    assert "already running" in out["error"]
+
+
+def test_publish_neighbors_endpoint_refuses_when_disabled(monkeypatch):
+    """No broker opted in: refuse rather than burn airtime on an unpublishable cycle."""
+    publisher = _FakePublisher(is_enabled=False)
+    api = _api_with_publisher(monkeypatch, publisher)
+
+    out = api.publish_neighbors()
+
+    assert out["success"] is False
+    assert publisher.triggered == 0
+
+
+def test_publish_neighbors_endpoint_without_a_publisher(monkeypatch):
+    api = _api_with_publisher(monkeypatch, None)
+
+    out = api.publish_neighbors()
+
+    assert out["success"] is False
+    assert "not available" in out["error"]
+
+
+# ====================================================================
+# self.default_scope
+# ====================================================================
+@pytest.mark.parametrize(
+    "mesh_cfg,expected",
+    [
+        ({"default_region": "DEN"}, "DEN"),
+        ({"default_region": "#DEN"}, "DEN"),  # transport-key tables prefix with '#'
+        ({"default_region": "  DEN  "}, "DEN"),
+        ({"default_region": None}, "*"),  # unset -> floods unscoped
+        ({"default_region": ""}, "*"),
+        ({"default_region": "   "}, "*"),
+        ({}, "*"),  # key absent entirely
+        ({"default_region": "*"}, "*"),
+        (True, "*"),  # hand-edited scalar must not raise
+    ],
+)
+def test_self_default_scope_normalisation(mesh_cfg, expected):
+    publisher = _publisher({"mqtt_brokers": {}, "mesh": mesh_cfg})
+    assert publisher._self_default_scope() == expected
+
+
+def test_default_scope_is_published_inside_self():
+    publisher = _publisher({"mqtt_brokers": {}, "mesh": {"default_region": "#PDX"}})
+
+    payload = publisher._build_payload([], {})
+
+    assert payload["self"]["default_scope"] == "PDX"
+    assert "scopes" in payload["self"]
+
+
+def test_default_scope_tracks_a_live_config_edit():
+    """`region default <name>` writes into the same dict and must not need a restart."""
+    config = {"mqtt_brokers": {}, "mesh": {"default_region": None}}
+    publisher = _publisher(config)
+
+    assert publisher._build_payload([], {})["self"]["default_scope"] == "*"
+
+    config["mesh"]["default_region"] = "DEN"
+    assert publisher._build_payload([], {})["self"]["default_scope"] == "DEN"
+
+
+def test_payload_defaults_default_scope_to_the_wildcard():
+    """Callers that omit it still emit a valid self block."""
+    payload = build_neighbors_payload(
+        origin="node", origin_id="AA" * 32, self_scopes="DEN", entries=[]
+    )
+
+    assert payload["self"] == {"scopes": "DEN", "default_scope": "*"}
+
+
+# ====================================================================
+# Schedule persistence across restarts
+# ====================================================================
+class _FakeStateStore:
+    """Stands in for the daemon_state table."""
+
+    def __init__(self, initial=None):
+        self.rows = dict(initial or {})
+        self.writes = 0
+
+    def get_daemon_state(self, key):
+        return self.rows.get(key)
+
+    def set_daemon_state(self, key, value):
+        self.rows[key] = dict(value)
+        self.writes += 1
+        return True
+
+
+def _enabled_handler():
+    return SimpleNamespace(
+        has_neighbors_brokers=lambda: True, has_connected_neighbors_brokers=lambda: True
+    )
+
+
+def test_restore_resumes_the_interval_from_the_last_successful_publish():
+    now = time.time()
+    store = _FakeStateStore({STATE_KEY: {"last_success_at": now - 3600, "last_result": "ok"}})
+    publisher = _publisher(
+        {"mqtt_brokers": {"neighbors": {"interval_hours": 24}}},
+        handler=_enabled_handler(),
+        storage=store,
+    )
+
+    publisher._restore_schedule()
+
+    # 1h since the last publish on a 24h interval -> ~23h to go, not "due now".
+    secs = publisher.status()["secs_until_next"]
+    assert 22.9 * 3600 < secs < 23.1 * 3600
+    assert publisher.status()["phase"] == "scheduled"
+    assert publisher._last_result == "ok"
+
+
+def test_restore_applies_the_grace_delay_when_already_overdue():
+    """A node off for a week must not transmit the instant it boots."""
+    store = _FakeStateStore(
+        {STATE_KEY: {"last_success_at": time.time() - 7 * 86400, "last_result": "ok"}}
+    )
+    publisher = _publisher(
+        {"mqtt_brokers": {"neighbors": {"interval_hours": 24}}},
+        handler=_enabled_handler(),
+        storage=store,
+    )
+
+    publisher._restore_schedule()
+
+    assert publisher.status()["secs_until_next"] == pytest.approx(STARTUP_GRACE_SECONDS, abs=2)
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        None,  # fresh install
+        {},
+        {"last_success_at": None},
+        {"last_success_at": "nonsense"},
+        {"last_success_at": 0},
+        # Clock moved backwards, or a junk row: must not park the schedule in the
+        # far future where nothing would ever publish again.
+        {"last_success_at": time.time() + 5 * 86400},
+    ],
+)
+def test_restore_falls_back_to_the_grace_delay_on_unusable_state(state):
+    store = _FakeStateStore({STATE_KEY: state} if state is not None else {})
+    publisher = _publisher(
+        {"mqtt_brokers": {"neighbors": {"interval_hours": 24}}},
+        handler=_enabled_handler(),
+        storage=store,
+    )
+
+    publisher._restore_schedule()
+
+    assert publisher.status()["secs_until_next"] == pytest.approx(STARTUP_GRACE_SECONDS, abs=2)
+
+
+def test_restore_clamps_a_delay_longer_than_the_interval():
+    """An interval shortened since the last publish must take effect now."""
+    store = _FakeStateStore({STATE_KEY: {"last_success_at": time.time()}})
+    publisher = _publisher(
+        {"mqtt_brokers": {"neighbors": {"interval_hours": 12}}},
+        handler=_enabled_handler(),
+        storage=store,
+    )
+    publisher._restore_schedule()
+    assert publisher.status()["secs_until_next"] <= 12 * 3600
+
+    # Same stored publish time, but the config now says 24h -> still bounded.
+    publisher.config["mqtt_brokers"]["neighbors"]["interval_hours"] = 24
+    publisher._restore_schedule()
+    assert publisher.status()["secs_until_next"] <= 24 * 3600
+
+
+def test_restore_without_a_state_capable_storage_backend():
+    """An older storage backend must still start, just without resuming."""
+    publisher = _publisher({"mqtt_brokers": {}}, handler=_enabled_handler(), storage=object())
+
+    publisher._restore_schedule()
+
+    assert publisher.status()["secs_until_next"] == pytest.approx(STARTUP_GRACE_SECONDS, abs=2)
+
+
+@pytest.mark.asyncio
+async def test_failed_publish_is_not_recorded_as_a_successful_one():
+    """Otherwise a restart turns the 15-minute retry into a full interval."""
+    store = _FakeStateStore()
+    handler = SimpleNamespace(
+        has_neighbors_brokers=lambda: True,
+        has_connected_neighbors_brokers=lambda: True,
+        publish_neighbors=lambda payload: [],  # reached no broker
+        node_name="n",
+        public_key="AB" * 32,
+    )
+    store.get_neighbors = lambda: {}
+    publisher = _publisher({"mqtt_brokers": {}}, handler=handler, storage=store)
+
+    await publisher.run_cycle(trigger="test")
+
+    saved = store.rows[STATE_KEY]
+    assert saved["last_success_at"] is None
+    assert saved["last_publish_at"] is not None  # the attempt is still recorded
+    assert "publish failed" in saved["last_result"]
+
+    # A restart therefore retries promptly rather than waiting out the interval.
+    restarted = _publisher(
+        {"mqtt_brokers": {"neighbors": {"interval_hours": 24}}},
+        handler=_enabled_handler(),
+        storage=store,
+    )
+    restarted._restore_schedule()
+    assert restarted.status()["secs_until_next"] == pytest.approx(STARTUP_GRACE_SECONDS, abs=2)
+
+
+@pytest.mark.asyncio
+async def test_successful_publish_persists_a_resumable_schedule():
+    store = _FakeStateStore()
+    handler = SimpleNamespace(
+        has_neighbors_brokers=lambda: True,
+        has_connected_neighbors_brokers=lambda: True,
+        publish_neighbors=lambda payload: [("broker", None)],
+        node_name="n",
+        public_key="AB" * 32,
+    )
+    store.get_neighbors = lambda: {}
+    publisher = _publisher({"mqtt_brokers": {}}, handler=handler, storage=store)
+
+    await publisher.run_cycle(trigger="test")
+
+    assert store.rows[STATE_KEY]["last_success_at"] == pytest.approx(time.time(), abs=5)
+
+    restarted = _publisher(
+        {"mqtt_brokers": {"neighbors": {"interval_hours": 24}}},
+        handler=_enabled_handler(),
+        storage=store,
+    )
+    restarted._restore_schedule()
+    assert restarted.status()["secs_until_next"] > 23 * 3600
+
+
+@pytest.mark.asyncio
+async def test_boot_tick_does_not_discard_the_restored_schedule():
+    """The disabled branch of _tick must not fire before we were ever enabled.
+
+    At boot the MQTT connections may not be up, so enabled() can briefly be
+    False. Clearing the schedule there would mark the node due and re-run the
+    sweep on every restart -- the exact thing persistence prevents.
+    """
+    store = _FakeStateStore({STATE_KEY: {"last_success_at": time.time() - 3600}})
+    not_ready = SimpleNamespace(has_neighbors_brokers=lambda: False)
+    publisher = _publisher(
+        {"mqtt_brokers": {"neighbors": {"interval_hours": 24}}},
+        handler=not_ready,
+        storage=store,
+    )
+    publisher._restore_schedule()
+    restored = publisher._next_publish_at
+
+    await publisher._tick()
+
+    assert publisher._next_publish_at == restored
+
+
+@pytest.mark.asyncio
+async def test_disabling_after_being_enabled_still_clears_the_schedule():
+    """Re-enabling should publish promptly; that behaviour is preserved."""
+    store = _FakeStateStore()
+    enabled = True
+    handler = SimpleNamespace(
+        has_neighbors_brokers=lambda: enabled,
+        has_connected_neighbors_brokers=lambda: False,
+    )
+    publisher = _publisher({"mqtt_brokers": {}}, handler=handler, storage=store)
+    publisher._next_publish_at = time.monotonic() + 3600
+
+    await publisher._tick()  # enabled, but no connected broker -> schedule kept
+    assert publisher._next_publish_at is not None
+
+    enabled = False
+    await publisher._tick()
+    assert publisher._next_publish_at is None
+
+
+def test_daemon_state_round_trips_through_real_sqlite(tmp_path):
+    """The fake store above cannot prove the migration or the accessors work."""
+    from repeater.data_acquisition.sqlite_handler import SQLiteHandler
+
+    handler = SQLiteHandler(tmp_path)
+
+    assert handler.get_daemon_state(STATE_KEY) is None  # absent, not an error
+
+    assert handler.set_daemon_state(STATE_KEY, {"last_success_at": 1785372000.0}) is True
+    assert handler.get_daemon_state(STATE_KEY) == {"last_success_at": 1785372000.0}
+
+    # Upsert, not a second row.
+    assert handler.set_daemon_state(STATE_KEY, {"last_success_at": 1785458400.0}) is True
+    assert handler.get_daemon_state(STATE_KEY)["last_success_at"] == 1785458400.0
+
+    # A fresh handler on the same file sees it -- this is the restart path.
+    assert SQLiteHandler(tmp_path).get_daemon_state(STATE_KEY)["last_success_at"] == 1785458400.0
+
+
+def test_daemon_state_survives_a_corrupt_row(tmp_path):
+    """Unparseable state must read as "no history", never break startup."""
+    import sqlite3
+
+    from repeater.data_acquisition.sqlite_handler import SQLiteHandler
+
+    handler = SQLiteHandler(tmp_path)
+    handler.set_daemon_state(STATE_KEY, {"last_success_at": 1.0})
+    with sqlite3.connect(handler.sqlite_path) as conn:
+        conn.execute("UPDATE daemon_state SET value_json = ?", ("{not json",))
+        conn.commit()
+
+    assert handler.get_daemon_state(STATE_KEY) is None
+
+    publisher = _publisher({"mqtt_brokers": {}}, handler=_enabled_handler(), storage=handler)
+    publisher._restore_schedule()
+    assert publisher.status()["secs_until_next"] == pytest.approx(STARTUP_GRACE_SECONDS, abs=2)
+
+
+def test_migration_is_idempotent_on_an_existing_database(tmp_path):
+    """Migration 14 runs against nibbler's populated DB, not a fresh file."""
+    from repeater.data_acquisition.sqlite_handler import SQLiteHandler
+
+    first = SQLiteHandler(tmp_path)
+    first.set_daemon_state(STATE_KEY, {"last_success_at": 42.0})
+
+    # Re-running migrations must not drop the table or its contents.
+    for _ in range(3):
+        SQLiteHandler(tmp_path)._run_migrations()
+
+    assert SQLiteHandler(tmp_path).get_daemon_state(STATE_KEY) == {"last_success_at": 42.0}

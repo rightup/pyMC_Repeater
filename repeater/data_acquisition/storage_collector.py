@@ -539,6 +539,12 @@ class StorageCollector:
     def get_neighbors(self) -> dict:
         return self.sqlite_handler.get_neighbors()
 
+    def get_daemon_state(self, key: str) -> Optional[dict]:
+        return self.sqlite_handler.get_daemon_state(key)
+
+    def set_daemon_state(self, key: str, value: dict) -> bool:
+        return self.sqlite_handler.set_daemon_state(key, value)
+
     def get_node_name_by_pubkey(self, pubkey: str) -> Optional[str]:
         """
         Lookup node name from adverts table by public key.

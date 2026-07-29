@@ -31,6 +31,7 @@ from repeater.handler_helpers.neighbor_scopes import (
     STATUS_TIMEOUT,
     NeighborSnapshot,
     ScopeResult,
+    neighbors_config_block,
 )
 
 logger = logging.getLogger("NeighborsPublisher")
@@ -58,6 +59,19 @@ _TICK_SECONDS = 30.0
 # waiting out the full interval.
 RETRY_DELAY_SECONDS = 900.0
 
+# How an unset default region is spelled in the payload. Matches the wildcard
+# LoginHelper._format_region_names already emits for unscoped flood.
+DEFAULT_SCOPE_WILDCARD = "*"
+
+# daemon_state key holding the persisted schedule.
+STATE_KEY = "neighbors_publisher"
+
+# A restored schedule never fires inside this window after boot, even when it is
+# already overdue. Keeps a restart quiet and lets the radio and brokers settle
+# before a cycle claims the airtime. Firmware has no equivalent -- it treats
+# every boot as immediately due.
+STARTUP_GRACE_SECONDS = 300.0
+
 # Phases reported by status(), mirroring the firmware's NeighborsPhase.
 PHASE_DISABLED = "disabled"
 PHASE_SCHEDULED = "scheduled"
@@ -72,6 +86,9 @@ def build_neighbors_payload(
     self_scopes: str,
     entries: List[dict],
     timestamp: Optional[str] = None,
+    total_neighbors: Optional[int] = None,
+    queried_neighbors: Optional[int] = None,
+    self_default_scope: str = DEFAULT_SCOPE_WILDCARD,
 ) -> dict:
     """Assemble the ``neighbors`` topic payload.
 
@@ -80,18 +97,47 @@ def build_neighbors_payload(
     needs that order so it can drop the tail when its fixed buffer fills; we keep
     it because it is the documented shape of the topic and it puts the useful rows
     first for consumers.
+
+    ``self`` carries this node's own advertised scopes plus ``default_scope``, the
+    region it stamps on outgoing floods (``*`` when it floods unscoped). The
+    firmware tracks a ``default_scope`` internally but does not publish it; it is
+    included here because a consumer reading the table cannot otherwise tell which
+    of several scopes this node actually transmits under.
+
+    Two progress counters mirror firmware ``buildNeighborsMessage``:
+
+    * ``total_neighbors`` — neighbours in this cycle's table, which is also how
+      many rows ``neighbors`` carries.
+    * ``queried_neighbors`` — how many scope requests reached the air.
+
+    The firmware's third field, ``truncated``, is deliberately not emitted: it
+    reports that a fixed PSRAM JSON buffer filled and the tail was dropped, and
+    openhop has no such buffer, so it could only ever be false. That also keeps
+    ``total_neighbors`` equal to the published row count here, where firmware
+    allows it to run ahead. Both are emitted only when the caller supplies the
+    counts, matching the firmware's ``total_neighbors >= 0`` guard.
     """
     ordered = sorted(
         entries,
         key=lambda e: (e.get("heard_secs_ago", 0), -float(e.get("snr", 0.0)), e.get("pubkey", "")),
     )
-    return {
+    payload = {
         "timestamp": timestamp or datetime.now(timezone.utc).isoformat(),
         "origin": origin,
         "origin_id": origin_id,
-        "self": {"scopes": self_scopes or ""},
-        "neighbors": ordered,
     }
+    # Key order matches the firmware writer so the two payloads diff cleanly.
+    if total_neighbors is not None:
+        payload["total_neighbors"] = int(total_neighbors)
+        payload["queried_neighbors"] = int(
+            queried_neighbors if queried_neighbors is not None else total_neighbors
+        )
+    payload["self"] = {
+        "scopes": self_scopes or "",
+        "default_scope": self_default_scope or DEFAULT_SCOPE_WILDCARD,
+    }
+    payload["neighbors"] = ordered
+    return payload
 
 
 class NeighborsPublisher:
@@ -124,14 +170,26 @@ class NeighborsPublisher:
         self._discovery_seen: Dict[str, dict] = {}
         self._next_publish_at: Optional[float] = None
         self._last_result: Optional[str] = None
+        # When the last cycle finished, whatever its outcome -- this is what
+        # status() reports alongside last_result.
         self._last_publish_at: Optional[float] = None
+        # When a cycle last actually reached a broker. The schedule is measured
+        # from this, not from the above: a cycle that failed to publish reschedules
+        # on the short retry delay, and restoring from a failed attempt would
+        # silently turn that retry into a full interval.
+        self._last_success_at: Optional[float] = None
+        # Whether the feature has been enabled at any point in this process. The
+        # disabled branch of _tick clears the schedule so re-enabling publishes
+        # promptly, which must not fire before we have ever been enabled -- that
+        # would throw away a schedule just restored from disk.
+        self._was_enabled = False
 
     # ------------------------------------------------------------------
     # Config accessors (re-read every cycle so live edits take effect)
     # ------------------------------------------------------------------
     @property
     def _neighbors_config(self) -> dict:
-        return (self.config.get("mqtt_brokers", {}) or {}).get("neighbors", {}) or {}
+        return neighbors_config_block(self.config)
 
     @property
     def master_enabled(self) -> bool:
@@ -181,9 +239,86 @@ class NeighborsPublisher:
     def start(self) -> None:
         if self._task is not None and not self._task.done():
             return
+        # Say so once, loudly, rather than from the config accessors: those run
+        # several times per tick and would bury the log.
+        raw_block = (self.config.get("mqtt_brokers") or {}) if isinstance(self.config, dict) else {}
+        if isinstance(raw_block, dict) and not isinstance(raw_block.get("neighbors", {}), dict):
+            logger.warning(
+                "mqtt_brokers.neighbors is %s, not a settings block - using defaults. "
+                "The per-broker 'neighbors: true' flag is what opts a broker in.",
+                type(raw_block.get("neighbors")).__name__,
+            )
+        self._restore_schedule()
         self._running = True
         self._task = asyncio.create_task(self._run_loop(), name="neighbors-publisher")
         logger.info("Neighbors publisher started (interval %.1fh)", self.interval_seconds / 3600.0)
+
+    # ------------------------------------------------------------------
+    # Schedule persistence
+    # ------------------------------------------------------------------
+    def _restore_schedule(self) -> None:
+        """Resume the schedule from the last publish instead of restarting it.
+
+        Without this a restart leaves ``_next_publish_at`` unset, which reads as
+        "due" and spends a discovery broadcast plus a serialized scope query per
+        neighbour on every boot. ``_next_publish_at`` is monotonic and so cannot
+        be stored directly; the persisted value is the wall-clock publish time,
+        converted back to a monotonic deadline here.
+        """
+        storage = self._storage()
+        reader = getattr(storage, "get_daemon_state", None) if storage else None
+        if not callable(reader):
+            # Older storage backend, or none wired up: behave as before.
+            self._next_publish_at = time.monotonic() + STARTUP_GRACE_SECONDS
+            return
+
+        state = reader(STATE_KEY) or {}
+        last = _as_epoch(state.get("last_success_at"))
+
+        # Restore the display fields too, so a restart does not report the node as
+        # having never run.
+        self._last_result = state.get("last_result") or None
+        self._last_publish_at = _as_epoch(state.get("last_publish_at")) or None
+        interval = self.interval_seconds
+        now = time.time()
+
+        if last <= 0 or last > now:
+            # No successful publish on record, or a timestamp from the future --
+            # the clock moved backwards, or the row is junk. Either way it cannot
+            # place the next cycle, so fall back to the grace delay.
+            if last > now:
+                logger.warning(
+                    "Persisted neighbours publish time is %.0fs in the future; ignoring it",
+                    last - now,
+                )
+            self._next_publish_at = time.monotonic() + STARTUP_GRACE_SECONDS
+            return
+
+        self._last_success_at = last
+        # Never sooner than the grace window, never later than a full interval
+        # from now -- the latter bounds the damage from an interval that shrank
+        # since the last publish.
+        delay = min(max((last + interval) - now, STARTUP_GRACE_SECONDS), interval)
+        self._next_publish_at = time.monotonic() + delay
+        logger.info(
+            "Neighbours schedule resumed: last published %.1fh ago, next in %.1fh",
+            (now - last) / 3600.0,
+            delay / 3600.0,
+        )
+
+    def _persist_schedule(self) -> None:
+        storage = self._storage()
+        writer = getattr(storage, "set_daemon_state", None) if storage else None
+        if not callable(writer):
+            return
+        writer(
+            STATE_KEY,
+            {
+                "last_success_at": self._last_success_at,
+                "last_publish_at": self._last_publish_at,
+                "last_result": self._last_result,
+            },
+        )
 
     def trigger_cycle(self) -> bool:
         """Start a manual cycle, tracked so shutdown can cancel it.
@@ -303,10 +438,16 @@ class NeighborsPublisher:
     async def _tick(self) -> None:
         if not self.enabled():
             # Drop the schedule so re-enabling runs a pass promptly, matching the
-            # firmware's next_neighbors_publish = 0 reset.
-            self._next_publish_at = None
+            # firmware's next_neighbors_publish = 0 reset. Only once the feature
+            # has actually been on in this process, though: at boot the MQTT
+            # handler may not have its connections up yet, and clearing here would
+            # discard the schedule just restored from disk and re-run the sweep
+            # anyway -- the exact thing persistence exists to prevent.
+            if self._was_enabled:
+                self._next_publish_at = None
             return
 
+        self._was_enabled = True
         handler = self._mqtt_handler()
         if not handler or not handler.has_connected_neighbors_brokers():
             logger.debug("Neighbors publish deferred: no connected opted-in broker")
@@ -361,6 +502,9 @@ class NeighborsPublisher:
                 else "publish failed (broker unreachable or rejected the payload)"
             )
             self._last_publish_at = time.time()
+            if published:
+                self._last_success_at = self._last_publish_at
+            self._persist_schedule()
             logger.info(
                 "Neighbors %s cycle finished in %.1fs: %d neighbour(s), %d with scopes, "
                 "published=%s",
@@ -486,6 +630,8 @@ class NeighborsPublisher:
         # the same ordering the firmware applies before it starts querying.
         snapshots.sort(key=lambda s: (-s.last_seen, -s.snr, s.pubkey))
         if len(snapshots) > self.max_neighbors:
+            # Only logged, not published: the payload reports the capped table, so
+            # the dropped rows would otherwise be invisible here.
             logger.info(
                 "Neighbour table has %d entries; querying the freshest %d",
                 len(snapshots),
@@ -495,12 +641,17 @@ class NeighborsPublisher:
         return snapshots
 
     def _build_payload(
-        self, targets: List[NeighborSnapshot], scope_results: Dict[str, ScopeResult]
+        self,
+        targets: List[NeighborSnapshot],
+        scope_results: Dict[str, ScopeResult],
     ) -> dict:
         now = time.time()
         entries = []
+        queried = 0
         for target in targets:
             result = scope_results.get(target.pubkey) or ScopeResult(STATUS_TIMEOUT)
+            if result.transmitted:
+                queried += 1
             heard_secs_ago = int(max(0.0, now - target.last_seen)) if target.last_seen else 0
             entries.append(
                 {
@@ -527,8 +678,32 @@ class NeighborsPublisher:
             origin=origin,
             origin_id=origin_id,
             self_scopes=self._self_scopes(),
+            self_default_scope=self._self_default_scope(),
             entries=entries,
+            total_neighbors=len(entries),
+            queried_neighbors=queried,
         )
+
+    def _self_default_scope(self) -> str:
+        """The region this node stamps on outgoing floods, or ``*`` when unset.
+
+        Read from live config on every cycle because ``region default <name>`` over
+        the mesh CLI writes straight into ``config["mesh"]`` (the same dict this
+        holds) and expects to take effect without a restart.
+
+        Normalised like the ``scopes`` field beside it: the transport-key table
+        stores region names with a leading ``#``, which is not part of the name a
+        consumer matches on, so it is stripped here as
+        ``LoginHelper._format_region_names`` strips it there.
+        """
+        mesh_cfg = self.config.get("mesh", {}) if isinstance(self.config, dict) else {}
+        if not isinstance(mesh_cfg, dict):
+            return DEFAULT_SCOPE_WILDCARD
+        raw = mesh_cfg.get("default_region")
+        name = str(raw).strip() if raw not in (None, "") else ""
+        if name.startswith("#"):
+            name = name[1:].strip()
+        return name or DEFAULT_SCOPE_WILDCARD
 
     def _self_scopes(self) -> str:
         if not self._self_scopes_fn:
@@ -549,6 +724,16 @@ class NeighborsPublisher:
             logger.error(f"Neighbors publish failed: {e}")
             return False
         return bool(results)
+
+
+def _as_epoch(value) -> float:
+    """Coerce a persisted timestamp to a float, or 0.0 when it is unusable."""
+    try:
+        if value is None:
+            return 0.0
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def normalize_interval_hours(value) -> float:

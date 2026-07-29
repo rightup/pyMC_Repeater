@@ -562,6 +562,12 @@ mqtt_brokers:
   #   max_neighbors: 32                 # cap on neighbours queried per cycle
   #   max_neighbor_age_seconds: 86400   # ignore zero-hop rows older than this
   #   max_sweep_seconds: 900            # give up on a cycle after this long
+  #   duty_cycle_abort_seconds: 30      # abandon the sweep when the airtime
+  #                                     # backlog exceeds this
+  #
+  # This must be a block, not a boolean - `neighbors: true` here is ignored (with
+  # a startup warning) because the on/off switch that matters is the per-broker
+  # `neighbors: true` flag documented in the broker schema below.
   #
   # `discover.scopes` over the mesh CLI runs one cycle immediately.
 

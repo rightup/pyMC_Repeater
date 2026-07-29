@@ -3417,6 +3417,28 @@ paths:
               schema:
                 type: object
 
+  /publish_neighbors:
+    post:
+      tags: [System]
+      summary: Publish the neighbours table now
+      description: >
+        Runs one neighbours cycle immediately: a zero-hop discovery broadcast, a
+        serialized scope query per neighbour, then a publish to every opted-in
+        broker. Returns as soon as the cycle is scheduled; the cycle itself takes
+        minutes. Poll /mqtt_status for the outcome.
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      responses:
+        '200':
+          description: Cycle started, or an error when one is already running
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+        '405':
+          description: Method not allowed
+
   /update_web_config:
     post:
       tags: [System]

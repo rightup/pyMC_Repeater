@@ -68,6 +68,32 @@ DEFAULT_MAX_SWEEP_SECONDS = 900.0
 DEFAULT_DUTY_CYCLE_ABORT_SECONDS = 30.0
 
 
+def neighbors_config_block(config: Optional[dict]) -> dict:
+    """Return ``mqtt_brokers.neighbors`` as a mapping, or ``{}`` when it is not one.
+
+    ``neighbors`` names a settings block under ``mqtt_brokers`` but a plain
+    boolean on each broker entry, and ``config.yaml.example`` documents both, so
+    ``mqtt_brokers.neighbors: true`` is an easy hand-edit to make. A truthy
+    non-mapping used to reach ``.get()`` directly, which raised AttributeError
+    inside :meth:`NeighborScopeHelper.refresh_config` — and because that helper is
+    built during daemon init, it took the whole daemon down on startup. Ignore the
+    value instead; saving from the API rewrites it as a proper block.
+    """
+    if not isinstance(config, dict):
+        return {}
+    brokers_cfg = config.get("mqtt_brokers", {})
+    if not isinstance(brokers_cfg, dict):
+        return {}
+    block = brokers_cfg.get("neighbors", {})
+    if not isinstance(block, dict):
+        logger.debug(
+            "Ignoring mqtt_brokers.neighbors: expected a settings block, got %s",
+            type(block).__name__,
+        )
+        return {}
+    return block
+
+
 @dataclass(frozen=True)
 class NeighborSnapshot:
     """One neighbour, frozen at sweep start.
@@ -91,6 +117,12 @@ class NeighborSnapshot:
 class ScopeResult:
     status: str
     scopes: str = ""
+    # Whether the request actually reached the air. Feeds the payload's
+    # ``queried_neighbors``, which firmware increments in ``logTx`` when a QUEUED
+    # entry becomes PENDING. It is not derivable from ``status``: a target the
+    # sweep never reached is reported as ``timeout`` exactly like one that was
+    # asked and stayed silent.
+    transmitted: bool = False
 
 
 @dataclass
@@ -149,7 +181,7 @@ class NeighborScopeHelper:
             config = self.config
         else:
             self.config = config
-        neighbors_cfg = (config.get("mqtt_brokers", {}) or {}).get("neighbors", {}) or {}
+        neighbors_cfg = neighbors_config_block(config)
 
         self._response_timeout_override = _as_float(
             neighbors_cfg.get("scope_response_timeout_seconds", 0), 0.0
@@ -163,8 +195,10 @@ class NeighborScopeHelper:
                 neighbors_cfg.get("duty_cycle_abort_seconds"), DEFAULT_DUTY_CYCLE_ABORT_SECONDS
             ),
         )
+        delays_cfg = config.get("delays", {}) if isinstance(config, dict) else {}
         self._direct_tx_delay_factor = _as_float(
-            (config.get("delays", {}) or {}).get("direct_tx_delay_factor"), 0.5
+            delays_cfg.get("direct_tx_delay_factor") if isinstance(delays_cfg, dict) else None,
+            0.5,
         )
 
     def response_timeout(self) -> float:
@@ -308,13 +342,15 @@ class NeighborScopeHelper:
                 logger.debug(f"Scope request not transmitted for {target.pubkey[:8]}")
                 return ScopeResult(STATUS_SEND_FAILED)
 
+            # Past this point the request is on air, so every outcome counts as
+            # queried regardless of whether the neighbour answers.
             try:
                 scopes = await asyncio.wait_for(pending.future, timeout)
             except asyncio.TimeoutError:
                 logger.debug(f"Scope query timed out for {target.pubkey[:8]}")
-                return ScopeResult(STATUS_TIMEOUT)
+                return ScopeResult(STATUS_TIMEOUT, transmitted=True)
             logger.debug(f"Scope response from {target.pubkey[:8]}: '{scopes}'")
-            return ScopeResult(STATUS_RESPONDED, scopes)
+            return ScopeResult(STATUS_RESPONDED, scopes, transmitted=True)
         finally:
             self._pending = None
 

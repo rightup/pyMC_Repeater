@@ -2337,6 +2337,60 @@ class APIEndpoints:
             logger.error(f"Error listing broker presets: {e}")
             return self._error(str(e))
 
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    def publish_neighbors(self):
+        """Run one neighbours discovery + publish cycle now.
+
+        POST /api/publish_neighbors
+
+        The HTTP equivalent of the ``discover.scopes`` mesh CLI command. A cycle
+        runs for minutes -- a discovery window plus one serialized scope query per
+        neighbour -- so this schedules it on the event loop and returns
+        immediately rather than holding the request open. Poll ``mqtt_status``
+        for the outcome.
+        """
+        self._set_cors_headers()
+
+        if cherrypy.request.method == "OPTIONS":
+            return ""
+
+        future = None
+        try:
+            self._require_post()
+            publisher = getattr(self.daemon_instance, "neighbors_publisher", None)
+            if not publisher:
+                return self._error("Neighbors publisher not available")
+            if not publisher.enabled():
+                return self._error(
+                    "Neighbours publishing is disabled - enable it and opt a broker in first"
+                )
+            if self.event_loop is None:
+                return self._error("Event loop not available")
+
+            import asyncio
+
+            # trigger_cycle owns the already-running check and tracks the task so
+            # shutdown can cancel it. Doing either here would race: this runs on a
+            # cherrypy thread while the cycle lives on the event loop.
+            async def _start():
+                return publisher.trigger_cycle()
+
+            future = asyncio.run_coroutine_threadsafe(_start(), self.event_loop)
+            if future.result(timeout=10):
+                return self._success("Neighbours discovery cycle started")
+            return self._error("A neighbours cycle is already running")
+        except FutureTimeoutError:
+            logger.error("Timed out starting the neighbours cycle", exc_info=True)
+            if future is not None:
+                future.cancel()
+            return self._error("Timed out starting the neighbours cycle")
+        except cherrypy.HTTPError:
+            raise
+        except Exception as e:
+            logger.error(f"Error starting neighbours cycle: {e}", exc_info=True)
+            return self._error(str(e))
+
     @staticmethod
     def _validate_neighbors_settings(raw):
         """Validate the ``mqtt_brokers.neighbors`` block.
@@ -2489,16 +2543,22 @@ class APIEndpoints:
             if "email" in data:
                 mqtt_updates["email"] = str(data["email"]).strip()
             if "neighbors" in data:
+                from repeater.handler_helpers.neighbor_scopes import neighbors_config_block
+
                 neighbors_settings, error = self._validate_neighbors_settings(data["neighbors"])
                 if error:
                     return self._error(error)
                 # update_and_save replaces a section's key outright, so merge onto
                 # the stored block instead of letting a partial POST drop the
-                # settings it did not mention.
-                existing_neighbors = (self.config.get("mqtt_brokers", {}) or {}).get(
-                    "neighbors", {}
-                ) or {}
-                mqtt_updates["neighbors"] = {**existing_neighbors, **neighbors_settings}
+                # settings it did not mention. neighbors_config_block returns {} for
+                # a hand-edited scalar (`neighbors: true` is an easy mistake, since
+                # the per-broker key of the same name is a boolean), which would
+                # otherwise fail the merge with a TypeError; the save then rewrites
+                # it as a proper block.
+                mqtt_updates["neighbors"] = {
+                    **neighbors_config_block(self.config),
+                    **neighbors_settings,
+                }
             # if "disallowed_packet_types" in data:
             #     mqtt_updates["disallowed_packet_types"] = list(data["disallowed_packet_types"])
             if "brokers" in data:
