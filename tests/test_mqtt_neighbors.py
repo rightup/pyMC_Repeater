@@ -2128,3 +2128,43 @@ def test_purging_the_advert_table_takes_the_scopes_with_it(tmp_path):
     handler.purge_table("adverts")
 
     assert handler.get_neighbor_scopes() == {}
+
+
+def test_neighbor_scopes_endpoint_reports_our_own_served_scopes(monkeypatch):
+    """The comparison a client draws must be against what we tell neighbours.
+
+    Same formatter as the anon-regions responder, so "we serve this too" cannot
+    drift from the answer a neighbour would get by asking us.
+    """
+    store = _FakeScopeStore(scopes={})
+    api = _api_with_publisher(monkeypatch, None, method="GET", storage=store)
+    api.daemon_instance.login_helper = SimpleNamespace(_format_region_names=lambda: "*,DEN,BOU")
+
+    out = api.neighbor_scopes()
+
+    assert out["success"] is True
+    assert out["served"]["scopes"] == "*,DEN,BOU"
+
+
+def test_served_scopes_degrade_to_empty_without_a_login_helper(monkeypatch):
+    """An older or half-started daemon must not fail the whole request."""
+    api = _api_with_publisher(monkeypatch, None, method="GET", storage=_FakeScopeStore())
+    api.daemon_instance.login_helper = None
+
+    out = api.neighbor_scopes()
+
+    assert out["success"] is True
+    assert out["served"]["scopes"] == ""
+
+
+def test_served_scopes_survive_a_raising_formatter(monkeypatch):
+    def _boom():
+        raise RuntimeError("transport keys unreadable")
+
+    api = _api_with_publisher(monkeypatch, None, method="GET", storage=_FakeScopeStore())
+    api.daemon_instance.login_helper = SimpleNamespace(_format_region_names=_boom)
+
+    out = api.neighbor_scopes()
+
+    assert out["success"] is True
+    assert out["served"]["scopes"] == ""

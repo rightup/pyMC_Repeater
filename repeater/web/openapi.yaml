@@ -3450,7 +3450,10 @@ paths:
         answer given and an empty string is a real answer meaning the neighbour
         serves unscoped traffic only. `status`/`queried_at` describe the most
         recent query, which may have failed after a good answer, so `responded_at`
-        is what says how fresh `scopes` is.
+        is what says how fresh `scopes` is. `served` carries this node's own scopes
+        in the same comma-separated form — the very string it sends when a neighbour
+        asks it the same question — so a client can tell which of a neighbour's
+        scopes it already shares.
       security:
         - BearerAuth: []
         - ApiKeyAuth: []
@@ -3471,6 +3474,16 @@ paths:
                     type: string
                   count:
                     type: integer
+                  served:
+                    type: object
+                    required: [scopes]
+                    properties:
+                      scopes:
+                        type: string
+                        description: >
+                          This node's own advertised scopes, comma-separated, `*`
+                          first when it floods unscoped. Empty when they cannot be
+                          read.
                   data:
                     type: object
                     additionalProperties:

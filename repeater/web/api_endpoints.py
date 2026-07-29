@@ -2415,6 +2415,11 @@ class APIEndpoints:
         answer meaning it serves unscoped traffic only. ``status``/``queried_at``
         describe the most recent query, which may have failed after a good answer,
         so ``responded_at`` is how fresh the scopes themselves are.
+
+        ``served`` carries this node's own scopes in the same comma-separated form,
+        so a client can tell which of a neighbour's scopes it already shares without
+        re-deriving the rule (the wildcard plus every allow-flood region). It is the
+        very string this node sends when a neighbour asks *it* the same question.
         """
         self._set_cors_headers()
 
@@ -2424,10 +2429,31 @@ class APIEndpoints:
         try:
             storage = self._get_storage()
             scopes = storage.get_neighbor_scopes() or {}
-            return self._success(scopes, count=len(scopes))
+            # Keyword cannot be named `self` here -- it would collide with the
+            # method's own first argument.
+            return self._success(
+                scopes, count=len(scopes), served={"scopes": self._served_scopes()}
+            )
         except Exception as e:
             logger.error(f"Error reading neighbour scopes: {e}")
             return self._error(str(e))
+
+    def _served_scopes(self) -> str:
+        """This node's advertised region scopes, or "" when they cannot be read.
+
+        Deliberately the same formatter the anon-regions responder uses, rather
+        than a second reading of the transport-key table: whatever a neighbour
+        would be told is what a client comparing against it has to see.
+        """
+        login_helper = getattr(self.daemon_instance, "login_helper", None)
+        formatter = getattr(login_helper, "_format_region_names", None) if login_helper else None
+        if not callable(formatter):
+            return ""
+        try:
+            return formatter() or ""
+        except Exception as e:
+            logger.debug(f"Could not read served region scopes: {e}")
+            return ""
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
