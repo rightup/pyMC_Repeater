@@ -1,0 +1,1 @@
+import{t as e}from"./dataService-CYKRnu5m.js";export{e as useDataService};
