@@ -93,6 +93,26 @@ def persist_discovery_result(storage, result: dict) -> bool:
         logger.debug("Storage backend cannot persist discovery results")
         return False
 
+    # Discovery responses do not carry advert metadata such as name or location.
+    # Preserve those fields from an existing advert instead of replacing them
+    # with None when SQLite updates the neighbor row.
+    reader = getattr(storage, "get_neighbors", None)
+    if callable(reader):
+        try:
+            neighbors = reader()
+            if isinstance(neighbors, dict):
+                existing = neighbors.get(record["pubkey"])
+                if isinstance(existing, dict):
+                    for field in ("node_name", "latitude", "longitude"):
+                        if record.get(field) is None:
+                            record[field] = existing.get(field)
+        except Exception as e:
+            logger.debug(
+                "Failed to read existing discovery metadata for %s: %s",
+                record["pubkey"][:8],
+                e,
+            )
+
     try:
         writer(record)
         return True

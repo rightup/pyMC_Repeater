@@ -513,6 +513,47 @@ def test_discovery_auto_add_persists_through_the_storage_actually_wired_in():
     assert record["rssi"] == -70
 
 
+def test_discovery_auto_add_preserves_existing_advert_name_and_location(tmp_path):
+    """Discovery responses must not erase metadata learned from real adverts."""
+    from repeater.data_acquisition.sqlite_handler import SQLiteHandler
+    from repeater.handler_helpers.discovery import persist_discovery_result
+
+    pubkey = "22" * 32
+    storage = SQLiteHandler(tmp_path)
+    storage.store_advert(
+        {
+            "timestamp": 100.0,
+            "pubkey": pubkey,
+            "node_name": "Named Repeater",
+            "is_repeater": True,
+            "route_type": 1,
+            "contact_type": "Repeater",
+            "latitude": 37.5,
+            "longitude": -122.25,
+            "rssi": -80,
+            "snr": 2.0,
+            "zero_hop": True,
+        }
+    )
+
+    assert persist_discovery_result(
+        storage,
+        {
+            "pub_key": pubkey,
+            "node_type": 2,
+            "rssi": -65,
+            "response_snr": 6.5,
+        },
+    )
+
+    neighbor = storage.get_neighbors()[pubkey]
+    assert neighbor["node_name"] == "Named Repeater"
+    assert neighbor["latitude"] == 37.5
+    assert neighbor["longitude"] == -122.25
+    assert neighbor["rssi"] == -65
+    assert neighbor["snr"] == 6.5
+
+
 def test_discovery_auto_add_prefers_record_advert_when_the_collector_is_wired_in():
     """StorageCollector.record_advert also publishes the advert; prefer it."""
     from repeater.data_acquisition.storage_collector import StorageCollector
