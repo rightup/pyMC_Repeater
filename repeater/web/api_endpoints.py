@@ -191,6 +191,14 @@ POLICY_GROUP_KINDS = {
 
 
 class APIEndpoints:
+    # How long /api/query_neighbor_scopes holds a request open. The scope helper's
+    # response window is normally its 5 s floor; a slow radio config (SF12) or a
+    # duty-cycle deferral can push a single query past this, in which case the
+    # query is left running so its answer still reaches the stored table and the
+    # client is told to re-read it. Chosen to stay inside a default reverse-proxy
+    # read timeout rather than to cover the helper's 120 s ceiling.
+    SCOPE_QUERY_HTTP_TIMEOUT = 45.0
+
     def __init__(
         self,
         stats_getter: Optional[Callable] = None,
@@ -2389,6 +2397,103 @@ class APIEndpoints:
             raise
         except Exception as e:
             logger.error(f"Error starting neighbours cycle: {e}", exc_info=True)
+            return self._error(str(e))
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    def neighbor_scopes(self):
+        """Last known region scopes per neighbour.
+
+        GET /api/neighbor_scopes
+
+        Served as its own endpoint rather than folded into the advert queries: the
+        advert list is paginated per contact type and read on every neighbours-page
+        load, and this table is small enough (one row per queried neighbour) that
+        the client can hold the whole thing and join on pubkey.
+
+        ``scopes`` is the last answer a neighbour gave; an empty string is a real
+        answer meaning it serves unscoped traffic only. ``status``/``queried_at``
+        describe the most recent query, which may have failed after a good answer,
+        so ``responded_at`` is how fresh the scopes themselves are.
+        """
+        self._set_cors_headers()
+
+        if cherrypy.request.method == "OPTIONS":
+            return ""
+
+        try:
+            storage = self._get_storage()
+            scopes = storage.get_neighbor_scopes() or {}
+            return self._success(scopes, count=len(scopes))
+        except Exception as e:
+            logger.error(f"Error reading neighbour scopes: {e}")
+            return self._error(str(e))
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    @cherrypy.tools.json_in()
+    def query_neighbor_scopes(self):
+        """Ask one neighbour for its region scopes now.
+
+        POST /api/query_neighbor_scopes  {"pubkey": "<64 hex chars>"}
+
+        Unlike ``publish_neighbors`` this holds the request open for the answer:
+        one query is a single route-direct request whose response window is
+        normally the 5 s floor (only a slow radio config approaches the 120 s
+        ceiling), so a spinner is a better fit than a poll. Nothing is published
+        as a result -- the answer is stored and returned, and the periodic cycle
+        remains the only thing that writes to the MQTT topic.
+
+        The request is route-direct with an empty path, so it only reaches a
+        zero-hop neighbour, and the responder rate-limits anonymous replies (4 per
+        3 minutes, shared across its identities) -- both show up here as a
+        ``timeout``.
+        """
+        self._set_cors_headers()
+
+        if cherrypy.request.method == "OPTIONS":
+            return ""
+
+        try:
+            self._require_post()
+            data = cherrypy.request.json or {}
+            pubkey = str(data.get("pubkey") or "").strip()
+            if not pubkey:
+                return self._error("Missing pubkey parameter")
+
+            publisher = getattr(self.daemon_instance, "neighbors_publisher", None)
+            if not publisher:
+                return self._error("Neighbors publisher not available")
+            if self.event_loop is None:
+                return self._error("Event loop not available")
+
+            import asyncio
+
+            future = asyncio.run_coroutine_threadsafe(publisher.query_one(pubkey), self.event_loop)
+            result = future.result(timeout=self.SCOPE_QUERY_HTTP_TIMEOUT)
+            return self._success(result)
+        except FutureTimeoutError:
+            # Deliberately not cancelled: the query has already spent the airtime,
+            # and it persists its own outcome, so letting it finish means the answer
+            # still shows up on a re-read instead of being thrown away here.
+            logger.warning(
+                "Neighbour scope query still in flight after %.0fs",
+                self.SCOPE_QUERY_HTTP_TIMEOUT,
+            )
+            return self._error("Still waiting for the neighbour to reply - check back in a moment")
+        except cherrypy.HTTPError:
+            raise
+        except ValueError as e:
+            return self._error(str(e))
+        except RuntimeError as e:
+            # query_one raises this when a cycle or another query already holds the
+            # scope helper -- one request in flight at a time, by design. Still
+            # logged, because an unrelated RuntimeError from the event loop lands
+            # here too and would otherwise leave no trace.
+            logger.warning(f"Neighbour scope query refused: {e}")
+            return self._error(str(e))
+        except Exception as e:
+            logger.error(f"Error querying neighbour scopes: {e}", exc_info=True)
             return self._error(str(e))
 
     @staticmethod

@@ -28,6 +28,7 @@ from typing import Any, Callable, Dict, List, Optional
 from repeater.handler_helpers.discovery import persist_discovery_result
 from repeater.handler_helpers.neighbor_scopes import (
     STATUS_RESPONDED,
+    STATUS_SEND_FAILED,
     STATUS_TIMEOUT,
     NeighborSnapshot,
     ScopeResult,
@@ -166,6 +167,12 @@ class NeighborsPublisher:
         self._manual_task: Optional[asyncio.Task] = None
         self._running = False
         self._active = False
+        # Single-neighbour queries running outside a cycle. A cycle must not start
+        # on top of one: it would reach the sweep and find the helper's lock held,
+        # which raises and costs the whole cycle (including its discovery
+        # broadcast). Tracked as a count, and as tasks so shutdown can cancel them.
+        self._queries_in_flight = 0
+        self._query_tasks: set = set()
         # Discovery responses collected during the current cycle, keyed by pubkey.
         self._discovery_seen: Dict[str, dict] = {}
         self._next_publish_at: Optional[float] = None
@@ -329,6 +336,8 @@ class NeighborsPublisher:
         """
         if self._active or (self._manual_task is not None and not self._manual_task.done()):
             return False
+        if self._queries_in_flight:
+            return False
         self._manual_task = asyncio.create_task(
             self.run_cycle(trigger="manual"), name="neighbors-manual-cycle"
         )
@@ -347,9 +356,14 @@ class NeighborsPublisher:
 
     async def stop(self) -> None:
         self._running = False
-        tasks = [t for t in (self._task, self._manual_task) if t and not t.done()]
+        tasks = [
+            t
+            for t in (self._task, self._manual_task, *self._query_tasks)
+            if t and not t.done() and t is not asyncio.current_task()
+        ]
         self._task = None
         self._manual_task = None
+        self._query_tasks.clear()
         for task in tasks:
             task.cancel()
         for task in tasks:
@@ -457,6 +471,12 @@ class NeighborsPublisher:
         if self._next_publish_at is not None and now < self._next_publish_at:
             return
 
+        if self._queries_in_flight:
+            # Deferred, not rescheduled: the next tick is 30 s away and a single
+            # query is far shorter than that, so the cycle simply runs then.
+            logger.debug("Neighbors cycle deferred: a manual scope query is in flight")
+            return
+
         await self.run_cycle(trigger="periodic")
 
     def _reschedule(self, *, retry: bool = False) -> None:
@@ -488,7 +508,18 @@ class NeighborsPublisher:
 
             scope_results: Dict[str, ScopeResult] = {}
             if targets and self.scope_helper:
-                scope_results = await self.scope_helper.sweep(targets)
+                try:
+                    scope_results = await self.scope_helper.sweep(targets)
+                except RuntimeError as e:
+                    # A manual query took the helper between the checks in _tick /
+                    # trigger_cycle and here -- the discovery window above leaves a
+                    # wide gap for that. Give up on this pass rather than publish a
+                    # table with every scope missing; the finally below reschedules
+                    # on the short retry delay.
+                    logger.warning("Neighbors cycle abandoned: %s", e)
+                    self._last_result = f"deferred: {e}"
+                    return {"success": False, "error": str(e)}
+                self._persist_scope_results(scope_results)
             elif targets:
                 logger.warning("No scope helper available; publishing without scopes")
 
@@ -523,6 +554,169 @@ class NeighborsPublisher:
         finally:
             self._active = False
             self._reschedule(retry=not published)
+
+    @staticmethod
+    def _was_asked(result: ScopeResult) -> bool:
+        """Whether this outcome represents a query the node actually attempted.
+
+        ``timeout`` is ambiguous on its own: the sweep reports it both for a
+        neighbour that was asked and stayed silent and for one it never reached
+        (budget exhausted), so ``transmitted`` is what separates those. A
+        ``send_failed`` was attempted and refused by the transmit path -- the
+        duty-cycle pre-flight -- which is worth recording even though nothing went
+        on air, otherwise a repeater that keeps refusing reads as "never queried"
+        forever.
+        """
+        return result.transmitted or result.status == STATUS_SEND_FAILED
+
+    def _persist_scope_results(
+        self, results: Dict[str, ScopeResult], now: Optional[float] = None
+    ) -> None:
+        """Store what a sweep learned, so it outlives the MQTT publish.
+
+        The payload used to be the only consumer, which left the web UI with
+        nothing to show between cycles. One row per neighbour the node actually
+        asked (see :meth:`_was_asked`); targets the sweep never reached are left
+        untouched rather than credited with a query that never happened.
+        """
+        storage = self._storage()
+        writer = getattr(storage, "record_neighbor_scope", None) if storage else None
+        if not callable(writer):
+            return
+
+        stamp = time.time() if now is None else now
+        for pubkey, result in (results or {}).items():
+            if not self._was_asked(result):
+                continue
+            try:
+                # scopes is passed only for an answer, so a failed query keeps the
+                # last known value instead of blanking it.
+                writer(
+                    pubkey,
+                    result.status,
+                    result.scopes if result.status == STATUS_RESPONDED else None,
+                    stamp,
+                )
+            except Exception as e:
+                logger.debug(f"Could not persist scopes for {pubkey[:8]}: {e}")
+
+    async def query_one(self, pubkey: str) -> dict:
+        """Query a single neighbour's scopes now, outside the periodic cycle.
+
+        Deliberately independent of ``enabled()``: the answer is stored for the
+        web UI, so this is useful on a repeater that publishes to no broker at
+        all. Nothing is published as a result -- the periodic cycle owns that.
+
+        Raises ``ValueError`` for a key that cannot be queried and ``RuntimeError``
+        when a cycle or another query already holds the scope helper; the caller
+        turns both into a message. The cycle check is on ``_active`` rather than on
+        the helper's lock because a cycle spends its first minute in the discovery
+        window without holding that lock, and colliding later -- once the sweep has
+        taken it -- would cost the whole cycle.
+        """
+        key = str(pubkey or "").strip().lower()
+        if len(key) != 64:
+            # ECDH against the responder needs the full 32-byte key; a prefix
+            # (which is all an advert-only sighting may carry) cannot be used.
+            raise ValueError("A full 64-character public key is required")
+        try:
+            bytes.fromhex(key)
+        except ValueError:
+            raise ValueError("Public key is not valid hex") from None
+        if key == self._local_pubkey_hex():
+            raise ValueError("Cannot query this repeater's own scopes")
+        if not self.scope_helper:
+            raise RuntimeError("Scope helper not available")
+
+        if self._active:
+            # A cycle owns the helper for its whole run, including the discovery
+            # window before the sweep takes the lock. Refusing here is the mirror
+            # of the sweep-side guard below and keeps the two from colliding.
+            raise RuntimeError("A neighbours cycle is running - try again once it finishes")
+
+        snapshot = self._snapshot_for(key)
+        self._queries_in_flight += 1
+        task = asyncio.current_task()
+        if task is not None:
+            # Tracked for the same reason trigger_cycle tracks its task: this holds
+            # the radio for up to a response window, and shutdown has to be able to
+            # cut it short rather than transmit through the teardown.
+            self._query_tasks.add(task)
+        try:
+            try:
+                results = await self.scope_helper.sweep([snapshot])
+            except RuntimeError:
+                # The helper's own wording names its internals; say what the
+                # operator can act on instead.
+                raise RuntimeError(
+                    "A neighbour scope sweep is already running - try again once it finishes"
+                ) from None
+
+            now = time.time()
+            self._persist_scope_results(results, now=now)
+            result = results.get(key) or ScopeResult(STATUS_TIMEOUT)
+            return self._scope_record(key, result, now)
+        finally:
+            self._queries_in_flight = max(0, self._queries_in_flight - 1)
+            if task is not None:
+                self._query_tasks.discard(task)
+
+    def _scope_record(self, pubkey: str, result: ScopeResult, now: float) -> dict:
+        """The stored view of one query's outcome, as the API returns it.
+
+        Read back through the stored row rather than reported straight from
+        ``result``: a failed query deliberately keeps the neighbour's last known
+        scopes, so returning this query's empty string would tell the client to
+        forget an answer the database still holds.
+        """
+        responded = result.status == STATUS_RESPONDED
+        record = {
+            "pubkey": pubkey,
+            "status": result.status,
+            "scopes": result.scopes if responded else "",
+            "transmitted": result.transmitted,
+            "queried_at": now if self._was_asked(result) else None,
+            "responded_at": now if responded else None,
+        }
+        if responded:
+            return record
+
+        storage = self._storage()
+        reader = getattr(storage, "get_neighbor_scopes", None) if storage else None
+        if not callable(reader):
+            return record
+        try:
+            stored = (reader() or {}).get(pubkey) or {}
+        except Exception as e:
+            logger.debug(f"Could not re-read stored scopes for {pubkey[:8]}: {e}")
+            return record
+        if stored.get("responded_at") is not None:
+            record["scopes"] = stored.get("scopes") or ""
+            record["responded_at"] = stored.get("responded_at")
+        return record
+
+    def _snapshot_for(self, pubkey: str) -> NeighborSnapshot:
+        """Build a one-target snapshot, borrowing last_seen/snr when we have them.
+
+        Neither field affects the query -- they are carried so a single query goes
+        through exactly the same path as a sweep entry.
+        """
+        storage = self._storage()
+        if storage:
+            try:
+                # The adverts table does not normalise key case, so match on the
+                # lowercased form rather than indexing directly.
+                for candidate, info in (storage.get_neighbors() or {}).items():
+                    if str(candidate or "").lower() != pubkey:
+                        continue
+                    return NeighborSnapshot(
+                        pubkey=pubkey,
+                        last_seen=float(info.get("last_seen") or 0.0),
+                        snr=float(info.get("snr") or 0.0),
+                    )
+            except Exception as e:
+                logger.debug(f"Could not read neighbour row for {pubkey[:8]}: {e}")
+        return NeighborSnapshot(pubkey=pubkey)
 
     async def _refresh_neighbor_table(self) -> None:
         """Stage 1: zero-hop node discovery, awaited to completion.

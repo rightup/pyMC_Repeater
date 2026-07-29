@@ -539,6 +539,18 @@ class StorageCollector:
     def get_neighbors(self) -> dict:
         return self.sqlite_handler.get_neighbors()
 
+    def get_neighbor_scopes(self) -> dict:
+        return self.sqlite_handler.get_neighbor_scopes()
+
+    def record_neighbor_scope(
+        self,
+        pubkey: str,
+        status: str,
+        scopes: Optional[str] = None,
+        queried_at: Optional[float] = None,
+    ) -> bool:
+        return self.sqlite_handler.record_neighbor_scope(pubkey, status, scopes, queried_at)
+
     def get_daemon_state(self, key: str) -> Optional[dict]:
         return self.sqlite_handler.get_daemon_state(key)
 

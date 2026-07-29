@@ -27,6 +27,7 @@ from repeater.handler_helpers.neighbor_scopes import (
     STATUS_TIMEOUT,
     NeighborScopeHelper,
     NeighborSnapshot,
+    ScopeResult,
 )
 from repeater.neighbors_publisher import (
     DEFAULT_INTERVAL_HOURS,
@@ -1187,19 +1188,22 @@ async def test_transmitted_flag_tracks_whether_the_request_reached_the_air():
 # ====================================================================
 # Manual trigger endpoint
 # ====================================================================
-def _api_with_publisher(monkeypatch, publisher, method="POST"):
+def _api_with_publisher(monkeypatch, publisher, method="POST", json=None, storage=None):
     import cherrypy
 
     from repeater.web.api_endpoints import APIEndpoints
 
-    request = SimpleNamespace(method=method, params={}, json={})
+    request = SimpleNamespace(method=method, params={}, json=json if json is not None else {})
     response = SimpleNamespace(headers={}, status=200)
     monkeypatch.setattr(cherrypy, "request", request, raising=False)
     monkeypatch.setattr(cherrypy, "response", response, raising=False)
 
     api = APIEndpoints.__new__(APIEndpoints)
     api.config = {}
-    api.daemon_instance = SimpleNamespace(neighbors_publisher=publisher)
+    api.daemon_instance = SimpleNamespace(
+        neighbors_publisher=publisher,
+        repeater_handler=SimpleNamespace(storage=storage),
+    )
     api.event_loop = asyncio.new_event_loop()
     api.send_advert_func = None
     api.stats_getter = None
@@ -1222,7 +1226,7 @@ class _FakePublisher:
         return self._starts
 
 
-def _run_endpoint(api):
+def _run_endpoint(api, call=None):
     """Drive the endpoint's run_coroutine_threadsafe against a real loop."""
     import threading
 
@@ -1230,7 +1234,7 @@ def _run_endpoint(api):
     thread = threading.Thread(target=loop.run_forever, daemon=True)
     thread.start()
     try:
-        return api.publish_neighbors()
+        return (call or api.publish_neighbors)()
     finally:
         loop.call_soon_threadsafe(loop.stop)
         thread.join(timeout=5)
@@ -1592,3 +1596,535 @@ def test_migration_is_idempotent_on_an_existing_database(tmp_path):
         SQLiteHandler(tmp_path)._run_migrations()
 
     assert SQLiteHandler(tmp_path).get_daemon_state(STATE_KEY) == {"last_success_at": 42.0}
+
+
+# ====================================================================
+# Scope persistence
+# ====================================================================
+class _FakeScopeStore:
+    """Neighbour table plus the scope rows, without touching sqlite."""
+
+    def __init__(self, neighbors=None, scopes=None):
+        self._neighbors = dict(neighbors or {})
+        self.scopes = dict(scopes or {})
+        self.writes = []
+
+    def get_neighbors(self):
+        return self._neighbors
+
+    def get_neighbor_scopes(self):
+        return self.scopes
+
+    def record_neighbor_scope(self, pubkey, status, scopes=None, queried_at=None):
+        self.writes.append((pubkey, status, scopes))
+        row = self.scopes.setdefault(pubkey, {"scopes": "", "responded_at": None})
+        row["status"] = status
+        row["queried_at"] = queried_at
+        if scopes is not None:
+            row["scopes"] = scopes
+            row["responded_at"] = queried_at
+        return True
+
+
+class _StubSweep:
+    """Scope helper stand-in returning canned results for one sweep."""
+
+    def __init__(self, results):
+        self.results = results
+        self.targets = None
+
+    async def sweep(self, targets):
+        self.targets = list(targets)
+        return dict(self.results)
+
+
+def _repeater_row(last_seen=None, snr=6.0):
+    return {
+        "is_repeater": True,
+        "zero_hop": True,
+        "last_seen": time.time() if last_seen is None else last_seen,
+        "snr": snr,
+    }
+
+
+@pytest.mark.asyncio
+async def test_cycle_persists_what_the_sweep_learned():
+    """The MQTT payload used to be the only consumer, leaving the UI nothing."""
+    answered, silent = "aa" * 32, "bb" * 32
+    store = _FakeScopeStore({answered: _repeater_row(), silent: _repeater_row()})
+    helper = _StubSweep(
+        {
+            answered: ScopeResult(STATUS_RESPONDED, "DEN,BOU", transmitted=True),
+            silent: ScopeResult(STATUS_TIMEOUT, transmitted=True),
+        }
+    )
+    publisher = _publisher(
+        {"mqtt_brokers": {}},
+        handler=SimpleNamespace(
+            has_neighbors_brokers=lambda: True,
+            has_connected_neighbors_brokers=lambda: True,
+            publish_neighbors=lambda payload: [("broker", None)],
+            node_name="n",
+            public_key="AB" * 32,
+        ),
+        storage=store,
+        scope_helper=helper,
+    )
+
+    await publisher.run_cycle(trigger="test")
+
+    assert store.scopes[answered]["scopes"] == "DEN,BOU"
+    assert store.scopes[answered]["responded_at"] is not None
+    # A silent neighbour is recorded as asked, but claims no scopes.
+    assert store.scopes[silent]["status"] == STATUS_TIMEOUT
+    assert store.scopes[silent]["responded_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_neighbors_never_put_on_air_are_not_recorded_as_queried():
+    """`timeout` covers both "asked, silent" and "never reached"; only the first counts."""
+    unreached = "cc" * 32
+    store = _FakeScopeStore({unreached: _repeater_row()})
+    publisher = _publisher(
+        {"mqtt_brokers": {}},
+        handler=SimpleNamespace(
+            has_neighbors_brokers=lambda: True,
+            has_connected_neighbors_brokers=lambda: True,
+            publish_neighbors=lambda payload: [("broker", None)],
+            node_name="n",
+            public_key="AB" * 32,
+        ),
+        storage=store,
+        scope_helper=_StubSweep({unreached: ScopeResult(STATUS_TIMEOUT, transmitted=False)}),
+    )
+
+    await publisher.run_cycle(trigger="test")
+
+    assert store.writes == []
+    assert store.scopes == {}
+
+
+@pytest.mark.asyncio
+async def test_query_one_returns_and_stores_the_answer():
+    target = "dd" * 32
+    store = _FakeScopeStore({target: _repeater_row(snr=3.5)})
+    helper = _StubSweep({target: ScopeResult(STATUS_RESPONDED, "DEN", transmitted=True)})
+    publisher = _publisher({"mqtt_brokers": {}}, storage=store, scope_helper=helper)
+
+    out = await publisher.query_one(target.upper())
+
+    assert out["status"] == STATUS_RESPONDED
+    assert out["scopes"] == "DEN"
+    assert out["responded_at"] is not None
+    assert store.scopes[target]["scopes"] == "DEN"
+    # The snapshot borrows the stored row so a single query walks the sweep path.
+    assert helper.targets[0].snr == 3.5
+
+
+@pytest.mark.asyncio
+async def test_query_one_does_not_publish():
+    """Only the periodic cycle writes to the neighbors topic."""
+    target = "ee" * 32
+    published = []
+    handler = SimpleNamespace(
+        has_neighbors_brokers=lambda: True,
+        has_connected_neighbors_brokers=lambda: True,
+        publish_neighbors=lambda payload: published.append(payload) or [("broker", None)],
+        node_name="n",
+        public_key="AB" * 32,
+    )
+    publisher = _publisher(
+        {"mqtt_brokers": {}},
+        handler=handler,
+        storage=_FakeScopeStore({target: _repeater_row()}),
+        scope_helper=_StubSweep({target: ScopeResult(STATUS_RESPONDED, "DEN", transmitted=True)}),
+    )
+
+    await publisher.query_one(target)
+
+    assert published == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad", ["", "abcd", "zz" * 32, "aa" * 31])
+async def test_query_one_rejects_keys_it_cannot_query(bad):
+    """ECDH needs the full 32-byte key; a prefix or non-hex cannot be used."""
+    publisher = _publisher({"mqtt_brokers": {}}, scope_helper=_StubSweep({}))
+
+    with pytest.raises(ValueError):
+        await publisher.query_one(bad)
+
+
+@pytest.mark.asyncio
+async def test_query_one_refuses_our_own_key():
+    local = LocalIdentity()
+    publisher = _publisher({"mqtt_brokers": {}}, scope_helper=_StubSweep({}), local_identity=local)
+
+    with pytest.raises(ValueError):
+        await publisher.query_one(local.get_public_key().hex())
+
+
+@pytest.mark.asyncio
+async def test_query_one_reports_a_sweep_already_in_progress():
+    """One request in flight at a time; the wording has to be actionable."""
+    local = LocalIdentity()
+    helper = _helper_with_injector(local, lambda packet, wait_for_ack=False: True)
+    publisher = _publisher({"mqtt_brokers": {}}, scope_helper=helper)
+
+    async with helper._sweep_lock:
+        with pytest.raises(RuntimeError, match="already running"):
+            await publisher.query_one("ff" * 32)
+
+
+@pytest.mark.asyncio
+async def test_query_one_without_storage_still_answers():
+    """Scope queries are useful on a repeater with no storage wired up."""
+    target = "ab" * 32
+    helper = _StubSweep({target: ScopeResult(STATUS_RESPONDED, "", transmitted=True)})
+    publisher = _publisher({"mqtt_brokers": {}}, storage=None, scope_helper=helper)
+
+    out = await publisher.query_one(target)
+
+    assert out["status"] == STATUS_RESPONDED
+    assert out["scopes"] == ""  # a real answer: unscoped traffic only
+
+
+def test_neighbor_scopes_round_trip_through_real_sqlite(tmp_path):
+    from repeater.data_acquisition.sqlite_handler import SQLiteHandler
+
+    handler = SQLiteHandler(tmp_path)
+    pubkey = "1f" * 32
+
+    assert handler.get_neighbor_scopes() == {}
+
+    assert handler.record_neighbor_scope(pubkey, STATUS_RESPONDED, "DEN,BOU", 1785372000.0) is True
+    row = handler.get_neighbor_scopes()[pubkey]
+    assert row == {
+        "scopes": "DEN,BOU",
+        "responded_at": 1785372000.0,
+        "status": STATUS_RESPONDED,
+        "queried_at": 1785372000.0,
+    }
+
+    # An empty answer is an answer -- the neighbour serves unscoped traffic only.
+    handler.record_neighbor_scope(pubkey, STATUS_RESPONDED, "", 1785372600.0)
+    assert handler.get_neighbor_scopes()[pubkey]["scopes"] == ""
+
+    # Keys are normalised, so an upper-case caller does not create a second row.
+    handler.record_neighbor_scope(pubkey.upper(), STATUS_RESPONDED, "DEN", 1785373000.0)
+    assert list(handler.get_neighbor_scopes()) == [pubkey]
+
+    # Survives a restart.
+    assert SQLiteHandler(tmp_path).get_neighbor_scopes()[pubkey]["scopes"] == "DEN"
+
+
+def test_failed_query_keeps_the_last_known_scopes(tmp_path):
+    """The responder rate-limits anon replies, so one timeout is weak evidence."""
+    from repeater.data_acquisition.sqlite_handler import SQLiteHandler
+
+    handler = SQLiteHandler(tmp_path)
+    pubkey = "2f" * 32
+    handler.record_neighbor_scope(pubkey, STATUS_RESPONDED, "DEN", 1785372000.0)
+
+    handler.record_neighbor_scope(pubkey, STATUS_TIMEOUT, None, 1785375600.0)
+
+    row = handler.get_neighbor_scopes()[pubkey]
+    assert row["scopes"] == "DEN"
+    assert row["responded_at"] == 1785372000.0  # still says how fresh the scopes are
+    assert row["status"] == STATUS_TIMEOUT
+    assert row["queried_at"] == 1785375600.0
+
+
+def test_deleting_a_neighbor_drops_its_scope_row(tmp_path):
+    """Otherwise the row outlives the neighbour with nothing to display it against."""
+    from repeater.data_acquisition.sqlite_handler import SQLiteHandler
+
+    handler = SQLiteHandler(tmp_path)
+    pubkey = "3f" * 32
+    handler.store_advert(
+        {
+            "pubkey": pubkey,
+            "node_name": "gone",
+            "is_repeater": True,
+            "contact_type": "Repeater",
+            "timestamp": time.time(),
+        }
+    )
+    handler.record_neighbor_scope(pubkey, STATUS_RESPONDED, "DEN", time.time())
+    advert_id = handler.get_adverts_by_contact_type(contact_type="Repeater")[0]["id"]
+
+    assert handler.delete_advert(advert_id) is True
+    assert handler.get_neighbor_scopes() == {}
+
+
+def test_scope_migration_is_idempotent_on_an_existing_database(tmp_path):
+    """Migration 15 runs against nibbler's populated DB, not a fresh file."""
+    from repeater.data_acquisition.sqlite_handler import SQLiteHandler
+
+    pubkey = "4f" * 32
+    SQLiteHandler(tmp_path).record_neighbor_scope(pubkey, STATUS_RESPONDED, "DEN", 42.0)
+
+    for _ in range(3):
+        SQLiteHandler(tmp_path)._run_migrations()
+
+    assert SQLiteHandler(tmp_path).get_neighbor_scopes()[pubkey]["scopes"] == "DEN"
+
+
+# ====================================================================
+# Scope endpoints
+# ====================================================================
+class _QueryPublisher:
+    def __init__(self, result=None, error=None):
+        self.result = result
+        self.error = error
+        self.calls = []
+
+    async def query_one(self, pubkey):
+        self.calls.append(pubkey)
+        if self.error:
+            raise self.error
+        return self.result
+
+
+def test_neighbor_scopes_endpoint_serves_the_stored_table(monkeypatch):
+    store = _FakeScopeStore(
+        scopes={"5f" * 32: {"scopes": "DEN", "status": STATUS_RESPONDED, "queried_at": 1.0}}
+    )
+    api = _api_with_publisher(monkeypatch, None, method="GET", storage=store)
+
+    out = api.neighbor_scopes()
+
+    assert out["success"] is True
+    assert out["count"] == 1
+    assert out["data"]["5f" * 32]["scopes"] == "DEN"
+
+
+def test_query_neighbor_scopes_endpoint_returns_the_answer(monkeypatch):
+    target = "6f" * 32
+    publisher = _QueryPublisher(
+        {"pubkey": target, "status": STATUS_RESPONDED, "scopes": "DEN", "transmitted": True}
+    )
+    api = _api_with_publisher(monkeypatch, publisher, json={"pubkey": target})
+
+    out = _run_endpoint(api, api.query_neighbor_scopes)
+
+    assert out["success"] is True
+    assert out["data"]["scopes"] == "DEN"
+    assert publisher.calls == [target]
+
+
+def test_query_neighbor_scopes_endpoint_requires_a_pubkey(monkeypatch):
+    publisher = _QueryPublisher()
+    api = _api_with_publisher(monkeypatch, publisher, json={})
+
+    out = api.query_neighbor_scopes()
+
+    assert out["success"] is False
+    assert publisher.calls == []
+
+
+@pytest.mark.parametrize(
+    "error",
+    [ValueError("A full 64-character public key is required"), RuntimeError("already running")],
+)
+def test_query_neighbor_scopes_endpoint_surfaces_refusals(monkeypatch, error):
+    """Both a bad key and a busy sweep must read as a message, not a 500."""
+    publisher = _QueryPublisher(error=error)
+    api = _api_with_publisher(monkeypatch, publisher, json={"pubkey": "7f" * 32})
+
+    out = _run_endpoint(api, api.query_neighbor_scopes)
+
+    assert out["success"] is False
+    assert str(error) in out["error"]
+
+
+def test_query_neighbor_scopes_endpoint_without_a_publisher(monkeypatch):
+    api = _api_with_publisher(monkeypatch, None, json={"pubkey": "8f" * 32})
+
+    out = api.query_neighbor_scopes()
+
+    assert out["success"] is False
+    assert "not available" in out["error"]
+
+
+@pytest.mark.parametrize("name", ["query_neighbor_scopes"])
+def test_json_body_endpoints_enable_the_json_in_tool(name):
+    """cherrypy.request.json only exists when json_in is on for the handler.
+
+    It is not enabled globally for /api, and Request has no __getattr__, so a
+    handler that reads .json without the decorator raises AttributeError on every
+    real request -- while a test that fabricates cherrypy.request still passes.
+    That is exactly how this was missed, hence a check on the decorator itself.
+    """
+    from repeater.web.api_endpoints import APIEndpoints
+
+    handler = getattr(APIEndpoints, name)
+    config = getattr(handler, "_cp_config", {})
+    assert config.get("tools.json_in.on") is True
+
+
+# ====================================================================
+# Scope persistence: the rules the review found broken
+# ====================================================================
+@pytest.mark.asyncio
+async def test_duty_cycle_refusal_is_recorded_as_a_query():
+    """Nothing reached the air, but the node did try -- and kept trying.
+
+    Recording only `transmitted` outcomes left a repeater that refuses on duty
+    cycle reading as "never queried" forever, however often it was asked.
+    """
+    target = "1a" * 32
+    store = _FakeScopeStore({target: _repeater_row()})
+    publisher = _publisher(
+        {"mqtt_brokers": {}},
+        storage=store,
+        scope_helper=_StubSweep({target: ScopeResult(STATUS_SEND_FAILED, transmitted=False)}),
+    )
+
+    out = await publisher.query_one(target)
+
+    assert out["status"] == STATUS_SEND_FAILED
+    assert out["queried_at"] is not None
+    assert store.scopes[target]["status"] == STATUS_SEND_FAILED
+
+
+@pytest.mark.asyncio
+async def test_failed_query_returns_the_scopes_still_on_record():
+    """The row keeps the last answer, so the response must not tell the UI to drop it."""
+    target = "2a" * 32
+    store = _FakeScopeStore({target: _repeater_row()})
+    publisher = _publisher(
+        {"mqtt_brokers": {}},
+        storage=store,
+        scope_helper=_StubSweep(
+            {target: ScopeResult(STATUS_RESPONDED, "DEN,BOU", transmitted=True)}
+        ),
+    )
+    await publisher.query_one(target)
+
+    publisher.scope_helper = _StubSweep({target: ScopeResult(STATUS_TIMEOUT, transmitted=True)})
+    out = await publisher.query_one(target)
+
+    assert out["status"] == STATUS_TIMEOUT
+    assert out["scopes"] == "DEN,BOU"  # not blanked
+    assert out["responded_at"] is not None
+    assert out["responded_at"] < out["queried_at"]
+
+
+@pytest.mark.asyncio
+async def test_query_refuses_while_a_cycle_is_running():
+    """The cycle owns the helper for its whole run, discovery window included."""
+    publisher = _publisher({"mqtt_brokers": {}}, scope_helper=_StubSweep({}))
+    publisher._active = True
+
+    with pytest.raises(RuntimeError, match="cycle is running"):
+        await publisher.query_one("3a" * 32)
+
+
+@pytest.mark.asyncio
+async def test_a_cycle_defers_rather_than_dies_when_a_query_holds_the_helper():
+    """Colliding with a manual query must not cost a whole cycle's airtime."""
+    target = "4a" * 32
+    store = _FakeScopeStore({target: _repeater_row()})
+    published = []
+    handler = SimpleNamespace(
+        has_neighbors_brokers=lambda: True,
+        has_connected_neighbors_brokers=lambda: True,
+        publish_neighbors=lambda payload: published.append(payload) or [("broker", None)],
+        node_name="n",
+        public_key="AB" * 32,
+    )
+
+    class _BusyHelper:
+        async def sweep(self, targets):
+            raise RuntimeError("neighbor scope sweep already active")
+
+    publisher = _publisher(
+        {"mqtt_brokers": {}}, handler=handler, storage=store, scope_helper=_BusyHelper()
+    )
+
+    out = await publisher.run_cycle(trigger="test")
+
+    assert out["success"] is False
+    # No scope-less table published, and the short retry delay applies.
+    assert published == []
+    assert "deferred" in publisher._last_result
+    assert publisher.status()["secs_until_next"] <= 900
+
+
+@pytest.mark.asyncio
+async def test_a_query_in_flight_blocks_a_cycle_from_starting():
+    publisher = _publisher(
+        {"mqtt_brokers": {}}, handler=_enabled_handler(), scope_helper=_StubSweep({})
+    )
+    publisher._queries_in_flight = 1
+
+    assert publisher.trigger_cycle() is False
+
+    publisher._next_publish_at = None  # due
+    await publisher._tick()
+    assert publisher._last_publish_at is None  # no cycle ran
+
+
+@pytest.mark.asyncio
+async def test_shutdown_cancels_an_in_flight_query():
+    """A query holds the radio for a response window; teardown must cut it short."""
+    local = LocalIdentity()
+    peer = LocalIdentity()  # a real key, so the request actually builds
+    on_air = asyncio.Event()
+
+    async def _never_returns(packet, wait_for_ack=False):
+        on_air.set()
+        await asyncio.sleep(3600)
+
+    helper = _helper_with_injector(local, _never_returns)
+    publisher = _publisher({"mqtt_brokers": {}}, scope_helper=helper, local_identity=local)
+
+    task = asyncio.create_task(publisher.query_one(peer.get_public_key().hex()))
+    # Waited on an event rather than polling the task set: if the query fails
+    # before it gets on air this fails fast instead of spinning.
+    await asyncio.wait_for(on_air.wait(), timeout=5)
+    assert publisher._query_tasks
+
+    await publisher.stop()
+
+    assert task.done()
+    assert publisher._queries_in_flight == 0
+
+
+def test_retention_cleanup_drops_scope_rows_for_pruned_neighbours(tmp_path):
+    """cleanup_old_data is the path that actually runs unattended on the Pi."""
+    from repeater.data_acquisition.sqlite_handler import SQLiteHandler
+
+    handler = SQLiteHandler(tmp_path)
+    gone, kept = "6a" * 32, "7a" * 32
+    old = time.time() - (60 * 24 * 3600)
+    for pubkey, ts in ((gone, old), (kept, time.time())):
+        handler.store_advert(
+            {
+                "pubkey": pubkey,
+                "node_name": pubkey[:4],
+                "is_repeater": True,
+                "contact_type": "Repeater",
+                "timestamp": ts,
+            }
+        )
+        handler.record_neighbor_scope(pubkey, STATUS_RESPONDED, "DEN", time.time())
+
+    handler.cleanup_old_data(days=31)
+
+    remaining = handler.get_neighbor_scopes()
+    assert kept in remaining
+    assert gone not in remaining
+
+
+def test_purging_the_advert_table_takes_the_scopes_with_it(tmp_path):
+    """Otherwise the UI shows scope counts for repeaters it no longer lists."""
+    from repeater.data_acquisition.sqlite_handler import SQLiteHandler
+
+    handler = SQLiteHandler(tmp_path)
+    handler.record_neighbor_scope("8a" * 32, STATUS_RESPONDED, "DEN", time.time())
+
+    handler.purge_table("adverts")
+
+    assert handler.get_neighbor_scopes() == {}
