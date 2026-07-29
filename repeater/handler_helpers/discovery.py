@@ -36,6 +36,91 @@ NODE_TYPE_NAMES = {
 }
 
 
+def build_discovery_advert_record(result: dict) -> Optional[dict]:
+    """Turn a discovery response into a zero-hop advert row, or None if unusable.
+
+    A node-discover response is only ever answered by a node that heard our
+    zero-hop broadcast directly, so the row is recorded with ``zero_hop=True``
+    and ``route_type=2`` — the same thing firmware ``putNeighbour()`` records
+    when a discovery response arrives.
+    """
+    pubkey = str(result.get("pub_key") or "").strip().lower()
+    if pubkey.startswith("0x"):
+        pubkey = pubkey[2:]
+    if not pubkey:
+        return None
+
+    node_type = int(result.get("node_type", 0) or 0)
+    rssi = result.get("rssi")
+    # response_snr is our RX of their reply; plain snr is the fallback shape.
+    snr = result.get("response_snr", result.get("snr"))
+
+    return {
+        "timestamp": time.time(),
+        "pubkey": pubkey,
+        "node_name": result.get("node_name"),
+        "is_repeater": node_type == 2,
+        "route_type": 2,
+        "contact_type": NODE_TYPE_NAMES.get(node_type, "Unknown"),
+        "latitude": None,
+        "longitude": None,
+        "rssi": int(rssi) if rssi is not None else None,
+        "snr": float(snr) if snr is not None else None,
+        "is_new_neighbor": True,
+        "zero_hop": True,
+    }
+
+
+def persist_discovery_result(storage, result: dict) -> bool:
+    """Store one discovery response, returning whether it was written.
+
+    Accepts either storage object the callers actually hold: ``StorageCollector``
+    exposes ``record_advert`` (store plus the MQTT/Glass advert publish), while
+    ``SQLiteHandler`` exposes only ``store_advert``. Preferring the first and
+    falling back to the second is what makes this work from the mesh CLI, which
+    is constructed with the SQLiteHandler — checking for ``record_advert`` alone
+    made ``discover.neighbors`` silently persist nothing.
+    """
+    if storage is None:
+        return False
+
+    record = build_discovery_advert_record(result)
+    if record is None:
+        return False
+
+    writer = getattr(storage, "record_advert", None) or getattr(storage, "store_advert", None)
+    if not callable(writer):
+        logger.debug("Storage backend cannot persist discovery results")
+        return False
+
+    # Discovery responses do not carry advert metadata such as name or location.
+    # Preserve those fields from an existing advert instead of replacing them
+    # with None when SQLite updates the neighbor row.
+    reader = getattr(storage, "get_neighbors", None)
+    if callable(reader):
+        try:
+            neighbors = reader()
+            if isinstance(neighbors, dict):
+                existing = neighbors.get(record["pubkey"])
+                if isinstance(existing, dict):
+                    for field in ("node_name", "latitude", "longitude"):
+                        if record.get(field) is None:
+                            record[field] = existing.get(field)
+        except Exception as e:
+            logger.debug(
+                "Failed to read existing discovery metadata for %s: %s",
+                record["pubkey"][:8],
+                e,
+            )
+
+    try:
+        writer(record)
+        return True
+    except Exception as e:
+        logger.debug("Failed to persist discovery result for %s: %s", record["pubkey"][:8], e)
+        return False
+
+
 class DiscoveryHelper:
     """Helper class for processing discovery requests in the repeater."""
 

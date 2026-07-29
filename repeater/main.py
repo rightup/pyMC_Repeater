@@ -31,6 +31,7 @@ from repeater.handler_helpers import (
     AdvertHelper,
     DiscoveryHelper,
     LoginHelper,
+    NeighborScopeHelper,
     PathHelper,
     ProtocolRequestHelper,
     TextHelper,
@@ -38,6 +39,7 @@ from repeater.handler_helpers import (
 )
 from repeater.identity_manager import IdentityConfigurationError, IdentityManager, IdentitySpec
 from repeater.logging_utils import normalize_log_level
+from repeater.neighbors_publisher import NeighborsPublisher
 from repeater.packet_router import PacketRouter
 from repeater.region_map_builder import build_region_map
 from repeater.sensors import SensorManager
@@ -99,6 +101,8 @@ class RepeaterDaemon:
         self.trace_helper = None
         self.advert_helper = None
         self.discovery_helper = None
+        self.neighbor_scope_helper = None
+        self.neighbors_publisher = None
         self.login_helper = None
         self.text_helper = None
         self.path_helper = None
@@ -653,6 +657,35 @@ class RepeaterDaemon:
 
             # When trace reaches final node, push PUSH_CODE_TRACE_DATA (0x89) to companion clients (firmware onTraceRecv)
             self.trace_helper.on_trace_complete = self._on_trace_complete_for_companions
+
+            # Neighbour scope discovery + periodic MQTT neighbors publication.
+            # Created unconditionally and self-gating: the publisher idles unless
+            # the master switch is on and some broker opted in with neighbors:true.
+            self.neighbor_scope_helper = NeighborScopeHelper(
+                local_identity=self.local_identity,
+                packet_injector=self.router.inject_packet,
+                airtime_manager=(
+                    getattr(self.repeater_handler, "airtime_mgr", None)
+                    if self.repeater_handler
+                    else None
+                ),
+                config=self.config,
+            )
+            self.neighbors_publisher = NeighborsPublisher(
+                config=self.config,
+                local_identity=self.local_identity,
+                discovery_helper=self.discovery_helper,
+                scope_helper=self.neighbor_scope_helper,
+                mqtt_handler_provider=lambda: getattr(
+                    getattr(self.repeater_handler, "storage", None), "mqtt_handler", None
+                ),
+                storage_provider=lambda: getattr(self.repeater_handler, "storage", None),
+                self_scopes_fn=(
+                    self.login_helper._format_region_names if self.login_helper else None
+                ),
+            )
+            self.neighbors_publisher.start()
+            logger.info("Neighbors publisher initialized")
 
             # Optional pyMC_Glass integration loop (inform/control plane)
             self.glass_handler = GlassHandler(
@@ -1631,6 +1664,13 @@ class RepeaterDaemon:
             await self._shutdown_step(
                 "http server", asyncio.to_thread(self.http_server.stop), timeout=3
             )
+
+        # Stop the neighbours publication loop.
+        if self.neighbors_publisher:
+            try:
+                await self.neighbors_publisher.stop()
+            except Exception as e:
+                logger.warning(f"Error stopping neighbors publisher: {e}")
 
         # Stop Glass inform loop
         if self.glass_handler:

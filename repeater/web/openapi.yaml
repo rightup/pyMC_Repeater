@@ -3417,6 +3417,140 @@ paths:
               schema:
                 type: object
 
+  /publish_neighbors:
+    post:
+      tags: [System]
+      summary: Publish the neighbours table now
+      description: >
+        Runs one neighbours cycle immediately: a zero-hop discovery broadcast, a
+        serialized scope query per neighbour, then a publish to every opted-in
+        broker. Returns as soon as the cycle is scheduled; the cycle itself takes
+        minutes. Poll /mqtt_status for the outcome.
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      responses:
+        '200':
+          description: Cycle started, or an error when one is already running
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+        '405':
+          description: Method not allowed
+
+  /neighbor_scopes:
+    get:
+      tags: [Network Policy]
+      summary: Last known region scopes per neighbour
+      description: >
+        Region scopes learned from the anon-regions query the neighbours publisher
+        issues, keyed by lowercase pubkey hex. One row per neighbour that has been
+        queried; neighbours never queried are simply absent. `scopes` is the last
+        answer given and an empty string is a real answer meaning the neighbour
+        serves unscoped traffic only. `status`/`queried_at` describe the most
+        recent query, which may have failed after a good answer, so `responded_at`
+        is what says how fresh `scopes` is. `served` carries this node's own scopes
+        in the same comma-separated form — the very string it sends when a neighbour
+        asks it the same question — so a client can tell which of a neighbour's
+        scopes it already shares.
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      responses:
+        '200':
+          description: >
+            Stored scope records, or an error when storage is unavailable (as it
+            briefly is during daemon startup) — `data` is absent in that case.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success]
+                properties:
+                  success:
+                    type: boolean
+                  error:
+                    type: string
+                  count:
+                    type: integer
+                  served:
+                    type: object
+                    required: [scopes]
+                    properties:
+                      scopes:
+                        type: string
+                        description: >
+                          This node's own advertised scopes, comma-separated, `*`
+                          first when it floods unscoped. Empty when they cannot be
+                          read.
+                  data:
+                    type: object
+                    additionalProperties:
+                      $ref: '#/components/schemas/NeighborScopeRecord'
+
+  /query_neighbor_scopes:
+    post:
+      tags: [Network Policy]
+      summary: Query one neighbour's region scopes now
+      description: >
+        Sends a single route-direct anon-regions request and waits for the reply,
+        then stores and returns the outcome. Nothing is published to MQTT; the
+        periodic cycle owns the neighbors topic. The request only reaches a
+        zero-hop neighbour, and the responder rate-limits anonymous replies (4 per
+        3 minutes), so both a multi-hop target and a repeated query show up as
+        `timeout`. Errors when a neighbours cycle already holds the scope helper.
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [pubkey]
+              properties:
+                pubkey:
+                  type: string
+                  description: Full 64-character public key hex of the neighbour
+      responses:
+        '200':
+          description: Query outcome, or an error when it could not be run
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success]
+                properties:
+                  success:
+                    type: boolean
+                  error:
+                    type: string
+                  data:
+                    type: object
+                    required: [pubkey, status, scopes, transmitted]
+                    properties:
+                      pubkey:
+                        type: string
+                      status:
+                        type: string
+                        enum: [responded, timeout, send_failed]
+                      scopes:
+                        type: string
+                        description: Comma-separated scope names; empty when unscoped
+                      transmitted:
+                        type: boolean
+                        description: Whether the request actually reached the air
+                      queried_at:
+                        type: number
+                        nullable: true
+                      responded_at:
+                        type: number
+                        nullable: true
+        '405':
+          description: Method not allowed
+
   /update_web_config:
     post:
       tags: [System]
@@ -4384,6 +4518,27 @@ components:
         error:
           type: string
           description: Error message
+
+    NeighborScopeRecord:
+      type: object
+      required: [scopes, status, queried_at]
+      properties:
+        scopes:
+          type: string
+          description: >
+            Comma-separated region scope names from the neighbour's last answer.
+            Empty means it answered that it serves unscoped traffic only.
+        responded_at:
+          type: number
+          nullable: true
+          description: Epoch seconds of the answer `scopes` came from
+        status:
+          type: string
+          enum: [responded, timeout, send_failed]
+          description: Outcome of the most recent query
+        queried_at:
+          type: number
+          description: Epoch seconds of the most recent query
 
     NeighborLinkSnapshot:
       type: object

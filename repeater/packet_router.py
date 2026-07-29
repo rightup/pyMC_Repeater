@@ -713,7 +713,28 @@ class PacketRouter:
             # to first hop instead of original requester).
             consumed = False
             dest_hash = packet.payload[0] if packet.payload and len(packet.payload) >= 1 else None
-            companion_bridges = self._companion_bridges_for_packet(packet, metadata)
+
+            # A neighbour's answer to our own anon-regions scope query is addressed
+            # to this repeater's identity, and no companion bridge owns it. Offer it
+            # to the scope helper first; it consumes the packet only when the
+            # ciphertext authenticates under the pending neighbour's shared secret
+            # AND echoes that query's tag, so an unrelated RESPONSE still falls
+            # through to the companion paths below.
+            scope_helper = getattr(self.daemon, "neighbor_scope_helper", None)
+            scope_consumed = False
+            if scope_helper is not None:
+                try:
+                    scope_consumed = await scope_helper.process_response_packet(packet)
+                except Exception as e:
+                    logger.debug(f"Neighbor scope response matching failed: {e}")
+
+            if scope_consumed:
+                packet.mark_do_not_retransmit()
+                processed_by_injection = True
+                self._record_for_ui(packet, metadata)
+                companion_bridges = {}
+            else:
+                companion_bridges = self._companion_bridges_for_packet(packet, metadata)
             local_hash = getattr(self.daemon, "local_hash", None)
             if dest_hash is not None and dest_hash in companion_bridges:
                 _, consumed = await self._fan_out_to_bridges(

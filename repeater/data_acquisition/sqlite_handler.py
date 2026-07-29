@@ -735,10 +735,189 @@ class SQLiteHandler:
                     )
                     logger.info(f"Migration '{migration_name}' applied successfully")
 
+                # Migration 14: Small key/value store for daemon state that must
+                # outlive a restart. Added for the neighbours publisher, whose
+                # schedule otherwise resets on every boot and re-runs a discovery
+                # sweep; kept generic so the next such need does not add another
+                # table. Not for anything hot -- one row per writer, rewritten at
+                # whatever cadence that writer already has.
+                migration_name = "add_daemon_state"
+                existing = conn.execute(
+                    "SELECT migration_name FROM migrations WHERE migration_name = ?",
+                    (migration_name,),
+                ).fetchone()
+                if not existing:
+                    conn.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS daemon_state (
+                            key TEXT PRIMARY KEY,
+                            value_json TEXT NOT NULL,
+                            updated_at REAL NOT NULL
+                        )
+                        """
+                    )
+                    conn.execute(
+                        "INSERT INTO migrations (migration_name, applied_at) VALUES (?, ?)",
+                        (migration_name, time.time()),
+                    )
+                    logger.info(f"Migration '{migration_name}' applied successfully")
+
+                # Migration 15: Last-known region scopes per neighbour, from the
+                # anon-regions query the neighbours publisher issues. The MQTT
+                # payload was the only consumer, so the answers were discarded as
+                # soon as they were published and the web UI had nothing to show.
+                # One row per queried neighbour, rewritten at most once per query.
+                migration_name = "add_neighbor_scopes"
+                existing = conn.execute(
+                    "SELECT migration_name FROM migrations WHERE migration_name = ?",
+                    (migration_name,),
+                ).fetchone()
+                if not existing:
+                    conn.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS neighbor_scopes (
+                            pubkey TEXT PRIMARY KEY,
+                            scopes TEXT NOT NULL DEFAULT '',
+                            responded_at REAL,
+                            status TEXT NOT NULL,
+                            queried_at REAL NOT NULL
+                        )
+                        """
+                    )
+                    conn.execute(
+                        "INSERT INTO migrations (migration_name, applied_at) VALUES (?, ?)",
+                        (migration_name, time.time()),
+                    )
+                    logger.info(f"Migration '{migration_name}' applied successfully")
+
                 conn.commit()
 
         except Exception as e:
             logger.error(f"Failed to run migrations: {e}")
+
+    # Neighbour scope methods
+    def get_neighbor_scopes(self) -> dict:
+        """Return every stored scope record, keyed by lowercase pubkey hex.
+
+        Never raises: the caller renders a column from this, and a missing or
+        corrupt table must degrade to "nothing known" rather than fail the
+        request that also carries the neighbour table.
+        """
+        try:
+            with self._connect() as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute(
+                    "SELECT pubkey, scopes, responded_at, status, queried_at FROM neighbor_scopes"
+                ).fetchall()
+            return {
+                row["pubkey"]: {
+                    "scopes": row["scopes"] or "",
+                    "responded_at": row["responded_at"],
+                    "status": row["status"],
+                    "queried_at": row["queried_at"],
+                }
+                for row in rows
+            }
+        except Exception as e:
+            logger.debug(f"Could not read neighbour scopes: {e}")
+            return {}
+
+    def record_neighbor_scope(
+        self,
+        pubkey: str,
+        status: str,
+        scopes: Optional[str] = None,
+        queried_at: Optional[float] = None,
+    ) -> bool:
+        """Record the outcome of one scope query.
+
+        ``scopes`` is the answer the neighbour gave, and is only supplied when it
+        actually answered. A failed query updates ``status``/``queried_at`` but
+        leaves the last known ``scopes`` and ``responded_at`` in place: the
+        responder rate-limits anon replies (4 per 3 minutes, shared across
+        identities), so a single timeout is weak evidence that a neighbour's
+        scopes changed and is not worth discarding a good answer over.
+
+        An empty ``scopes`` string is a real answer -- it means the neighbour
+        serves unscoped traffic only -- so it is stored, not treated as absent.
+        """
+        pubkey = str(pubkey or "").strip().lower()
+        if not pubkey:
+            return False
+        when = time.time() if queried_at is None else float(queried_at)
+        try:
+            with self._connect() as conn:
+                if scopes is None:
+                    conn.execute(
+                        """
+                        INSERT INTO neighbor_scopes (pubkey, scopes, responded_at,
+                                                     status, queried_at)
+                        VALUES (?, '', NULL, ?, ?)
+                        ON CONFLICT(pubkey) DO UPDATE SET
+                            status = excluded.status,
+                            queried_at = excluded.queried_at
+                        """,
+                        (pubkey, str(status), when),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        INSERT INTO neighbor_scopes (pubkey, scopes, responded_at,
+                                                     status, queried_at)
+                        VALUES (?, ?, ?, ?, ?)
+                        ON CONFLICT(pubkey) DO UPDATE SET
+                            scopes = excluded.scopes,
+                            responded_at = excluded.responded_at,
+                            status = excluded.status,
+                            queried_at = excluded.queried_at
+                        """,
+                        (pubkey, str(scopes), when, str(status), when),
+                    )
+                conn.commit()
+            return True
+        except Exception as e:
+            logger.warning(f"Could not persist neighbour scopes for {pubkey[:8]}: {e}")
+            return False
+
+    # Daemon state methods
+    def get_daemon_state(self, key: str) -> Optional[dict]:
+        """Read a persisted daemon-state blob, or None when absent/unreadable.
+
+        Never raises: every caller treats missing state as "no history", so a
+        corrupt row must degrade to that rather than break startup.
+        """
+        try:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT value_json FROM daemon_state WHERE key = ?", (key,)
+                ).fetchone()
+            if not row:
+                return None
+            value = json.loads(row[0])
+            return value if isinstance(value, dict) else None
+        except Exception as e:
+            logger.debug(f"Could not read daemon state '{key}': {e}")
+            return None
+
+    def set_daemon_state(self, key: str, value: dict) -> bool:
+        """Upsert a daemon-state blob. Returns whether it was written."""
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO daemon_state (key, value_json, updated_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(key) DO UPDATE SET
+                        value_json = excluded.value_json,
+                        updated_at = excluded.updated_at
+                    """,
+                    (key, json.dumps(value), time.time()),
+                )
+                conn.commit()
+            return True
+        except Exception as e:
+            logger.warning(f"Could not persist daemon state '{key}': {e}")
+            return False
 
     # API Token methods
     def create_api_token(self, name: str, token_hash: str) -> int:
@@ -2564,6 +2743,11 @@ class SQLiteHandler:
         try:
             with self._connect() as conn:
                 result = conn.execute(purge_queries[table_name])
+                if table_name == "adverts":
+                    # Purging the neighbour table has to take the scopes with it,
+                    # or the UI shows scope counts for repeaters it no longer lists
+                    # and presents them as current.
+                    conn.execute("DELETE FROM neighbor_scopes")
                 conn.commit()
                 logger.info(f"Purged {result.rowcount} rows from {table_name}")
                 return result.rowcount
@@ -2599,6 +2783,14 @@ class SQLiteHandler:
 
                 result = conn.execute("DELETE FROM adverts WHERE timestamp < ?", (cutoff,))
                 adverts_deleted = result.rowcount
+
+                # A scope row describes a neighbour, so it has nothing left to be
+                # displayed against once that neighbour's advert is pruned. Without
+                # this it would survive every retention pass and grow without bound.
+                conn.execute(
+                    "DELETE FROM neighbor_scopes WHERE pubkey NOT IN "
+                    "(SELECT lower(pubkey) FROM adverts)"
+                )
 
                 result = conn.execute("DELETE FROM noise_floor WHERE timestamp < ?", (cutoff,))
                 noise_deleted = result.rowcount
@@ -3085,7 +3277,17 @@ class SQLiteHandler:
     def delete_advert(self, advert_id: int) -> bool:
         try:
             with self._connect() as conn:
+                # Adverts are one row per pubkey (migration `adverts_unique_pubkey`),
+                # so deleting one drops the neighbour entirely; its scope row would
+                # otherwise outlive it with nothing left to display it against.
+                row = conn.execute(
+                    "SELECT pubkey FROM adverts WHERE id = ?", (advert_id,)
+                ).fetchone()
                 cursor = conn.execute("DELETE FROM adverts WHERE id = ?", (advert_id,))
+                if row and row[0]:
+                    conn.execute(
+                        "DELETE FROM neighbor_scopes WHERE pubkey = ?", (str(row[0]).lower(),)
+                    )
                 self._neighbors_cache = {"timestamp": 0.0, "value": None}
                 return cursor.rowcount > 0
         except Exception as e:
@@ -3098,9 +3300,14 @@ class SQLiteHandler:
             with self._connect() as conn:
                 if pubkey_prefix is None:
                     cursor = conn.execute("DELETE FROM adverts")
+                    conn.execute("DELETE FROM neighbor_scopes")
                 else:
                     cursor = conn.execute(
                         "DELETE FROM adverts WHERE lower(pubkey) LIKE ?",
+                        (f"{pubkey_prefix.lower()}%",),
+                    )
+                    conn.execute(
+                        "DELETE FROM neighbor_scopes WHERE pubkey LIKE ?",
                         (f"{pubkey_prefix.lower()}%",),
                     )
                 self._neighbors_cache = {"timestamp": 0.0, "value": None}

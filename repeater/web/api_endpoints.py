@@ -191,6 +191,14 @@ POLICY_GROUP_KINDS = {
 
 
 class APIEndpoints:
+    # How long /api/query_neighbor_scopes holds a request open. The scope helper's
+    # response window is normally its 5 s floor; a slow radio config (SF12) or a
+    # duty-cycle deferral can push a single query past this, in which case the
+    # query is left running so its answer still reaches the stored table and the
+    # client is told to re-read it. Chosen to stay inside a default reverse-proxy
+    # read timeout rather than to cover the helper's 120 s ceiling.
+    SCOPE_QUERY_HTTP_TIMEOUT = 45.0
+
     def __init__(
         self,
         stats_getter: Optional[Callable] = None,
@@ -2258,13 +2266,25 @@ class APIEndpoints:
                                 "reconnecting": conn.has_pending_reconnect(),
                             },
                             "format": conn.format,
+                            "neighbors": getattr(conn, "neighbors_enabled", False),
                         }
                     )
+
+            # Schedule summary for the neighbors topic, the openhop equivalent of
+            # the firmware's trailing "nbr: <next>/<last>" in `get mqtt.status`.
+            neighbors_status = None
+            publisher = getattr(self.daemon_instance, "neighbors_publisher", None)
+            if publisher:
+                try:
+                    neighbors_status = publisher.status()
+                except Exception as exc:
+                    logger.debug(f"mqtt_status could not read neighbors publisher: {exc}")
 
             return self._success(
                 {
                     "handler_active": handler is not None,
                     "brokers": connected_brokers,
+                    "neighbors": neighbors_status,
                 }
             )
         except Exception as e:
@@ -2327,6 +2347,294 @@ class APIEndpoints:
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
+    def publish_neighbors(self):
+        """Run one neighbours discovery + publish cycle now.
+
+        POST /api/publish_neighbors
+
+        The HTTP equivalent of the ``discover.scopes`` mesh CLI command. A cycle
+        runs for minutes -- a discovery window plus one serialized scope query per
+        neighbour -- so this schedules it on the event loop and returns
+        immediately rather than holding the request open. Poll ``mqtt_status``
+        for the outcome.
+        """
+        self._set_cors_headers()
+
+        if cherrypy.request.method == "OPTIONS":
+            return ""
+
+        future = None
+        try:
+            self._require_post()
+            publisher = getattr(self.daemon_instance, "neighbors_publisher", None)
+            if not publisher:
+                return self._error("Neighbors publisher not available")
+            if not publisher.enabled():
+                return self._error(
+                    "Neighbours publishing is disabled - enable it and opt a broker in first"
+                )
+            if self.event_loop is None:
+                return self._error("Event loop not available")
+
+            import asyncio
+
+            # trigger_cycle owns the already-running check and tracks the task so
+            # shutdown can cancel it. Doing either here would race: this runs on a
+            # cherrypy thread while the cycle lives on the event loop.
+            async def _start():
+                return publisher.trigger_cycle()
+
+            future = asyncio.run_coroutine_threadsafe(_start(), self.event_loop)
+            if future.result(timeout=10):
+                return self._success("Neighbours discovery cycle started")
+            return self._error("A neighbours cycle is already running")
+        except FutureTimeoutError:
+            logger.error("Timed out starting the neighbours cycle", exc_info=True)
+            if future is not None:
+                future.cancel()
+            return self._error("Timed out starting the neighbours cycle")
+        except cherrypy.HTTPError:
+            raise
+        except Exception as e:
+            logger.error(f"Error starting neighbours cycle: {e}", exc_info=True)
+            return self._error(str(e))
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    def neighbor_scopes(self):
+        """Last known region scopes per neighbour.
+
+        GET /api/neighbor_scopes
+
+        Served as its own endpoint rather than folded into the advert queries: the
+        advert list is paginated per contact type and read on every neighbours-page
+        load, and this table is small enough (one row per queried neighbour) that
+        the client can hold the whole thing and join on pubkey.
+
+        ``scopes`` is the last answer a neighbour gave; an empty string is a real
+        answer meaning it serves unscoped traffic only. ``status``/``queried_at``
+        describe the most recent query, which may have failed after a good answer,
+        so ``responded_at`` is how fresh the scopes themselves are.
+
+        ``served`` carries this node's own scopes in the same comma-separated form,
+        so a client can tell which of a neighbour's scopes it already shares without
+        re-deriving the rule (the wildcard plus every allow-flood region). It is the
+        very string this node sends when a neighbour asks *it* the same question.
+        """
+        self._set_cors_headers()
+
+        if cherrypy.request.method == "OPTIONS":
+            return ""
+
+        try:
+            storage = self._get_storage()
+            scopes = storage.get_neighbor_scopes() or {}
+            # Keyword cannot be named `self` here -- it would collide with the
+            # method's own first argument.
+            return self._success(
+                scopes, count=len(scopes), served={"scopes": self._served_scopes()}
+            )
+        except Exception as e:
+            logger.error(f"Error reading neighbour scopes: {e}")
+            return self._error(str(e))
+
+    def _served_scopes(self) -> str:
+        """This node's advertised region scopes, or "" when they cannot be read.
+
+        Deliberately the same formatter the anon-regions responder uses, rather
+        than a second reading of the transport-key table: whatever a neighbour
+        would be told is what a client comparing against it has to see.
+        """
+        login_helper = getattr(self.daemon_instance, "login_helper", None)
+        formatter = getattr(login_helper, "_format_region_names", None) if login_helper else None
+        if not callable(formatter):
+            return ""
+        try:
+            return formatter() or ""
+        except Exception as e:
+            logger.debug(f"Could not read served region scopes: {e}")
+            return ""
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    @cherrypy.tools.json_in()
+    def query_neighbor_scopes(self):
+        """Ask one neighbour for its region scopes now.
+
+        POST /api/query_neighbor_scopes  {"pubkey": "<64 hex chars>"}
+
+        Unlike ``publish_neighbors`` this holds the request open for the answer:
+        one query is a single route-direct request whose response window is
+        normally the 5 s floor (only a slow radio config approaches the 120 s
+        ceiling), so a spinner is a better fit than a poll. Nothing is published
+        as a result -- the answer is stored and returned, and the periodic cycle
+        remains the only thing that writes to the MQTT topic.
+
+        The request is route-direct with an empty path, so it only reaches a
+        zero-hop neighbour, and the responder rate-limits anonymous replies (4 per
+        3 minutes, shared across its identities) -- both show up here as a
+        ``timeout``.
+        """
+        self._set_cors_headers()
+
+        if cherrypy.request.method == "OPTIONS":
+            return ""
+
+        try:
+            self._require_post()
+            data = cherrypy.request.json or {}
+            pubkey = str(data.get("pubkey") or "").strip()
+            if not pubkey:
+                return self._error("Missing pubkey parameter")
+
+            publisher = getattr(self.daemon_instance, "neighbors_publisher", None)
+            if not publisher:
+                return self._error("Neighbors publisher not available")
+            if self.event_loop is None:
+                return self._error("Event loop not available")
+
+            import asyncio
+
+            future = asyncio.run_coroutine_threadsafe(publisher.query_one(pubkey), self.event_loop)
+            result = future.result(timeout=self.SCOPE_QUERY_HTTP_TIMEOUT)
+            return self._success(result)
+        except FutureTimeoutError:
+            # Deliberately not cancelled: the query has already spent the airtime,
+            # and it persists its own outcome, so letting it finish means the answer
+            # still shows up on a re-read instead of being thrown away here.
+            logger.warning(
+                "Neighbour scope query still in flight after %.0fs",
+                self.SCOPE_QUERY_HTTP_TIMEOUT,
+            )
+            return self._error("Still waiting for the neighbour to reply - check back in a moment")
+        except cherrypy.HTTPError:
+            raise
+        except ValueError as e:
+            return self._error(str(e))
+        except RuntimeError as e:
+            # query_one raises this when a cycle or another query already holds the
+            # scope helper -- one request in flight at a time, by design. Still
+            # logged, because an unrelated RuntimeError from the event loop lands
+            # here too and would otherwise leave no trace.
+            logger.warning(f"Neighbour scope query refused: {e}")
+            return self._error(str(e))
+        except Exception as e:
+            logger.error(f"Error querying neighbour scopes: {e}", exc_info=True)
+            return self._error(str(e))
+
+    @staticmethod
+    def _validate_neighbors_settings(raw):
+        """Validate the ``mqtt_brokers.neighbors`` block.
+
+        Returns ``(settings, error)``; ``error`` is None on success. The interval
+        is rejected rather than clamped when out of range, matching the firmware's
+        ``set mqtt.neighbors.interval`` behavior.
+        """
+        from repeater.neighbors_publisher import (
+            DEFAULT_INTERVAL_HOURS,
+            MAX_INTERVAL_HOURS,
+            MIN_INTERVAL_HOURS,
+        )
+
+        if not isinstance(raw, dict):
+            return None, "neighbors must be an object"
+
+        # Reject unknown keys rather than accepting them silently: a typo would
+        # otherwise return success while changing nothing the runtime reads.
+        known_keys = {
+            "enabled",
+            "interval_hours",
+            "discovery_timeout_seconds",
+            "scope_response_timeout_seconds",
+            "max_sweep_seconds",
+            "duty_cycle_abort_seconds",
+            "max_neighbors",
+            "max_neighbor_age_seconds",
+        }
+        unknown = sorted(set(raw) - known_keys)
+        if unknown:
+            return None, f"Unknown neighbors settings: {', '.join(unknown)}"
+
+        settings = {}
+
+        if "enabled" in raw:
+            if not isinstance(raw["enabled"], bool):
+                return None, "neighbors.enabled must be true or false"
+            settings["enabled"] = raw["enabled"]
+
+        if "interval_hours" in raw:
+            interval = raw["interval_hours"]
+            if isinstance(interval, bool) or not isinstance(interval, (int, float)):
+                return None, "neighbors.interval_hours must be a number"
+            if float(interval) != int(interval):
+                return None, "neighbors.interval_hours must be a whole number of hours"
+            interval = int(interval)
+            if interval < MIN_INTERVAL_HOURS or interval > MAX_INTERVAL_HOURS:
+                return (
+                    None,
+                    f"neighbors.interval_hours must be between {MIN_INTERVAL_HOURS} "
+                    f"and {MAX_INTERVAL_HOURS} (default {DEFAULT_INTERVAL_HOURS})",
+                )
+            settings["interval_hours"] = interval
+
+        if "discovery_timeout_seconds" in raw:
+            try:
+                timeout = float(raw["discovery_timeout_seconds"])
+            except (TypeError, ValueError):
+                return None, "neighbors.discovery_timeout_seconds must be a number"
+            if timeout < 5 or timeout > 300:
+                return None, "neighbors.discovery_timeout_seconds must be between 5 and 300"
+            settings["discovery_timeout_seconds"] = timeout
+
+        if "scope_response_timeout_seconds" in raw:
+            try:
+                scope_timeout = float(raw["scope_response_timeout_seconds"])
+            except (TypeError, ValueError):
+                return None, "neighbors.scope_response_timeout_seconds must be a number"
+            if scope_timeout < 0 or scope_timeout > 300:
+                return None, "neighbors.scope_response_timeout_seconds must be between 0 and 300"
+            settings["scope_response_timeout_seconds"] = scope_timeout
+
+        if "max_neighbors" in raw:
+            try:
+                max_neighbors = int(raw["max_neighbors"])
+            except (TypeError, ValueError):
+                return None, "neighbors.max_neighbors must be a number"
+            if max_neighbors < 1 or max_neighbors > 255:
+                return None, "neighbors.max_neighbors must be between 1 and 255"
+            settings["max_neighbors"] = max_neighbors
+
+        if "max_neighbor_age_seconds" in raw:
+            try:
+                max_age = float(raw["max_neighbor_age_seconds"])
+            except (TypeError, ValueError):
+                return None, "neighbors.max_neighbor_age_seconds must be a number"
+            if max_age < 60:
+                return None, "neighbors.max_neighbor_age_seconds must be at least 60"
+            settings["max_neighbor_age_seconds"] = max_age
+
+        if "max_sweep_seconds" in raw:
+            try:
+                max_sweep = float(raw["max_sweep_seconds"])
+            except (TypeError, ValueError):
+                return None, "neighbors.max_sweep_seconds must be a number"
+            if max_sweep < 30 or max_sweep > 7200:
+                return None, "neighbors.max_sweep_seconds must be between 30 and 7200"
+            settings["max_sweep_seconds"] = max_sweep
+
+        if "duty_cycle_abort_seconds" in raw:
+            try:
+                abort_after = float(raw["duty_cycle_abort_seconds"])
+            except (TypeError, ValueError):
+                return None, "neighbors.duty_cycle_abort_seconds must be a number"
+            if abort_after < 0 or abort_after > 600:
+                return None, "neighbors.duty_cycle_abort_seconds must be between 0 and 600"
+            settings["duty_cycle_abort_seconds"] = abort_after
+
+        return settings, None
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
     @cherrypy.tools.json_in()
     def update_mqtt_config(self):
         """Update MQTT Observer configuration.
@@ -2365,12 +2673,41 @@ class APIEndpoints:
                 mqtt_updates["owner"] = str(data["owner"]).strip()
             if "email" in data:
                 mqtt_updates["email"] = str(data["email"]).strip()
+            if "neighbors" in data:
+                from repeater.handler_helpers.neighbor_scopes import neighbors_config_block
+
+                neighbors_settings, error = self._validate_neighbors_settings(data["neighbors"])
+                if error:
+                    return self._error(error)
+                # update_and_save replaces a section's key outright, so merge onto
+                # the stored block instead of letting a partial POST drop the
+                # settings it did not mention. neighbors_config_block returns {} for
+                # a hand-edited scalar (`neighbors: true` is an easy mistake, since
+                # the per-broker key of the same name is a boolean), which would
+                # otherwise fail the merge with a TypeError; the save then rewrites
+                # it as a proper block.
+                mqtt_updates["neighbors"] = {
+                    **neighbors_config_block(self.config),
+                    **neighbors_settings,
+                }
             # if "disallowed_packet_types" in data:
             #     mqtt_updates["disallowed_packet_types"] = list(data["disallowed_packet_types"])
             if "brokers" in data:
                 brokers = data["brokers"]
                 if not isinstance(brokers, list):
                     return self._error("brokers must be a list")
+
+                # The rebuild below is a strict field whitelist, so any key a
+                # client omits is reset to its default. For neighbors that would
+                # silently switch the feature off whenever a UI that predates it
+                # saves an unrelated MQTT setting, so fall back to the stored
+                # value per broker name instead of to False.
+                stored_neighbors_by_name = {
+                    str(existing.get("name")): bool(existing.get("neighbors", False))
+                    for existing in (self.config.get("mqtt_brokers", {}) or {}).get("brokers", [])
+                    if isinstance(existing, dict) and existing.get("name")
+                }
+
                 validated = []
                 for i, b in enumerate(brokers):
                     if not isinstance(b, dict):
@@ -2402,6 +2739,13 @@ class APIEndpoints:
                         "format": str(b["format"]).strip(),
                         "disallowed_packet_types": list(b.get("disallowed_packet_types", [])),
                         "retain_status": bool(b.get("retain_status", False)),
+                        # Opt-in per broker; brokers that do not expect the
+                        # neighbors topic can reject it and drop the connection.
+                        "neighbors": bool(
+                            b["neighbors"]
+                            if "neighbors" in b
+                            else stored_neighbors_by_name.get(str(b["name"]).strip(), False)
+                        ),
                         "tls": {
                             "enabled": bool(
                                 b.get("tls", {}).get("enabled", True if port == 443 else False)

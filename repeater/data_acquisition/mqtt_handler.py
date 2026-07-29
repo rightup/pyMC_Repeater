@@ -239,6 +239,12 @@ class _BrokerConnection:
 
         self.enabled = broker.get("enabled", False)
         self.retain_status = broker.get("retain_status", False)
+        # Opt-in per broker, default off. The neighbors topic is not part of every
+        # MC2MQTT deployment's contract, and a broker that rejects an unexpected
+        # topic closes the connection (rc=16) - see the format auto-correction
+        # below for the same hazard. This is the openhop equivalent of the
+        # firmware's packets-only MeshRank exclusion.
+        self.neighbors_enabled = bool(broker.get("neighbors", False))
 
         self._tls_verified = False
 
@@ -1013,6 +1019,61 @@ class MeshCoreToMqttPusher:
 
         if not results:
             logger.warning(f"No active broker connections for publishing to {subtopic}")
+
+        return results
+
+    def has_neighbors_brokers(self) -> bool:
+        """True when at least one enabled broker opted into the neighbors topic."""
+        return any(conn.enabled and conn.neighbors_enabled for conn in self.connections)
+
+    def has_connected_neighbors_brokers(self) -> bool:
+        """True when an opted-in broker is connected and could receive a publish."""
+        return any(
+            conn.enabled and conn.neighbors_enabled and conn.is_connected()
+            for conn in self.connections
+        )
+
+    def publish_neighbors(self, payload: dict):
+        """Publish the neighbours table to every broker that opted in.
+
+        QoS 1 and non-retained, matching the firmware's ``publishNeighbors()``:
+        the table is a periodic snapshot, so a stale retained copy would outlive
+        its usefulness, but it is infrequent enough to be worth delivering once.
+        """
+        message = json.dumps(payload)
+        neighbor_count = len(payload.get("neighbors", []))
+        logger.debug(
+            f"Publishing topic='neighbors', neighbors={neighbor_count}, "
+            f"bytes={len(message.encode('utf-8'))}"
+        )
+
+        results = []
+        with self._lock:
+            for conn in self.connections:
+                if not (conn.enabled and conn.neighbors_enabled):
+                    continue
+                if not conn.is_connected():
+                    logger.warning(
+                        f"Cannot publish neighbors to {conn.broker['name']} - not connected"
+                    )
+                    continue
+                result = conn.publish("neighbors", message, retain=False, qos=1)
+                # This is by far the largest payload the node emits and it is not
+                # size-capped, so an oversized or queue-full rejection is a real
+                # outcome. Check paho's rc rather than reporting a publish that
+                # never left the client as a success.
+                rc = getattr(result, "rc", None)
+                if result is None or (rc is not None and rc != mqtt.MQTT_ERR_SUCCESS):
+                    logger.warning(
+                        f"Neighbors publish rejected by {conn.broker['name']} "
+                        f"(rc={rc}, bytes={len(message.encode('utf-8'))})"
+                    )
+                    continue
+                results.append((conn.broker["name"], result))
+                _trace(f"Published to {conn.broker['name']} -- neighbors")
+
+        if not results:
+            logger.warning("Neighbors table was not published to any broker")
 
         return results
 
