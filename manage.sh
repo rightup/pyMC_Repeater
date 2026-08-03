@@ -500,7 +500,6 @@ show_main_menu() {
             manage_service "restart" "false"
             ;;
         "logs")
-            clear
             print_live_logs_header
             echo ""
             journalctl -u "$SERVICE_NAME" -f -o cat --no-hostname | sed -e 's/.*ERROR.*/\x1b[1;31m&\x1b[0m/' -e 's/.*CRITICAL.*/\x1b[1;41;37m&\x1b[0m/' -e 's/.*WARNING.*/\x1b[1;33m&\x1b[0m/' -e 's/.*INFO.*/\x1b[0;32m&\x1b[0m/' -e 's/.*DEBUG.*/\x1b[0;36m&\x1b[0m/'
@@ -605,16 +604,16 @@ install_repeater() {
 
     echo "25"; echo "# Installing system dependencies..."
     apt-get update -qq
-    DEBIAN_FRONTEND=noninteractive apt-get install -y libffi-dev libusb-1.0-0 sudo jq pip python3-venv python3-rrdtool wget swig build-essential python3-dev i2c-tools
+    DEBIAN_FRONTEND=noninteractive apt-get install -y libffi-dev libusb-1.0-0 sudo jq python3-pip python3-venv python3-rrdtool wget swig build-essential python3-dev i2c-tools
     # Install polkit (package name varies by distro version)
     DEBIAN_FRONTEND=noninteractive apt-get install -y policykit-1 2>/dev/null \
         || DEBIAN_FRONTEND=noninteractive apt-get install -y polkitd pkexec 2>/dev/null \
         || echo "    Warning: Could not install polkit (sudo fallback will be used)"
-    # setuptools_scm needed for git version detection during build
-    PIP_ROOT_USER_ACTION=ignore python3 -m pip install -q --break-system-packages setuptools_scm
-
     echo "28"; echo "# Creating virtual environment..."
     ensure_venv
+
+    # Install setuptools_scm in the dedicated venv to avoid PEP 668 system-pip errors.
+    "$VENV_PYTHON" -m pip install -q setuptools_scm || true
 
     # Install mikefarah yq v4 if not already installed
     if ! command -v yq &> /dev/null || [[ "$(yq --version 2>&1)" != *"mikefarah/yq"* ]]; then
@@ -816,7 +815,6 @@ UPGRADEEOF
     fi
 
     # Install Python package outside of progress gauge for better error handling
-    clear
     echo "=== Installing Python Dependencies ==="
     echo ""
     echo "Installing openhop_repeater and dependencies (including openhop_core from PyPI)..."
@@ -899,7 +897,6 @@ UPGRADEEOF
     sleep 2
     local ip_address=$(hostname -I | awk '{print $1}')
     if is_running; then
-        clear
         echo "═══════════════════════════════════════════════════════════════"
         echo "        ✓ Installation Completed Successfully!"
         echo "═══════════════════════════════════════════════════════════════"
@@ -988,7 +985,6 @@ reset_repeater() {
         sleep 2
         local ip_address=$(hostname -I | awk '{print $1}')
         if is_running; then
-            clear
             echo "═══════════════════════════════════════════════════════════════"
             echo "        ✓ Reset Completed Successfully!"
             echo "═══════════════════════════════════════════════════════════════"
@@ -1018,7 +1014,6 @@ reset_repeater() {
             return 1
         fi
     fi
-
     return 0
 }
 
@@ -1103,13 +1098,15 @@ upgrade_repeater() {
 
     echo "[4/9] Updating system dependencies..."
     apt-get update -qq
-    apt-get install -y libffi-dev libusb-1.0-0 sudo jq pip python3-venv python3-rrdtool wget swig build-essential python3-dev i2c-tools
+    apt-get install -y libffi-dev libusb-1.0-0 sudo jq python3-pip python3-venv python3-rrdtool wget swig build-essential python3-dev i2c-tools
     apt-get install -y policykit-1 2>/dev/null \
         || apt-get install -y polkitd pkexec 2>/dev/null \
         || echo "    Warning: Could not install polkit (sudo fallback will be used)"
-    if ! PIP_ROOT_USER_ACTION=ignore python3 -m pip install -q --break-system-packages setuptools_scm; then
-        error "Failed to install setuptools_scm"
-        return 1
+
+    # Keep setuptools_scm in the venv instead of system Python (PEP 668 safe).
+    ensure_venv
+    if ! "$VENV_PYTHON" -m pip install -q setuptools_scm; then
+        echo "    Warning: Could not install setuptools_scm in venv; continuing without git-derived version"
     fi
 
     if ! command -v yq >/dev/null 2>&1 || [[ "$(yq --version 2>&1)" != *"mikefarah/yq"* ]]; then
@@ -1400,7 +1397,6 @@ configure_radio() {
 
     # Show info about web-based configuration
     if ask_yes_no "Configure Radio Settings" "Radio configuration is now done through the web interface.\n\nThe web-based setup wizard provides an easy way to:\n\n• Change repeater name\n• Select hardware board\n• Configure radio frequency and settings\n• Update admin password\n\nWeb Dashboard: http://$ip_address:8000/setup\n\nWould you like to open this information?"; then
-        clear
         echo "═══════════════════════════════════════════════════════════════"
         echo "        Web-Based Radio Configuration"
         echo "═══════════════════════════════════════════════════════════════"
@@ -1810,7 +1806,6 @@ main() {
             manage_service "$command" "$silent_mode"
             ;;
         "logs")
-            clear
             print_live_logs_header
             echo ""
             journalctl -u "$SERVICE_NAME" -f -o cat --no-hostname | sed -e 's/.*ERROR.*/\x1b[1;31m&\x1b[0m/' -e 's/.*CRITICAL.*/\x1b[1;41;37m&\x1b[0m/' -e 's/.*WARNING.*/\x1b[1;33m&\x1b[0m/' -e 's/.*INFO.*/\x1b[0;32m&\x1b[0m/' -e 's/.*DEBUG.*/\x1b[0;36m&\x1b[0m/'
