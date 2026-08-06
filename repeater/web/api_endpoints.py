@@ -34,6 +34,14 @@ from .auth.middleware import require_auth
 from .auth_endpoints import AuthAPIEndpoints
 from .cad_calibration_engine import CADCalibrationEngine
 from .companion_endpoints import CompanionAPIEndpoints
+from .hardware_presets import (
+    SECTION_BY_RADIO_TYPE,
+    SUPPORTED_RADIO_TYPES,
+    apply_hardware_preset,
+    load_hardware_presets,
+    sections_allowed_for,
+    validate_section,
+)
 from .update_endpoints import UpdateAPIEndpoints
 
 logger = logging.getLogger("HTTPServer")
@@ -1332,30 +1340,17 @@ class APIEndpoints:
     def hardware_options(self):
         """Get available hardware configurations from radio-settings.json"""
         try:
-            import json
-
-            # Check config-based location first, then development location
-            config_dir = resolve_storage_dir(self.config, config_path=self._config_path)
-            installed_path = config_dir / "radio-settings.json"
-            dev_path = os.path.join(os.path.dirname(__file__), "..", "..", "radio-settings.json")
-
-            hardware_file = str(installed_path) if installed_path.exists() else dev_path
-            hardware_list = []
-
-            if os.path.exists(hardware_file):
-                with open(hardware_file, "r") as f:
-                    hardware_data = json.load(f)
-                hardware_configs = hardware_data.get("hardware", {})
-                for hw_key, hw_config in hardware_configs.items():
-                    if isinstance(hw_config, dict):
-                        hardware_list.append(
-                            {
-                                "key": hw_key,
-                                "name": hw_config.get("name", hw_key),
-                                "description": hw_config.get("description", ""),
-                                "config": hw_config,
-                            }
-                        )
+            hardware_list = [
+                {
+                    "key": hw_key,
+                    "name": hw_config.get("name", hw_key),
+                    "description": hw_config.get("description", ""),
+                    "config": hw_config,
+                }
+                for hw_key, hw_config in load_hardware_presets(
+                    self.config, self._config_path
+                ).items()
+            ]
 
             return {"hardware": hardware_list}
         except Exception as e:
@@ -1394,6 +1389,158 @@ class APIEndpoints:
         except Exception as e:
             logger.error(f"Error loading radio presets: {e}")
             return {"error": str(e)}
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    @cherrypy.tools.json_in()
+    def update_radio_hardware_config(self):
+        """Change the radio hardware backend.
+
+        Dedicated endpoint for the Configuration → Radio Hardware tab.
+        Auth is inherited from the /api mount (require_auth tool);
+        /api/config_import stays dedicated to first-run bootstrap restore.
+
+        POST /api/update_radio_hardware_config
+
+        Preset mode — the preset is applied backend-side from
+        radio-settings.json, including fields the UI has no widgets for
+        (use_dio3_tcxo, use_dio2_rf, gpio backend, ...), then the
+        overrides merge on top section-by-section:
+            {"hardware_key": "bq-station-g3",
+             "overrides": {"sx1262": {"irq_pin": 23}}}
+        The sx1262/ch341 sections are REPLACED by the preset+overrides
+        result: they are shared across SPI boards, so stale pins from a
+        previous board must not linger. Serial/network modem sections
+        (kiss/pymc_usb/pymc_tcp) belong to exactly one backend and may
+        hold operator keys with no preset equivalent (pymc_tcp.token,
+        lbt_enabled, ...) — those are MERGED. The radio section is
+        merged too (frequency/SF/BW belong to the Radio Settings tab),
+        though a preset that defines tx_power/preamble_length DOES
+        overwrite those two values on every preset save.
+
+        Manual mode — explicit sections for custom builds; only the
+        section owned by radio_type is accepted (plus ch341 for
+        sx1262_ch341) and it is MERGED into the existing section, so
+        preset-managed fields without form widgets survive pin tweaks.
+        radio_type null/"none" disables the radio:
+            {"radio_type": "pymc_usb",
+             "pymc_usb": {"port": "/dev/ttyACM0", "baudrate": 921600}}
+
+        Returns: {"success": true, "restart_required": true,
+                  "applied": [...]}
+        """
+        self._set_cors_headers()
+        if cherrypy.request.method == "OPTIONS":
+            return ""
+        try:
+            self._require_post()
+            data = cherrypy.request.json or {}
+
+            applied = []
+            hardware_key = str(data.get("hardware_key") or "").strip()
+
+            if hardware_key:
+                # ── Preset mode ─────────────────────────────────
+                presets = load_hardware_presets(self.config, self._config_path)
+                hw_config = presets.get(hardware_key)
+                if not hw_config:
+                    return self._error(f"Unknown hardware preset: {hardware_key}")
+
+                # Stage preset + overrides on a scratch dict so nothing is
+                # committed when a later override fails validation.
+                staged = {}
+                apply_hardware_preset(staged, hw_config)
+                radio_type = staged.get("radio_type") or "sx1262"
+
+                overrides = data.get("overrides") or {}
+                if not isinstance(overrides, dict):
+                    return self._error("'overrides' must be an object")
+                allowed = sections_allowed_for(radio_type)
+                for section, fields in overrides.items():
+                    if section not in allowed:
+                        return self._error(
+                            f"Section '{section}' is not valid for "
+                            f"radio_type '{radio_type}'"
+                        )
+                    sanitized = validate_section(section, fields)
+                    staged.setdefault(section, {}).update(sanitized)
+
+                self.config["radio_type"] = radio_type
+                applied.append(f"radio_type={radio_type}")
+                applied.append(f"preset={hardware_key}")
+                for section, fields in staged.items():
+                    if section == "radio_type":
+                        continue
+                    if section in ("sx1262", "ch341"):
+                        # Replace: shared across SPI boards — stale pins
+                        # from a previous board must not linger.
+                        self.config[section] = dict(fields)
+                    else:
+                        # Merge: 'radio' keeps frequency/SF/BW, and the
+                        # kiss/pymc_* sections keep operator keys that
+                        # have no preset equivalent (token, lbt_*, ...).
+                        self.config.setdefault(section, {}).update(fields)
+                    applied.extend(f"{section}.{key}" for key in fields)
+            else:
+                # ── Manual mode ─────────────────────────────────
+                if "radio_type" not in data:
+                    return self._error("Missing 'hardware_key' or 'radio_type'")
+                radio_type_raw = data.get("radio_type")
+                if radio_type_raw in (None, "", "none"):
+                    self.config["radio_type"] = None
+                    applied.append("radio_type=none")
+                else:
+                    radio_type = str(radio_type_raw).strip().lower()
+                    if radio_type not in SUPPORTED_RADIO_TYPES:
+                        return self._error(
+                            f"Unsupported radio_type '{radio_type_raw}'. Supported: "
+                            f"{', '.join(SUPPORTED_RADIO_TYPES)}, none"
+                        )
+                    allowed = sections_allowed_for(radio_type)
+                    unexpected = [
+                        section
+                        for section in SECTION_BY_RADIO_TYPE.values()
+                        if section in data and section not in allowed
+                    ]
+                    if "ch341" in data and "ch341" not in allowed:
+                        unexpected.append("ch341")
+                    if unexpected:
+                        return self._error(
+                            f"Section(s) {', '.join(sorted(set(unexpected)))} not "
+                            f"valid for radio_type '{radio_type}'"
+                        )
+                    # Stage: validate every section BEFORE mutating
+                    # self.config, so a failed validation cannot leave the
+                    # in-memory config (served by /api/stats) diverged from
+                    # the persisted file.
+                    staged_sections = {}
+                    for section in sorted(allowed):
+                        if section not in data:
+                            continue
+                        staged_sections[section] = validate_section(section, data[section])
+                    self.config["radio_type"] = radio_type
+                    applied.append(f"radio_type={radio_type}")
+                    for section, sanitized in staged_sections.items():
+                        self.config.setdefault(section, {}).update(sanitized)
+                        applied.extend(f"{section}.{key}" for key in sanitized)
+
+            saved = self.config_manager.save_to_file()
+            if not saved:
+                return self._error("Failed to save configuration to file")
+
+            logger.info(f"Radio hardware config updated: {', '.join(applied)}")
+            return {
+                "success": True,
+                "restart_required": True,
+                "applied": applied,
+            }
+        except ValueError as e:
+            return self._error(str(e))
+        except cherrypy.HTTPError:
+            raise
+        except Exception as e:
+            logger.exception("Error updating radio hardware config")
+            return self._error(str(e))
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
@@ -1612,74 +1759,14 @@ class APIEndpoints:
                 if "preamble_length" in hw_config:
                     config_yaml["radio"]["preamble_length"] = hw_config.get("preamble_length", 32)
             else:
-                # SX1262 / sx1262_ch341: radio_type and optional CH341 from hw_config
-                if "radio_type" in hw_config:
-                    config_yaml["radio_type"] = hw_config.get("radio_type")
-                else:
-                    config_yaml["radio_type"] = "sx1262"
-
-                ch341_cfg = (
-                    hw_config.get("ch341") if isinstance(hw_config.get("ch341"), dict) else None
+                # SX1262 / sx1262_ch341: apply the preset via the shared
+                # helper — radio_type, ch341 vid/pid, radio.tx_power /
+                # preamble_length, and every known sx1262-section field.
+                # (Same helper as /api/update_radio_hardware_config, so a
+                # new preset field only needs support in one place.)
+                apply_hardware_preset(
+                    config_yaml, hw_config, tx_power_override=tx_power_preset
                 )
-                vid = (ch341_cfg or {}).get("vid", hw_config.get("vid"))
-                pid = (ch341_cfg or {}).get("pid", hw_config.get("pid"))
-                if vid is not None or pid is not None:
-                    if "ch341" not in config_yaml:
-                        config_yaml["ch341"] = {}
-                    if vid is not None:
-                        config_yaml["ch341"]["vid"] = vid
-                    if pid is not None:
-                        config_yaml["ch341"]["pid"] = pid
-
-                if tx_power_preset is not None:
-                    config_yaml["radio"]["tx_power"] = tx_power_preset
-                elif "tx_power" in hw_config:
-                    config_yaml["radio"]["tx_power"] = hw_config.get("tx_power", 22)
-                if "preamble_length" in hw_config:
-                    config_yaml["radio"]["preamble_length"] = hw_config.get("preamble_length", 32)
-
-                if "sx1262" not in config_yaml:
-                    config_yaml["sx1262"] = {}
-                if "bus_id" in hw_config:
-                    config_yaml["sx1262"]["bus_id"] = hw_config.get("bus_id", 0)
-                if "cs_id" in hw_config:
-                    config_yaml["sx1262"]["cs_id"] = hw_config.get("cs_id", 0)
-                if "reset_pin" in hw_config:
-                    config_yaml["sx1262"]["reset_pin"] = hw_config.get("reset_pin", 22)
-                if "busy_pin" in hw_config:
-                    config_yaml["sx1262"]["busy_pin"] = hw_config.get("busy_pin", 17)
-                if "irq_pin" in hw_config:
-                    config_yaml["sx1262"]["irq_pin"] = hw_config.get("irq_pin", 16)
-                if "txen_pin" in hw_config:
-                    config_yaml["sx1262"]["txen_pin"] = hw_config.get("txen_pin", -1)
-                if "rxen_pin" in hw_config:
-                    config_yaml["sx1262"]["rxen_pin"] = hw_config.get("rxen_pin", -1)
-                if "en_pin" in hw_config:
-                    config_yaml["sx1262"]["en_pin"] = hw_config.get("en_pin", -1)
-                if "en_pins" in hw_config:
-                    config_yaml["sx1262"]["en_pins"] = hw_config.get("en_pins", [])
-                if "cs_pin" in hw_config:
-                    config_yaml["sx1262"]["cs_pin"] = hw_config.get("cs_pin", -1)
-                if "txled_pin" in hw_config:
-                    config_yaml["sx1262"]["txled_pin"] = hw_config.get("txled_pin", -1)
-                if "rxled_pin" in hw_config:
-                    config_yaml["sx1262"]["rxled_pin"] = hw_config.get("rxled_pin", -1)
-                if "use_dio3_tcxo" in hw_config:
-                    config_yaml["sx1262"]["use_dio3_tcxo"] = hw_config.get("use_dio3_tcxo", False)
-                if "dio3_tcxo_voltage" in hw_config:
-                    config_yaml["sx1262"]["dio3_tcxo_voltage"] = hw_config.get(
-                        "dio3_tcxo_voltage", 1.8
-                    )
-                if "use_dio2_rf" in hw_config:
-                    config_yaml["sx1262"]["use_dio2_rf"] = hw_config.get("use_dio2_rf", False)
-                if "is_waveshare" in hw_config:
-                    config_yaml["sx1262"]["is_waveshare"] = hw_config.get("is_waveshare", False)
-                if "gpio_chip" in hw_config:
-                    config_yaml["sx1262"]["gpio_chip"] = hw_config.get("gpio_chip", 0)
-                if "use_gpiod_backend" in hw_config:
-                    config_yaml["sx1262"]["use_gpiod_backend"] = hw_config.get(
-                        "use_gpiod_backend", False
-                    )
             # Write updated config
             with open(self._config_path, "w") as f:
                 yaml.dump(config_yaml, f, default_flow_style=False, sort_keys=False)

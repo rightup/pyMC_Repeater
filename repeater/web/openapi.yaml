@@ -855,6 +855,66 @@ paths:
               schema:
                 $ref: '#/components/schemas/SuccessResponse'
 
+  /update_radio_hardware_config:
+    post:
+      tags: [System]
+      summary: Change the radio hardware backend
+      description: >
+        Dedicated save endpoint for the Configuration → Radio Hardware tab.
+        Preset mode ({"hardware_key": "...", "overrides": {...}}) applies the
+        radio-settings.json preset backend-side — including fields the UI has
+        no widgets for — then merges the overrides on top. The sx1262/ch341
+        sections are replaced by the preset+overrides result (stale pins from
+        a previous board must not linger); other sections are merged, so
+        operator keys without a preset equivalent (pymc_tcp.token, lbt_*)
+        survive. A preset that defines tx_power/preamble_length overwrites
+        those two radio values on every preset save. Manual mode
+        ({"radio_type": "...", "<section>": {...}}) accepts only the section
+        owned by the radio_type; radio_type null/"none" disables the radio.
+        Changes require a service restart to take effect.
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              # Manual mode carries the section owned by radio_type at the
+              # top level (kiss / pymc_usb / pymc_tcp / sx1262 / ch341).
+              additionalProperties: true
+              properties:
+                hardware_key:
+                  type: string
+                  description: Preset key from radio-settings.json
+                overrides:
+                  type: object
+                  description: Per-section field overrides (preset mode)
+                radio_type:
+                  type: string
+                  nullable: true
+                  enum: [sx1262, sx1262_ch341, kiss, pymc_usb, pymc_tcp, none]
+                  description: Radio backend (manual mode)
+      responses:
+        '200':
+          description: Radio hardware config updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  restart_required:
+                    type: boolean
+                  applied:
+                    type: array
+                    items:
+                      type: string
+                  error:
+                    type: string
+
   # ============================================================================
   # Packet Endpoints
   # ============================================================================
