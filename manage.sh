@@ -1,27 +1,122 @@
 #!/bin/bash
 # openHop Repeater Management Script - Deploy, Upgrade, Uninstall
 
-set -e
+set -Eeuo pipefail
 
-INSTALL_DIR="/opt/openhop_repeater"
-VENV_DIR="$INSTALL_DIR/venv"
-VENV_PIP="$VENV_DIR/bin/pip"
-VENV_PYTHON="$VENV_DIR/bin/python"
-CONFIG_DIR="/etc/openhop_repeater"
-LOG_DIR="/var/log/openhop_repeater"
-DATA_DIR="/var/lib/openhop_repeater"
-SERVICE_USER="repeater"
-SERVICE_NAME="openhop-repeater"
-SILENT_MODE="${PYMC_SILENT:-${SILENT:-}}"
+readonly SCRIPT_PATH="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/$(basename -- "${BASH_SOURCE[0]}")"
+readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 
-LEGACY_PYMC_INSTALL_DIR="/opt/pymc_repeater"
-LEGACY_PYMC_CONFIG_DIR="/etc/pymc_repeater"
-LEGACY_PYMC_LOG_DIR="/var/log/pymc_repeater"
-LEGACY_PYMC_DATA_DIR="/var/lib/pymc_repeater"
+readonly REPOSITORY_URL="https://github.com/openhop-dev/openhop_repeater.git"
+readonly DEFAULT_UPGRADE_REF="dev"
+readonly PACKAGE_DIST_NAME="openhop_repeater"
+readonly LOCK_FILE="/run/lock/openhop-repeater-manage.lock"
+
+readonly INSTALL_DIR="/opt/openhop_repeater"
+readonly VENV_DIR="$INSTALL_DIR/venv"
+readonly VENV_PIP="$VENV_DIR/bin/pip"
+readonly VENV_PYTHON="$VENV_DIR/bin/python"
+readonly CONFIG_DIR="/etc/openhop_repeater"
+readonly LOG_DIR="/var/log/openhop_repeater"
+readonly DATA_DIR="/var/lib/openhop_repeater"
+readonly SERVICE_USER="repeater"
+readonly SERVICE_NAME="openhop-repeater"
+readonly SILENT_MODE="${PYMC_SILENT:-${SILENT:-}}"
+
+readonly LEGACY_PYMC_INSTALL_DIR="/opt/pymc_repeater"
+readonly LEGACY_PYMC_CONFIG_DIR="/etc/pymc_repeater"
+readonly LEGACY_PYMC_LOG_DIR="/var/log/pymc_repeater"
+readonly LEGACY_PYMC_DATA_DIR="/var/lib/pymc_repeater"
 
 # R2 Wheels Configuration improves install speed on ARM devices
-R2_BASE_URL="https://wheel.pymc.dev/pymc_build_deps"
-R2_ENABLED=1  # Set to 0 to disable R2 wheels and always build from source
+readonly R2_BASE_URL="https://wheel.pymc.dev/pymc_build_deps"
+readonly R2_ENABLED=1  # Set to 0 to disable R2 wheels and always build from source
+
+error() {
+    printf 'ERROR: %s\n' "$*" >&2
+}
+
+die() {
+    error "$*"
+    exit 1
+}
+
+is_safe_git_ref() {
+    local ref="${1:-}"
+    [[ "$ref" =~ ^[a-zA-Z0-9._/-]{1,80}$ ]]
+}
+
+is_expected_repo_checkout() {
+    local source_dir=$1
+    local remote_url=""
+
+    [ -d "${source_dir}/.git" ] || return 1
+    remote_url="$(git -C "$source_dir" remote get-url origin 2>/dev/null || true)"
+    [ -n "$remote_url" ] || return 1
+    case "$remote_url" in
+        "$REPOSITORY_URL"|"${REPOSITORY_URL%.git}"|git@github.com:openhop-dev/openhop_repeater.git)
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+determine_package_source() {
+    local script_dir=$1
+    local requested_ref=$2
+
+    if [ -f "${script_dir}/pyproject.toml" ]; then
+        printf '%s\n' "$script_dir"
+    else
+        printf '%s\n' "git+${REPOSITORY_URL}@${requested_ref}"
+    fi
+}
+
+build_package_requirement() {
+    local package_source=$1
+
+    if [[ "$package_source" == git+* ]]; then
+        printf '%s\n' "${PACKAGE_DIST_NAME}[hardware] @ ${package_source}"
+    else
+        printf '%s\n' "${package_source}[hardware]"
+    fi
+}
+
+log_package_source() {
+    local package_source=$1
+
+    if [[ "$package_source" == git+* ]]; then
+        echo "Using package source: Git URL (${package_source})"
+    else
+        echo "Using package source: local checkout (${package_source})"
+    fi
+}
+
+acquire_global_lock() {
+    if ! command -v flock >/dev/null 2>&1; then
+        error "Required command not found: flock (install util-linux)"
+        return 1
+    fi
+
+    mkdir -p "$(dirname "$LOCK_FILE")" || {
+        error "Unable to create lock directory for ${LOCK_FILE}"
+        return 1
+    }
+
+    exec 9>"$LOCK_FILE" || {
+        error "Unable to open lock file ${LOCK_FILE}"
+        return 1
+    }
+
+    if ! flock -n 9; then
+        error "Another OpenHOP install, upgrade, or uninstall operation is already running"
+        return 1
+    fi
+}
+
+run_locked_action() {
+    acquire_global_lock || return 1
+    "$@"
+}
 
 # ---------------------------------------------------------------------------
 # Virtual-environment helpers
@@ -132,7 +227,10 @@ ensure_venv() {
     fi
 
     # Always use python -m pip so we don't rely on a potentially stale pip wrapper.
-    "$VENV_PYTHON" -m pip install --upgrade pip setuptools wheel >/dev/null 2>&1 || true
+    if ! "$VENV_PYTHON" -m pip install --upgrade pip setuptools wheel; then
+        error "Failed to bootstrap pip/setuptools/wheel in venv"
+        return 1
+    fi
 }
 
 # Migrate an existing system-pip install into the venv.
@@ -200,7 +298,7 @@ is_interactive_flag() {
 
 # Check if we're running in an interactive terminal
 if [ ! -t 0 ] || [ -z "$TERM" ]; then
-    if [[ "$1" =~ ^(upgrade|start|stop|restart)$ ]] && ! is_interactive_flag "$2"; then
+    if [[ "${1:-}" =~ ^(upgrade|start|stop|restart)$ ]] && ! is_interactive_flag "${2:-}"; then
         :
     else
         echo "Error: This script requires an interactive terminal."
@@ -248,14 +346,45 @@ show_progress() {
     echo "$2" | $DIALOG --backtitle "openHop Repeater Management" --title "$1" --gauge "$3" 8 70 0
 }
 
+print_live_logs_header() {
+    local width=70
+    local border
+    border="$(printf '%*s' "$width" '' | tr ' ' '=')"
+
+    printf '\033[1;36m╔%s╗\033[0m\n' "$border"
+    printf '\033[1;36m║\033[0m%*s%-*s%*s\033[1;36m║\033[0m\n' 2 '' $((width - 4)) 'openHop Repeater - Live Logs' 2 ''
+    printf '\033[1;36m║\033[0m%*s%-*s%*s\033[1;36m║\033[0m\n' 2 '' $((width - 4)) '(Press Ctrl+C to return)' 2 ''
+    printf '\033[1;36m╚%s╝\033[0m\n' "$border"
+}
+
 # Function to check if service exists
 service_exists() {
-    systemctl list-unit-files | grep -q "^$SERVICE_NAME.service"
+    local unit_file="/etc/systemd/system/${SERVICE_NAME}.service"
+
+    if [ -f "$unit_file" ]; then
+        return 0
+    fi
+
+    systemctl list-unit-files --type=service --no-legend 2>/dev/null | awk '{print $1}' | grep -Fxq "${SERVICE_NAME}.service"
 }
 
 # Function to check if service is installed
 is_installed() {
     [ -d "$INSTALL_DIR" ] && service_exists
+}
+
+# Uninstall should be available for partial/broken installs too.
+has_installation_artifacts() {
+    [ -d "$INSTALL_DIR" ] \
+        || [ -d "$CONFIG_DIR" ] \
+        || [ -d "$LOG_DIR" ] \
+        || [ -d "$DATA_DIR" ] \
+        || [ -d "$LEGACY_PYMC_INSTALL_DIR" ] \
+        || [ -d "$LEGACY_PYMC_CONFIG_DIR" ] \
+        || [ -d "$LEGACY_PYMC_LOG_DIR" ] \
+        || [ -d "$LEGACY_PYMC_DATA_DIR" ] \
+        || [ -f /etc/systemd/system/openhop-repeater.service ] \
+        || service_exists
 }
 
 # Function to check if service is running
@@ -334,26 +463,26 @@ show_main_menu() {
             if is_installed; then
                 show_error "openHop Repeater is already installed!\n\nUse 'upgrade' to update or 'uninstall' first."
             else
-                install_repeater
+                run_locked_action install_repeater || show_error "Installation failed."
             fi
             ;;
         "upgrade")
             if is_installed; then
-                upgrade_repeater "false"
+                run_locked_action upgrade_repeater "false" || show_error "Upgrade failed."
             else
                 show_error "openHop Repeater is not installed!\n\nUse 'install' first."
             fi
             ;;
         "reset")
             if is_installed; then
-                reset_repeater
+                run_locked_action reset_repeater || show_error "Reset failed."
             else
                 show_error "openHop Repeater is not installed!\n\nUse 'install' first."
             fi
             ;;
         "uninstall")
-            if is_installed; then
-                uninstall_repeater
+            if has_installation_artifacts; then
+                run_locked_action uninstall_repeater || show_error "Uninstall failed."
             else
                 show_error "openHop Repeater is not installed."
             fi
@@ -371,11 +500,7 @@ show_main_menu() {
             manage_service "restart" "false"
             ;;
         "logs")
-            clear
-            echo -e "\033[1;36m╔══════════════════════════════════════════════════════════════════════╗\033[0m"
-            echo -e "\033[1;36m║\033[0m                  \033[1;37mopenHop Repeater - Live Logs\033[0m                     \033[1;36m║\033[0m"
-            echo -e "\033[1;36m║\033[0m                  \033[0;90m(Press Ctrl+C to return)\033[0m                      \033[1;36m║\033[0m"
-            echo -e "\033[1;36m╚══════════════════════════════════════════════════════════════════════╝\033[0m"
+            print_live_logs_header
             echo ""
             journalctl -u "$SERVICE_NAME" -f -o cat --no-hostname | sed -e 's/.*ERROR.*/\x1b[1;31m&\x1b[0m/' -e 's/.*CRITICAL.*/\x1b[1;41;37m&\x1b[0m/' -e 's/.*WARNING.*/\x1b[1;33m&\x1b[0m/' -e 's/.*INFO.*/\x1b[0;32m&\x1b[0m/' -e 's/.*DEBUG.*/\x1b[0;36m&\x1b[0m/'
             ;;
@@ -393,7 +518,7 @@ install_repeater() {
     # Check root
     if [ "$EUID" -ne 0 ]; then
         show_error "Installation requires root privileges.\n\nPlease run: sudo $0"
-        return
+        return 1
     fi
 
     # Welcome screen (Bypass if the script was passd with the "install" option, assume we want a silent install)
@@ -448,9 +573,6 @@ install_repeater() {
         show_info "Warning" "\nContinuing without SPI enabled.\n\nLoRa radio will not work until SPI is enabled and /dev/spidev* is available."
     fi
 
-    # Get script directory for file copying during installation
-    SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-
     # Installation progress
     echo ""
     echo "═══════════════════════════════════════════════════════════════"
@@ -466,6 +588,7 @@ install_repeater() {
 
     disable_legacy_services
 
+    set +e
     (
     echo "10"; echo "# Adding user to hardware groups..."
     for grp in plugdev dialout gpio i2c spi; do
@@ -481,16 +604,16 @@ install_repeater() {
 
     echo "25"; echo "# Installing system dependencies..."
     apt-get update -qq
-    DEBIAN_FRONTEND=noninteractive apt-get install -y libffi-dev libusb-1.0-0 sudo jq pip python3-venv python3-rrdtool wget swig build-essential python3-dev i2c-tools
+    DEBIAN_FRONTEND=noninteractive apt-get install -y libffi-dev libusb-1.0-0 sudo jq python3-pip python3-venv python3-rrdtool wget swig build-essential python3-dev i2c-tools
     # Install polkit (package name varies by distro version)
     DEBIAN_FRONTEND=noninteractive apt-get install -y policykit-1 2>/dev/null \
         || DEBIAN_FRONTEND=noninteractive apt-get install -y polkitd pkexec 2>/dev/null \
         || echo "    Warning: Could not install polkit (sudo fallback will be used)"
-    # setuptools_scm needed for git version detection during build
-    pip install --break-system-packages setuptools_scm >/dev/null 2>&1 || python3 -m pip install --break-system-packages setuptools_scm >/dev/null 2>&1 || true
-
     echo "28"; echo "# Creating virtual environment..."
     ensure_venv
+
+    # Install setuptools_scm in the dedicated venv to avoid PEP 668 system-pip errors.
+    "$VENV_PYTHON" -m pip install -q setuptools_scm || true
 
     # Install mikefarah yq v4 if not already installed
     if ! command -v yq &> /dev/null || [[ "$(yq --version 2>&1)" != *"mikefarah/yq"* ]]; then
@@ -588,7 +711,7 @@ EOF
 #!/bin/bash
 # pymc-do-upgrade: invoked by the repeater service user via sudo for OTA upgrades.
 # Usage: sudo /usr/local/bin/pymc-do-upgrade [channel] [pretend-version]
-set -e
+set -Eeuo pipefail
 CHANNEL="${1:-main}"
 PRETEND_VERSION="${2:-}"
 VENV_DIR="/opt/openhop_repeater/venv"
@@ -606,7 +729,7 @@ fi
 if [ ! -x "$VENV_PYTHON" ]; then
     echo "[pymc-do-upgrade] Creating venv at $VENV_DIR ..."
     python3 -m venv --system-site-packages "$VENV_DIR"
-    "$VENV_PYTHON" -m pip install --upgrade pip setuptools wheel >/dev/null 2>&1 || true
+    "$VENV_PYTHON" -m pip install --upgrade pip setuptools wheel
 fi
 # ---- Migration: clean up legacy service unit issues ----
 SVC_UNIT=/etc/systemd/system/openhop-repeater.service
@@ -677,27 +800,43 @@ UPGRADEEOF
     systemctl enable "$SERVICE_NAME"
 
     echo "90"; echo "# Installation files complete..."
-    ) | $DIALOG --backtitle "openHop Repeater Management" --title "Installing" --gauge "Setting up openHop Repeater..." 8 70 0
+    ) | "$DIALOG" --backtitle "openHop Repeater Management" --title "Installing" --gauge "Setting up openHop Repeater..." 8 70 0
+    local pipeline_status=("${PIPESTATUS[@]}")
+    set -e
+
+    if (( pipeline_status[0] != 0 )); then
+        error "Installation setup failed with status ${pipeline_status[0]}"
+        return "${pipeline_status[0]}"
+    fi
+
+    if (( pipeline_status[1] != 0 )); then
+        error "Installation progress dialog failed with status ${pipeline_status[1]}"
+        return "${pipeline_status[1]}"
+    fi
 
     # Install Python package outside of progress gauge for better error handling
-    clear
     echo "=== Installing Python Dependencies ==="
     echo ""
     echo "Installing openhop_repeater and dependencies (including openhop_core from PyPI)..."
     echo "This may take a few minutes..."
     echo ""
 
-    SCRIPT_DIR="$(dirname "$0")"
-    cd "$SCRIPT_DIR"
+    local requested_ref="${OPENHOP_UPGRADE_REF:-$DEFAULT_UPGRADE_REF}"
+    if ! is_safe_git_ref "$requested_ref"; then
+        error "Invalid upgrade ref: $requested_ref"
+        return 1
+    fi
 
-    # Calculate version from git for setuptools_scm
-    if [ -d .git ]; then
-        git fetch --tags 2>/dev/null || true
-        GIT_VERSION=$(python3 -m setuptools_scm 2>/dev/null || echo "1.0.5")
-        export SETUPTOOLS_SCM_PRETEND_VERSION="$GIT_VERSION"
-        echo "Installing version: $GIT_VERSION"
-    else
-        export SETUPTOOLS_SCM_PRETEND_VERSION="1.0.5"
+    local package_source
+    package_source="$(determine_package_source "$SCRIPT_DIR" "$requested_ref")"
+    log_package_source "$package_source"
+
+    # Only inspect git metadata when this directory is a checkout of the expected repo.
+    if is_expected_repo_checkout "$SCRIPT_DIR"; then
+        if GIT_VERSION="$(python3 -m setuptools_scm 2>/dev/null)"; then
+            export SETUPTOOLS_SCM_PRETEND_VERSION="$GIT_VERSION"
+            echo "Installing version: $GIT_VERSION"
+        fi
     fi
     # We don't have any binary wheels available for these on a LuckFox, so we need to ignore them on that platform.
     if ! grep -q "Luckfox Pico" /proc/device-tree/model 2>/dev/null; then
@@ -735,25 +874,29 @@ UPGRADEEOF
         fi
     fi
     
-    if "$VENV_PYTHON" -m pip install --upgrade --no-cache-dir .[hardware]; then
-        echo ""
-        echo "✓ Python package installation completed successfully!"
+    local package_requirement
+    package_requirement="$(build_package_requirement "$package_source")"
+    if ! "$VENV_PYTHON" -m pip install --upgrade --no-cache-dir "$package_requirement"; then
+        error "Python package installation failed"
+        return 1
+    fi
+    echo ""
+    echo "✓ Python package installation completed successfully!"
 
-        # Reload systemd and start the service
-        systemctl daemon-reload
-        systemctl start "$SERVICE_NAME"
-    else
-        echo ""
-        echo "✗ Python package installation failed!"
-        echo "Please check the error messages above and try again."
-        read -p "Press Enter to continue..." || true
+    # Reload systemd and start the service
+    if ! systemctl daemon-reload; then
+        error "Failed to reload systemd units"
+        return 1
+    fi
+    if ! systemctl start "$SERVICE_NAME"; then
+        error "Failed to start ${SERVICE_NAME}"
+        return 1
     fi
 
     # Show final results
     sleep 2
     local ip_address=$(hostname -I | awk '{print $1}')
     if is_running; then
-        clear
         echo "═══════════════════════════════════════════════════════════════"
         echo "        ✓ Installation Completed Successfully!"
         echo "═══════════════════════════════════════════════════════════════"
@@ -799,7 +942,10 @@ UPGRADEEOF
         fi
     else
         show_error "Installation completed but service failed to start!\n\nCheck logs from the main menu for details."
+        return 1
     fi
+
+    return 0
 }
 
 # Reset function
@@ -809,12 +955,12 @@ reset_repeater() {
 
     if [ "$EUID" -ne 0 ]; then
         show_error "Upgrade requires root privileges.\n\nPlease run: sudo $0"
-        return
+        return 1
     fi
 
     local current_version=$(get_version)
 
-    if ask_yes_no "Confirm Reset of openHop Repeater restoring to default configuration.\n\nContinue?"; then
+    if ask_yes_no "Confirm Reset" "Reset openHop Repeater to default configuration?\n\nContinue?"; then
 
         # Show info that upgrade is starting
         show_info "Reseting" "Starting reset process...\n\nProgress will be shown in the terminal."
@@ -828,8 +974,8 @@ reset_repeater() {
             cp -r "$CONFIG_DIR" "$CONFIG_DIR.backup.$(date +%Y%m%d_%H%M%S)" 2>/dev/null || true
             echo "    ✓ Configuration backed up"
         fi
-	echo "3/4 Restore default config.yaml from config.yaml.example"
-	cp $updated_example $config_file
+    echo "3/4 Restore default config.yaml from config.yaml.example"
+    cp "$updated_example" "$config_file"
 	sleep 5
         # Reload systemd and start the service
 	echo "4/4 Restart the service"
@@ -839,7 +985,6 @@ reset_repeater() {
         sleep 2
         local ip_address=$(hostname -I | awk '{print $1}')
         if is_running; then
-            clear
             echo "═══════════════════════════════════════════════════════════════"
             echo "        ✓ Reset Completed Successfully!"
             echo "═══════════════════════════════════════════════════════════════"
@@ -866,13 +1011,29 @@ reset_repeater() {
             read -p "Press Enter to return to main menu..." || true
         else
             show_error "Installation completed but service failed to start!\n\nCheck logs from the main menu for details."
+            return 1
         fi
     fi
+    return 0
 }
 
 # Upgrade function
 upgrade_repeater() {
     local silent="${1:-false}"
+    local requested_ref="${OPENHOP_UPGRADE_REF:-$DEFAULT_UPGRADE_REF}"
+    local package_source=""
+    local package_requirement=""
+    local service_was_running=0
+    local service_was_enabled=0
+    local service_stopped=0
+
+    restart_service_after_failure() {
+        if (( service_stopped == 1 )) && (( service_was_running == 1 || service_was_enabled == 1 )); then
+            error "Upgrade failed after stopping service; attempting best-effort restart"
+            systemctl start "$SERVICE_NAME" >/dev/null 2>&1 || true
+        fi
+    }
+
     if [ "$EUID" -ne 0 ]; then
         if [[ "$silent" == "true" ]]; then
             echo "Upgrade requires root privileges. Please run: sudo $0 upgrade"
@@ -896,100 +1057,115 @@ upgrade_repeater() {
         echo "Current version: $current_version"
     fi
 
-        echo "=== Upgrade Progress ==="
-        echo "[1/9] Stopping service..."
-        systemctl stop "$SERVICE_NAME" 2>/dev/null || true
-        disable_legacy_services
+    if ! is_safe_git_ref "$requested_ref"; then
+        error "Invalid upgrade ref: $requested_ref"
+        return 1
+    fi
 
-        echo "[1.5/9] Migrating legacy paths..."
-        migrate_legacy_paths
-        cleanup_stale_source_trees
+    package_source="$(determine_package_source "$SCRIPT_DIR" "$requested_ref")"
+    package_requirement="$(build_package_requirement "$package_source")"
+    log_package_source "$package_source"
 
-        echo "[1.6/9] Ensuring required directories..."
-        mkdir -p "$INSTALL_DIR" "$CONFIG_DIR" "$LOG_DIR" "$DATA_DIR"
-        ensure_service_user_home
+    if is_running; then
+        service_was_running=1
+    fi
+    if is_enabled; then
+        service_was_enabled=1
+    fi
 
-        echo "[2/9] Backing up configuration..."
-        if [ -d "$CONFIG_DIR" ]; then
-            cp -r "$CONFIG_DIR" "$CONFIG_DIR.backup.$(date +%Y%m%d_%H%M%S)" 2>/dev/null || true
-            echo "    ✓ Configuration backed up"
+    if is_expected_repo_checkout "$SCRIPT_DIR"; then
+        if GIT_VERSION="$(python3 -m setuptools_scm 2>/dev/null)"; then
+            export SETUPTOOLS_SCM_PRETEND_VERSION="$GIT_VERSION"
+            echo "Upgrading to version: $GIT_VERSION"
         fi
+    fi
 
-        echo "[3/9] Updating system dependencies..."
-        apt-get update -qq
+    echo "=== Upgrade Progress ==="
+    echo "[1/9] Migrating legacy paths..."
+    migrate_legacy_paths
+    cleanup_stale_source_trees
+    disable_legacy_services
 
-        apt-get install -y libffi-dev libusb-1.0-0 sudo jq pip python3-venv python3-rrdtool wget swig build-essential python3-dev i2c-tools
-        # Install polkit (package name varies by distro version)
-        apt-get install -y policykit-1 2>/dev/null \
-            || apt-get install -y polkitd pkexec 2>/dev/null \
-            || echo "    Warning: Could not install polkit (sudo fallback will be used)"
-        pip install --break-system-packages setuptools_scm >/dev/null 2>&1 || python3 -m pip install --break-system-packages setuptools_scm >/dev/null 2>&1 || true
+    echo "[2/9] Ensuring required directories..."
+    mkdir -p "$INSTALL_DIR" "$CONFIG_DIR" "$LOG_DIR" "$DATA_DIR"
+    ensure_service_user_home
 
-        # Install mikefarah yq v4 if not already installed
-        if ! command -v yq &> /dev/null || [[ "$(yq --version 2>&1)" != *"mikefarah/yq"* ]]; then
-            YQ_VERSION="v4.40.5"
-            YQ_BINARY="yq_linux_arm64"
-            if [[ "$(uname -m)" == "x86_64" ]]; then
-                YQ_BINARY="yq_linux_amd64"
-            elif [[ "$(uname -m)" == "armv7"* ]]; then
-                YQ_BINARY="yq_linux_arm"
-            fi
-            wget -qO /usr/local/bin/yq "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/${YQ_BINARY}" && chmod +x /usr/local/bin/yq
+    echo "[3/9] Backing up configuration..."
+    if [ -d "$CONFIG_DIR" ]; then
+        cp -r "$CONFIG_DIR" "$CONFIG_DIR.backup.$(date +%Y%m%d_%H%M%S)" 2>/dev/null || true
+        echo "    ✓ Configuration backed up"
+    fi
+
+    echo "[4/9] Updating system dependencies..."
+    apt-get update -qq
+    apt-get install -y libffi-dev libusb-1.0-0 sudo jq python3-pip python3-venv python3-rrdtool wget swig build-essential python3-dev i2c-tools
+    apt-get install -y policykit-1 2>/dev/null \
+        || apt-get install -y polkitd pkexec 2>/dev/null \
+        || echo "    Warning: Could not install polkit (sudo fallback will be used)"
+
+    # Keep setuptools_scm in the venv instead of system Python (PEP 668 safe).
+    ensure_venv
+    if ! "$VENV_PYTHON" -m pip install -q setuptools_scm; then
+        echo "    Warning: Could not install setuptools_scm in venv; continuing without git-derived version"
+    fi
+
+    if ! command -v yq >/dev/null 2>&1 || [[ "$(yq --version 2>&1)" != *"mikefarah/yq"* ]]; then
+        YQ_VERSION="v4.40.5"
+        YQ_BINARY="yq_linux_arm64"
+        if [[ "$(uname -m)" == "x86_64" ]]; then
+            YQ_BINARY="yq_linux_amd64"
+        elif [[ "$(uname -m)" == "armv7"* ]]; then
+            YQ_BINARY="yq_linux_arm"
         fi
-        echo "    ✓ Dependencies updated"
+        wget -qO /usr/local/bin/yq "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/${YQ_BINARY}" && chmod +x /usr/local/bin/yq
+    fi
+    echo "    ✓ Dependencies updated"
 
-        echo "[4/9] Installing files..."
-        SCRIPT_DIR="$(dirname "$0")"
-        if ! cp "$SCRIPT_DIR/openhop-repeater.service" /etc/systemd/system/; then
-            echo "    ⚠ Warning: Failed to update service file – old service file may remain"
-        fi
-        cp "$SCRIPT_DIR/radio-settings.json" "$DATA_DIR/" 2>/dev/null || true
-        cp "$SCRIPT_DIR/radio-presets.json" "$DATA_DIR/" 2>/dev/null || true
-        echo "    ✓ Files updated"
+    echo "[5/9] Installing files..."
+    if ! cp "$SCRIPT_DIR/openhop-repeater.service" /etc/systemd/system/; then
+        echo "    ⚠ Warning: Failed to update service file – old service file may remain"
+    fi
+    cp "$SCRIPT_DIR/radio-settings.json" "$DATA_DIR/" 2>/dev/null || true
+    cp "$SCRIPT_DIR/radio-presets.json" "$DATA_DIR/" 2>/dev/null || true
+    echo "    ✓ Files updated"
 
-        echo "[5/9] Validating and updating configuration..."
-        if validate_and_update_config; then
-            echo "    ✓ Configuration validated and updated"
-        else
-            echo "    ⚠ Configuration validation failed, keeping existing config"
-        fi
+    echo "[6/9] Validating and updating configuration..."
+    if validate_and_update_config; then
+        echo "    ✓ Configuration validated and updated"
+    else
+        echo "    ⚠ Configuration validation failed, keeping existing config"
+    fi
 
-        echo "[5.5/9] Ensuring user groups and udev rules..."
-        for grp in plugdev dialout gpio i2c spi; do
-            getent group "$grp" >/dev/null 2>&1 && usermod -a -G "$grp" "$SERVICE_USER" 2>/dev/null || true
-        done
-        # Install/update CH341 udev rules
-        SCRIPT_DIR_UPGRADE="$(cd "$(dirname "$0")" && pwd)"
-        if [ -f "$SCRIPT_DIR_UPGRADE/../openhop-core/99-ch341.rules" ]; then
-            cp "$SCRIPT_DIR_UPGRADE/../openhop-core/99-ch341.rules" /etc/udev/rules.d/99-ch341.rules
-            udevadm control --reload-rules 2>/dev/null || true
-            udevadm trigger 2>/dev/null || true
-            echo "    ✓ CH341 udev rules updated"
-        elif [ -f /etc/udev/rules.d/99-ch341.rules ]; then
-            echo "    ✓ CH341 udev rules already present"
-        fi
-        echo "    ✓ User groups updated"
+    echo "[6.5/9] Ensuring user groups and udev rules..."
+    for grp in plugdev dialout gpio i2c spi; do
+        getent group "$grp" >/dev/null 2>&1 && usermod -a -G "$grp" "$SERVICE_USER" 2>/dev/null || true
+    done
+    if [ -f "$SCRIPT_DIR/../openhop-core/99-ch341.rules" ]; then
+        cp "$SCRIPT_DIR/../openhop-core/99-ch341.rules" /etc/udev/rules.d/99-ch341.rules
+        udevadm control --reload-rules 2>/dev/null || true
+        udevadm trigger 2>/dev/null || true
+        echo "    ✓ CH341 udev rules updated"
+    elif [ -f /etc/udev/rules.d/99-ch341.rules ]; then
+        echo "    ✓ CH341 udev rules already present"
+    fi
+    echo "    ✓ User groups updated"
 
-        echo "[6/9] Fixing permissions..."
-        
-        # Venv stays root-owned (pip runs as root); service user only needs read+execute
-        chown -R "$SERVICE_USER:$SERVICE_USER" "$CONFIG_DIR" "$LOG_DIR" "$DATA_DIR" 2>/dev/null || true
-        chown root:root "$INSTALL_DIR" 2>/dev/null || true
-        chmod 755 "$INSTALL_DIR" 2>/dev/null || true
-        chmod 750 "$CONFIG_DIR" "$LOG_DIR" 2>/dev/null || true
-        chmod 755 "$DATA_DIR" 2>/dev/null || true
-        
-        # Pre-create the .config directory that the service will need
-        mkdir -p "$DATA_DIR/.config/openhop_repeater" 2>/dev/null || true
-        chown -R "$SERVICE_USER:$SERVICE_USER" "$DATA_DIR/.config" 2>/dev/null || true
-        
-        # Configure polkit for passwordless service restart
-        POLKIT_VERSION=$(pkaction --version 2>/dev/null | awk '{print $NF}')
-        if echo "$POLKIT_VERSION" | awk '{ exit ($1 > 0.105) ? 0 : 1 }'; then
-            echo "Polkit 0.106 or greater detected, using rules file"
-            echo ">>> Configuring polkit for service management..."
-            mkdir -p /etc/polkit-1/rules.d
-            cat > /etc/polkit-1/rules.d/10-openhop-repeater.rules <<'EOF'
+    echo "[7/9] Fixing permissions and helper files..."
+    chown -R "$SERVICE_USER:$SERVICE_USER" "$CONFIG_DIR" "$LOG_DIR" "$DATA_DIR" 2>/dev/null || true
+    chown root:root "$INSTALL_DIR" 2>/dev/null || true
+    chmod 755 "$INSTALL_DIR" 2>/dev/null || true
+    chmod 750 "$CONFIG_DIR" "$LOG_DIR" 2>/dev/null || true
+    chmod 755 "$DATA_DIR" 2>/dev/null || true
+
+    mkdir -p "$DATA_DIR/.config/openhop_repeater" 2>/dev/null || true
+    chown -R "$SERVICE_USER:$SERVICE_USER" "$DATA_DIR/.config" 2>/dev/null || true
+
+    POLKIT_VERSION=$(pkaction --version 2>/dev/null | awk '{print $NF}')
+    if echo "$POLKIT_VERSION" | awk '{ exit ($1 > 0.105) ? 0 : 1 }'; then
+        echo "Polkit 0.106 or greater detected, using rules file"
+        echo ">>> Configuring polkit for service management..."
+        mkdir -p /etc/polkit-1/rules.d
+        cat > /etc/polkit-1/rules.d/10-openhop-repeater.rules <<'EOF'
 polkit.addRule(function(action, subject) {
     if (action.id == "org.freedesktop.systemd1.manage-units" &&
         action.lookup("unit") == "openhop-repeater.service" &&
@@ -998,11 +1174,11 @@ polkit.addRule(function(action, subject) {
     }
 });
 EOF
-            chmod 0644 /etc/polkit-1/rules.d/10-openhop-repeater.rules
-        else
-            echo "Polkit 0.105 or less detected, using pkla file"
-            mkdir -p /etc/polkit-1/localauthority/50-local.d
-            cat > /etc/polkit-1/localauthority/50-local.d/10-openhop-repeater.pkla <<'EOF'
+        chmod 0644 /etc/polkit-1/rules.d/10-openhop-repeater.rules
+    else
+        echo "Polkit 0.105 or less detected, using pkla file"
+        mkdir -p /etc/polkit-1/localauthority/50-local.d
+        cat > /etc/polkit-1/localauthority/50-local.d/10-openhop-repeater.pkla <<'EOF'
 [Allow repeater to restart openhop-repeater service]
 Identity=unix-user:repeater
 Action=org.freedesktop.systemd1.manage-units
@@ -1010,21 +1186,21 @@ ResultAny=yes
 ResultInactive=yes
 ResultActive=yes
 EOF
-            chmod 0644 /etc/polkit-1/localauthority/50-local.d/10-openhop-repeater.pkla
-        fi
-        # Also configure sudoers as fallback for service restart
-        mkdir -p /etc/sudoers.d
-        cat > /etc/sudoers.d/openhop-repeater <<'EOF'
+    chmod 0644 /etc/polkit-1/localauthority/50-local.d/10-openhop-repeater.pkla
+    fi
+
+    mkdir -p /etc/sudoers.d
+    cat > /etc/sudoers.d/openhop-repeater <<'EOF'
 # Allow repeater user to manage the openhop-repeater service without password
 repeater ALL=(root) NOPASSWD: /usr/bin/systemctl restart openhop-repeater, /usr/bin/systemctl stop openhop-repeater, /usr/bin/systemctl start openhop-repeater, /usr/bin/systemctl status openhop-repeater, /usr/local/bin/pymc-do-upgrade
 EOF
-        chmod 0440 /etc/sudoers.d/openhop-repeater
-        # Install / refresh OTA upgrade wrapper
-        cat > /usr/local/bin/pymc-do-upgrade <<'UPGRADEEOF'
+    chmod 0440 /etc/sudoers.d/openhop-repeater
+
+    cat > /usr/local/bin/pymc-do-upgrade <<'UPGRADEEOF'
 #!/bin/bash
 # pymc-do-upgrade: invoked by the repeater service user via sudo for OTA upgrades.
 # Usage: sudo /usr/local/bin/pymc-do-upgrade [channel] [pretend-version]
-set -e
+set -Eeuo pipefail
 CHANNEL="${1:-main}"
 PRETEND_VERSION="${2:-}"
 VENV_DIR="/opt/openhop_repeater/venv"
@@ -1042,7 +1218,7 @@ fi
 if [ ! -x "$VENV_PYTHON" ]; then
     echo "[pymc-do-upgrade] Creating venv at $VENV_DIR ..."
     python3 -m venv --system-site-packages "$VENV_DIR"
-    "$VENV_PYTHON" -m pip install --upgrade pip setuptools wheel >/dev/null 2>&1 || true
+    "$VENV_PYTHON" -m pip install --upgrade pip setuptools wheel
 fi
 # ---- Migration: clean up legacy service unit issues ----
 SVC_UNIT=/etc/systemd/system/openhop-repeater.service
@@ -1107,118 +1283,105 @@ python3 -m pip uninstall -y pymc_core 2>/dev/null || true
             exit 1
         fi
 UPGRADEEOF
-        chmod 0755 /usr/local/bin/pymc-do-upgrade
-        echo "    ✓ Permissions updated"
+    chmod 0755 /usr/local/bin/pymc-do-upgrade
+    echo "    ✓ Permissions updated"
 
-        echo "[7/9] Reloading systemd..."
-        systemctl daemon-reload
-        echo "    ✓ Systemd reloaded"
+    echo "[8/9] Installing Python Dependencies..."
 
-        echo "=== Installing Python Dependencies ==="
-        echo ""
-        echo "Updating openhop_repeater and dependencies (including openhop_core from PyPI)..."
-        echo "This may take a few minutes..."
-        echo ""
+    if ! grep -q "Luckfox Pico" /proc/device-tree/model 2>/dev/null; then
+        export PIP_ONLY_BINARY=pycryptodome,cffi,PyNaCl,psutil
+    fi
+    echo "Note: Using optimized binary wheels for faster installation"
+    echo ""
 
-        # Install from source directory to properly resolve Git dependencies
-        SCRIPT_DIR="$(dirname "$0")"
-        cd "$SCRIPT_DIR"
+    if ! migrate_to_venv; then
+        error "Failed to migrate installation to venv"
+        return 1
+    fi
 
-        # Calculate version from git for setuptools_scm
-        if [ -d .git ]; then
-            git fetch --tags 2>/dev/null || true
-            GIT_VERSION=$(python3 -m setuptools_scm 2>/dev/null || echo "1.0.5")
-            export SETUPTOOLS_SCM_PRETEND_VERSION="$GIT_VERSION"
-            echo "Upgrading to version: $GIT_VERSION"
-        else
-            export SETUPTOOLS_SCM_PRETEND_VERSION="1.0.5"
-        fi
-
-    # We don't have any binary wheels available for these on a LuckFox, so we need to ignore them on that platform.
-        if ! grep -q "Luckfox Pico" /proc/device-tree/model 2>/dev/null; then
-            # Force binary wheels for slow-to-compile packages (much faster on Raspberry Pi)
-            export PIP_ONLY_BINARY=pycryptodome,cffi,PyNaCl,psutil
-        fi
-        echo "Note: Using optimized binary wheels for faster installation"
-        echo ""
-
-        # Migrate from system pip to venv (idempotent)
-        migrate_to_venv
-
-        # Install into the venv (clean, no system-packages flags needed)
-        echo "Upgrading openhop_repeater into venv ($VENV_DIR)..."
-        
-        # Attempt R2 wheels first for faster installation
-        if [ "$R2_ENABLED" -eq 1 ]; then
-            MACHINE_ARCH=$(uname -m)
-            case "$MACHINE_ARCH" in
-                aarch64) ARCH_TAG="arm64"; PLATFORM_TAG="aarch64" ;;
-                armv7l|armv7) ARCH_TAG="armv7"; PLATFORM_TAG="armv7l" ;;
-                x86_64) ARCH_TAG="x86_64"; PLATFORM_TAG="x86_64" ;;
-                *) ARCH_TAG=""; PLATFORM_TAG="" ;;
-            esac
-            if [ -n "$ARCH_TAG" ]; then
-                PY_TAG=$("$VENV_PYTHON" -c 'import sys; v=f"cp{sys.version_info.major}{sys.version_info.minor}"; print(f"{v}-{v}")' 2>/dev/null || echo "cp311-cp311")
-                WHEEL_BASE="${R2_BASE_URL}/${ARCH_TAG}/${PLATFORM_TAG}/${PY_TAG}"
-                echo "  Checking for R2 wheels (${ARCH_TAG}/${PLATFORM_TAG}/${PY_TAG})..."
-                echo "  Trying install from R2 pre-built wheels..."
-                "$VENV_PYTHON" -m pip install --find-links "${WHEEL_BASE}/index.html" --no-cache-dir "pycryptodome>=3.23.0" "PyNaCl>=1.5.0" cffi "pyyaml>=6.0.0" 2>/dev/null && R2_SUCCESS=1 || R2_SUCCESS=0
-                if [ "$R2_SUCCESS" -eq 1 ]; then
-                    echo "  ✓ R2 wheels installed"
-                else
-                    echo "  - R2 wheels unavailable for this platform/tag, falling back"
-                fi
-            fi
-        fi
-        
-        if "$VENV_PYTHON" -m pip install --upgrade --no-cache-dir .[hardware]; then
-            echo ""
-            echo "✓ Package and dependencies upgraded successfully!"
-        else
-            echo ""
-            echo "⚠ Package upgrade failed, but continuing..."
-        fi
-
-
-        echo "[8/9] Starting service..."
-        systemctl daemon-reload
-        systemctl start "$SERVICE_NAME"
-        echo "    ✓ Service started"
-
-        echo "[9/9] Verifying installation..."
-        sleep 3  # Give service time to start
-
-        local new_version=$(get_version)
-
-        if is_running; then
-            echo "    ✓ Service is running"
-            # Container detection: warn about host-side udev rules
-            local container_note=""
-            if [ -f /run/host/container-manager ] || [ -n "${container:-}" ] || grep -qsai 'container=' /proc/1/environ 2>/dev/null || [ -f /.dockerenv ]; then
-                container_note="\n\n⚠ CONTAINER DETECTED:\nUSB udev rules must be set on the HOST, not here.\nSee documentation for CH341 host-side setup."
-            fi
-            if [[ "$silent" == "true" ]]; then
-                echo "Upgrade completed successfully!"
-                echo "Version: $current_version -> $new_version"
-                echo "✓ Service is running"
-                echo "✓ Configuration preserved"
-                if [[ -n "$container_note" ]]; then
-                    echo "$container_note"
-                fi
+    echo "Upgrading openhop_repeater into venv ($VENV_DIR)..."
+    if [ "$R2_ENABLED" -eq 1 ]; then
+        MACHINE_ARCH=$(uname -m)
+        case "$MACHINE_ARCH" in
+            aarch64) ARCH_TAG="arm64"; PLATFORM_TAG="aarch64" ;;
+            armv7l|armv7) ARCH_TAG="armv7"; PLATFORM_TAG="armv7l" ;;
+            x86_64) ARCH_TAG="x86_64"; PLATFORM_TAG="x86_64" ;;
+            *) ARCH_TAG=""; PLATFORM_TAG="" ;;
+        esac
+        if [ -n "$ARCH_TAG" ]; then
+            PY_TAG=$("$VENV_PYTHON" -c 'import sys; v=f"cp{sys.version_info.major}{sys.version_info.minor}"; print(f"{v}-{v}")' 2>/dev/null || echo "cp311-cp311")
+            WHEEL_BASE="${R2_BASE_URL}/${ARCH_TAG}/${PLATFORM_TAG}/${PY_TAG}"
+            echo "  Checking for R2 wheels (${ARCH_TAG}/${PLATFORM_TAG}/${PY_TAG})..."
+            echo "  Trying install from R2 pre-built wheels..."
+            if "$VENV_PYTHON" -m pip install --find-links "${WHEEL_BASE}/index.html" --no-cache-dir "pycryptodome>=3.23.0" "PyNaCl>=1.5.0" cffi "pyyaml>=6.0.0" 2>/dev/null; then
+                echo "  ✓ R2 wheels installed"
             else
-                show_info "Upgrade Complete" "Upgrade completed successfully!\n\nVersion: $current_version → $new_version\n\n✓ Service is running\n✓ Configuration preserved${container_note}"
-            fi
-        else
-            echo "    ✗ Service failed to start"
-            if [[ "$silent" == "true" ]]; then
-                echo "Upgrade completed but service failed to start!"
-                echo "Version updated: $current_version -> $new_version"
-                echo "Check logs from the main menu for details."
-            else
-                show_error "Upgrade completed but service failed to start!\n\nVersion updated: $current_version → $new_version\n\nCheck logs from the main menu for details."
+                echo "  - R2 wheels unavailable for this platform/tag, falling back"
             fi
         fi
-        echo "=== Upgrade Complete ==="
+    fi
+
+    if ! "$VENV_PYTHON" -m pip install --upgrade --no-cache-dir "$package_requirement"; then
+        error "Package upgrade failed"
+        return 1
+    fi
+    echo ""
+    echo "✓ Package and dependencies upgraded successfully!"
+
+    echo "[9/9] Reloading systemd and restarting service..."
+    if ! systemctl daemon-reload; then
+        error "Failed to reload systemd"
+        return 1
+    fi
+
+    if (( service_was_running == 1 || service_was_enabled == 1 )); then
+        if ! systemctl stop "$SERVICE_NAME" 2>/dev/null; then
+            error "Failed to stop ${SERVICE_NAME} before restart"
+            return 1
+        fi
+        service_stopped=1
+
+        if ! systemctl restart "$SERVICE_NAME"; then
+            restart_service_after_failure
+            error "Failed to restart ${SERVICE_NAME}"
+            return 1
+        fi
+
+        sleep 3
+        if ! is_running; then
+            restart_service_after_failure
+            error "Service restart completed but ${SERVICE_NAME} is not active"
+            return 1
+        fi
+        echo "    ✓ Service restarted and active"
+    else
+        echo "    ✓ Service was not running/enabled before upgrade; no restart required"
+    fi
+
+    local new_version
+    new_version=$(get_version)
+
+    local container_note=""
+    if [ -f /run/host/container-manager ] || [ -n "${container:-}" ] || grep -qsai 'container=' /proc/1/environ 2>/dev/null || [ -f /.dockerenv ]; then
+        container_note="\n\n⚠ CONTAINER DETECTED:\nUSB udev rules must be set on the HOST, not here.\nSee documentation for CH341 host-side setup."
+    fi
+
+    if [[ "$silent" == "true" ]]; then
+        echo "Upgrade completed successfully!"
+        echo "Version: $current_version -> $new_version"
+        if (( service_was_running == 1 || service_was_enabled == 1 )); then
+            echo "✓ Service is running"
+        fi
+        echo "✓ Configuration preserved"
+        if [[ -n "$container_note" ]]; then
+            echo "$container_note"
+        fi
+    else
+        show_info "Upgrade Complete" "Upgrade completed successfully!\n\nVersion: $current_version → $new_version\n\n✓ Configuration preserved${container_note}"
+    fi
+
+    echo "=== Upgrade Complete ==="
+    return 0
 }
 
 # Radio Configuration function
@@ -1234,7 +1397,6 @@ configure_radio() {
 
     # Show info about web-based configuration
     if ask_yes_no "Configure Radio Settings" "Radio configuration is now done through the web interface.\n\nThe web-based setup wizard provides an easy way to:\n\n• Change repeater name\n• Select hardware board\n• Configure radio frequency and settings\n• Update admin password\n\nWeb Dashboard: http://$ip_address:8000/setup\n\nWould you like to open this information?"; then
-        clear
         echo "═══════════════════════════════════════════════════════════════"
         echo "        Web-Based Radio Configuration"
         echo "═══════════════════════════════════════════════════════════════"
@@ -1265,7 +1427,7 @@ configure_radio() {
 uninstall_repeater() {
     if [ "$EUID" -ne 0 ]; then
         show_error "Uninstall requires root privileges.\n\nPlease run: sudo $0"
-        return
+        return 1
     fi
 
     if ask_yes_no "Confirm Uninstall" "This will completely remove openHop Repeater including:\n\n- Service and files\n- Configuration (backup will be created)\n- Logs and data\n\nThis action cannot be undone!\n\nContinue?"; then
@@ -1279,6 +1441,7 @@ uninstall_repeater() {
         systemctl stop "$SERVICE_NAME" 2>/dev/null || true
         systemctl disable "$SERVICE_NAME" 2>/dev/null || true
 
+        set +e
         (
         echo "20"; echo "# Backing up configuration..."
         if [ -d "$CONFIG_DIR" ]; then
@@ -1311,10 +1474,25 @@ uninstall_repeater() {
         fi
 
         echo "100"; echo "# Uninstall complete!"
-        ) | $DIALOG --backtitle "openHop Repeater Management" --title "Uninstalling" --gauge "Removing openHop Repeater..." 8 70 0
+        ) | "$DIALOG" --backtitle "openHop Repeater Management" --title "Uninstalling" --gauge "Removing openHop Repeater..." 8 70 0
+        local pipeline_status=("${PIPESTATUS[@]}")
+        set -e
+
+        if (( pipeline_status[0] != 0 )); then
+            error "Uninstall failed with status ${pipeline_status[0]}"
+            return "${pipeline_status[0]}"
+        fi
+
+        if (( pipeline_status[1] != 0 )); then
+            error "Uninstall progress dialog failed with status ${pipeline_status[1]}"
+            return "${pipeline_status[1]}"
+        fi
 
         show_info "Uninstall Complete" "\nopenHop Repeater has been completely removed.\n\nConfiguration backup saved to /tmp/\n\nThank you for using openHop Repeater!"
+        return 0
     fi
+
+    return 1
 }
 
 # Service management
@@ -1332,6 +1510,13 @@ manage_service() {
     fi
 
     if ! service_exists; then
+        if [ -f "/etc/systemd/system/${SERVICE_NAME}.service" ]; then
+            # Unit file may exist but systemd cache may be stale.
+            systemctl daemon-reload >/dev/null 2>&1 || true
+        fi
+    fi
+
+    if ! service_exists; then
         if [[ "$silent" == "true" ]]; then
             echo "Service is not installed."
         else
@@ -1345,13 +1530,17 @@ manage_service() {
             if ! is_enabled; then
                 systemctl enable "$SERVICE_NAME"
             fi
-            systemctl start "$SERVICE_NAME"
+            if ! systemctl start "$SERVICE_NAME"; then
+                error "Failed to start ${SERVICE_NAME}"
+                return 1
+            fi
             if is_running; then
                 if [[ "$silent" == "true" ]]; then
                     echo "✓ openHop Repeater service has been started successfully."
                 else
                     show_info "Service Started" "\n✓ openHop Repeater service has been started successfully."
                 fi
+                return 0
             else
                 if [[ "$silent" == "true" ]]; then
                     echo "Failed to start service!"
@@ -1359,24 +1548,33 @@ manage_service() {
                 else
                     show_error "Failed to start service!\n\nCheck logs for details."
                 fi
+                return 1
             fi
             ;;
         "stop")
-            systemctl stop "$SERVICE_NAME"
+            if ! systemctl stop "$SERVICE_NAME"; then
+                error "Failed to stop ${SERVICE_NAME}"
+                return 1
+            fi
             if [[ "$silent" == "true" ]]; then
                 echo "✓ openHop Repeater service has been stopped."
             else
                 show_info "Service Stopped" "\n✓ openHop Repeater service has been stopped."
             fi
+            return 0
             ;;
         "restart")
-            systemctl restart "$SERVICE_NAME"
+            if ! systemctl restart "$SERVICE_NAME"; then
+                error "Failed to restart ${SERVICE_NAME}"
+                return 1
+            fi
             if is_running; then
                 if [[ "$silent" == "true" ]]; then
                     echo "✓ openHop Repeater service has been restarted successfully."
                 else
                     show_info "Service Restarted" "\n✓ openHop Repeater service has been restarted successfully."
                 fi
+                return 0
             else
                 if [[ "$silent" == "true" ]]; then
                     echo "Failed to restart service!"
@@ -1384,9 +1582,12 @@ manage_service() {
                 else
                     show_error "Failed to restart service!\n\nCheck logs for details."
                 fi
+                return 1
             fi
             ;;
     esac
+
+    return 1
 }
 
 # Show detailed status
@@ -1432,7 +1633,7 @@ show_detailed_status() {
 # Function to validate and update configuration
 validate_and_update_config() {
     local config_file="$CONFIG_DIR/config.yaml"
-    local example_file="config.yaml.example"
+    local example_file="$SCRIPT_DIR/config.yaml.example"
     local updated_example="$CONFIG_DIR/config.yaml.example"
 
     normalize_legacy_paths_in_config() {
@@ -1465,7 +1666,7 @@ validate_and_update_config() {
     fi
 
     # Check if yq is available
-    YQ_CMD="/usr/local/bin/yq"
+    local YQ_CMD="/usr/local/bin/yq"
     if ! command -v "$YQ_CMD" &> /dev/null; then
         echo "    ⚠ mikefarah yq not found at $YQ_CMD, skipping config merge"
         return 0
@@ -1521,15 +1722,15 @@ validate_and_update_config() {
     fi
 }
 
-# Main script logic
-if [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
+usage() {
     echo "openHop Repeater Management Script"
     echo ""
-    echo "Usage: $0 [action]"
+    echo "Usage: $SCRIPT_PATH [action]"
     echo ""
     echo "Actions:"
     echo "  install   - Install openHop Repeater"
     echo "  upgrade   - Upgrade existing installation (CLI is silent by default; use --interactive to show dialogs)"
+    echo "  reset     - Reset existing installation to defaults"
     echo "  uninstall - Remove openHop Repeater"
     echo "  config    - Configure radio settings"
     echo "  start     - Start the service (CLI is silent by default; use --interactive to show dialogs)"
@@ -1540,71 +1741,83 @@ if [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
     echo "  debug     - Show debug information"
     echo ""
     echo "Run without arguments for interactive menu."
-    exit 0
-fi
+}
 
-# Debug mode
-if [ "$1" = "debug" ]; then
-    echo "=== Debug Information ==="
-    echo "DIALOG: $DIALOG"
-    echo "TERM: $TERM"
-    echo "TTY: $(tty 2>/dev/null || echo 'not a tty')"
-    echo "EUID: $EUID"
-    echo "PWD: $PWD"
-    echo "Script: $0"
-    echo ""
-    echo "Testing dialog..."
-    $DIALOG --backtitle "openHop Repeater Management" --title "Test" --msgbox "Dialog test successful!" 8 40
-    echo "Dialog test completed."
-    exit 0
-fi
+main() {
+    local command="${1:-}"
+    local silent_mode="true"
 
-# Handle command line arguments
-case "$1" in
-    "install")
-        install_repeater install
-        exit 0
-        ;;
-    "upgrade")
-        silent_mode="true"
-        if is_interactive_flag "${2:-}" || [[ "$SILENT_MODE" == "0" || "$SILENT_MODE" == "false" ]]; then
-            silent_mode="false"
-        fi
-        upgrade_repeater "$silent_mode"
-        exit 0
-        ;;
-    "uninstall")
-        uninstall_repeater
-        exit 0
-        ;;
-    "config")
-        configure_radio
-        exit 0
-        ;;
-    "start"|"stop"|"restart")
-        silent_mode="true"
-        if is_interactive_flag "${2:-}" || [[ "$SILENT_MODE" == "0" || "$SILENT_MODE" == "false" ]]; then
-            silent_mode="false"
-        fi
-        manage_service "$1" "$silent_mode"
-        exit 0
-        ;;
-    "logs")
-        clear
-        echo -e "\033[1;36m╔══════════════════════════════════════════════════════════════════════╗\033[0m"
-        echo -e "\033[1;36m║\033[0m                  \033[1;37mopenHop Repeater - Live Logs\033[0m                     \033[1;36m║\033[0m"
-        echo -e "\033[1;36m║\033[0m                  \033[0;90m(Press Ctrl+C to return)\033[0m                      \033[1;36m║\033[0m"
-        echo -e "\033[1;36m╚══════════════════════════════════════════════════════════════════════╝\033[0m"
-        echo ""
-        journalctl -u "$SERVICE_NAME" -f -o cat --no-hostname | sed -e 's/.*ERROR.*/\x1b[1;31m&\x1b[0m/' -e 's/.*CRITICAL.*/\x1b[1;41;37m&\x1b[0m/' -e 's/.*WARNING.*/\x1b[1;33m&\x1b[0m/' -e 's/.*INFO.*/\x1b[0;32m&\x1b[0m/' -e 's/.*DEBUG.*/\x1b[0;36m&\x1b[0m/'
-        ;;
-    "status")
-        show_detailed_status
-        exit 0
-        ;;
-esac
+    case "$command" in
+        "" )
+            while true; do
+                show_main_menu
+            done
+            ;;
+        "--help"|"-h")
+            usage
+            return 0
+            ;;
+        "debug")
+            echo "=== Debug Information ==="
+            echo "DIALOG: $DIALOG"
+            echo "TERM: $TERM"
+            echo "TTY: $(tty 2>/dev/null || echo 'not a tty')"
+            echo "EUID: $EUID"
+            echo "PWD: $PWD"
+            echo "Script: $SCRIPT_PATH"
+            echo ""
+            echo "Testing dialog..."
+            "$DIALOG" --backtitle "openHop Repeater Management" --title "Test" --msgbox "Dialog test successful!" 8 40
+            echo "Dialog test completed."
+            return 0
+            ;;
+        "install"|"upgrade"|"reset"|"uninstall")
+            if [ "$EUID" -ne 0 ]; then
+                error "${command} requires root privileges. Please run: sudo $SCRIPT_PATH ${command}"
+                return 1
+            fi
+            acquire_global_lock || return 1
+            ;;
+    esac
 
-# Interactive menu loop
-while true; do
-    show_main_menu
-done
+    case "$command" in
+        "install")
+            install_repeater install
+            ;;
+        "upgrade")
+            if is_interactive_flag "${2:-}" || [[ "$SILENT_MODE" == "0" || "$SILENT_MODE" == "false" ]]; then
+                silent_mode="false"
+            fi
+            upgrade_repeater "$silent_mode"
+            ;;
+        "reset")
+            reset_repeater
+            ;;
+        "uninstall")
+            uninstall_repeater
+            ;;
+        "config")
+            configure_radio
+            ;;
+        "start"|"stop"|"restart")
+            if is_interactive_flag "${2:-}" || [[ "$SILENT_MODE" == "0" || "$SILENT_MODE" == "false" ]]; then
+                silent_mode="false"
+            fi
+            manage_service "$command" "$silent_mode"
+            ;;
+        "logs")
+            print_live_logs_header
+            echo ""
+            journalctl -u "$SERVICE_NAME" -f -o cat --no-hostname | sed -e 's/.*ERROR.*/\x1b[1;31m&\x1b[0m/' -e 's/.*CRITICAL.*/\x1b[1;41;37m&\x1b[0m/' -e 's/.*WARNING.*/\x1b[1;33m&\x1b[0m/' -e 's/.*INFO.*/\x1b[0;32m&\x1b[0m/' -e 's/.*DEBUG.*/\x1b[0;36m&\x1b[0m/'
+            ;;
+        "status")
+            show_detailed_status
+            ;;
+        *)
+            usage >&2
+            return 2
+            ;;
+    esac
+}
+
+main "$@"

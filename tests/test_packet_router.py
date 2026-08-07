@@ -15,6 +15,7 @@ or:
 """
 
 import asyncio
+import functools
 import hashlib
 import time
 import unittest
@@ -36,12 +37,14 @@ from openhop_core.node.handlers.text import TextMessageHandler
 from openhop_core.node.handlers.trace import TraceHandler
 from openhop_core.protocol.constants import (
     PAYLOAD_TYPE_GRP_DATA,
+    PAYLOAD_TYPE_GRP_TXT,
     ROUTE_TYPE_DIRECT,
     ROUTE_TYPE_FLOOD,
     ROUTE_TYPE_TRANSPORT_DIRECT,
 )
 from openhop_core.protocol import LocalIdentity, Packet, PacketBuilder
 
+from repeater.companion.bridge import RepeaterCompanionBridge
 from repeater.companion.correlation import injected_tx_outcome
 from repeater.packet_router import (
     PacketRouter,
@@ -84,6 +87,7 @@ def _make_packet(payload_type: int = 0xFF):
     pkt.snr = 5.0
     pkt.timestamp = time.time()
     pkt._injected_for_tx = False
+    pkt._injected_origin_hash = None
     pkt.path = bytearray()
     pkt.calculate_packet_hash.return_value = b"\x01" * 32
     pkt.mark_do_not_retransmit = MagicMock()
@@ -1561,6 +1565,119 @@ class TestInjectedTxRawEcho(unittest.IsolatedAsyncioTestCase):
         ok = await router.inject_packet(_make_packet())
 
         self.assertTrue(ok)
+
+
+class TestInjectedOriginExclusion(unittest.IsolatedAsyncioTestCase):
+    """A companion never hears its own transmission back through the router.
+
+    inject_packet tags the packet with the originating companion's "0xHH" hash
+    and _companion_bridges_for_packet withholds that bridge from every fan-out,
+    the same rule the 0x88 raw-RX echo already applies to the frame servers.
+    """
+
+    @staticmethod
+    def _daemon_with_two_bridges():
+        daemon = _make_daemon()
+        daemon._on_raw_rx_for_companions = None
+        origin = _make_bridge()
+        other = _make_bridge()
+        daemon.companion_bridges = {0x1A: origin, 0x2B: other}
+        return daemon, origin, other
+
+    @staticmethod
+    async def _inject_and_drain(router, pkt, origin_hash):
+        await router.start()
+        try:
+            injected = await router.inject_packet(pkt, origin_hash=origin_hash)
+            await asyncio.sleep(0.05)  # let queue drain into _route_packet
+        finally:
+            await router.stop()
+        return injected
+
+    async def test_injected_advert_is_not_redelivered_to_the_originating_bridge(self):
+        """A companion's own advert reaches the other bridge only."""
+        daemon, origin, other = self._daemon_with_two_bridges()
+        router = PacketRouter(daemon)
+        pkt = _make_packet(AdvertHandler.payload_type())
+
+        self.assertTrue(await self._inject_and_drain(router, pkt, "0x1a"))
+
+        origin.process_received_packet.assert_not_awaited()
+        other.process_received_packet.assert_awaited_once()
+
+    async def test_inject_without_origin_hash_still_fans_out_to_all_bridges(self):
+        """Repeater-originated injects (trace, discovery, login, text) have no
+        origin companion, so every bridge must still be offered the packet."""
+        daemon, origin, other = self._daemon_with_two_bridges()
+        router = PacketRouter(daemon)
+        pkt = _make_packet(AdvertHandler.payload_type())
+
+        self.assertTrue(await self._inject_and_drain(router, pkt, None))
+
+        origin.process_received_packet.assert_awaited_once()
+        other.process_received_packet.assert_awaited_once()
+
+    async def test_ota_advert_still_reaches_every_bridge(self):
+        """Anti-over-blocking control: an advert heard off the air is untagged,
+        so the origin filter must leave both bridges in place."""
+        daemon, origin, other = self._daemon_with_two_bridges()
+        router = PacketRouter(daemon)
+
+        await router._route_packet(_make_packet(AdvertHandler.payload_type()))
+
+        origin.process_received_packet.assert_awaited_once()
+        other.process_received_packet.assert_awaited_once()
+
+    async def test_injected_group_message_is_not_returned_to_its_origin(self):
+        """GRP_TXT fans out to every companion, so it needs the same exclusion."""
+        daemon, origin, other = self._daemon_with_two_bridges()
+        router = PacketRouter(daemon)
+        pkt = _make_packet(PAYLOAD_TYPE_GRP_TXT)
+
+        self.assertTrue(await self._inject_and_drain(router, pkt, "0x1a"))
+
+        origin.process_received_packet.assert_not_awaited()
+        other.process_received_packet.assert_awaited_once()
+
+    async def test_injected_advert_skips_advert_helper_neighbour_tracking(self):
+        """Our own TX is not a neighbour observation: feeding it to the helper
+        would record a phantom neighbour from the zeroed rssi/snr and burn a
+        rate-limit token. An advert heard off the air must still reach it."""
+        daemon, _origin, _other = self._daemon_with_two_bridges()
+        daemon.advert_helper = MagicMock()
+        daemon.advert_helper.process_advert_packet = AsyncMock()
+        router = PacketRouter(daemon)
+
+        injected = _make_packet(AdvertHandler.payload_type())
+        self.assertTrue(await self._inject_and_drain(router, injected, "0x1a"))
+        daemon.advert_helper.process_advert_packet.assert_not_awaited()
+
+        await router._route_packet(_make_packet(AdvertHandler.payload_type()))
+        daemon.advert_helper.process_advert_packet.assert_awaited_once()
+
+    async def test_self_advert_never_returns_to_its_own_companion_end_to_end(self):
+        """A real bridge advertising through the real injector must not end up
+        holding itself as a contact once the router queue has drained."""
+        identity = LocalIdentity()
+        companion_hash = identity.get_public_key()[0]
+        daemon = _make_daemon()
+        daemon._on_raw_rx_for_companions = None
+        router = PacketRouter(daemon)
+        bridge = RepeaterCompanionBridge(
+            identity,
+            functools.partial(router.inject_packet, origin_hash=f"0x{companion_hash:02x}"),
+            companion_hash=f"0x{companion_hash:02x}",
+        )
+        daemon.companion_bridges = {companion_hash: bridge}
+
+        await router.start()
+        try:
+            self.assertTrue(await bridge.advertise())
+            await asyncio.sleep(0.05)  # let queue drain into _route_packet
+        finally:
+            await router.stop()
+
+        self.assertEqual(bridge.get_contact_count(), 0)
 
 
 class TestCompanionDeliveryFailureHandling(unittest.IsolatedAsyncioTestCase):

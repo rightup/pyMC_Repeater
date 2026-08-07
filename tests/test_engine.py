@@ -2837,6 +2837,11 @@ class TestEngineTransmissionAndBackgroundLifecycle:
             await handler._record_noise_floor_async()
         handler.storage.record_noise_floor.assert_not_called()
 
+        with patch.object(handler, "get_noise_floor", return_value=0.0):
+            await handler._record_noise_floor_async()
+        handler.storage.record_noise_floor.assert_called_once_with(0.0)
+        assert handler._cached_noise_floor == 0.0
+
         with patch.object(handler, "get_noise_floor", side_effect=RuntimeError("noise fail")):
             await handler._record_noise_floor_async()
 

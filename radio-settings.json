@@ -95,6 +95,8 @@
       "txled_pin": -1,
       "rxled_pin": -1,
       "tx_power": 22,
+      "use_dio3_tcxo": true,
+      "use_dio2_rf": true,
       "preamble_length": 32
     },
     "meshadv": {

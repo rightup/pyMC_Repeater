@@ -1,4 +1,3 @@
-import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -57,14 +56,12 @@ async def test_load_additional_identities_valid_and_invalid_entries():
 
 
 @pytest.mark.asyncio
-async def test_run_starts_http_and_handles_dispatcher_cancelled_gracefully():
+async def test_run_starts_http_and_handles_dispatcher_completion_gracefully():
     daemon = RepeaterDaemon(_base_config(), radio=SimpleNamespace(cleanup=MagicMock()))
 
     async def _init_stub():
         daemon.local_identity = SimpleNamespace(get_public_key=lambda: b"\x22" * 32)
-        daemon.dispatcher = SimpleNamespace(
-            run_forever=AsyncMock(side_effect=asyncio.CancelledError())
-        )
+        daemon.dispatcher = SimpleNamespace(run_forever=AsyncMock())
 
     daemon.initialize = _init_stub
 
@@ -75,6 +72,7 @@ async def test_run_starts_http_and_handles_dispatcher_cancelled_gracefully():
     with (
         patch("asyncio.get_running_loop", return_value=fake_loop_for_signals),
         patch("repeater.main.HTTPStatsServer", return_value=fake_http_instance),
+        patch.object(daemon, "_arm_exit_watchdog"),
         patch("os.path.exists", return_value=False),
     ):
         await daemon.run()
@@ -91,9 +89,7 @@ async def test_run_with_http_disabled_does_not_construct_http_server():
 
     async def _init_stub():
         daemon.local_identity = SimpleNamespace(get_public_key=lambda: b"\x22" * 32)
-        daemon.dispatcher = SimpleNamespace(
-            run_forever=AsyncMock(side_effect=asyncio.CancelledError())
-        )
+        daemon.dispatcher = SimpleNamespace(run_forever=AsyncMock())
 
     daemon.initialize = _init_stub
     fake_loop_for_signals = SimpleNamespace(add_signal_handler=MagicMock())
@@ -101,6 +97,7 @@ async def test_run_with_http_disabled_does_not_construct_http_server():
     with (
         patch("asyncio.get_running_loop", return_value=fake_loop_for_signals),
         patch("repeater.main.HTTPStatsServer") as server_factory,
+        patch.object(daemon, "_arm_exit_watchdog"),
         patch("os.path.exists", return_value=False),
     ):
         await daemon.run()

@@ -5,6 +5,7 @@ import os
 import signal
 import socket
 import sys
+import threading
 import time
 from collections import OrderedDict
 from typing import Optional
@@ -50,6 +51,7 @@ from repeater.handler_helpers import (
     AdvertHelper,
     DiscoveryHelper,
     LoginHelper,
+    NeighborScopeHelper,
     PathHelper,
     ProtocolRequestHelper,
     TextHelper,
@@ -57,6 +59,7 @@ from repeater.handler_helpers import (
 )
 from repeater.identity_manager import IdentityConfigurationError, IdentityManager, IdentitySpec
 from repeater.logging_utils import normalize_log_level
+from repeater.neighbors_publisher import NeighborsPublisher
 from repeater.packet_router import PacketRouter
 from repeater.region_map_builder import build_region_map
 from repeater.sensors import SensorManager
@@ -122,6 +125,8 @@ class RepeaterDaemon:
         self.trace_helper = None
         self.advert_helper = None
         self.discovery_helper = None
+        self.neighbor_scope_helper = None
+        self.neighbors_publisher = None
         self.login_helper = None
         self.text_helper = None
         self.path_helper = None
@@ -165,12 +170,10 @@ class RepeaterDaemon:
         # in-process.
         self._retiring_companions: dict[str, dict[str, object]] = {}
         self._shutdown_started = False
-        # The signal handler starts teardown in its own task while run() is
-        # being cancelled. Retain that owner so run()'s finally block joins the
-        # same teardown instead of returning early and letting asyncio.run()
-        # cancel it.
-        self._shutdown_task: asyncio.Task | None = None
         self._main_task = None
+        # Set by the first shutdown signal so a second one is ignored while
+        # run() is still unwinding.
+        self._stop_requested = False
         self.radio_status = "unknown"
         self.radio_error = None
 
@@ -756,6 +759,35 @@ class RepeaterDaemon:
             # When trace reaches final node, push PUSH_CODE_TRACE_DATA (0x89) to companion clients (firmware onTraceRecv)
             self.trace_helper.on_trace_complete = self._on_trace_complete_for_companions
 
+            # Neighbour scope discovery + periodic MQTT neighbors publication.
+            # Created unconditionally and self-gating: the publisher idles unless
+            # the master switch is on and some broker opted in with neighbors:true.
+            self.neighbor_scope_helper = NeighborScopeHelper(
+                local_identity=self.local_identity,
+                packet_injector=self.router.inject_packet,
+                airtime_manager=(
+                    getattr(self.repeater_handler, "airtime_mgr", None)
+                    if self.repeater_handler
+                    else None
+                ),
+                config=self.config,
+            )
+            self.neighbors_publisher = NeighborsPublisher(
+                config=self.config,
+                local_identity=self.local_identity,
+                discovery_helper=self.discovery_helper,
+                scope_helper=self.neighbor_scope_helper,
+                mqtt_handler_provider=lambda: getattr(
+                    getattr(self.repeater_handler, "storage", None), "mqtt_handler", None
+                ),
+                storage_provider=lambda: getattr(self.repeater_handler, "storage", None),
+                self_scopes_fn=(
+                    self.login_helper._format_region_names if self.login_helper else None
+                ),
+            )
+            self.neighbors_publisher.start()
+            logger.info("Neighbors publisher initialized")
+
             # Optional pyMC_Glass integration loop (inform/control plane)
             self.glass_handler = GlassHandler(
                 config=self.config,
@@ -1077,6 +1109,15 @@ class RepeaterDaemon:
                 # Share the dispatcher's served-region map so this bridge re-scopes
                 # its own flood replies to the region the request arrived under.
                 bridge.region_map = getattr(self, "_region_map", None)
+
+                # Feed this bridge every pre-dedup copy of a flood reply so its
+                # return-path teacher can pick the best-received route rather than
+                # the first-arrived one. The router hands a bridge only the first
+                # copy (later ones are dropped by the engine's seen-table) and the
+                # pre-dedup firehose lives on the dispatcher, which the bridge does
+                # not own -- so the host has to wire it.
+                if self.dispatcher:
+                    self.dispatcher.add_raw_packet_subscriber(bridge.note_flood_copy)
 
                 # Restore persisted state (contacts/channels/messages) from SQLite.
                 # Raises CompanionStateLoadError instead of continuing with an
@@ -1789,6 +1830,9 @@ class RepeaterDaemon:
                 **bridge_kwargs,
             )
             self._wire_companion_history_observers(bridge, journal)
+            # Match the boot path: hot-added bridges share the dispatcher's
+            # current served-region map before any persisted state is restored.
+            bridge.region_map = getattr(self, "_region_map", None)
         except BaseException:
             self._detach_companion_push_listener(
                 journal,
@@ -1936,6 +1980,13 @@ class RepeaterDaemon:
             await self._stop_partial_companion(frame_server, bridge)
             raise IdentityConfigurationError(publication_error)
 
+        # Feed this fully-started bridge every pre-dedup copy of a flood reply
+        # so its return-path teacher can choose the best-received route. Delay
+        # subscription until publication succeeds, avoiding a stale callback
+        # when hot-add setup fails partway through.
+        if self.dispatcher:
+            self.dispatcher.add_raw_packet_subscriber(bridge.note_flood_copy)
+
         limits = format_companion_bridge_limits(bridge_kwargs)
         frame_status = (
             f"port={tcp_port}, bind={bind_address}, "
@@ -2036,6 +2087,16 @@ class RepeaterDaemon:
                 companion_hash_str,
                 None,
             )
+
+            # The raw-packet subscriber holds a bound method (and therefore the
+            # bridge) alive independently of the routing registries below.
+            remove_raw_subscriber = getattr(
+                self.dispatcher,
+                "remove_raw_packet_subscriber",
+                None,
+            )
+            if bridge is not None and callable(remove_raw_subscriber):
+                remove_raw_subscriber(bridge.note_flood_copy)
 
             # Detach every discovery/routing index before the first await.
             # In-flight work may finish on the retained handles, but no new
@@ -2686,52 +2747,130 @@ class RepeaterDaemon:
         )
         return True
 
-    def _signal_shutdown(self, sig, loop):
-        """Handle SIGTERM/SIGINT by scheduling async shutdown."""
-        if self._shutdown_started or self._shutdown_task is not None:
-            logger.info(f"Received signal {sig.name}, shutdown already in progress")
-            return
-        logger.info(f"Received signal {sig.name}, shutting down...")
-        self._shutdown_task = loop.create_task(self._shutdown())
-        # Cancel run() so dispatcher.run_forever() unwinds cleanly.
+    def _cancel_main_task_for_shutdown(self) -> None:
+        """Unwind ``run()`` so its finalizer can perform bounded teardown."""
         if self._main_task and not self._main_task.done():
             self._main_task.cancel()
 
+    async def _stop_dispatcher_for_signal(self, dispatcher) -> None:
+        """Stop the dispatcher within a bound, then fall back to cancellation.
+
+        The cooperative path remains preferred because it lets
+        ``run_forever()`` return normally.  If the dispatcher is wedged, the
+        requested-cancellation handler in ``run()`` still transfers ownership
+        to its sole ``finally`` block instead of stranding teardown forever.
+        """
+        try:
+            await asyncio.wait_for(
+                dispatcher.stop(),
+                timeout=self.SHUTDOWN_STEP_TIMEOUT_S,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Dispatcher did not stop within %.1fs after shutdown signal; "
+                "cancelling daemon task",
+                self.SHUTDOWN_STEP_TIMEOUT_S,
+            )
+            self._cancel_main_task_for_shutdown()
+        except asyncio.CancelledError:
+            # A cancelled signal helper must not leave run() stranded.  This is
+            # normally reached only while the loop itself is already exiting.
+            self._cancel_main_task_for_shutdown()
+            raise
+        except Exception as e:
+            logger.warning(
+                "Dispatcher stop failed after shutdown signal: %s; cancelling daemon task",
+                e,
+            )
+            self._cancel_main_task_for_shutdown()
+
+    def _signal_shutdown(self, sig, loop):
+        """Handle SIGTERM/SIGINT by requesting cooperative shutdown."""
+        if self._shutdown_started or self._stop_requested:
+            logger.info(f"Received signal {sig.name}, shutdown already in progress")
+            return
+        logger.info(f"Received signal {sig.name}, shutting down...")
+        self._stop_requested = True
+        # Prefer cooperative unwinding: stopping the dispatcher makes
+        # run_forever() return, and run()'s finally then owns cleanup.  The
+        # helper bounds that stop and cancels run() only as a fallback; run()'s
+        # requested-cancellation handler still reaches the same finalizer.
+        #
+        # Cancelling run() instead — the previous behaviour — meant its finally
+        # awaited _shutdown() from inside an already-cancelled task, so the first
+        # await raised CancelledError, run() returned, and asyncio.run() tore the
+        # loop down before any cleanup happened. Observed on SIGTERM: not one
+        # shutdown step logged, all three companion listen sockets still bound
+        # and the serial port still held, and the process then hung
+        # indefinitely in interpreter finalization. Running cleanup in a sibling
+        # task does not fix it either: run() returns as soon as the dispatcher
+        # stops, and asyncio.run() cancels every leftover task on the way out.
+        if self.dispatcher is not None and hasattr(self.dispatcher, "stop"):
+            loop.create_task(self._stop_dispatcher_for_signal(self.dispatcher))
+        else:
+            # No dispatcher to stop (a failure before startup finished): fall
+            # back to cancelling, and accept the reduced cleanup.
+            self._cancel_main_task_for_shutdown()
+
+    # Per-step ceiling for shutdown. A best-effort shutdown must never be able to
+    # hang: one stuck step used to strand the whole sequence, leaving sockets
+    # bound and the serial port held.
+    SHUTDOWN_STEP_TIMEOUT_S = 5.0
+    # Grace period after cleanup before the process is forced down. Interpreter
+    # finalization joins non-daemon threads with no timeout of its own, so a
+    # single library thread that never returns hangs SIGTERM forever.
+    SHUTDOWN_EXIT_GRACE_S = 5.0
+
+    async def _shutdown_step(self, name: str, awaitable, timeout: float = None) -> None:
+        """Await one shutdown step, bounded and logged; never raise."""
+        try:
+            await asyncio.wait_for(
+                awaitable, timeout=self.SHUTDOWN_STEP_TIMEOUT_S if timeout is None else timeout
+            )
+        except asyncio.TimeoutError:
+            logger.warning("Shutdown step '%s' timed out; continuing", name)
+        except asyncio.CancelledError:
+            logger.warning("Shutdown step '%s' was cancelled; continuing", name)
+        except Exception as e:
+            logger.warning("Shutdown step '%s' failed: %s", name, e)
+
     async def _shutdown(self):
         """Best-effort shutdown: stop background services and release hardware."""
-        current_task = asyncio.current_task()
-        owner_task = self._shutdown_task
-        if owner_task is not None and owner_task is not current_task:
-            await asyncio.shield(owner_task)
-            return
         if self._shutdown_started:
             return
-        if owner_task is None:
-            self._shutdown_task = current_task
         self._shutdown_started = True
+        logger.info("Shutdown: stopping services and releasing hardware")
+
+        # Stop the dispatcher first so RX stops before its radio is taken away.
+        if self.dispatcher is not None and hasattr(self.dispatcher, "stop"):
+            await self._shutdown_step("dispatcher", self.dispatcher.stop())
 
         # Quiesce every HTTP API before stopping the shared companion bridges
         # or radio router. Otherwise a request accepted during teardown can
         # resolve a still-published bridge and enqueue RF work after its
         # workers have stopped.
         if self.http_server:
-            try:
-                await asyncio.wait_for(
-                    asyncio.to_thread(self.http_server.stop),
-                    timeout=3,
-                )
-            except asyncio.TimeoutError:
-                logger.warning("Timeout stopping HTTP server")
-            except Exception as e:
-                logger.warning(f"Error stopping HTTP server: {e}")
+            await self._shutdown_step(
+                "http server",
+                asyncio.to_thread(self.http_server.stop),
+                timeout=3,
+            )
 
         # Stop the push notifier's worker thread before tearing down journals.
         if self.push_notifier is not None:
-            try:
-                self.push_notifier.stop()
-            except Exception as e:
-                logger.warning(f"Push notifier stop error: {e}")
+            await self._shutdown_step(
+                "push notifier",
+                asyncio.to_thread(self.push_notifier.stop),
+            )
         self._companion_push_listeners.clear()
+
+        # Stop the neighbours publication loop before companion and router
+        # teardown so it cannot enqueue new discovery or scope work.
+        if self.neighbors_publisher:
+            await self._shutdown_step(
+                "neighbors publisher",
+                self.neighbors_publisher.stop(),
+            )
 
         retiring = tuple(getattr(self, "_retiring_companions", {}).values())
         frame_servers = list(getattr(self, "companion_frame_servers", ()))
@@ -2744,10 +2883,10 @@ class RepeaterDaemon:
             if id(frame_server) in seen_components:
                 continue
             seen_components.add(id(frame_server))
-            try:
-                await frame_server.stop()
-            except Exception as e:
-                logger.warning(f"Companion frame server stop error: {e}")
+            await self._shutdown_step(
+                f"frame server :{getattr(frame_server, 'port', '?')}",
+                frame_server.stop(),
+            )
 
         # Stop companion bridges to flush/persist state.
         bridges = list(getattr(self, "companion_bridges", {}).values())
@@ -2758,56 +2897,35 @@ class RepeaterDaemon:
                 continue
             seen_components.add(id(bridge))
             if hasattr(bridge, "stop"):
-                try:
-                    await bridge.stop()
-                except Exception as e:
-                    logger.warning(f"Companion bridge stop error: {e}")
+                await self._shutdown_step("companion bridge", bridge.stop())
 
         # Stop router
         if self.router:
-            try:
-                await self.router.stop()
-            except Exception as e:
-                logger.warning(f"Error stopping router: {e}")
-
+            await self._shutdown_step("router", self.router.stop())
         # Stop Glass inform loop
         if self.glass_handler:
-            try:
-                await self.glass_handler.stop()
-            except Exception as e:
-                logger.warning(f"Error stopping Glass handler: {e}")
+            await self._shutdown_step("glass handler", self.glass_handler.stop())
 
         # Stop sensor manager.
         if self.sensor_manager:
-            try:
-                self.sensor_manager.stop()
-            except Exception as e:
-                logger.warning(f"Error stopping sensor manager: {e}")
+            await self._shutdown_step("sensor manager", asyncio.to_thread(self.sensor_manager.stop))
 
         # Stop GPS diagnostics.
         if self.gps_service:
-            try:
-                self.gps_service.stop()
-            except Exception as e:
-                logger.warning(f"Error stopping GPS diagnostics: {e}")
+            await self._shutdown_step("gps service", asyncio.to_thread(self.gps_service.stop))
 
         # Close storage publishers (MQTT/LetsMesh) to stop their worker threads.
-        try:
-            if self.repeater_handler and self.repeater_handler.storage:
-                await asyncio.wait_for(
-                    asyncio.to_thread(self.repeater_handler.storage.close), timeout=5
-                )
-        except asyncio.TimeoutError:
-            logger.warning("Timeout closing storage publishers")
-        except Exception as e:
-            logger.warning(f"Error closing storage: {e}")
+        if self.repeater_handler and self.repeater_handler.storage:
+            await self._shutdown_step(
+                "storage publishers",
+                asyncio.to_thread(self.repeater_handler.storage.close),
+                timeout=5,
+            )
 
-        # Release radio resources
+        # Release radio resources. Off-loop for the same reason as the HTTP
+        # server: closing a serial port can block on a stuck driver.
         if self.radio and hasattr(self.radio, "cleanup"):
-            try:
-                self.radio.cleanup()
-            except Exception as e:
-                logger.warning(f"Error cleaning up radio: {e}")
+            await self._shutdown_step("radio cleanup", asyncio.to_thread(self.radio.cleanup))
 
         # Release CH341 USB device if in use
         try:
@@ -2821,6 +2939,60 @@ class RepeaterDaemon:
             logger.debug(f"CH341 reset skipped/failed: {e}")
 
         # Do not force-stop the event loop here; asyncio.run() owns loop lifecycle.
+        logger.info("Shutdown: services stopped")
+        self._report_lingering_threads()
+        self._arm_exit_watchdog()
+
+    @staticmethod
+    def _report_lingering_threads() -> None:
+        """Name any non-daemon threads that will block interpreter exit.
+
+        Python joins non-daemon threads at finalization with no timeout, so one
+        library thread that never returns hangs SIGTERM indefinitely — observed
+        here for 18 minutes, the main thread parked in
+        ``Py_FinalizeEx -> wait_for_thread_shutdown``. The watchdog below stops
+        that from holding up a restart; this names the culprit so it can be
+        fixed at the source rather than papered over every time.
+        """
+        current = threading.current_thread()
+        expected, unexpected = [], []
+        for t in threading.enumerate():
+            if t is current or t is threading.main_thread() or t.daemon or not t.is_alive():
+                continue
+            # asyncio names its default-executor workers "asyncio_N". Those are
+            # joined by asyncio.run() under its own timeout, so they are not the
+            # unbounded kind; warning about them every shutdown would bury the
+            # thread that actually matters.
+            (expected if t.name.startswith("asyncio_") else unexpected).append(t.name)
+        if unexpected:
+            logger.warning(
+                "Non-daemon threads still alive; these block interpreter exit: %s",
+                ", ".join(sorted(unexpected)),
+            )
+        if expected:
+            logger.debug("Executor threads still winding down: %s", ", ".join(sorted(expected)))
+
+    def _arm_exit_watchdog(self) -> None:
+        """Force the process down if finalization does not complete promptly.
+
+        Cleanup is finished by the time this is armed, so exiting hard costs
+        nothing and guarantees SIGTERM is honoured. A daemon timer, so it never
+        becomes the thing holding the process open.
+        """
+        grace = self.SHUTDOWN_EXIT_GRACE_S
+
+        def _force_exit() -> None:
+            logger.warning(
+                "Shutdown did not complete within %.0fs of cleanup finishing; exiting now",
+                grace,
+            )
+            logging.shutdown()
+            os._exit(0)
+
+        watchdog = threading.Timer(grace, _force_exit)
+        watchdog.name = "shutdown-watchdog"
+        watchdog.daemon = True
+        watchdog.start()
 
     @staticmethod
     def _detect_container() -> bool:
@@ -2855,6 +3027,15 @@ class RepeaterDaemon:
 
         try:
             await self.initialize()
+
+            # A dispatcher can be constructed long before initialization
+            # finishes.  If its stop() completed before run_forever() became
+            # active, entering run_forever() now would clear that stop event
+            # and lose SIGTERM.  Skip all remaining startup instead and let the
+            # sole finalizer tear down whatever initialization created.
+            if self._stop_requested:
+                logger.info("Shutdown requested during initialization; skipping service startup")
+                return
 
             # Start HTTP stats server
             http_config = self.config.get("http", {})
@@ -2913,8 +3094,6 @@ class RepeaterDaemon:
             # Run dispatcher (handles RX/TX via openhop_core)
             try:
                 await self.dispatcher.run_forever()
-            except asyncio.CancelledError:
-                logger.info("Dispatcher loop cancelled for shutdown")
             except KeyboardInterrupt:
                 logger.info("Shutting down...")
         except asyncio.CancelledError:
@@ -2922,7 +3101,7 @@ class RepeaterDaemon:
             # arrive before the dispatcher-specific handler above exists.
             # A requested shutdown is a normal exit; unrelated task
             # cancellation retains asyncio's ordinary propagation semantics.
-            if self._shutdown_task is None and not self._shutdown_started:
+            if not self._stop_requested:
                 raise
             logger.info("Daemon task cancelled for requested shutdown")
         finally:

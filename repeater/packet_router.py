@@ -270,12 +270,30 @@ class PacketRouter:
         return False
 
     def _companion_bridges_for_packet(self, packet, metadata: dict) -> dict:
-        """Return companion bridges unless policy drop pre-check blocks delivery."""
+        """Return companion bridges unless policy drop or origin exclusion blocks delivery.
+
+        This is the single choke point every companion fan-out reads, so the
+        "a node never hears its own transmission" rule is applied here once and
+        covers ADVERT, ACK, PATH, RESPONSE, GRP_TXT, GRP_DATA and the dest-hash
+        candidate paths — the same rule ``inject_packet`` already applies to the
+        0x88 raw-RX echo.
+        """
         companion_bridges = getattr(self.daemon, "companion_bridges", {})
         if not companion_bridges:
             return {}
         if self._policy_blocks_companion(packet, metadata):
             return {}
+        # Both isinstance checks are load-bearing, not defensive noise: bridges are
+        # keyed by the int hash byte while origin_hash is the "0xHH" text form
+        # used by the frame servers, and a non-int key would raise inside the
+        # f-string. Do not simplify either away.
+        origin_hash = getattr(packet, "_injected_origin_hash", None)
+        if isinstance(origin_hash, str):
+            companion_bridges = {
+                key: bridge
+                for key, bridge in companion_bridges.items()
+                if not (isinstance(key, int) and f"0x{key:02x}" == origin_hash)
+            }
         return dict(companion_bridges)
 
     async def _fan_out_to_bridges(self, packet, bridges, *, context: str) -> tuple:
@@ -422,6 +440,14 @@ class PacketRouter:
                 "timestamp": getattr(packet, "timestamp", 0),
             }
 
+            # Tag the originating companion before anything reaches the air: enqueue()
+            # is a bare queue.put, so the packet itself is the only carrier that
+            # survives to _route_packet, where the fan-out withholds it from that
+            # bridge — the same "a node never hears its own transmission" rule the
+            # 0x88 echo below applies.  Set ahead of the TX so a core without the
+            # matching Packet slot fails before transmitting rather than after.
+            packet._injected_origin_hash = origin_hash
+
             # Serialize injects so one local TX completes before the next runs
             # (avoids duty-cycle or dispatcher races where a later packet goes out first)
             async with self._inject_lock:
@@ -476,8 +502,11 @@ class PacketRouter:
                             e,
                         )
 
-                # Queue delivery is part of local completion: TXT_MSG routes to
-                # its destination bridge; ACK reaches every interested bridge.
+                # Queue delivery is part of local completion and remains in the
+                # injection ordering boundary: TXT_MSG routes to its destination;
+                # ACK/ADVERT/GRP_TXT/GRP_DATA reach every bridge except the origin.
+                # _companion_bridges_for_packet applies that exclusion once for
+                # every fan-out path.
                 await self.enqueue(packet)
 
             if wait_for_ack:
@@ -648,8 +677,13 @@ class PacketRouter:
                 await deliver(snr, rssi, path_len, path_bytes, payload_bytes)
 
         elif payload_type == AdvertHandler.payload_type():
-            # Process advertisement packet for neighbor tracking
-            if self.daemon.advert_helper:
+            # Process advertisement packet for neighbor tracking. A locally injected
+            # advert is our own TX, never something heard off the air, so feeding it
+            # to the helper would record a phantom neighbour from the zeroed rssi/snr
+            # and burn a rate-limit token. AdvertHelper's own self-skip
+            # (handler_helpers/advert.py) only knows the repeater identity, not the
+            # co-hosted companions. Same _injected_for_tx idiom as the TRACE branches.
+            if self.daemon.advert_helper and not getattr(packet, "_injected_for_tx", False):
                 rssi = getattr(packet, "rssi", 0)
                 snr = getattr(packet, "snr", 0.0)
                 await self.daemon.advert_helper.process_advert_packet(packet, rssi, snr)
@@ -762,7 +796,28 @@ class PacketRouter:
             # to first hop instead of original requester).
             consumed = False
             dest_hash = packet.payload[0] if packet.payload and len(packet.payload) >= 1 else None
-            companion_bridges = self._companion_bridges_for_packet(packet, metadata)
+
+            # A neighbour's answer to our own anon-regions scope query is addressed
+            # to this repeater's identity, and no companion bridge owns it. Offer it
+            # to the scope helper first; it consumes the packet only when the
+            # ciphertext authenticates under the pending neighbour's shared secret
+            # AND echoes that query's tag, so an unrelated RESPONSE still falls
+            # through to the companion paths below.
+            scope_helper = getattr(self.daemon, "neighbor_scope_helper", None)
+            scope_consumed = False
+            if scope_helper is not None:
+                try:
+                    scope_consumed = await scope_helper.process_response_packet(packet)
+                except Exception as e:
+                    logger.debug(f"Neighbor scope response matching failed: {e}")
+
+            if scope_consumed:
+                packet.mark_do_not_retransmit()
+                processed_by_injection = True
+                self._record_for_ui(packet, metadata)
+                companion_bridges = {}
+            else:
+                companion_bridges = self._companion_bridges_for_packet(packet, metadata)
             local_hash = getattr(self.daemon, "local_hash", None)
             if dest_hash is not None and dest_hash in companion_bridges:
                 _, consumed = await self._fan_out_to_bridges(

@@ -20,6 +20,8 @@ from openhop_core.node.handlers.protocol_request import (
 )
 from openhop_core.protocol.cayenne_lpp import (
     TELEM_CHANNEL_SELF,
+    encode_current,
+    encode_power,
     encode_relative_humidity,
     encode_temperature,
     encode_voltage,
@@ -167,6 +169,10 @@ class ProtocolRequestHelper:
         # uint16 err_events, int16 last_snr (×4), uint16 n_direct_dups, n_flood_dups,
         # uint32 total_rx_air_time_secs, n_recv_errors  → 56 bytes
 
+        # Battery Readings: uses first configured sensor that reports bus/pack voltage.
+        readings = self._get_sensor_readings()
+        batt = int(min(max(self._battery_voltage(readings) * 1000, 0), 0xFFFF))
+
         # Uptime: use engine start_time when available (fixes wrong "20521 days" from time.time())
         if self.engine and hasattr(self.engine, "start_time"):
             total_up_time_secs = int(time.time() - self.engine.start_time)
@@ -223,7 +229,7 @@ class ProtocolRequestHelper:
         # Pack 56-byte RepeaterStats (layout matches firmware)
         stats = struct.pack(
             "<HHhhIIIIIIIIHhHHII",
-            0,  # batt_milli_volts (not available on Pi)
+            batt,  # battery in mV
             0,  # curr_tx_queue_len (TODO)
             noise_floor,
             last_rssi,
@@ -281,10 +287,21 @@ class ProtocolRequestHelper:
         # else 0.0 V (voltage-only floor, mirroring the companion self-telemetry).
         lpp = bytearray(encode_voltage(TELEM_CHANNEL_SELF, self._battery_voltage(readings)))
 
-        # Environment sensors: each gets the next channel starting at 2, in the
-        # order they are configured (firmware querySensors channel assignment).
+        # INA219 power telemetry and environment sensors: the power telemetry
+        # channels are emitted first, then environment sensors continue on the
+        # next available channel.
         if perm_mask & TELEM_PERM_ENVIRONMENT:
             channel = TELEM_CHANNEL_SELF + 1
+            if self._has_sensor_data(readings, "bus_voltage_v"):
+                lpp.extend(encode_voltage(channel, self._battery_voltage(readings)))
+                channel += 1
+            if self._has_sensor_data(readings, "current_ma"):
+                lpp.extend(encode_current(channel, self._battery_current(readings)))
+                channel += 1
+            if self._has_sensor_data(readings, "power_mw"):
+                lpp.extend(encode_power(channel, self._battery_power(readings)))
+                channel += 1
+
             for reading in readings:
                 entry = self._encode_environment_reading(channel, reading)
                 if entry:
@@ -323,6 +340,47 @@ class ProtocolRequestHelper:
                 except (TypeError, ValueError):
                     continue
         return 0.0
+
+    @staticmethod
+    def _has_sensor_data(readings, key: str) -> bool:
+        """Return True when any reading exposes the requested sensor field."""
+        for reading in readings:
+            if not reading.get("ok"):
+                continue
+            data = reading.get("data") or {}
+            if data.get(key) is not None:
+                return True
+        return False
+
+    @staticmethod
+    def _battery_current(readings) -> float:
+        """First configured sensor's current in amps, else 0.000A."""
+        for reading in readings:
+            if not reading.get("ok"):
+                continue
+            data = reading.get("data") or {}
+            current = data.get("current_ma")
+            if current is not None:
+                try:
+                    return float(current) / 1000.0
+                except (TypeError, ValueError):
+                    continue
+        return 0.000
+
+    @staticmethod
+    def _battery_power(readings) -> int:
+        """First configured sensor's power in watts, else 0W."""
+        for reading in readings:
+            if not reading.get("ok"):
+                continue
+            data = reading.get("data") or {}
+            power = data.get("power_mw")
+            if power is not None:
+                try:
+                    return int(float(power) / 1000.0)
+                except (TypeError, ValueError):
+                    continue
+        return 0
 
     @staticmethod
     def _encode_environment_reading(channel: int, reading) -> bytes:
