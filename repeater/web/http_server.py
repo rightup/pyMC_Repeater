@@ -16,6 +16,7 @@ from typing import Callable, Optional
 
 import cherrypy
 import yaml
+from cherrypy.lib import static as cherrypy_static
 
 try:
     import fcntl
@@ -68,6 +69,9 @@ _CORS_HEADERS = frozenset(
 )
 _CORS_EXPOSE_HEADERS = ("ETag", "Idempotency-Replayed", "Retry-After")
 _JWT_SECRET_THREAD_LOCK = threading.Lock()
+_HASHED_ASSET_RE = re.compile(r"(?:^|-)[A-Za-z0-9_-]{8}(?=(?:\.[A-Za-z0-9]+){1,3}$)")
+_PRECOMPRESSED_SUFFIXES = frozenset({".br", ".gz"})
+_IMMUTABLE_ASSET_CACHE = "public, max-age=31536000, immutable"
 
 
 def _cors_origins(config: dict) -> tuple[str, ...]:
@@ -105,11 +109,78 @@ def _cors_origins(config: dict) -> tuple[str, ...]:
     return tuple(dict.fromkeys(origins))
 
 
-def _append_vary_origin(headers) -> None:
+def _append_vary(headers, value: str) -> None:
     values = [item.strip() for item in headers.get("Vary", "").split(",") if item.strip()]
-    if "Origin" not in values:
-        values.append("Origin")
+    if value.lower() not in {item.lower() for item in values}:
+        values.append(value)
     headers["Vary"] = ", ".join(values)
+
+
+def _append_vary_origin(headers) -> None:
+    _append_vary(headers, "Origin")
+
+
+def _encoding_quality(accept_encoding: str, encoding: str) -> float:
+    """Return the RFC-style quality for one content encoding."""
+
+    explicit_quality = None
+    wildcard_quality = None
+    for item in accept_encoding.split(","):
+        parts = [part.strip() for part in item.split(";") if part.strip()]
+        if not parts:
+            continue
+        name = parts[0].lower()
+        quality = 1.0
+        for parameter in parts[1:]:
+            key, separator, value = parameter.partition("=")
+            if separator and key.strip().lower() == "q":
+                try:
+                    quality = float(value.strip())
+                except ValueError:
+                    quality = 0.0
+        quality = min(1.0, max(0.0, quality))
+        if name == encoding:
+            explicit_quality = max(explicit_quality or 0.0, quality)
+        elif name == "*":
+            wildcard_quality = max(wildcard_quality or 0.0, quality)
+
+    if explicit_quality is not None:
+        return explicit_quality
+    return wildcard_quality or 0.0
+
+
+def _select_precompressed_file(
+    target: Path,
+    static_root: Path,
+    accept_encoding: str,
+) -> tuple[Path, str | None]:
+    """Select an existing sidecar for a logical asset without reinterpreting sidecar URLs."""
+
+    if target.suffix.lower() in _PRECOMPRESSED_SUFFIXES:
+        return target, None
+
+    candidates = []
+    for encoding, suffix, preference in (("br", ".br", 1), ("gzip", ".gz", 0)):
+        quality = _encoding_quality(accept_encoding, encoding)
+        sidecar = target.with_name(f"{target.name}{suffix}").resolve()
+        try:
+            sidecar.relative_to(static_root)
+        except ValueError:
+            continue
+        if quality > 0 and sidecar.is_file():
+            candidates.append((quality, preference, sidecar, encoding))
+
+    if not candidates:
+        return target, None
+    _, _, selected, encoding = max(candidates, key=lambda item: (item[0], item[1]))
+    return selected, encoding
+
+
+def _apply_static_cache_policy(headers, target: Path) -> None:
+    if target.suffix.lower() in {".html", ".htm"}:
+        headers["Cache-Control"] = "no-cache"
+    elif _HASHED_ASSET_RE.search(target.name):
+        headers["Cache-Control"] = _IMMUTABLE_ASSET_CACHE
 
 
 def _safe_cors(origins: tuple[str, ...]) -> None:
@@ -596,11 +667,29 @@ class StatsApp:
             raise cherrypy.NotFound()
         root = Path(root_dir).resolve()
         target = (root.joinpath(*relative_parts)).resolve()
-        if not str(target).startswith(str(root)) or not target.is_file():
+        try:
+            target.relative_to(root)
+        except ValueError:
             raise cherrypy.NotFound()
+        if not target.is_file():
+            raise cherrypy.NotFound()
+
+        request_headers = getattr(cherrypy.request, "headers", {})
+        selected, content_encoding = _select_precompressed_file(
+            target,
+            root,
+            request_headers.get("Accept-Encoding", ""),
+        )
         guessed_type, _ = mimetypes.guess_type(str(target))
-        cherrypy.response.headers["Content-Type"] = guessed_type or "application/octet-stream"
-        return target.read_bytes()
+        response_headers = cherrypy.response.headers
+        _append_vary(response_headers, "Accept-Encoding")
+        _apply_static_cache_policy(response_headers, target)
+        if content_encoding is not None:
+            response_headers["Content-Encoding"] = content_encoding
+        return cherrypy_static.serve_file(
+            str(selected),
+            content_type=guessed_type or "application/octet-stream",
+        )
 
     @cherrypy.expose
     def favicon_ico(self):
@@ -615,6 +704,8 @@ class StatsApp:
         index_path = os.path.join(self.html_dir, "index.html")
         try:
             with open(index_path, "r", encoding="utf-8") as f:
+                cherrypy.response.headers["Cache-Control"] = "no-cache"
+                cherrypy.response.headers["Content-Type"] = "text/html; charset=utf-8"
                 return f.read()
         except FileNotFoundError:
             raise cherrypy.HTTPError(404, "Application not found. Please build the frontend first.")
