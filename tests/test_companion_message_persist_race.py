@@ -22,7 +22,7 @@ from repeater.companion.frame_server import CompanionFrameServer
 from repeater.data_acquisition.sqlite_handler import SQLiteHandler
 
 _HASH = "0x01"
-_TO_THREAD = "repeater.companion.frame_server.asyncio.to_thread"
+_TO_THREAD = "repeater.companion.correlation.asyncio.to_thread"
 
 
 class _Bridge:
@@ -114,8 +114,7 @@ async def _settle() -> None:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("order", ["a_first", "b_first"])
 async def test_interleaved_persist_no_dup_no_loss(tmp_path, order):
-    """Two receive tasks persist concurrently; regardless of completion order the
-    older message ends up only in SQLite and the newer only in memory."""
+    """Concurrent duplicate hashes leave one durable message and no frame copy."""
     handler = SQLiteHandler(tmp_path)
     bridge = _Bridge()
     fs = _server(handler, bridge)
@@ -145,18 +144,17 @@ async def test_interleaved_persist_no_dup_no_loss(tmp_path, order):
 
     memory = _memory_texts(bridge.message_queue)
     persisted = _persisted_texts(handler)
-    # Exactly one message persisted, the other retained: no message in both
-    # stores (no duplication) and none dropped (no loss). Which of the two wins
-    # the SQLite insert depends on completion order; the invariant does not.
+    # Which write wins depends on completion order. Both queue entries are
+    # removed because SQLite is the pending-delivery source of truth and the
+    # second write was identified as the same packet.
     assert len(persisted) == 1
-    assert memory & persisted == set()
-    assert memory | persisted == {"older", "newer"}
+    assert persisted <= {"older", "newer"}
+    assert memory == set()
 
 
 @pytest.mark.asyncio
 async def test_asymmetric_rejection_removes_persisted_not_newer(tmp_path):
-    """msg1 persists, msg2 is rejected: msg1 is removed by identity and msg2 stays,
-    even though msg2 is the queue tail pop_last would have taken."""
+    """A duplicate hash removes both exact frame-queue copies after persistence."""
     handler = SQLiteHandler(tmp_path)
     bridge = _Bridge()
     fs = _server(handler, bridge)
@@ -170,14 +168,13 @@ async def test_asymmetric_rejection_removes_persisted_not_newer(tmp_path):
     await fs._persist_companion_message(dict2, entry2)  # rejected (duplicate)
 
     memory = _memory_texts(bridge.message_queue)
-    assert memory == {"msg2"}  # newer retained, msg1 removed exactly
+    assert memory == set()
     assert _persisted_texts(handler) == {"msg1"}  # msg1 persisted once, not duplicated
 
 
 @pytest.mark.asyncio
 async def test_cancelled_sibling_entry_survives_other_persist(tmp_path):
-    """A sibling task cancelled after its push must keep its queue entry when
-    another task's persist completes."""
+    """Cancellation waits for its SQLite outcome before reconciling the queue."""
     handler = SQLiteHandler(tmp_path)
     bridge = _Bridge()
     fs = _server(handler, bridge)
@@ -194,13 +191,16 @@ async def test_cancelled_sibling_entry_survives_other_persist(tmp_path):
         task_b = asyncio.create_task(fs._persist_companion_message(dict2, entry2))
         await _settle()
         task_b.cancel()
+        await _settle()
+        assert not task_b.done()
+
+        # Both started writes finish before task_b propagates cancellation.
+        await gate.release(0)
+        await gate.release(1)
+        await task_a
         with pytest.raises(asyncio.CancelledError):
             await task_b
-        # Task A now finishes its persist.
-        await gate.release(0)
-        await task_a
 
     memory = _memory_texts(bridge.message_queue)
-    assert "msg2" in memory  # cancelled sibling's message retained
-    assert "msg1" not in memory  # A removed only its own entry
-    assert _persisted_texts(handler) == {"msg1"}
+    assert memory == set()
+    assert _persisted_texts(handler) == {"msg1", "msg2"}

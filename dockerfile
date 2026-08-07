@@ -85,7 +85,10 @@ WORKDIR ${INSTALL_DIR}
 
 # Copy source
 COPY repeater ./repeater
+COPY companion_client ./companion_client
 COPY pyproject.toml .
+COPY README.md .
+COPY LICENSE .
 COPY config.yaml.example .
 COPY radio-presets.json .
 COPY radio-settings.json .
@@ -103,6 +106,6 @@ RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
 USER ${USER}
 
-EXPOSE 8000
+EXPOSE 8000 5000
 
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]

@@ -1,4 +1,8 @@
 import asyncio
+import copy
+import io
+import json
+import threading
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from pathlib import Path
 from types import SimpleNamespace
@@ -6,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, mock_open, patch
 
 import cherrypy
 import pytest
+import yaml
 
 from repeater.web.api_endpoints import APIEndpoints
 
@@ -13,17 +18,33 @@ from repeater.web.api_endpoints import APIEndpoints
 def _make_api(config=None):
     api = APIEndpoints.__new__(APIEndpoints)
     api.config = config or {}
+    api._bootstrap_mutation_lock = threading.Lock()
     api.daemon_instance = None
     api.send_advert_func = None
     api.event_loop = None
     api.stats_getter = None
-    api._config_path = "/tmp/test-config.yaml"
+    # Most unit tests exercise the in-memory authority directly. Tests for
+    # persisted rechecks set an explicit temporary path.
+    api._config_path = None
     api.config_manager = MagicMock()
     return api
 
 
 def _attach_storage(api, storage):
     api.daemon_instance = SimpleNamespace(repeater_handler=SimpleNamespace(storage=storage))
+
+
+def _set_json_body(request, value):
+    raw = json.dumps(value).encode("utf-8")
+    _set_raw_json_body(request, raw)
+
+
+def _set_raw_json_body(request, raw):
+    if isinstance(raw, str):
+        raw = raw.encode("utf-8")
+    request.body = io.BytesIO(raw)
+    request.headers["Content-Length"] = str(len(raw))
+    request.headers["Content-Type"] = "application/json"
 
 
 class _FakeDiscoveryHelper:
@@ -83,7 +104,7 @@ class _FakeDiscoveryHelper:
 
 @pytest.fixture
 def cherrypy_ctx(monkeypatch):
-    request = SimpleNamespace(method="GET", params={}, json={})
+    request = SimpleNamespace(method="GET", params={}, json={}, headers={})
     response = SimpleNamespace(headers={}, status=200)
     monkeypatch.setattr(cherrypy, "request", request, raising=False)
     monkeypatch.setattr(cherrypy, "response", response, raising=False)
@@ -91,14 +112,26 @@ def cherrypy_ctx(monkeypatch):
 
 
 def test_set_cors_headers_enabled(cherrypy_ctx):
-    _, response = cherrypy_ctx
-    api = _make_api({"web": {"cors_enabled": True}})
+    request, response = cherrypy_ctx
+    request.headers["Origin"] = "https://chat.example"
+    api = _make_api(
+        {
+            "web": {
+                "cors_enabled": True,
+                "cors_origins": ["https://chat.example"],
+            }
+        }
+    )
 
     api._set_cors_headers()
 
-    assert response.headers["Access-Control-Allow-Origin"] == "*"
+    assert response.headers["Access-Control-Allow-Origin"] == "https://chat.example"
+    assert response.headers["Vary"] == "Origin"
     assert "POST" in response.headers["Access-Control-Allow-Methods"]
     assert "Authorization" in response.headers["Access-Control-Allow-Headers"]
+    assert response.headers["Access-Control-Expose-Headers"] == (
+        "ETag, Idempotency-Replayed, Retry-After"
+    )
 
 
 def test_set_cors_headers_disabled(cherrypy_ctx):
@@ -215,12 +248,172 @@ def test_discover_neighbors_start_schedules_session(cherrypy_ctx):
     api.event_loop = loop
     api.daemon_instance = SimpleNamespace(discovery_helper=helper)
 
-    result = api.discover_neighbors_start()
+    def run_now(coro, _loop):
+        future = MagicMock()
+        try:
+            future.result.return_value = asyncio.run(coro)
+        except BaseException as exc:
+            future.result.side_effect = exc
+        return future
+
+    with patch(
+        "repeater.web.api_endpoints.asyncio.run_coroutine_threadsafe",
+        side_effect=run_now,
+    ) as schedule:
+        result = api.discover_neighbors_start()
 
     assert result["success"] is True
     assert result["data"]["session_id"] == "sess-1"
     assert helper.cleanup_called is True
-    loop.call_soon_threadsafe.assert_called_once()
+    assert helper.started_sessions == ["sess-1"]
+    schedule.assert_called_once()
+    loop.call_soon_threadsafe.assert_not_called()
+
+
+def test_concurrent_discovery_allocations_are_serial_on_the_daemon_loop(
+    cherrypy_ctx,
+):
+    request, _ = cherrypy_ctx
+    request.method = "POST"
+    request.json = {
+        "timeout": 7,
+        "filter_mask": 0x04,
+        "since": 0,
+        "prefix_only": False,
+    }
+    loop = asyncio.new_event_loop()
+    loop_ready = threading.Event()
+    loop_thread_id = []
+
+    def run_loop():
+        asyncio.set_event_loop(loop)
+        loop_thread_id.append(threading.get_ident())
+        loop_ready.set()
+        loop.run_forever()
+
+    loop_thread = threading.Thread(target=run_loop)
+    loop_thread.start()
+    assert loop_ready.wait(timeout=2.0)
+
+    actions = []
+
+    class _RecordingHelper:
+        def __init__(self):
+            self.next_session = 1
+
+        def cleanup_sessions(self):
+            actions.append(("cleanup", threading.get_ident()))
+
+        def create_session(self, **_kwargs):
+            session_id = f"sess-{self.next_session}"
+            self.next_session += 1
+            actions.append((f"create:{session_id}", threading.get_ident()))
+            return {"session_id": session_id}
+
+        def start_session_task(self, session_id):
+            actions.append((f"start:{session_id}", threading.get_ident()))
+
+    api = _make_api()
+    api.event_loop = loop
+    api.daemon_instance = SimpleNamespace(discovery_helper=_RecordingHelper())
+    callers_ready = threading.Barrier(3)
+    results = []
+
+    def call_start():
+        callers_ready.wait()
+        results.append(api.discover_neighbors_start())
+
+    callers = [threading.Thread(target=call_start) for _ in range(2)]
+    for caller in callers:
+        caller.start()
+    callers_ready.wait()
+    for caller in callers:
+        caller.join(timeout=3.0)
+
+    loop.call_soon_threadsafe(loop.stop)
+    loop_thread.join(timeout=3.0)
+    loop.close()
+
+    assert len(results) == 2
+    assert all(result["success"] for result in results)
+    assert [action for action, _thread in actions] in (
+        [
+            "cleanup",
+            "create:sess-1",
+            "start:sess-1",
+            "cleanup",
+            "create:sess-2",
+            "start:sess-2",
+        ],
+        [
+            "cleanup",
+            "create:sess-2",
+            "start:sess-2",
+            "cleanup",
+            "create:sess-1",
+            "start:sess-1",
+        ],
+    )
+    assert {thread_id for _action, thread_id in actions} == {loop_thread_id[0]}
+
+
+def test_trace_tag_retries_pending_frame_and_companion_owned_values():
+    api = _make_api()
+    trace_helper = SimpleNamespace(pending_pings={0x11: {}})
+    frame_has_owner = MagicMock(side_effect=lambda _kind, tag: tag == 0x22)
+    companion_has_owner = MagicMock(side_effect=lambda tag: tag == 0x33)
+    api.daemon_instance = SimpleNamespace(
+        _frame_has_response_owner=frame_has_owner,
+        _companion_has_trace_owner=companion_has_owner,
+    )
+
+    with patch(
+        "repeater.web.api_endpoints.secrets.randbits",
+        side_effect=[0x11, 0x22, 0x33, 0x44],
+    ):
+        tag = api._allocate_trace_tag(trace_helper)
+
+    assert tag == 0x44
+    frame_has_owner.assert_any_call("trace", 0x22)
+    companion_has_owner.assert_any_call(0x33)
+
+
+def test_trace_tag_exhaustion_fails_before_radio_injection(cherrypy_ctx):
+    request, _ = cherrypy_ctx
+    request.method = "POST"
+    request.json = {"target_id": "0x42", "timeout": 1}
+    router = SimpleNamespace(inject_packet=AsyncMock())
+    api = _make_api()
+    api.event_loop = object()
+    api.daemon_instance = SimpleNamespace(
+        router=router,
+        trace_helper=SimpleNamespace(pending_pings={}),
+        _frame_has_response_owner=lambda _kind, _tag: True,
+    )
+
+    def run_now(coro, _loop):
+        future = MagicMock()
+        try:
+            future.result.return_value = asyncio.run(coro)
+        except BaseException as exc:
+            future.result.side_effect = exc
+        return future
+
+    with (
+        patch(
+            "repeater.web.api_endpoints.secrets.randbits",
+            return_value=0x44,
+        ),
+        patch(
+            "repeater.web.api_endpoints.asyncio.run_coroutine_threadsafe",
+            side_effect=run_now,
+        ),
+    ):
+        result = api.ping_neighbor()
+
+    assert result["success"] is False
+    assert "No unique trace response tag" in result["error"]
+    router.inject_packet.assert_not_awaited()
 
 
 def test_discover_neighbors_stream_yields_session_events(cherrypy_ctx):
@@ -598,13 +791,365 @@ def test_config_export_full_backup_includes_hex_keys(cherrypy_ctx):
 def test_config_import_rejects_missing_config_object(cherrypy_ctx):
     request, _ = cherrypy_ctx
     request.method = "POST"
-    request.json = {}
+    _set_json_body(request, {})
     api = _make_api()
 
     result = api.config_import()
 
     assert result["success"] is False
     assert "Missing or invalid 'config' object" in result["error"]
+
+
+def test_config_import_rejects_cross_origin_simple_content_type_before_mutation(
+    cherrypy_ctx,
+):
+    request, _ = cherrypy_ctx
+    request.method = "POST"
+    _set_json_body(request, {"config": {"web": {"site_name": "unsafe"}}})
+    request.headers["Content-Type"] = "text/plain"
+    api = _make_api()
+
+    with pytest.raises(cherrypy.HTTPError) as exc_info:
+        api.config_import()
+
+    assert int(str(exc_info.value.status).split()[0]) == 415
+    assert api.config == {}
+    api.config_manager.update_and_save.assert_not_called()
+
+
+def test_public_config_import_is_single_use_under_concurrency(
+    cherrypy_ctx,
+    monkeypatch,
+):
+    request, _ = cherrypy_ctx
+    request.method = "POST"
+    api = _make_api(
+        {
+            "repeater": {
+                "security": {"admin_password": "admin123"},
+            }
+        }
+    )
+    api.config_manager.update_and_save.return_value = {"success": True}
+    api.config_manager.save_to_file.return_value = True
+    api._require_admin_on_public_route = MagicMock(
+        side_effect=cherrypy.HTTPError(403, "Public bootstrap is closed")
+    )
+
+    first_body_started = threading.Event()
+    release_first_body = threading.Event()
+    second_body_read = threading.Event()
+
+    def read_body():
+        thread_name = threading.current_thread().name
+        if thread_name == "first-import":
+            first_body_started.set()
+            assert release_first_body.wait(timeout=2)
+        else:
+            second_body_read.set()
+        return {
+            "config": {
+                "repeater": {"security": {"admin_password": f"{thread_name}-password"}},
+                "web": {"site_name": thread_name},
+            }
+        }
+
+    monkeypatch.setattr(
+        "repeater.web.api_endpoints.read_json_object",
+        lambda **_kwargs: read_body(),
+    )
+
+    results = {}
+    errors = {}
+
+    def run_import(label):
+        try:
+            results[label] = api.config_import()
+        except Exception as exc:
+            errors[label] = exc
+
+    first = threading.Thread(
+        target=run_import,
+        args=("first",),
+        name="first-import",
+    )
+    second = threading.Thread(
+        target=run_import,
+        args=("second",),
+        name="second-import",
+    )
+
+    first.start()
+    assert first_body_started.wait(timeout=2)
+    second.start()
+    assert second_body_read.wait(timeout=2)
+    second.join(timeout=2)
+    assert not second.is_alive()
+    release_first_body.set()
+    first.join(timeout=2)
+    assert not first.is_alive()
+
+    assert results["second"]["success"] is True
+    assert isinstance(errors["first"], cherrypy.HTTPError)
+    assert errors["first"].status == 403
+    assert api.config["repeater"]["setup_complete"] is True
+    assert api.config_manager.update_and_save.call_count == 1
+    assert api.config_manager.save_to_file.call_count == 1
+
+
+def test_public_config_import_requires_strong_admin_password(cherrypy_ctx):
+    request, _ = cherrypy_ctx
+    request.method = "POST"
+    original = {
+        "repeater": {
+            "security": {"admin_password": "admin123"},
+        }
+    }
+    api = _make_api(copy.deepcopy(original))
+    _set_json_body(request, {"config": {"web": {"site_name": "restored"}}})
+
+    result = api.config_import()
+
+    assert result["success"] is False
+    assert "non-default administrator password" in result["error"]
+    assert api.config == original
+    api.config_manager.update_and_save.assert_not_called()
+    api.config_manager.save_to_file.assert_not_called()
+
+
+def test_config_import_rejects_malformed_section_before_live_mutation(cherrypy_ctx):
+    request, _ = cherrypy_ctx
+    request.method = "POST"
+    original = {
+        "repeater": {
+            "security": {"admin_password": "admin123"},
+        }
+    }
+    api = _make_api(copy.deepcopy(original))
+    _set_json_body(request, {"config": {"repeater": "not-an-object"}})
+
+    result = api.config_import()
+
+    assert result == {
+        "success": False,
+        "error": "Configuration section 'repeater' must be an object",
+    }
+    assert api.config == original
+    api.config_manager.update_and_save.assert_not_called()
+
+
+def test_config_import_rejects_null_security_before_live_mutation(cherrypy_ctx):
+    request, _ = cherrypy_ctx
+    request.method = "POST"
+    original = {
+        "repeater": {
+            "security": {"admin_password": "admin123"},
+        }
+    }
+    api = _make_api(copy.deepcopy(original))
+    _set_json_body(request, {"config": {"repeater": {"security": None}}})
+
+    result = api.config_import()
+
+    assert result == {
+        "success": False,
+        "error": "Configuration field 'repeater.security' must be an object",
+    }
+    assert api.config == original
+    api.config_manager.update_and_save.assert_not_called()
+    api.config_manager.save_to_file.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "admin_password",
+    [None, 123, "short", "admin123", " admin123 ", "x" * 1025],
+)
+def test_authenticated_config_import_rejects_unusable_new_admin_password(
+    cherrypy_ctx,
+    admin_password,
+):
+    request, _ = cherrypy_ctx
+    request.method = "POST"
+    request.headers["Authorization"] = "Bearer operator"
+    original = {
+        "repeater": {
+            "setup_complete": True,
+            "security": {
+                "admin_password": "operator-password",
+                "jwt_secret": "s" * 32,
+            },
+        }
+    }
+    api = _make_api(copy.deepcopy(original))
+    api._require_admin_on_public_route = MagicMock()
+    _set_json_body(
+        request,
+        {
+            "config": {
+                "repeater": {
+                    "security": {
+                        "admin_password": admin_password,
+                    }
+                }
+            }
+        },
+    )
+
+    result = api.config_import()
+
+    assert result["success"] is False
+    assert "repeater.security.admin_password" in result["error"]
+    assert api.config == original
+    api.config_manager.update_and_save.assert_not_called()
+    api.config_manager.save_to_file.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "persistence_result",
+    [
+        {"success": False, "saved": False},
+        {"success": False},
+    ],
+)
+def test_config_import_save_failure_restores_shared_live_config(
+    cherrypy_ctx,
+    persistence_result,
+):
+    request, response = cherrypy_ctx
+    request.method = "POST"
+    original = {
+        "repeater": {
+            "security": {"admin_password": "admin123"},
+        },
+        "web": {"site_name": "before"},
+    }
+    api = _make_api(copy.deepcopy(original))
+    api.config_manager.update_and_save.return_value = persistence_result
+    api.config_manager.save_to_file.return_value = False
+    _set_json_body(
+        request,
+        {
+            "config": {
+                "repeater": {
+                    "security": {"admin_password": "strong-password"},
+                },
+                "web": {"site_name": "after"},
+            }
+        },
+    )
+
+    result = api.config_import()
+
+    assert response.status == 503
+    assert result["success"] is False
+    assert "could not be persisted" in result["error"]
+    assert api.config == original
+
+
+def test_public_config_import_fails_closed_when_persisted_recheck_disappears(
+    cherrypy_ctx,
+    monkeypatch,
+    tmp_path,
+):
+    request, _ = cherrypy_ctx
+    request.method = "POST"
+    config_path = tmp_path / "config.yaml"
+    original = {
+        "repeater": {
+            "security": {"admin_password": "admin123"},
+        }
+    }
+    config_path.write_text(yaml.safe_dump(original), encoding="utf-8")
+    api = _make_api(copy.deepcopy(original))
+    api._config_path = str(config_path)
+    _set_json_body(
+        request,
+        {
+            "config": {
+                "repeater": {
+                    "security": {"admin_password": "strong-password"},
+                }
+            }
+        },
+    )
+
+    real_open = open
+    reads = 0
+
+    def fail_second_read(path, *args, **kwargs):
+        nonlocal reads
+        if str(path) == str(config_path):
+            reads += 1
+            if reads == 2:
+                raise OSError("persisted config disappeared")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.open", fail_second_read)
+
+    with pytest.raises(cherrypy.HTTPError) as exc_info:
+        api.config_import()
+
+    assert exc_info.value.status == 503
+    assert api.config == original
+    api.config_manager.update_and_save.assert_not_called()
+    assert api._bootstrap_mutation_lock.acquire(blocking=False)
+    api._bootstrap_mutation_lock.release()
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {
+            "repeater": {
+                "node_name": "mesh-repeater-01",
+                "security": {"admin_password": "strong-password"},
+            },
+            "radio_type": "none",
+        },
+        {
+            "repeater": {
+                "node_name": "configured",
+                "security": {"admin_password": "strong-password"},
+            },
+        },
+    ],
+)
+def test_config_import_strong_password_closes_public_bootstrap(cherrypy_ctx, config):
+    request, _ = cherrypy_ctx
+    request.method = "POST"
+    _set_json_body(request, {"config": {"web": {"site_name": "attacker"}}})
+    api = _make_api(config)
+
+    with pytest.raises(cherrypy.HTTPError, match="Public bootstrap is closed"):
+        api.config_import()
+
+    assert api.config == config
+    api.config_manager.update_and_save.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("raw", "status"),
+    [
+        ('{"config":{"web":{"site_name":"first","site_name":"second"}}}', 400),
+        ("{" + '"config":' + "[" * 1100 + "0" + "]" * 1100 + "}", 400),
+        (
+            json.dumps({"config": {"web": {"padding": "x" * (1024 * 1024)}}}),
+            413,
+        ),
+    ],
+)
+def test_config_import_rejects_unsafe_json_before_mutation(cherrypy_ctx, raw, status):
+    request, _ = cherrypy_ctx
+    request.method = "POST"
+    _set_raw_json_body(request, raw)
+    api = _make_api()
+
+    with pytest.raises(cherrypy.HTTPError) as exc_info:
+        api.config_import()
+
+    assert int(str(exc_info.value.status).split()[0]) == status
+    assert api.config == {}
+    api.config_manager.update_and_save.assert_not_called()
 
 
 def test_config_import_updates_sections_and_preserves_redacted(cherrypy_ctx):
@@ -617,7 +1162,7 @@ def test_config_import_updates_sections_and_preserves_redacted(cherrypy_ctx):
                 "security": {
                     "admin_password": "keep-admin",
                     "guest_password": "keep-guest",
-                    "jwt_secret": "keep-jwt",
+                    "jwt_secret": "k" * 32,
                 }
             },
             "identities": {
@@ -628,27 +1173,31 @@ def test_config_import_updates_sections_and_preserves_redacted(cherrypy_ctx):
         }
     )
 
-    request.json = {
-        "config": {
-            "repeater": {
-                "security": {
-                    "admin_password": "*** REDACTED ***",
-                    "guest_password": "new-guest",
-                    "jwt_secret": "*** REDACTED ***",
+    _set_json_body(
+        request,
+        {
+            "config": {
+                "repeater": {
+                    "security": {
+                        "admin_password": "*** REDACTED ***",
+                        "guest_password": "new-guest",
+                        "jwt_secret": "*** REDACTED ***",
+                    },
+                    "identity_key": "AABBCC",
+                    "identity_file": "/tmp/remove-me",
                 },
-                "identity_key": "AABBCC",
-                "identity_file": "/tmp/remove-me",
+                "identities": {
+                    "companions": [
+                        {"name": "c1", "identity_key": "*** REDACTED ***"},
+                    ]
+                },
+                "radio": {"frequency": 915000000},
+                "radio_type": "pymc_usb",
+                "unknown": {"x": 1},
             },
-            "identities": {
-                "companions": [
-                    {"name": "c1", "identity_key": "*** REDACTED ***"},
-                ]
-            },
-            "radio": {"frequency": 915000000},
-            "radio_type": "pymc_usb",
-            "unknown": {"x": 1},
-        }
-    }
+        },
+    )
+    api._require_admin_on_public_route = MagicMock()
 
     api.config_manager.update_and_save.return_value = {"ok": True}
     api.config_manager.save_to_file.return_value = True
@@ -662,10 +1211,140 @@ def test_config_import_updates_sections_and_preserves_redacted(cherrypy_ctx):
     sec = api.config["repeater"]["security"]
     assert sec["admin_password"] == "keep-admin"
     assert sec["guest_password"] == "new-guest"
-    assert sec["jwt_secret"] == "keep-jwt"
+    assert sec["jwt_secret"] == "k" * 32
     assert api.config["repeater"]["identity_key"] == bytes.fromhex("AABBCC")
+    assert api.config["repeater"]["setup_complete"] is True
     assert "identity_file" not in api.config["repeater"]
     assert api.config["identities"]["companions"][0]["identity_key"] == bytes.fromhex("C0FFEE")
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("jwt_secret", "too-short", "jwt_secret"),
+        ("jwt_secret", 123, "jwt_secret"),
+        ("jwt_secret", " \t", "jwt_secret"),
+        ("jwt_expiry_minutes", True, "jwt_expiry_minutes"),
+        ("jwt_expiry_minutes", "60", "jwt_expiry_minutes"),
+        ("jwt_expiry_minutes", 1.0, "jwt_expiry_minutes"),
+        ("jwt_expiry_minutes", 0, "jwt_expiry_minutes"),
+        ("jwt_expiry_minutes", 10_081, "jwt_expiry_minutes"),
+    ],
+)
+def test_config_import_rejects_auth_values_that_cannot_restart(
+    cherrypy_ctx,
+    field,
+    value,
+    message,
+):
+    request, _ = cherrypy_ctx
+    request.method = "POST"
+    original = {
+        "repeater": {
+            "security": {
+                "admin_password": "admin123",
+            }
+        }
+    }
+    api = _make_api(copy.deepcopy(original))
+    _set_json_body(
+        request,
+        {
+            "config": {
+                "repeater": {
+                    "security": {
+                        "admin_password": "strong-password",
+                        field: value,
+                    }
+                }
+            }
+        },
+    )
+
+    result = api.config_import()
+
+    assert result["success"] is False
+    assert message in result["error"]
+    assert api.config == original
+    api.config_manager.update_and_save.assert_not_called()
+    api.config_manager.save_to_file.assert_not_called()
+
+
+@pytest.mark.parametrize("jwt_secret", [None, "", "é" * 16])
+def test_config_import_accepts_legacy_secret_sentinels_and_strong_utf8_secret(
+    cherrypy_ctx,
+    jwt_secret,
+):
+    request, _ = cherrypy_ctx
+    request.method = "POST"
+    api = _make_api()
+    api.config_manager.update_and_save.return_value = {"saved": True}
+    _set_json_body(
+        request,
+        {
+            "config": {
+                "repeater": {
+                    "security": {
+                        "admin_password": "strong-password",
+                        "jwt_secret": jwt_secret,
+                        "jwt_expiry_minutes": 10_080,
+                    }
+                }
+            }
+        },
+    )
+
+    result = api.config_import()
+
+    assert result["success"] is True
+    assert api.config["repeater"]["security"]["jwt_secret"] == jwt_secret
+    assert api.config["repeater"]["security"]["jwt_expiry_minutes"] == 10_080
+    assert result["restart_required"] is True
+
+
+def test_config_import_security_patch_preserves_omitted_credentials(
+    cherrypy_ctx,
+):
+    request, _ = cherrypy_ctx
+    request.method = "POST"
+    request.headers["Authorization"] = "Bearer operator"
+    original = {
+        "repeater": {
+            "setup_complete": True,
+            "security": {
+                "admin_password": "operator-password",
+                "guest_password": "guest-password",
+                "jwt_secret": "s" * 32,
+                "jwt_expiry_minutes": 60,
+            },
+        }
+    }
+    api = _make_api(copy.deepcopy(original))
+    api._require_admin_on_public_route = MagicMock()
+    api.config_manager.update_and_save.return_value = {"saved": True}
+    _set_json_body(
+        request,
+        {
+            "config": {
+                "repeater": {
+                    "security": {
+                        "jwt_expiry_minutes": 120,
+                    }
+                }
+            }
+        },
+    )
+
+    result = api.config_import()
+
+    assert result["success"] is True
+    assert api.config["repeater"]["security"] == {
+        "admin_password": "operator-password",
+        "guest_password": "guest-password",
+        "jwt_secret": "s" * 32,
+        "jwt_expiry_minutes": 120,
+    }
+    assert result["restart_required"] is True
 
 
 def test_openapi_success_sets_content_type(cherrypy_ctx):
@@ -696,9 +1375,15 @@ def test_docs_returns_html_bytes_and_content_type(cherrypy_ctx):
 
     content = api.docs()
 
-    assert response.headers["Content-Type"] == "text/html"
+    assert response.headers["Content-Type"] == "text/html; charset=utf-8"
+    assert response.headers["Cache-Control"] == "no-store"
+    assert response.headers["X-Content-Type-Options"] == "nosniff"
+    assert "script-src 'none'" in response.headers["Content-Security-Policy"]
     assert isinstance(content, bytes)
-    assert b"SwaggerUIBundle" in content
+    assert b"OpenAPI YAML" in content
+    assert b"/v1/companions" in content
+    assert b"<script" not in content
+    assert b"https://" not in content
 
 
 def test_packet_and_route_stats_endpoints(cherrypy_ctx):
@@ -978,19 +1663,42 @@ def test_db_purge_validation_and_results(cherrypy_ctx):
 
 def test_db_purge_all_and_options(cherrypy_ctx):
     request, _ = cherrypy_ctx
-    api = _make_api({"web": {"cors_enabled": True}})
+    api = _make_api({"web": {"cors_enabled": False}})
 
     request.method = "OPTIONS"
     assert api.db_purge() == ""
 
     request.method = "POST"
     request.json = {"tables": "all"}
-    sqlite_handler = SimpleNamespace(purge_table=MagicMock(return_value=1))
+    sqlite_handler = SimpleNamespace(
+        purge_table=MagicMock(return_value=1),
+        companion_journal_epoch_strict=MagicMock(return_value="new-epoch"),
+    )
     _attach_storage(api, SimpleNamespace(sqlite_handler=sqlite_handler))
 
     result = api.db_purge()
     assert result["success"] is True
     assert sqlite_handler.purge_table.call_count == 10
+    sqlite_handler.companion_journal_epoch_strict.assert_called_once_with()
+    assert result["journal_epoch"] == "new-epoch"
+
+
+def test_db_purge_does_not_rotate_epoch_for_non_companion_tables(cherrypy_ctx):
+    request, _ = cherrypy_ctx
+    request.method = "POST"
+    request.json = {"tables": ["packets", "adverts"]}
+    api = _make_api({"web": {"cors_enabled": False}})
+    sqlite_handler = SimpleNamespace(
+        purge_table=MagicMock(return_value=1),
+        companion_journal_epoch_strict=MagicMock(),
+    )
+    _attach_storage(api, SimpleNamespace(sqlite_handler=sqlite_handler))
+
+    result = api.db_purge()
+
+    assert result["success"] is True
+    sqlite_handler.companion_journal_epoch_strict.assert_not_called()
+    assert "journal_epoch" not in result
 
 
 def test_db_vacuum_options_success_and_error(cherrypy_ctx):
@@ -1035,7 +1743,7 @@ def test_config_import_options_and_no_valid_sections(cherrypy_ctx):
     assert api.config_import() == ""
 
     request.method = "POST"
-    request.json = {"config": {"unknown_section": {"x": 1}}}
+    _set_json_body(request, {"config": {"unknown_section": {"x": 1}}})
     result = api.config_import()
     assert result["success"] is False
     assert "No valid configuration sections" in result["error"]
@@ -1047,14 +1755,17 @@ def test_config_import_invalid_identity_key_hex_is_skipped(cherrypy_ctx):
     api = _make_api({"repeater": {"security": {}}})
     api.config_manager.update_and_save.return_value = {"ok": True}
     api.config_manager.save_to_file.return_value = True
-    request.json = {
-        "config": {
-            "repeater": {
-                "security": {},
-                "identity_key": "NOTHEX",
-            }
-        }
-    }
+    _set_json_body(
+        request,
+        {
+            "config": {
+                "repeater": {
+                    "security": {"admin_password": "strong-password"},
+                    "identity_key": "NOTHEX",
+                }
+            },
+        },
+    )
 
     result = api.config_import()
 
@@ -1438,26 +2149,100 @@ sx1262:
     assert "sx1262.en_pins[1]" in paths
 
 
-def test_config_import_web_only_no_restart_required(cherrypy_ctx):
+def test_config_import_cors_change_requires_restart(cherrypy_ctx):
     request, _ = cherrypy_ctx
     request.method = "POST"
+    request.headers["Authorization"] = "Bearer operator"
     api = _make_api({"web": {"site_name": "old"}})
+    api._require_admin_on_public_route = MagicMock()
     api.config_manager.update_and_save.return_value = {"ok": True}
     api.config_manager.save_to_file.return_value = True
-    request.json = {"config": {"web": {"site_name": "new", "cors_enabled": True}}}
+    _set_json_body(
+        request,
+        {"config": {"web": {"site_name": "new", "cors_enabled": True}}},
+    )
+
+    result = api.config_import()
+
+    assert result["success"] is True
+    assert result["restart_required"] is True
+    assert result["sections_updated"] == ["web"]
+    assert api.config["web"]["site_name"] == "new"
+    assert api.config["web"]["cors_enabled"] is True
+    assert api.config["repeater"]["setup_complete"] is True
+
+    request.headers.pop("Authorization")
+    api._require_admin_on_public_route = MagicMock(
+        side_effect=cherrypy.HTTPError(403, "Public bootstrap is closed")
+    )
+    _set_json_body(request, {"config": {"web": {"site_name": "second"}}})
+    with pytest.raises(cherrypy.HTTPError, match="Public bootstrap is closed"):
+        api.config_import()
+
+
+def test_config_import_site_name_only_remains_live(cherrypy_ctx):
+    request, _ = cherrypy_ctx
+    request.method = "POST"
+    request.headers["Authorization"] = "Bearer operator"
+    api = _make_api({"web": {"site_name": "old"}})
+    api._require_admin_on_public_route = MagicMock()
+    api.config_manager.update_and_save.return_value = {"saved": True}
+    _set_json_body(
+        request,
+        {"config": {"web": {"site_name": "new"}}},
+    )
 
     result = api.config_import()
 
     assert result["success"] is True
     assert result["restart_required"] is False
-    assert result["sections_updated"] == ["web"]
     assert api.config["web"]["site_name"] == "new"
-    assert api.config["web"]["cors_enabled"] is True
+
+
+def test_config_import_http_listener_change_defers_to_restart(cherrypy_ctx):
+    request, _ = cherrypy_ctx
+    request.method = "POST"
+    request.headers["Authorization"] = "Bearer operator"
+    api = _make_api(
+        {
+            "http": {
+                "enabled": True,
+                "host": "127.0.0.1",
+                "port": 8000,
+            }
+        }
+    )
+    api._require_admin_on_public_route = MagicMock()
+    api.config_manager.update_and_save.return_value = {"saved": True}
+    _set_json_body(
+        request,
+        {
+            "config": {
+                "http": {
+                    "enabled": True,
+                    "host": "127.0.0.1",
+                    "port": 9000,
+                }
+            }
+        },
+    )
+
+    result = api.config_import()
+
+    assert result["success"] is True
+    assert result["restart_required"] is True
+    assert api.config["http"]["port"] == 9000
+    api.config_manager.update_and_save.assert_called_once_with(
+        updates={},
+        live_update=False,
+        live_update_sections=[],
+    )
 
 
 def test_config_import_identity_redaction_preserves_by_name_for_room_servers(cherrypy_ctx):
     request, _ = cherrypy_ctx
     request.method = "POST"
+    request.headers["Authorization"] = "Bearer operator"
     api = _make_api(
         {
             "identities": {
@@ -1467,18 +2252,22 @@ def test_config_import_identity_redaction_preserves_by_name_for_room_servers(che
             }
         }
     )
+    api._require_admin_on_public_route = MagicMock()
     api.config_manager.update_and_save.return_value = {"ok": True}
     api.config_manager.save_to_file.return_value = True
-    request.json = {
-        "config": {
-            "identities": {
-                "room_servers": [
-                    {"name": "main-room", "identity_key": "*** REDACTED ***"},
-                    {"name": "new-room", "identity_key": "*** REDACTED ***"},
-                ]
-            }
-        }
-    }
+    _set_json_body(
+        request,
+        {
+            "config": {
+                "identities": {
+                    "room_servers": [
+                        {"name": "main-room", "identity_key": "*** REDACTED ***"},
+                        {"name": "new-room", "identity_key": "*** REDACTED ***"},
+                    ]
+                }
+            },
+        },
+    )
 
     result = api.config_import()
 
@@ -1488,6 +2277,39 @@ def test_config_import_identity_redaction_preserves_by_name_for_room_servers(che
     assert by_name["main-room"] == bytes.fromhex("ABCD")
     # Unknown existing room keeps empty value when imported as redacted.
     assert by_name["new-room"] == ""
+
+
+def test_config_import_rejects_listener_collision_without_partial_apply(cherrypy_ctx):
+    request, _ = cherrypy_ctx
+    request.method = "POST"
+    request.headers["Authorization"] = "Bearer operator"
+    original = {
+        "http": {"enabled": True, "port": 5000},
+        "web": {"site_name": "unchanged"},
+    }
+    api = _make_api(original)
+    api._require_admin_on_public_route = MagicMock()
+    _set_json_body(
+        request,
+        {
+            "config": {
+                "web": {"site_name": "must-not-apply"},
+                "identities": {
+                    "companions": [
+                        {"name": "chat", "settings": {"tcp_port": 5000}},
+                    ]
+                },
+            },
+        },
+    )
+
+    result = api.config_import()
+
+    assert result["success"] is False
+    assert "conflicts with Repeater HTTP API" in result["error"]
+    assert api.config == original
+    api.config_manager.update_and_save.assert_not_called()
+    api.config_manager.save_to_file.assert_not_called()
 
 
 def test_stats_includes_versions_and_buildroot_image_info(cherrypy_ctx):
@@ -2351,12 +3173,17 @@ def test_identity_endpoints_paths(cherrypy_ctx):
     assert ids["success"] is True
     assert ids["data"]["total_configured"] == 1
     assert ids["data"]["total_configured_companions"] == 1
+    assert "identity_key" not in str(ids)
 
     assert api.identity()["success"] is False
     assert api.identity(name="missing")["success"] is False
     one = api.identity(name="main")
     assert one["success"] is True
+    assert one["data"]["registered"] is False
     assert one["data"]["runtime"]["registered"] is True
+    assert one["data"]["runtime"]["matches_configuration"] is False
+    assert "identity_key" not in one["data"]
+    assert "runtime" not in api.config["identities"]["room_servers"][0]
 
     # create identity validation + success path
     request.method = "POST"
@@ -2372,12 +3199,45 @@ def test_identity_endpoints_paths(cherrypy_ctx):
     assert api.create_identity()["success"] is False
     request.json = {"name": "comp1", "type": "companion", "identity_key": "aa" * 32}
     assert api.create_identity()["success"] is False
+    request.json = {
+        "name": "bad/name",
+        "type": "companion",
+        "identity_key": "aa" * 32,
+    }
+    assert api.create_identity()["success"] is False
+    assert response.status == 400
+    response.status = 200
+    request.json = {
+        "name": "new-port",
+        "type": "companion",
+        "identity_key": "aa" * 32,
+        "settings": {"tcp_port": "5000"},
+    }
+    assert api.create_identity()["success"] is False
+    assert response.status == 400
+    response.status = 200
+    request.json = {
+        "name": "new-timeout",
+        "type": "companion",
+        "identity_key": "aa" * 32,
+        "settings": {"tcp_timeout": -1},
+    }
+    assert api.create_identity()["success"] is False
+    assert response.status == 400
+    response.status = 200
 
     request.json = {
         "name": "new-comp",
         "type": "companion",
         "identity_key": "cc" * 32,
-        "settings": {"node_name": "N"},
+        "settings": {
+            "node_name": "N",
+            "tcp_port": 5001,
+            "max_contacts": 100_000,
+            "offline_queue_size": 0,
+            "trim_contacts_on_overflow": True,
+            "rf_reception_events": True,
+        },
     }
     api.event_loop = object()
     api.daemon_instance = SimpleNamespace(add_companion_from_config=MagicMock())
@@ -2387,12 +3247,110 @@ def test_identity_endpoints_paths(cherrypy_ctx):
     ):
         created = api.create_identity()
     assert created["success"] is True
+    assert "identity_key" not in created["data"]
+    assert created["data"]["activation_pending"] is False
+    created_settings = next(
+        companion["settings"]
+        for companion in api.config["identities"]["companions"]
+        if companion["name"] == "new-comp"
+    )
+    assert created_settings["max_contacts"] == 100_000
+    assert created_settings["offline_queue_size"] == 0
+    assert created_settings["frame_enabled"] is True
+    assert created_settings["trim_contacts_on_overflow"] is True
+    assert created_settings["rf_reception_events"] is True
+
+    request.json = {
+        "name": "normalized-key",
+        "type": "companion",
+        "identity_key": f"  0X{'AB' * 32}  ",
+        "settings": {"tcp_port": 5002},
+    }
+    with patch(
+        "asyncio.run_coroutine_threadsafe",
+        return_value=SimpleNamespace(result=lambda timeout: True),
+    ):
+        normalized = api.create_identity()
+    assert normalized["success"] is True
+    assert (
+        next(
+            companion["identity_key"]
+            for companion in api.config["identities"]["companions"]
+            if companion["name"] == "normalized-key"
+        )
+        == "AB" * 32
+    )
+
+    response.status = 200
+    request.json = {
+        "name": "embedded-space-key",
+        "type": "companion",
+        "identity_key": ("AB" * 16) + " " + ("CD" * 16),
+    }
+    assert api.create_identity()["success"] is False
+    assert response.status == 400
+
+    response.status = 200
+    request.json = {
+        "name": "invalid-key-type",
+        "type": "companion",
+        "identity_key": False,
+    }
+    assert api.create_identity()["success"] is False
+    assert response.status == 400
 
     # update identity method guard and room_server success
     request.method = "GET"
     with pytest.raises(cherrypy.HTTPError):
         api.update_identity()
     request.method = "PUT"
+    request.json = {
+        "name": "new-comp",
+        "type": "companion",
+        "new_name": "bad:name",
+    }
+    assert api.update_identity()["success"] is False
+    assert response.status == 400
+    response.status = 200
+    request.json = {
+        "name": "new-comp",
+        "type": "companion",
+        "identity_key": "dd" * 32,
+    }
+    assert api.update_identity()["success"] is False
+    assert response.status == 400
+    assert (
+        next(
+            companion["identity_key"]
+            for companion in api.config["identities"]["companions"]
+            if companion["name"] == "new-comp"
+        )
+        == "cc" * 32
+    )
+    response.status = 200
+    request.json = {
+        "name": "new-comp",
+        "type": "companion",
+        "settings": {"tcp_port": 70_000},
+    }
+    assert api.update_identity()["success"] is False
+    assert response.status == 400
+    response.status = 200
+    request.json = {
+        "name": "new-comp",
+        "type": "companion",
+        "new_name": "renamed-comp",
+        "settings": {"tcp_timeout": -1},
+    }
+    assert api.update_identity()["success"] is False
+    assert response.status == 400
+    assert any(
+        companion["name"] == "new-comp" for companion in api.config["identities"]["companions"]
+    )
+    assert not any(
+        companion["name"] == "renamed-comp" for companion in api.config["identities"]["companions"]
+    )
+    response.status = 200
     api.daemon_instance = None
     request.json = {"name": "main", "settings": {"node_name": "updated"}}
     upd = api.update_identity()
@@ -2409,11 +3367,243 @@ def test_identity_endpoints_paths(cherrypy_ctx):
 
     # companion delete
     api.config["identities"]["companions"] = [{"name": "comp1", "identity_key": "11" * 32}]
-    api.daemon_instance = SimpleNamespace(identity_manager=id_mgr)
-    d2 = api.delete_identity(name="comp1", type="companion")
+    remove_companion = AsyncMock(return_value=True)
+    api.daemon_instance = SimpleNamespace(
+        identity_manager=id_mgr,
+        remove_companion=remove_companion,
+    )
+    api.event_loop = object()
+
+    def _completed(coro, _loop):
+        coro.close()
+        return SimpleNamespace(result=lambda timeout: True)
+
+    with patch("asyncio.run_coroutine_threadsafe", side_effect=_completed):
+        d2 = api.delete_identity(name="comp1", type="companion")
     assert d2["success"] is True
-    assert "comp1" not in id_mgr.named_identities
+    assert d2["data"]["deactivated"] is True
+    remove_companion.assert_called_once_with(
+        "comp1",
+        identity_key="11" * 32,
+    )
     assert response.status in (200, 405)
+
+
+def test_delete_companion_timeout_leaves_live_deactivation_running(
+    cherrypy_ctx,
+):
+    request, _response = cherrypy_ctx
+    request.method = "DELETE"
+    api = _make_api(
+        {
+            "identities": {
+                "room_servers": [],
+                "companions": [
+                    {
+                        "name": "slow-companion",
+                        "identity_key": "12" * 32,
+                    }
+                ],
+            }
+        }
+    )
+    api.config_manager.save_to_file.return_value = True
+    remove_companion = AsyncMock()
+    api.daemon_instance = SimpleNamespace(remove_companion=remove_companion)
+    api.event_loop = object()
+
+    slow_future = MagicMock()
+    slow_future.result.side_effect = FutureTimeoutError()
+
+    def _scheduled(coro, _loop):
+        coro.close()
+        return slow_future
+
+    with patch("asyncio.run_coroutine_threadsafe", side_effect=_scheduled):
+        result = api.delete_identity(
+            name="slow-companion",
+            type="companion",
+        )
+
+    assert result["success"] is True
+    assert result["data"] == {
+        "name": "slow-companion",
+        "deactivated": False,
+        "deactivation_pending": True,
+        "restart_required": True,
+    }
+    assert "still finishing" in result["message"]
+    slow_future.cancel.assert_not_called()
+    slow_future.add_done_callback.assert_called_once()
+    remove_companion.assert_called_once_with(
+        "slow-companion",
+        identity_key="12" * 32,
+    )
+
+
+def test_generated_identity_key_never_enters_logs_or_response(
+    cherrypy_ctx,
+    caplog,
+):
+    request, _response = cherrypy_ctx
+    request.method = "POST"
+    request.json = {"name": "generated-comp", "type": "companion"}
+    api = _make_api({"identities": {"room_servers": [], "companions": []}})
+    api.config_manager.save_to_file.return_value = True
+    private_key = b"\xde" * 64
+
+    with (
+        patch(
+            "repeater.keygen.generate_meshcore_keypair",
+            return_value=(b"\x00" * 32, private_key),
+        ),
+        caplog.at_level("INFO"),
+    ):
+        result = api.create_identity()
+
+    assert result["success"] is True
+    assert "identity_key" not in result["data"]
+    logged = caplog.text.lower()
+    assert private_key.hex() not in logged
+    assert private_key[:8].hex() not in logged
+
+
+def test_create_companion_passes_identity_type_to_conflict_validation(cherrypy_ctx):
+    request, _response = cherrypy_ctx
+    request.method = "POST"
+    request.json = {
+        "name": "typed-companion",
+        "type": "companion",
+        "identity_key": "ae" * 32,
+        "settings": {"frame_enabled": False},
+    }
+    api = _make_api({"identities": {"room_servers": [], "companions": []}})
+    api.config_manager.save_to_file.return_value = True
+    registration_error = MagicMock(return_value=None)
+    api.daemon_instance = SimpleNamespace(
+        identity_manager=SimpleNamespace(registration_error=registration_error),
+        add_companion_from_config=MagicMock(),
+    )
+    api.event_loop = object()
+
+    with patch(
+        "asyncio.run_coroutine_threadsafe",
+        return_value=SimpleNamespace(result=lambda timeout: True),
+    ):
+        result = api.create_identity()
+
+    assert result["success"] is True
+    assert registration_error.call_args.args[0] == "typed-companion"
+    assert registration_error.call_args.args[2] == "companion"
+
+
+def test_create_companion_reports_durable_namespace_collision(cherrypy_ctx):
+    from repeater.data_acquisition.sqlite_handler import (
+        CompanionNamespaceCollisionError,
+    )
+
+    request, _response = cherrypy_ctx
+    request.method = "POST"
+    request.json = {
+        "name": "colliding-companion",
+        "type": "companion",
+        "identity_key": "ab" * 32,
+        "settings": {"tcp_port": 5001},
+    }
+    api = _make_api({"identities": {"room_servers": [], "companions": []}})
+    api.config_manager.save_to_file.return_value = True
+    api.event_loop = object()
+    api.daemon_instance = SimpleNamespace(
+        add_companion_from_config=MagicMock(),
+    )
+    collision = CompanionNamespaceCollisionError(
+        "Companion namespace 0xab is already bound; refusing activation"
+    )
+    future = SimpleNamespace(result=MagicMock(side_effect=collision))
+
+    with patch("asyncio.run_coroutine_threadsafe", return_value=future):
+        result = api.create_identity()
+
+    assert result["success"] is True
+    assert "created, but not activated" in result["message"]
+    assert "already bound" in result["message"]
+    assert "refusing activation" in result["message"]
+
+
+def test_create_companion_reports_frame_listener_activation_failure(cherrypy_ctx):
+    from repeater.identity_manager import IdentityConfigurationError
+
+    request, _response = cherrypy_ctx
+    request.method = "POST"
+    request.json = {
+        "name": "frame-client",
+        "type": "companion",
+        "identity_key": "ac" * 32,
+        "settings": {"tcp_port": 5001},
+    }
+    api = _make_api({"identities": {"room_servers": [], "companions": []}})
+    api.config_manager.save_to_file.return_value = True
+    api.event_loop = object()
+    api.daemon_instance = SimpleNamespace(
+        add_companion_from_config=MagicMock(),
+    )
+    activation_error = IdentityConfigurationError(
+        "Companion 'frame-client' Frame listener failed to start "
+        "on 127.0.0.1:5001: address already in use"
+    )
+    future = SimpleNamespace(result=MagicMock(side_effect=activation_error))
+
+    with patch("asyncio.run_coroutine_threadsafe", return_value=future):
+        result = api.create_identity()
+
+    assert result["success"] is True
+    assert "created, but not activated" in result["message"]
+    assert "Frame listener failed to start" in result["message"]
+    assert "address already in use" in result["message"]
+
+
+def test_create_companion_timeout_leaves_live_activation_running(
+    cherrypy_ctx,
+):
+    request, _response = cherrypy_ctx
+    request.method = "POST"
+    request.json = {
+        "name": "slow-companion",
+        "type": "companion",
+        "identity_key": "ad" * 32,
+        "settings": {"frame_enabled": False},
+    }
+    api = _make_api({"identities": {"room_servers": [], "companions": []}})
+    api.config_manager.save_to_file.return_value = True
+    add_companion = MagicMock()
+    api.daemon_instance = SimpleNamespace(
+        add_companion_from_config=add_companion,
+    )
+    api.event_loop = object()
+
+    slow_future = MagicMock()
+    slow_future.result.side_effect = FutureTimeoutError()
+
+    def _scheduled(coro, _loop):
+        coro.close()
+        return slow_future
+
+    with patch("asyncio.run_coroutine_threadsafe", side_effect=_scheduled):
+        result = api.create_identity()
+
+    assert result["success"] is True
+    assert result["data"]["name"] == "slow-companion"
+    assert result["data"]["registered"] is False
+    assert result["data"]["activation_pending"] is True
+    assert "still finishing" in result["message"]
+    slow_future.cancel.assert_not_called()
+    slow_future.add_done_callback.assert_called_once()
+    add_companion.assert_called_once()
+    activation_call = add_companion.call_args
+    assert activation_call.args[0] == api.config["identities"]["companions"][0]
+    assert activation_call.kwargs == {
+        "require_current_config": True,
+    }
 
 
 def test_acl_endpoints_paths(cherrypy_ctx):

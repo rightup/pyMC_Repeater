@@ -28,6 +28,7 @@ DEFAULT_DISCOVERY_RESPONSE_JITTER_MS = 2000
 
 DEFAULT_DISCOVERY_TIMEOUT_SECONDS = 10.0
 DISCOVERY_EVENT_BACKLOG_LIMIT = 512
+RESPONSE_TAG_GENERATION_ATTEMPTS = 32
 
 NODE_TYPE_NAMES = {
     1: "Chat Node",
@@ -132,6 +133,7 @@ class DiscoveryHelper:
         log_fn=None,
         debug_log_fn=None,
         response_jitter_ms: int = DEFAULT_DISCOVERY_RESPONSE_JITTER_MS,
+        tag_conflict: Optional[Callable[[int], bool]] = None,
     ):
         """
         Initialize the discovery helper.
@@ -146,11 +148,14 @@ class DiscoveryHelper:
             response_jitter_ms: Upper bound (ms) for the randomized delay added before
                 transmitting a discovery response, to avoid multiple repeaters colliding
                 when answering the same broadcast. Set to 0 to disable (e.g. in tests).
+            tag_conflict: Optional process-wide check for a response tag already
+                owned by another API surface sharing this radio.
         """
         self.local_identity = local_identity
         self.packet_injector = packet_injector  # Function to inject packets into router
         self.node_type = node_type
         self.response_jitter_ms = max(0, int(response_jitter_ms))
+        self._tag_conflict = tag_conflict
 
         # Create ControlHandler internally as a parsing utility
         self.control_handler = ControlHandler(
@@ -176,26 +181,57 @@ class DiscoveryHelper:
     ) -> dict[str, Any]:
         """Create a new discovery session and return its public metadata."""
         session_id = uuid.uuid4().hex
-        tag = secrets.randbits(32)
         created_at = time.time()
-        session = {
-            "session_id": session_id,
-            "tag": tag,
-            "timeout": max(1.0, float(timeout)),
-            "filter_mask": int(filter_mask) & 0xFF,
-            "since": max(0, int(since)),
-            "prefix_only": bool(prefix_only),
-            "created_at": created_at,
-            "started_at": None,
-            "completed_at": None,
-            "status": "created",
-            "results": {},
-            "events": [],
-            "next_event_id": 1,
-            "error": None,
-            "result_enricher": result_enricher,
-        }
         with self._sessions_lock:
+            active_tags = {
+                int(item["tag"]) & 0xFFFFFFFF
+                for item in self._sessions.values()
+                if item["status"] in {"created", "running"}
+            }
+            callbacks = getattr(self.control_handler, "_response_callbacks", {})
+            tag = None
+            for _ in range(RESPONSE_TAG_GENERATION_ATTEMPTS):
+                candidate = secrets.randbits(32)
+                if candidate in active_tags or candidate in callbacks:
+                    continue
+                try:
+                    conflict = bool(
+                        self._tag_conflict is not None and self._tag_conflict(candidate)
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "Could not verify discovery response tag ownership: %s",
+                        exc,
+                        exc_info=True,
+                    )
+                    raise RuntimeError("Could not verify discovery response tag ownership") from exc
+                if not conflict:
+                    tag = candidate
+                    break
+            if tag is None:
+                logger.error(
+                    "Could not allocate a unique discovery response tag after %d attempts",
+                    RESPONSE_TAG_GENERATION_ATTEMPTS,
+                )
+                raise RuntimeError("No unique discovery response tag is available")
+
+            session = {
+                "session_id": session_id,
+                "tag": tag,
+                "timeout": max(1.0, float(timeout)),
+                "filter_mask": int(filter_mask) & 0xFF,
+                "since": max(0, int(since)),
+                "prefix_only": bool(prefix_only),
+                "created_at": created_at,
+                "started_at": None,
+                "completed_at": None,
+                "status": "created",
+                "results": {},
+                "events": [],
+                "next_event_id": 1,
+                "error": None,
+                "result_enricher": result_enricher,
+            }
             self._sessions[session_id] = session
         return self.get_session_snapshot(session_id) or {}
 
@@ -206,6 +242,17 @@ class DiscoveryHelper:
             if not session:
                 return None
             return self._public_session_snapshot(session)
+
+    def owns_response_tag(self, tag: int) -> bool:
+        """Return whether a created or running discovery reserves this tag."""
+
+        key = int(tag) & 0xFFFFFFFF
+        with self._sessions_lock:
+            return any(
+                int(session["tag"]) & 0xFFFFFFFF == key
+                and session["status"] in {"created", "running"}
+                for session in self._sessions.values()
+            )
 
     def get_events_since(self, session_id: str, last_event_id: int = 0) -> Optional[dict[str, Any]]:
         """Return all session events newer than last_event_id."""
@@ -292,15 +339,20 @@ class DiscoveryHelper:
         self._track_task(task)
 
     def cleanup_sessions(self, max_age_seconds: int = 120) -> None:
-        """Remove old completed sessions to keep memory bounded."""
+        """Remove old terminal or never-started sessions to keep memory bounded."""
         cutoff = time.time() - max_age_seconds
         with self._sessions_lock:
-            stale_ids = [
-                session_id
-                for session_id, session in self._sessions.items()
-                if session["status"] in {"completed", "timed_out", "error", "cancelled"}
-                and (session.get("completed_at") or session.get("created_at", 0)) < cutoff
-            ]
+            stale_ids = []
+            for session_id, session in self._sessions.items():
+                status = session["status"]
+                if status == "created":
+                    reference_time = session.get("created_at", 0)
+                elif status in {"completed", "timed_out", "error", "cancelled"}:
+                    reference_time = session.get("completed_at") or session.get("created_at", 0)
+                else:
+                    continue
+                if reference_time < cutoff:
+                    stale_ids.append(session_id)
             for session_id in stale_ids:
                 self._sessions.pop(session_id, None)
 

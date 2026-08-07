@@ -18,7 +18,7 @@ from unittest.mock import MagicMock
 
 from openhop_core.protocol.packet import Packet
 from openhop_core.protocol.region_map import REGION_DENY_FLOOD
-from openhop_core.protocol.transport_keys import get_auto_key_for, scope_packet
+from openhop_core.protocol.transport_keys import calc_transport_code, get_auto_key_for
 
 from repeater.data_acquisition.sqlite_handler import SQLiteHandler
 from repeater.main import RepeaterDaemon
@@ -41,7 +41,7 @@ def _scoped_flood(key, payload=b"reply-body"):
     """A TRANSPORT_FLOOD packet whose transport code was hashed with ``key``."""
     pkt = Packet()
     pkt.payload = bytearray(payload)
-    scope_packet(pkt, key)
+    pkt.transport_codes[0] = calc_transport_code(key, pkt)
     return pkt
 
 

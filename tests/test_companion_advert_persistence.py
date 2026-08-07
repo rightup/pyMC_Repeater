@@ -2,7 +2,8 @@
 
 import asyncio
 import sqlite3
-from unittest.mock import AsyncMock, patch
+import threading
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -10,6 +11,7 @@ from openhop_core.companion.models import Contact
 from openhop_core.protocol import LocalIdentity
 from repeater.companion.bridge import RepeaterCompanionBridge
 from repeater.companion.frame_server import CompanionFrameServer
+from repeater.companion.journal import CompanionEventJournal
 from repeater.data_acquisition.sqlite_handler import SQLiteHandler
 
 
@@ -50,12 +52,13 @@ def _contact(raw_advert=MESHCORE_ADVERT_WIRE) -> dict:
     }
 
 
-def _bridge(sqlite_handler) -> RepeaterCompanionBridge:
+def _bridge(sqlite_handler, journal=None) -> RepeaterCompanionBridge:
     return RepeaterCompanionBridge(
         LocalIdentity(),
         AsyncMock(return_value=True),
         sqlite_handler=sqlite_handler,
         companion_hash=COMPANION_HASH,
+        journal=journal,
     )
 
 
@@ -82,6 +85,129 @@ async def test_message_before_first_client_connection_survives_restart(tmp_path)
     assert message is not None
     assert message["text"] == "before-first-connect"
     assert message["timestamp"] == 123
+
+
+@pytest.mark.asyncio
+async def test_rest_only_contacts_and_evictions_are_durable(tmp_path):
+    handler = SQLiteHandler(tmp_path)
+    journal = CompanionEventJournal(handler, COMPANION_HASH)
+    bridge = _bridge(handler, journal)
+
+    assert bridge.import_contact(MESHCORE_ADVERT_WIRE) is True
+    rows = []
+    for _ in range(100):
+        rows = handler.companion_load_contacts(COMPANION_HASH) or []
+        if rows:
+            break
+        await asyncio.sleep(0.01)
+    assert rows[0]["last_advert_packet"] == MESHCORE_ADVERT_WIRE
+
+    contact = bridge.get_contact_by_key(MESHCORE_ADVERT_PUBKEY)
+    await bridge._fire_callbacks("contact_deleted", contact)
+
+    assert handler.companion_load_contacts(COMPANION_HASH) == []
+    events = [
+        event["payload"]["change"]
+        for event in handler.companion_get_events(COMPANION_HASH, 0)
+        if event["event_type"] == "contact"
+    ]
+    assert events == ["new", "remove"]
+
+
+@pytest.mark.asyncio
+async def test_contact_delete_failure_keeps_state_and_suppresses_transient_callback(
+    tmp_path,
+    monkeypatch,
+):
+    handler = SQLiteHandler(tmp_path)
+    journal = CompanionEventJournal(handler, COMPANION_HASH)
+    bridge = _bridge(handler, journal)
+    callback = AsyncMock()
+    bridge.on_contact_deleted(callback)
+
+    assert bridge.import_contact(MESHCORE_ADVERT_WIRE) is True
+    rows = []
+    for _ in range(100):
+        rows = handler.companion_load_contacts(COMPANION_HASH) or []
+        if rows:
+            break
+        await asyncio.sleep(0.01)
+    assert len(rows) == 1
+
+    remove_contact = MagicMock(side_effect=RuntimeError("storage unavailable"))
+    monkeypatch.setattr(journal, "remove_contact", remove_contact)
+    contact = bridge.get_contact_by_key(MESHCORE_ADVERT_PUBKEY)
+
+    await bridge._fire_callbacks("contact_deleted", contact)
+
+    remove_contact.assert_called_once_with(MESHCORE_ADVERT_PUBKEY)
+    callback.assert_not_awaited()
+    assert len(handler.companion_load_contacts(COMPANION_HASH)) == 1
+    assert [
+        event["payload"]["change"]
+        for event in handler.companion_get_events(COMPANION_HASH, 0)
+        if event["event_type"] == "contact"
+    ] == ["new"]
+
+
+@pytest.mark.asyncio
+async def test_import_rolls_back_memory_and_push_when_contact_commit_fails(tmp_path, monkeypatch):
+    handler = SQLiteHandler(tmp_path)
+    journal = CompanionEventJournal(handler, COMPANION_HASH)
+    bridge = _bridge(handler, journal)
+    server = CompanionFrameServer(
+        bridge,
+        COMPANION_HASH,
+        port=0,
+        sqlite_handler=handler,
+        journal=journal,
+    )
+    with patch("repeater.companion.frame_server._BaseFrameServer.start", AsyncMock()):
+        await server.start()
+    bridge.on_node_discovered(server._on_node_discovered)
+    server._enqueue_frame = MagicMock()
+    attempted = threading.Event()
+
+    def fail_commit(companion_hash, changes):
+        assert companion_hash == COMPANION_HASH
+        assert changes
+        attempted.set()
+        raise RuntimeError("storage unavailable")
+
+    monkeypatch.setattr(handler, "companion_apply_contact_changes", fail_commit)
+
+    assert bridge.import_contact(MESHCORE_ADVERT_WIRE) is True
+    for _ in range(100):
+        if attempted.is_set():
+            break
+        await asyncio.sleep(0.01)
+    assert attempted.is_set()
+    async with bridge.state_mutation_lock:
+        pass
+
+    assert bridge.get_contact_by_key(MESHCORE_ADVERT_PUBKEY) is None
+    assert handler.companion_load_contacts(COMPANION_HASH) in (None, [])
+    assert handler.companion_get_events(COMPANION_HASH, 0) == []
+    server._enqueue_frame.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_non_contact_packets_do_not_wait_for_contact_commit_lock(tmp_path):
+    bridge = _bridge(SQLiteHandler(tmp_path))
+    packet = MagicMock()
+    packet.get_payload_type.return_value = 0x02
+
+    with patch(
+        "repeater.companion.bridge.CompanionBridge.process_received_packet",
+        AsyncMock(return_value="processed"),
+    ):
+        async with bridge.state_mutation_lock:
+            result = await asyncio.wait_for(
+                bridge.process_received_packet(packet),
+                timeout=0.1,
+            )
+
+    assert result == "processed"
 
 
 def test_bulk_save_load_preserves_raw_advert_blob_and_upsert_replaces_it(tmp_path):

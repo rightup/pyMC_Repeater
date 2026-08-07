@@ -36,6 +36,29 @@ class Allowlist:
     prefixes: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class ClassRouteSpec:
+    """Describe where one CherryPy endpoint class is mounted.
+
+    ``path_params`` is needed only for classes using ``_cp_dispatch``.  It
+    maps handler parameter names to the collection segment that precedes
+    them.  ``None`` means the parameter is the collection's own member:
+
+    - ``companion_name: None`` -> ``/{}``
+    - ``contact_pubkey: "contacts"`` -> ``/contacts/{}``
+
+    The exposed handler name is then treated as an action unless it names
+    that member resource (``contact``/``channel``), or is the HTTP verb
+    itself (``delete``).  This mirrors the small, readable dispatch pattern
+    used by the v1 API without copying every route into this checker.
+    """
+
+    module_path: Path
+    class_name: str
+    prefixes: tuple[str, ...]
+    path_params: dict[str, str | None] | None = None
+
+
 def _normalize_path(path: str) -> str:
     path = path.strip()
     if not path:
@@ -117,50 +140,91 @@ def _extract_method_strings(node: ast.AST) -> set[str]:
     return set()
 
 
+def _is_request_method_ref(node: ast.AST, aliases: set[str]) -> bool:
+    return _is_cherrypy_request_method_expr(node) or (
+        isinstance(node, ast.Name) and node.id in aliases
+    )
+
+
 def _infer_methods(fn: ast.FunctionDef) -> tuple[set[str], bool]:
     methods: set[str] = set()
     confidence = False
-    has_require_post = False
-    saw_method_compare = False
+    positive_method_branches: set[str] = set()
+
+    # Handlers commonly bind ``method = cherrypy.request.method`` before
+    # branching.  Record those aliases once, then treat them exactly like the
+    # full CherryPy attribute expression below.
+    method_aliases = {
+        target.id
+        for node in ast.walk(fn)
+        if isinstance(node, (ast.Assign, ast.AnnAssign))
+        for target in (node.targets if isinstance(node, ast.Assign) else [node.target])
+        if isinstance(target, ast.Name) and _is_cherrypy_request_method_expr(node.value)
+    }
 
     for node in ast.walk(fn):
         if isinstance(node, ast.Call):
-            # self._require_post()
+            # self._require_get() / self._require_post()
             if (
                 isinstance(node.func, ast.Attribute)
-                and node.func.attr == "_require_post"
+                and node.func.attr in {"_require_get", "_require_post"}
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "self"
             ):
-                has_require_post = True
-                methods.add("POST")
+                methods.add(node.func.attr.removeprefix("_require_").upper())
                 confidence = True
 
         if not isinstance(node, ast.Compare):
             continue
-        if not _is_cherrypy_request_method_expr(node.left):
-            continue
-        saw_method_compare = True
         if not node.ops or not node.comparators:
             continue
 
+        left_is_method = _is_request_method_ref(node.left, method_aliases)
+        right_is_method = _is_request_method_ref(node.comparators[0], method_aliases)
+        if not left_is_method and not right_is_method:
+            continue
+
         op = node.ops[0]
-        rhs_vals = _extract_method_strings(node.comparators[0])
-        if not rhs_vals:
+        value_node = node.comparators[0] if left_is_method else node.left
+        compared_methods = _extract_method_strings(value_node)
+        if not compared_methods:
             continue
 
         # Treat equality and inequality guards as declared allowed methods.
         if isinstance(op, (ast.Eq, ast.In, ast.NotEq, ast.NotIn)):
-            methods |= rhs_vals
+            methods |= compared_methods
             confidence = True
+            if isinstance(op, (ast.Eq, ast.In)):
+                positive_method_branches |= compared_methods
 
     methods.discard("OPTIONS")
     methods.discard("HEAD")
 
-    # If a handler branches on request.method but is not explicitly POST-only,
-    # CherryPy's default method for uncovered branches is typically GET.
-    if saw_method_compare and not has_require_post and methods and "POST" in methods:
-        methods.add("GET")
+    # A common two-mode handler handles POST in an early branch and lets the
+    # rest of the function be its GET implementation.  Count GET only when
+    # there is an unconditional top-level return after that positive branch;
+    # unlike the old blanket heuristic, this does not mistake
+    # ``if method != "POST": raise 405`` for GET support.
+    if "POST" in positive_method_branches and methods == {"POST"}:
+        branch_indexes = [
+            index
+            for index, statement in enumerate(fn.body)
+            if isinstance(statement, ast.If)
+            and any(
+                isinstance(node, ast.Compare)
+                and any(
+                    method in positive_method_branches
+                    for method in _extract_method_strings(
+                        node.comparators[0] if node.comparators else node
+                    )
+                )
+                for node in ast.walk(statement.test)
+            )
+        ]
+        if branch_indexes and any(
+            isinstance(statement, ast.Return) for statement in fn.body[min(branch_indexes) + 1 :]
+        ):
+            methods.add("GET")
 
     if not methods:
         return {"GET"}, False
@@ -181,7 +245,11 @@ def _fn_params(fn: ast.FunctionDef) -> list[str]:
     return [p for p in params if p not in {"kwargs", "args"}]
 
 
-def _candidate_suffixes(fn: ast.FunctionDef) -> list[str]:
+def _candidate_suffixes(
+    fn: ast.FunctionDef,
+    methods: set[str],
+    path_params: dict[str, str | None] | None,
+) -> list[str]:
     name = fn.name
     params = _fn_params(fn)
 
@@ -193,6 +261,29 @@ def _candidate_suffixes(fn: ast.FunctionDef) -> list[str]:
             return ["/{}"]
         return ["/{path}"]
 
+    if path_params:
+        member_params = [param for param in params if param in path_params]
+        if member_params:
+            parts: list[str] = []
+            last_collection: str | None = None
+            for param in member_params:
+                collection = path_params[param]
+                if collection is not None:
+                    parts.append(collection)
+                    last_collection = collection
+                parts.append("{}")
+
+            singular_resource = (
+                last_collection[:-1]
+                if last_collection and last_collection.endswith("s")
+                else last_collection
+            )
+            is_member_handler = name == singular_resource
+            is_http_verb_handler = name.upper() in methods
+            if not is_member_handler and not is_http_verb_handler:
+                parts.append(name)
+            return ["/" + "/".join(parts)]
+
     base = f"/{name}"
     # Keep named endpoints canonical. Parameters are often query parameters,
     # so adding path-segment variants here produces false positives.
@@ -200,7 +291,10 @@ def _candidate_suffixes(fn: ast.FunctionDef) -> list[str]:
 
 
 def _collect_class_routes(
-    module_path: Path, class_name: str, prefixes: list[str]
+    module_path: Path,
+    class_name: str,
+    prefixes: tuple[str, ...],
+    path_params: dict[str, str | None] | None = None,
 ) -> dict[str, RouteInfo]:
     tree = ast.parse(module_path.read_text(encoding="utf-8"), filename=str(module_path))
     cls = next(
@@ -221,7 +315,7 @@ def _collect_class_routes(
             continue
 
         methods, confident = _infer_methods(node)
-        suffixes = _candidate_suffixes(node)
+        suffixes = _candidate_suffixes(node, methods, path_params)
 
         for prefix in prefixes:
             for suffix in suffixes:
@@ -240,19 +334,60 @@ def _collect_routes() -> dict[str, RouteInfo]:
 
     class_specs = [
         # /api/* methods are described in OpenAPI as /<endpoint>
-        (WEB_DIR / "api_endpoints.py", "APIEndpoints", [""]),
+        ClassRouteSpec(WEB_DIR / "api_endpoints.py", "APIEndpoints", ("",)),
         # Nested /api/companion/* endpoints are described as /companion/*.
-        (WEB_DIR / "companion_endpoints.py", "CompanionAPIEndpoints", ["/companion"]),
+        ClassRouteSpec(
+            WEB_DIR / "companion_endpoints.py",
+            "CompanionAPIEndpoints",
+            ("/companion",),
+        ),
         # Nested /api/update/* endpoints are described as /update/* when documented.
-        (WEB_DIR / "update_endpoints.py", "UpdateAPIEndpoints", ["/update"]),
+        ClassRouteSpec(WEB_DIR / "update_endpoints.py", "UpdateAPIEndpoints", ("/update",)),
         # Auth top-level endpoints are mounted at /auth/*
-        (WEB_DIR / "auth_endpoints.py", "AuthEndpoints", ["/auth"]),
-        # Token sub-resource is exposed both under /auth and /api/auth in current routing.
-        (WEB_DIR / "auth_endpoints.py", "TokensAPIEndpoint", ["/auth/tokens", "/api/auth/tokens"]),
+        ClassRouteSpec(WEB_DIR / "auth_endpoints.py", "AuthEndpoints", ("/auth",)),
+        # APIEndpoints.auth mounts this below the checker's implicit /api base,
+        # so the OpenAPI-relative route is /auth/tokens.
+        ClassRouteSpec(
+            WEB_DIR / "auth_endpoints.py",
+            "TokensAPIEndpoint",
+            ("/auth/tokens",),
+        ),
+        # Mobile companion API v1.  The root and PairV1 use ordinary
+        # attribute dispatch; CompanionsV1 and DevicesV1 use _cp_dispatch
+        # for collection members and actions.
+        ClassRouteSpec(WEB_DIR / "mobile_endpoints.py", "MobileAPIEndpoints", ("/v1",)),
+        ClassRouteSpec(
+            WEB_DIR / "mobile_endpoints.py",
+            "PairV1",
+            ("/v1/pair",),
+        ),
+        ClassRouteSpec(
+            WEB_DIR / "mobile_endpoints.py",
+            "CompanionsV1",
+            ("/v1/companions",),
+            {
+                "companion_name": None,
+                "contact_pubkey": "contacts",
+                "channel_index": "channels",
+                "message_id": "messages",
+                "packet_hash": "transmissions",
+            },
+        ),
+        ClassRouteSpec(
+            WEB_DIR / "mobile_endpoints.py",
+            "DevicesV1",
+            ("/v1/devices",),
+            {"device_id": None},
+        ),
     ]
 
-    for file_path, class_name, prefixes in class_specs:
-        class_routes = _collect_class_routes(file_path, class_name, prefixes)
+    for spec in class_specs:
+        class_routes = _collect_class_routes(
+            spec.module_path,
+            spec.class_name,
+            spec.prefixes,
+            spec.path_params,
+        )
         for path, info in class_routes.items():
             cur = route_map.get(path)
             if cur is None:

@@ -144,11 +144,9 @@ class PolicyEngine:
                 expected = self._normalize_channel_hash_values(expected)
             result = self._compare(actual, op, expected)
             logger.debug(
-                "Condition eval: field=%s op=%s expected=%r actual=%r -> %s",
+                "Condition eval: field=%s op=%s -> %s",
                 field,
                 op,
-                expected,
-                actual,
                 "MATCH" if result else "no match",
             )
             return result
@@ -298,34 +296,36 @@ class PolicyEngine:
         for secret in self._iter_policy_channel_secrets():
             secrets_tried += 1
             derived = self._derive_channel_hash(secret)
-            secret_preview = secret[:8] + "..." if len(secret) > 8 else secret
             if derived != channel_hash:
                 logger.debug(
-                    "Channel decrypt: secret %s derived hash 0x%02X != packet hash 0x%02X, skipping",
-                    secret_preview,
-                    derived,
+                    "Channel decrypt: candidate %d does not match packet channel 0x%02X",
+                    secrets_tried,
                     channel_hash,
                 )
                 continue
 
             logger.debug(
-                "Channel decrypt: secret %s hash matches 0x%02X, attempting MAC+decrypt",
-                secret_preview,
+                "Channel decrypt: candidate %d matches packet channel 0x%02X; "
+                "attempting MAC+decrypt",
+                secrets_tried,
                 channel_hash,
             )
             plaintext = self._decrypt_channel_message(secret, cipher_mac, ciphertext)
             if plaintext is None:
                 logger.debug(
-                    "Channel decrypt: secret %s MAC/decrypt failed",
-                    secret_preview,
+                    "Channel decrypt: candidate %d MAC/decrypt failed for packet channel 0x%02X",
+                    secrets_tried,
+                    channel_hash,
                 )
                 continue
 
             parsed = self._parse_channel_plaintext(plaintext)
             if not isinstance(parsed, dict):
                 logger.debug(
-                    "Channel decrypt: secret %s parse failed",
-                    secret_preview,
+                    "Channel decrypt: candidate %d plaintext parse failed for "
+                    "packet channel 0x%02X",
+                    secrets_tried,
+                    channel_hash,
                 )
                 continue
 
@@ -335,10 +335,12 @@ class PolicyEngine:
 
             sender, message_body = self._extract_sender_from_message(content)
             logger.debug(
-                "Channel decrypt: SUCCESS with secret %s, sender=%r, message_body=%r",
-                secret_preview,
-                sender,
-                message_body[:40] if message_body else "",
+                "Channel decrypt: success for packet channel 0x%02X with "
+                "candidate %d (sender_present=%s, message_bytes=%d)",
+                channel_hash,
+                secrets_tried,
+                bool(sender),
+                len(message_body.encode("utf-8")) if message_body else 0,
             )
             return {
                 "decryptable": True,

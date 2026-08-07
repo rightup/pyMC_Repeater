@@ -303,8 +303,14 @@ async def test_final_raw_custom_dispatcher_handler_bypasses_router_and_repeater_
 @pytest.mark.asyncio
 async def test_deliver_control_data_filters_non_discovery_and_pushes_valid():
     daemon = RepeaterDaemon(_base_config(), radio=object())
-    fs_ok = SimpleNamespace(push_control_data=AsyncMock())
-    fs_fail = SimpleNamespace(push_control_data=AsyncMock(side_effect=RuntimeError("err")))
+    fs_ok = SimpleNamespace(
+        owns_response_tag=lambda kind, tag: kind == "control" and tag == 0x44332211,
+        push_control_data=AsyncMock(),
+    )
+    fs_fail = SimpleNamespace(
+        owns_response_tag=lambda _kind, _tag: False,
+        push_control_data=AsyncMock(side_effect=RuntimeError("err")),
+    )
     daemon.companion_frame_servers = [fs_ok, fs_fail]
 
     await daemon.deliver_control_data(1.0, -70, 0, b"", b"\x80\x00")
@@ -313,12 +319,40 @@ async def test_deliver_control_data_filters_non_discovery_and_pushes_valid():
     payload = bytes([0x90, 0x00, 0x11, 0x22, 0x33, 0x44])
     await daemon.deliver_control_data(1.0, -70, 2, b"\xaa\xbb", payload)
     fs_ok.push_control_data.assert_awaited_once()
+    fs_fail.push_control_data.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_shared_radio_response_tag_collision_fails_closed_globally():
+    daemon = RepeaterDaemon(_base_config(), radio=object())
+    first = SimpleNamespace(
+        owns_response_tag=lambda _kind, _tag: True,
+        discard_response_tag=MagicMock(),
+        push_control_data=AsyncMock(),
+    )
+    second = SimpleNamespace(
+        owns_response_tag=lambda _kind, _tag: True,
+        discard_response_tag=MagicMock(),
+        push_control_data=AsyncMock(),
+    )
+    daemon.companion_frame_servers = [first, second]
+    payload = bytes([0x90, 0x00, 0x11, 0x22, 0x33, 0x44])
+
+    await daemon.deliver_control_data(1.0, -70, 0, b"", payload)
+
+    first.push_control_data.assert_not_awaited()
+    second.push_control_data.assert_not_awaited()
+    first.discard_response_tag.assert_called_once_with("control", 0x44332211)
+    second.discard_response_tag.assert_called_once_with("control", 0x44332211)
 
 
 @pytest.mark.asyncio
 async def test_trace_complete_for_companions_requires_valid_lengths():
     daemon = RepeaterDaemon(_base_config(), radio=object())
-    fs = SimpleNamespace(push_trace_data_async=AsyncMock())
+    fs = SimpleNamespace(
+        owns_response_tag=lambda kind, tag: kind == "trace" and tag == 1,
+        push_trace_data_async=AsyncMock(),
+    )
     daemon.companion_frame_servers = [fs]
 
     packet = SimpleNamespace(path=bytearray([1, 2, 3]), get_snr=lambda: 2.0)
@@ -334,6 +368,30 @@ async def test_trace_complete_for_companions_requires_valid_lengths():
     }
     await daemon._on_trace_complete_for_companions(packet, parsed)
     fs.push_trace_data_async.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_trace_complete_prefers_companion_api_owner_over_frame():
+    daemon = RepeaterDaemon(_base_config(), radio=object())
+    bridge = SimpleNamespace(resolve_trace_ping=MagicMock(return_value=True))
+    frame = SimpleNamespace(
+        owns_response_tag=lambda kind, tag: kind == "trace" and tag == 1,
+        push_trace_data_async=AsyncMock(),
+    )
+    daemon.companion_bridges = {1: bridge}
+    daemon.companion_frame_servers = [frame]
+    packet = SimpleNamespace(path=bytearray([1]), get_snr=lambda: 2.0)
+    parsed = {
+        "trace_path_bytes": b"\xaa",
+        "flags": 0,
+        "tag": 1,
+        "auth_code": 2,
+    }
+
+    await daemon._on_trace_complete_for_companions(packet, parsed)
+
+    bridge.resolve_trace_ping.assert_called_once_with(packet, parsed)
+    frame.push_trace_data_async.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -470,20 +528,15 @@ def test_update_repeater_location_from_gps_branches():
 
 
 def test_signal_shutdown_unwinds_run_cooperatively():
-    """The handler must not cancel run(): it stops the dispatcher instead.
+    """The handler prefers dispatcher stop and leaves cancellation as fallback.
 
-    Cancelling run() made its ``finally`` await _shutdown() from inside an
-    already-cancelled task, so the first await raised CancelledError and no
-    cleanup ran at all -- on SIGTERM the companion listen sockets stayed bound,
-    the serial port stayed held, and the process then hung in interpreter
-    finalization. Stopping the dispatcher lets run_forever() return so cleanup
-    runs in a task that is not being cancelled.
+    A healthy dispatcher lets run_forever() return normally. Cancellation is
+    reserved for the bounded helper's timeout/failure path, where run() handles
+    the requested cancellation before entering its sole cleanup finalizer.
     """
     daemon = RepeaterDaemon(_base_config(), radio=object())
-    created = []
 
     def _fake_create_task(coro):
-        created.append(coro)
         coro.close()  # never scheduled in this unit test
         return SimpleNamespace(done=lambda: False)
 
@@ -519,6 +572,193 @@ def test_signal_shutdown_falls_back_to_cancel_without_a_dispatcher():
 
     loop.create_task.assert_not_called()
     daemon._main_task.cancel.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_signal_during_initialization_skips_http_and_dispatcher_run():
+    """A pre-run dispatcher stop must not be erased by run_forever startup."""
+    daemon = RepeaterDaemon(
+        {**_base_config(), "http": {"enabled": True}},
+        radio=object(),
+    )
+    dispatcher = SimpleNamespace(stop=AsyncMock(), run_forever=AsyncMock())
+    real_loop = asyncio.get_running_loop()
+    signal_loop = SimpleNamespace(
+        add_signal_handler=MagicMock(),
+        create_task=real_loop.create_task,
+    )
+
+    async def signal_mid_initialize():
+        daemon.dispatcher = dispatcher
+        daemon._signal_shutdown(SimpleNamespace(name="SIGTERM"), signal_loop)
+        # Let the cooperative stop finish while run_forever is still absent.
+        await asyncio.sleep(0)
+
+    daemon.initialize = signal_mid_initialize
+    daemon._shutdown = AsyncMock()
+
+    with (
+        patch("asyncio.get_running_loop", return_value=signal_loop),
+        patch("repeater.main.HTTPStatsServer") as server_factory,
+        patch.object(RepeaterDaemon, "_detect_container", return_value=False),
+        patch("os.path.exists", return_value=False),
+    ):
+        await daemon.run()
+        await asyncio.sleep(0)
+
+    dispatcher.stop.assert_awaited_once()
+    dispatcher.run_forever.assert_not_awaited()
+    server_factory.assert_not_called()
+    daemon._shutdown.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_hung_signal_dispatcher_stop_reaches_finalizer_and_watchdog():
+    """A wedged cooperative stop must not strand the bounded teardown owner."""
+    daemon = RepeaterDaemon(
+        {**_base_config(), "http": {"enabled": False}, "radio_type": "none"},
+        radio=SimpleNamespace(cleanup=MagicMock()),
+    )
+    daemon.SHUTDOWN_STEP_TIMEOUT_S = 0.02
+    run_started = asyncio.Event()
+    never = asyncio.Event()
+
+    async def run_forever():
+        run_started.set()
+        await never.wait()
+
+    async def stop_forever():
+        await never.wait()
+
+    dispatcher = SimpleNamespace(
+        run_forever=AsyncMock(side_effect=run_forever),
+        stop=AsyncMock(side_effect=stop_forever),
+    )
+
+    async def initialize():
+        daemon.dispatcher = dispatcher
+
+    daemon.initialize = initialize
+    real_loop = asyncio.get_running_loop()
+    signal_loop = SimpleNamespace(
+        add_signal_handler=MagicMock(),
+        create_task=real_loop.create_task,
+    )
+
+    with (
+        patch("asyncio.get_running_loop", return_value=signal_loop),
+        patch.object(RepeaterDaemon, "_detect_container", return_value=False),
+        patch.object(daemon, "_arm_exit_watchdog") as watchdog,
+        patch("os.path.exists", return_value=False),
+    ):
+        run_task = asyncio.create_task(daemon.run())
+        await run_started.wait()
+        daemon._signal_shutdown(SimpleNamespace(name="SIGTERM"), signal_loop)
+        await asyncio.wait_for(run_task, timeout=1)
+
+    assert daemon._shutdown_started is True
+    assert dispatcher.stop.await_count == 2
+    daemon.radio.cleanup.assert_called_once()
+    watchdog.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_run_fails_closed_when_enabled_http_api_cannot_start():
+    """A configured API must not disappear behind an otherwise healthy daemon."""
+    daemon = RepeaterDaemon(
+        {
+            **_base_config(),
+            "http": {"enabled": True, "host": "127.0.0.1", "port": 8000},
+        },
+        radio=object(),
+    )
+    daemon.initialize = AsyncMock()
+    daemon._shutdown = AsyncMock()
+    loop = SimpleNamespace(add_signal_handler=MagicMock())
+    server = SimpleNamespace(start=MagicMock(side_effect=OSError("address in use")))
+
+    with (
+        patch("asyncio.get_running_loop", return_value=loop),
+        patch("asyncio.get_event_loop", return_value=loop),
+        patch("repeater.main.HTTPStatsServer", return_value=server),
+        patch.object(RepeaterDaemon, "_detect_container", return_value=False),
+        patch("os.path.exists", return_value=False),
+    ):
+        with pytest.raises(RuntimeError, match="Enabled HTTP API failed to start"):
+            await daemon.run()
+
+    daemon._shutdown.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_keyboard_interrupt_uses_single_shutdown_owner():
+    daemon = RepeaterDaemon(
+        {**_base_config(), "http": {"enabled": False}},
+        radio=object(),
+    )
+    daemon.initialize = AsyncMock()
+    daemon.dispatcher = SimpleNamespace(run_forever=AsyncMock(side_effect=KeyboardInterrupt))
+    frame_server = SimpleNamespace(stop=AsyncMock())
+    bridge = SimpleNamespace(stop=AsyncMock())
+    daemon.companion_frame_servers = [frame_server]
+    daemon.companion_bridges = {1: bridge}
+    daemon.router = SimpleNamespace(stop=AsyncMock())
+    daemon._shutdown = AsyncMock()
+    loop = SimpleNamespace(add_signal_handler=MagicMock())
+
+    with (
+        patch("asyncio.get_running_loop", return_value=loop),
+        patch.object(RepeaterDaemon, "_detect_container", return_value=False),
+        patch("os.path.exists", return_value=False),
+    ):
+        await daemon.run()
+
+    daemon._shutdown.assert_awaited_once()
+    frame_server.stop.assert_not_awaited()
+    bridge.stop.assert_not_awaited()
+    daemon.router.stop.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_run_swallows_only_shutdown_requested_cancellation():
+    fake_loop = SimpleNamespace(add_signal_handler=MagicMock())
+
+    async def start_blocked_run(daemon):
+        initialize_started = asyncio.Event()
+        never_finish = asyncio.Event()
+
+        async def blocked_initialize():
+            initialize_started.set()
+            await never_finish.wait()
+
+        daemon.initialize = blocked_initialize
+        task = asyncio.create_task(daemon.run())
+        await initialize_started.wait()
+        return task
+
+    with (
+        patch("asyncio.get_running_loop", return_value=fake_loop),
+        patch.object(RepeaterDaemon, "_detect_container", return_value=False),
+        patch.object(RepeaterDaemon, "_arm_exit_watchdog"),
+        patch("os.path.exists", return_value=False),
+    ):
+        requested = RepeaterDaemon(
+            {**_base_config(), "http": {"enabled": False}},
+            radio=object(),
+        )
+        requested._stop_requested = True
+        requested_task = await start_blocked_run(requested)
+        requested_task.cancel()
+        await requested_task
+
+        unrelated = RepeaterDaemon(
+            {**_base_config(), "http": {"enabled": False}},
+            radio=object(),
+        )
+        unrelated_task = await start_blocked_run(unrelated)
+        unrelated_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await unrelated_task
 
 
 def test_lingering_non_daemon_threads_are_named():
@@ -588,12 +828,22 @@ async def test_shutdown_stops_components_and_handles_errors():
     daemon = RepeaterDaemon(_base_config(), radio=SimpleNamespace(cleanup=MagicMock()))
     daemon.config["radio_type"] = "none"
 
-    frame_server = SimpleNamespace(stop=AsyncMock())
-    bridge = SimpleNamespace(stop=AsyncMock())
+    stop_order = []
+    frame_server = SimpleNamespace(stop=AsyncMock(side_effect=lambda: stop_order.append("frame")))
+    bridge = SimpleNamespace(stop=AsyncMock(side_effect=lambda: stop_order.append("bridge")))
     daemon.companion_frame_servers = [frame_server]
     daemon.companion_bridges = {1: bridge}
-    daemon.router = SimpleNamespace(stop=AsyncMock())
-    daemon.http_server = SimpleNamespace(stop=MagicMock())
+    daemon._retiring_companions = {"same-runtime": {"frame_server": frame_server, "bridge": bridge}}
+    daemon.router = SimpleNamespace(stop=AsyncMock(side_effect=lambda: stop_order.append("router")))
+    daemon.http_server = SimpleNamespace(
+        stop=MagicMock(side_effect=lambda: stop_order.append("http"))
+    )
+    daemon.push_notifier = SimpleNamespace(
+        stop=MagicMock(side_effect=lambda: stop_order.append("notifier"))
+    )
+    daemon.neighbors_publisher = SimpleNamespace(
+        stop=AsyncMock(side_effect=lambda: stop_order.append("neighbors"))
+    )
     daemon.glass_handler = SimpleNamespace(stop=AsyncMock())
     daemon.sensor_manager = SimpleNamespace(stop=MagicMock())
     daemon.gps_service = SimpleNamespace(stop=MagicMock())
@@ -609,6 +859,14 @@ async def test_shutdown_stops_components_and_handles_errors():
     bridge.stop.assert_awaited_once()
     daemon.router.stop.assert_awaited_once()
     daemon.radio.cleanup.assert_called_once()
+    assert stop_order[:6] == [
+        "http",
+        "notifier",
+        "neighbors",
+        "frame",
+        "bridge",
+        "router",
+    ]
     # The process is guaranteed to exit even if a thread lingers.
     watchdog.assert_called_once()
 

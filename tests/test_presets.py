@@ -245,6 +245,26 @@ def _make_broker_connection(format_value: str) -> _BrokerConnection:
     )
 
 
+def test_generated_mqtt_jwt_is_never_written_to_debug_logs(caplog):
+    conn = _make_broker_connection("letsmesh")
+    conn.broker["audience"] = "test.example"
+
+    class _Signer:
+        @staticmethod
+        def sign(_payload):
+            return b"s" * 64
+
+    conn.local_identity = _Signer()
+
+    with caplog.at_level(logging.DEBUG, logger="MQTTHandler"):
+        token = conn._generate_jwt()
+
+    assert "JWT token generated for test-letsmesh" in caplog.text
+    assert "expires=" in caplog.text
+    assert token not in caplog.text
+    assert token[:50] not in caplog.text
+
+
 def test_mc2mqtt_formats_share_topic_structure():
     """Every MC2MQTT family member resolves to the canonical topic prefix."""
     expected_mc2mqtt = "meshcore/LAX/" + ("ABCD" * 16)

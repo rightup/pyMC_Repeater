@@ -22,6 +22,7 @@ from openhop_core.protocol.constants import (
 )
 
 from repeater.engine import DropReason
+from repeater.companion.correlation import injected_tx_outcome
 from repeater.policy_engine import PolicyDecision, PolicyEngine
 
 logger = logging.getLogger("PacketRouter")
@@ -102,6 +103,10 @@ class PacketRouter:
         self._inject_lock = asyncio.Lock()
         # Hash -> expiry time; skip delivering same PATH/protocol-response to companions more than once
         self._companion_delivered = {}
+        # Keep the check -> authenticated fan-out -> mark sequence atomic.
+        # _route_packet tasks run concurrently, so a plain dict check on both
+        # sides of an await can otherwise deliver the same response twice.
+        self._companion_delivery_lock = asyncio.Lock()
         # Safety valve: cap the number of _route_packet tasks sleeping concurrently.
         # LoRa's airtime budget naturally limits throughput, but burst arrivals
         # (multi-hop amplification, collision retries) can stack many sleeping
@@ -279,9 +284,9 @@ class PacketRouter:
         if self._policy_blocks_companion(packet, metadata):
             return {}
         # Both isinstance checks are load-bearing, not defensive noise: bridges are
-        # keyed by the int hash byte (main.py:880) while origin_hash is the "0xHH"
-        # text form the frame servers compare against (main.py:787, :1167), and a
-        # non-int key would raise inside the f-string. Do not simplify either away.
+        # keyed by the int hash byte while origin_hash is the "0xHH" text form
+        # used by the frame servers, and a non-int key would raise inside the
+        # f-string. Do not simplify either away.
         origin_hash = getattr(packet, "_injected_origin_hash", None)
         if isinstance(origin_hash, str):
             companion_bridges = {
@@ -289,7 +294,7 @@ class PacketRouter:
                 for key, bridge in companion_bridges.items()
                 if not (isinstance(key, int) and f"0x{key:02x}" == origin_hash)
             }
-        return companion_bridges
+        return dict(companion_bridges)
 
     async def _fan_out_to_bridges(self, packet, bridges, *, context: str) -> tuple:
         """Offer packet to each bridge; report ``(delivered, authenticated)``.
@@ -307,7 +312,7 @@ class PacketRouter:
         """
         delivered = False
         authenticated = False
-        for bridge in bridges.values():
+        for bridge in tuple(bridges.values()):
             try:
                 result = await bridge.process_received_packet(packet)
             except Exception as e:
@@ -317,6 +322,30 @@ class PacketRouter:
             if result.authenticated is True:
                 authenticated = True
         return delivered, authenticated
+
+    async def _fan_out_to_bridges_once(
+        self,
+        packet,
+        bridges,
+        *,
+        context: str,
+    ) -> bool | None:
+        """Deliver one deduplicated response after authentication.
+
+        ``None`` means an earlier copy was already delivered. ``False`` means
+        this attempt did not authenticate, so a waiting duplicate may retry.
+        """
+        async with self._companion_delivery_lock:
+            if self._was_delivered_to_companions(packet):
+                return None
+            _, authenticated = await self._fan_out_to_bridges(
+                packet,
+                bridges,
+                context=context,
+            )
+            if authenticated:
+                self._mark_delivered_to_companions(packet)
+            return authenticated
 
     async def _consume_via_local_candidates(
         self, packet, metadata: dict, dest_hash, helper, process_method_name: str
@@ -397,6 +426,14 @@ class PacketRouter:
         ack_timeout_s: float = 5.0,
     ):
         try:
+            # RepeaterCompanionBridge uses this task-local marker to
+            # distinguish local rejection from False after RF acceptance
+            # (most notably a wait-for-ACK timeout). Packet is slotted, so an
+            # ad-hoc packet attribute is not portable.
+            tx_outcome = injected_tx_outcome.get()
+            if tx_outcome is not None:
+                tx_outcome["accepted"] = False
+                tx_outcome["attempted"] = False
             metadata = {
                 "rssi": getattr(packet, "rssi", 0),
                 "snr": getattr(packet, "snr", 0.0),
@@ -415,43 +452,62 @@ class PacketRouter:
             # (avoids duty-cycle or dispatcher races where a later packet goes out first)
             async with self._inject_lock:
                 # Use local_transmission=True to bypass forwarding logic
+                if tx_outcome is not None:
+                    tx_outcome["attempted"] = True
                 sent = await self.daemon.repeater_handler(packet, metadata, local_transmission=True)
-            if not sent:
-                logger.warning("Injected packet failed local transmission")
-                return False
+                if not sent:
+                    logger.warning("Injected packet failed local transmission")
+                    return False
+                if tx_outcome is not None:
+                    tx_outcome["accepted"] = True
 
-            # Mark so when this packet is dequeued we don't pass to engine again (avoid double-send / double-count)
-            packet._injected_for_tx = True
+                # Mark so dequeue processing does not pass this local TX to the
+                # engine a second time.
+                packet._injected_for_tx = True
 
-            # Echo this local TX to companion frame server clients as raw RX
-            # (PUSH_CODE_LOG_RX_DATA 0x88, snr=0/rssi=0 = local origin) so apps that
-            # decrypt locally from raw RX (e.g. RemoteTerm) see companion-originated
-            # traffic, matching what other mesh nodes would hear off the air. The
-            # originating companion (origin_hash) is excluded so it never hears its own TX.
-            push_rx = getattr(self.daemon, "_on_raw_rx_for_companions", None)
-            if push_rx is not None:
-                try:
-                    raw = packet.write_to()
-                    await push_rx(raw, 0, 0.0, exclude_hash=origin_hash)
-                    servers = getattr(self.daemon, "companion_frame_servers", [])
-                    pushed = sum(
-                        1 for fs in servers if getattr(fs, "companion_hash", None) != origin_hash
-                    )
-                    logger.debug(
-                        "Echoed injected TX as raw RX (0x88) to %d companion client(s) "
-                        "(%d bytes, origin=%s excluded)",
-                        pushed,
-                        len(raw),
-                        origin_hash,
-                    )
-                except Exception as e:
-                    logger.debug("Failed to echo injected TX to companions: %s", e)
+                # Keep local echo and enqueue in the same ordering boundary as
+                # RF acceptance. A later send must not become observable before
+                # an earlier on-air packet. ACK waiting remains outside the
+                # lock so it never stalls unrelated radio use.
+                push_rx = getattr(self.daemon, "_on_raw_rx_for_companions", None)
+                if push_rx is not None:
+                    try:
+                        raw = packet.write_to()
+                        await push_rx(
+                            raw,
+                            0,
+                            0.0,
+                            exclude_hash=origin_hash,
+                        )
+                        servers = getattr(
+                            self.daemon,
+                            "companion_frame_servers",
+                            [],
+                        )
+                        pushed = sum(
+                            1
+                            for fs in servers
+                            if getattr(fs, "companion_hash", None) != origin_hash
+                        )
+                        logger.debug(
+                            "Echoed injected TX as raw RX (0x88) to %d "
+                            "companion client(s) (%d bytes, origin=%s excluded)",
+                            pushed,
+                            len(raw),
+                            origin_hash,
+                        )
+                    except Exception as e:
+                        logger.debug(
+                            "Failed to echo injected TX to companions: %s",
+                            e,
+                        )
 
-            # Enqueue so router can deliver to the *other* companion(s): TXT_MSG -> dest
-            # bridge, ACK/ADVERT/GRP_TXT/GRP_DATA -> every bridge except the origin.
-            # The originating companion never gets its own packet back: that exclusion
-            # is enforced once in _companion_bridges_for_packet via the tag set above.
-            await self.enqueue(packet)
+                # Queue delivery is part of local completion and remains in the
+                # injection ordering boundary: TXT_MSG routes to its destination;
+                # ACK/ADVERT/GRP_TXT/GRP_DATA reach every bridge except the origin.
+                # _companion_bridges_for_packet applies that exclusion once for
+                # every fan-out path.
+                await self.enqueue(packet)
 
             if wait_for_ack:
                 ptype = getattr(packet, "get_payload_type", lambda: None)()
@@ -500,7 +556,27 @@ class PacketRouter:
                 )
             return True
 
+        except asyncio.CancelledError:
+            # Cancellation can arrive after the physical TX call has begun but
+            # before it reports whether the radio accepted the packet. Treat
+            # that window as indeterminate so callers retain correlation and
+            # do not safely retry a packet that may already be on air.
+            tx_outcome = injected_tx_outcome.get()
+            if (
+                tx_outcome is not None
+                and tx_outcome.get("attempted") is True
+                and tx_outcome.get("accepted") is not True
+            ):
+                tx_outcome["uncertain"] = True
+            raise
         except Exception as e:
+            tx_outcome = injected_tx_outcome.get()
+            if (
+                tx_outcome is not None
+                and tx_outcome.get("attempted") is True
+                and tx_outcome.get("accepted") is not True
+            ):
+                tx_outcome["uncertain"] = True
             logger.error(f"Error injecting packet through engine: {e}")
             return False
 
@@ -679,27 +755,34 @@ class PacketRouter:
             dest_hash = packet.payload[0] if packet.payload else None
             companion_bridges = self._companion_bridges_for_packet(packet, metadata)
             if dest_hash is not None and dest_hash in companion_bridges:
-                if not self._was_delivered_to_companions(packet):
-                    delivered, authenticated = await self._fan_out_to_bridges(
-                        packet, {dest_hash: companion_bridges[dest_hash]}, context="PATH"
-                    )
-                    consumed = authenticated or consumed
-                    if delivered:
-                        self._mark_delivered_to_companions(packet)
-            elif companion_bridges and not self._was_delivered_to_companions(packet):
+                bridge_authenticated = await self._fan_out_to_bridges_once(
+                    packet,
+                    {dest_hash: companion_bridges[dest_hash]},
+                    context="PATH",
+                )
+                if bridge_authenticated is None:
+                    # A prior copy authenticated as local, so this duplicate
+                    # is local too and must not fall through to forwarding.
+                    consumed = True
+                else:
+                    consumed = bridge_authenticated or consumed
+            elif companion_bridges:
                 # Dest not in bridges: path-return with ephemeral dest (e.g. multi-hop login).
                 # Deliver to all bridges; each will try to decrypt and ignore if not relevant.
-                delivered, authenticated = await self._fan_out_to_bridges(
-                    packet, companion_bridges, context="PATH"
+                bridge_authenticated = await self._fan_out_to_bridges_once(
+                    packet,
+                    companion_bridges,
+                    context="PATH",
                 )
-                consumed = authenticated or consumed
-                if delivered:
-                    self._mark_delivered_to_companions(packet)
-                logger.debug(
-                    "PATH dest=0x%02x (anon) delivered to %d bridge(s) for matching",
-                    dest_hash or 0,
-                    len(companion_bridges),
-                )
+                if bridge_authenticated is None:
+                    consumed = True
+                else:
+                    consumed = bridge_authenticated or consumed
+                    logger.debug(
+                        "PATH dest=0x%02x (anon) delivered to %d bridge(s) for matching",
+                        dest_hash or 0,
+                        len(companion_bridges),
+                    )
             if consumed:
                 # A local MAC-authenticated PATH belongs to this node. Do not
                 # let the forwarding engine retransmit it, but retain it for UI.
@@ -779,12 +862,12 @@ class PacketRouter:
             # processed_by_injection for a middle hop so the packet still reaches engine forwarding.
             companion_bridges = self._companion_bridges_for_packet(packet, metadata)
             final_hop = _is_direct_final_hop(packet)
-            if companion_bridges and (final_hop or not self._was_delivered_to_companions(packet)):
-                delivered, _ = await self._fan_out_to_bridges(
-                    packet, companion_bridges, context="RESPONSE"
+            if companion_bridges:
+                await self._fan_out_to_bridges_once(
+                    packet,
+                    companion_bridges,
+                    context="RESPONSE",
                 )
-                if delivered:
-                    self._mark_delivered_to_companions(packet)
             if companion_bridges and final_hop:
                 # DIRECT with empty path: we're the final hop, so consume after delivery.
                 processed_by_injection = True

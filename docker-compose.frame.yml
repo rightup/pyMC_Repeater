@@ -1,0 +1,14 @@
+# Opt-in access for one Frame client running on the Docker host.
+#
+# Before enabling this overlay, set the selected companion's container-side
+# settings to:
+#   tcp_port: 5000
+#   bind_address: "0.0.0.0"
+#
+# Docker publishes the unauthenticated listener on host loopback only. Because
+# it binds to all interfaces inside the container, peer containers on this
+# Compose network can still reach it. Keep that network private and trusted.
+services:
+  openhop-repeater:
+    ports:
+      - "127.0.0.1:${OPENHOP_FRAME_PORT:-5000}:5000"

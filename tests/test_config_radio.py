@@ -1,3 +1,6 @@
+import logging
+import stat
+from pathlib import Path
 from types import SimpleNamespace
 
 from repeater.config import BaselineCrcCounterRadio, load_config
@@ -43,3 +46,38 @@ def test_load_config_prefers_openhop_env_names(tmp_path, monkeypatch):
 
     assert config["repeater"]["identity_key"] == "openhop"
     assert config["logging"]["level"] == "DEBUG"
+
+
+def test_load_config_tightens_secret_file_permissions(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "repeater:\n  identity_key: explicit\n",
+        encoding="utf-8",
+    )
+    config_path.chmod(0o644)
+
+    load_config(str(config_path))
+
+    assert stat.S_IMODE(config_path.stat().st_mode) == 0o600
+
+
+def test_load_config_warns_but_continues_when_permissions_are_read_only(
+    tmp_path,
+    monkeypatch,
+    caplog,
+):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "repeater:\n  identity_key: explicit\n",
+        encoding="utf-8",
+    )
+
+    def deny_chmod(_self, _mode):
+        raise PermissionError("read-only mount")
+
+    monkeypatch.setattr(Path, "chmod", deny_chmod)
+    with caplog.at_level(logging.WARNING):
+        config = load_config(str(config_path))
+
+    assert config["repeater"]["identity_key"] == "explicit"
+    assert "Could not restrict configuration permissions" in caplog.text
