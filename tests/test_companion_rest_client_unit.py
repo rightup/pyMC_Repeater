@@ -172,6 +172,46 @@ def test_data_requires_explicit_success_envelope(payload):
 
 
 @pytest.mark.parametrize(
+    "entry",
+    [
+        {
+            "name": "field-radio",
+            "companion_hash": "0xaa",
+            "node_name": "Field Radio",
+            "public_key": "aa" * 32,
+        },
+        {
+            "name": "field-radio",
+            "companion_hash": "0xaa",
+            "node_name": "Field Radio",
+            "public_key": "aa" * 32,
+            "capabilities": {},
+        },
+        {
+            "name": "field-radio",
+            "companion_hash": "0xaa",
+            "node_name": "Field Radio",
+            "public_key": "aa" * 32,
+            "capabilities": {"max_channels": -1},
+        },
+        {
+            "name": "field-radio",
+            "companion_hash": "0xaa",
+            "node_name": "Field Radio",
+            "public_key": "aa" * 32,
+            "capabilities": {"max_channels": True},
+        },
+    ],
+)
+def test_companions_requires_valid_channel_capacity(entry):
+    client = CompanionRestClient("http://127.0.0.1:8000")
+
+    with patch.object(client, "_list_data", return_value=[entry]):
+        with pytest.raises(RestError, match="companion entry"):
+            client.companions()
+
+
+@pytest.mark.parametrize(
     "response",
     [
         {

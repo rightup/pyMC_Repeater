@@ -1541,9 +1541,7 @@ class TestContactActions:
         assert result["data"]["public_key"] == _PUBKEY_HEX
         assert result["data"]["request"] == "owner"
         assert result["data"]["response"]["node_name"] == "Nearby"
-        assert bridge.anonymous_requests == [
-            (bytes.fromhex(_PUBKEY_HEX), b"\x02", 15.0)
-        ]
+        assert bridge.anonymous_requests == [(bytes.fromhex(_PUBKEY_HEX), b"\x02", 15.0)]
 
     def test_anonymous_request_rejects_unknown_kind(self, endpoints, bridge):
         _post(

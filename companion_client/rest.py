@@ -1085,9 +1085,13 @@ class CompanionRestClient:
         for item in data:
             if not isinstance(item, dict):
                 raise self._wire_error(path, "companion entry must be an object")
-            required = ("name", "companion_hash", "node_name", "public_key")
+            required = ("name", "companion_hash", "node_name", "public_key", "capabilities")
             if any(key not in item for key in required):
                 raise self._wire_error(path, "companion entry is incomplete")
+            capabilities = item["capabilities"]
+            max_channels = (
+                capabilities.get("max_channels") if isinstance(capabilities, dict) else None
+            )
             if (
                 not isinstance(item["name"], str)
                 or not item["name"]
@@ -1096,6 +1100,9 @@ class CompanionRestClient:
                 or re.fullmatch(r"^0x[0-9a-f]{2}$", item["companion_hash"]) is None
                 or not isinstance(item["public_key"], str)
                 or _HEX64_RE.fullmatch(item["public_key"]) is None
+                or not isinstance(max_channels, int)
+                or isinstance(max_channels, bool)
+                or max_channels < 0
             ):
                 raise self._wire_error(path, "companion entry is invalid")
         return data

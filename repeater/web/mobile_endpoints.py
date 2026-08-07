@@ -1773,12 +1773,14 @@ class CompanionsV1:
                     continue
                 async with self._state_guard(bridge):
                     node_name = bridge.prefs.node_name
+                    max_channels = bridge.channels.max_channels
                 items.append(
                     {
                         "name": name,
                         "companion_hash": f"0x{hash_byte:02x}",  # noqa: E231
                         "node_name": node_name,
                         "public_key": identity_hex,
+                        "capabilities": {"max_channels": max_channels},
                     }
                 )
             return items

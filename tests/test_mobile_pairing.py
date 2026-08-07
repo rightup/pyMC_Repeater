@@ -57,6 +57,7 @@ class _FakeBridge:
     def __init__(self, hash_byte):
         self._hash_byte = hash_byte
         self.prefs = SimpleNamespace(node_name=f"node-{hash_byte:02x}")
+        self.channels = SimpleNamespace(max_channels=5)
 
     def get_public_key(self):
         return bytes([self._hash_byte]) + b"\x22" * 31
@@ -847,6 +848,7 @@ class TestScopeEnforcement:
         _set_user(scope=f"companion:{_NAME}")
         items = companions.index.__wrapped__(companions)["data"]
         assert [i["name"] for i in items] == [_NAME]
+        assert items[0]["capabilities"] == {"max_channels": 5}
 
     def test_listing_unfiltered_for_admin_and_wildcard(self, companions):
         for scope in ("admin", "companion:*"):

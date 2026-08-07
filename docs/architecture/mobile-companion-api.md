@@ -144,6 +144,7 @@ when they reuse the same `Idempotency-Key`.
 | `GET /companions/{name}/events` | Resumable SSE over the same journal |
 | `GET /companions/{name}/messages` | Newest-first durable history |
 | `POST /companions/{name}/messages` | Idempotent DM or channel send |
+| `POST /companions/{name}/advert` | Transmit the selected identity's configured signed self advert in `flood` or `local` mode |
 | `POST /companions/{name}/anonymous_request` | Query public v13 node metadata by full key |
 | `POST\|DELETE /companions/{name}/contacts/{pubkey}` | Contact mutation |
 | `PUT\|DELETE /companions/{name}/channels/{index}` | Channel mutation |
@@ -694,7 +695,7 @@ The v1 chat surface does not expose:
 - raw packet injection;
 - radio, tuning, repeat, or daemon configuration;
 - frame socket/session control;
-- self-advert setters/sending;
+- self-advert setters and arbitrary advert payloads;
 - contact import/export/share blobs;
 - auto-add policy mutation;
 - arbitrary binary/anonymous/control requests.
@@ -702,3 +703,8 @@ The v1 chat surface does not expose:
 These are operator, diagnostic, or high-trust frame capabilities. Adding them
 to a device-token surface would collide with shared-radio ownership or expand
 the effect of a leaked chat credential.
+
+`POST .../advert` is the intentionally narrow exception: it may retransmit
+only the selected companion's already-configured, signed self advert, and only
+in `flood` or `local` mode. It cannot change name/location, supply an arbitrary
+payload, export a key, or inject a raw packet.

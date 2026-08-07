@@ -176,7 +176,7 @@ for v1 and avoids a second command/result lifecycle beside message delivery.
 |---|---|---|---|
 | `SET_ADVERT_NAME` | — | ❌ | Keep on the frame/operator surface; it changes the shared companion identity. |
 | `SET_ADVERT_LATLON` | — | ❌ | Keep on the frame/operator surface; it changes shared, privacy-sensitive state. |
-| `SEND_SELF_ADVERT` | — | ❌ | Keep on the frame/operator surface; it transmits RF outside the chat send contract. |
+| `SEND_SELF_ADVERT` | `POST .../advert` | ✅ bounded | REST retransmits only the selected identity's configured signed advert, in `flood` or `local` mode; setters and arbitrary payloads remain unavailable. |
 | `GET_ADVERT_PATH` | `GET .../contacts/{pubkey}/paths` | ⚠️ related | None. |
 | `GET_DEVICE_TIME` / `SET_DEVICE_TIME` | `/server_info` time + HTTP `Date` | ⚠️ read-only | Do not add the setter to the device surface. |
 
@@ -247,12 +247,14 @@ The formerly blocking chat operations are implemented:
 4. ~~Remote login lifecycle~~ — `GET .../connection` and
    `POST .../logout`, distinct from API-device revocation.
 
-Self-advert control, radio/auto-add policy, private-key operations, raw packet
-injection, and contact transfer blobs remain deliberately outside the chat
-surface. Login/status/telemetry keep their synchronous, timeout-is-unknown
-contract. None of these exclusions prevents a complete REST chat client, and
-adding them would expand device-token authority or create a second lifecycle
-without a demonstrated chat need.
+Self-advert setters and arbitrary advert payloads, radio/auto-add policy,
+private-key operations, raw packet injection, and contact transfer blobs
+remain deliberately outside the chat surface. The bounded `POST .../advert`
+exception only retransmits the selected identity's configured signed advert.
+Login/status/telemetry keep their synchronous, timeout-is-unknown contract.
+None of these exclusions prevents a complete REST chat client, and adding
+them would expand device-token authority or create a second lifecycle without
+a demonstrated chat need.
 
 **Deliberately excluded, and should stay that way:** radio/tuning
 configuration, private key export/import, signing, raw packet transmission,

@@ -109,7 +109,20 @@ def test_common_and_mobile_wire_objects_require_every_always_present_key():
         "companion_hash",
         "node_name",
         "public_key",
+        "capabilities",
     }
+    capabilities = schemas["MobileCompanionSummary"]["properties"]["capabilities"]
+    assert capabilities["required"] == ["max_channels"]
+    assert capabilities["additionalProperties"] is True
+    assert capabilities["properties"]["max_channels"] == {
+        "type": "integer",
+        "minimum": 0,
+        "description": "Exclusive upper bound for valid channel indices.",
+    }
+
+    error_v1 = schemas["ErrorResponseV1"]["allOf"][1]
+    assert "data" in error_v1["properties"]
+    assert "data" not in error_v1.get("required", [])
     assert set(schemas["MobileJournalEvent"]["required"]) == {
         "seq",
         "type",

@@ -227,6 +227,7 @@ class TestCompanionsList:
         assert item["name"] == _NAME
         assert item["companion_hash"] == _HASH
         assert item["node_name"] == "TestNode"
+        assert item["capabilities"] == {"max_channels": 3}
 
     def test_mounts_under_root(self, handler):
         root = MobileAPIEndpoints(daemon_instance=_daemon(handler))

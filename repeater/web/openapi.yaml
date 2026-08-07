@@ -74,8 +74,10 @@ tags:
         auto-adds a contact at all — are not settable here.
       - **Node prefs are observable but not settable.** The `prefs` journal
         event reports changes from any surface; no v1 endpoint causes one.
-      - **Self-advert control is absent**: no set-name, set-latlon, or
-        send-advert.
+      - **Self-advert setters are absent.** Device tokens cannot change the
+        selected identity's name or location. `POST .../advert` is the bounded
+        exception: it can transmit only that identity's already-configured,
+        signed self advert in `flood` or `local` mode.
       - **Radio/tuning configuration, key export/import, signing and raw
         packet transmission are absent on purpose** and should stay that way:
         a device token is network-reachable, and these would turn a leaked one
@@ -8271,6 +8273,31 @@ components:
               type: integer
               description: HTTP status code, included by error paths that echo it.
               example: 401
+            data:
+              type: object
+              description: |
+                Optional machine-readable error details. Indeterminate message
+                sends use `state: indeterminate` and include correlation fields
+                when known so a client can safely reattach the same
+                `Idempotency-Key` instead of creating a duplicate RF send.
+              additionalProperties: true
+              properties:
+                state:
+                  type: string
+                  example: indeterminate
+                message_id:
+                  type: integer
+                  nullable: true
+                  minimum: 1
+                packet_hash:
+                  type: string
+                  nullable: true
+                  pattern: '^[0-9A-F]{16}$'
+                expected_ack:
+                  type: integer
+                  nullable: true
+                  minimum: 0
+                  maximum: 4294967295
 
     NeighborLinkSnapshot:
       type: object
@@ -9087,7 +9114,7 @@ components:
     MobileCompanionSummary:
       type: object
       description: One entry from `GET /api/v1/companions` (scope-filtered).
-      required: [name, companion_hash, node_name, public_key]
+      required: [name, companion_hash, node_name, public_key, capabilities]
       properties:
         name:
           $ref: '#/components/schemas/CompanionRegistrationName'
@@ -9101,6 +9128,15 @@ components:
         public_key:
           type: string
           description: Full ed25519 public key, hex-encoded (64 chars).
+        capabilities:
+          type: object
+          required: [max_channels]
+          additionalProperties: true
+          properties:
+            max_channels:
+              type: integer
+              minimum: 0
+              description: Exclusive upper bound for valid channel indices.
 
     MobileContact:
       type: object
