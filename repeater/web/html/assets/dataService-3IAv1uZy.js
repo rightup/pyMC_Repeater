@@ -1,0 +1,1 @@
+import{t as e}from"./dataService-CPAucQH-.js";export{e as useDataService};

@@ -239,7 +239,7 @@
       "preamble_length": 32
     },
     "ch341-usb-sx1262": {
-      "name": "CH341 USB-SPI + SX1262 (example)",
+      "name": "CH341 USB-SPI + SX1262",
       "description": "SX1262 via CH341 USB-to-SPI adapter. NOTE: pin numbers are CH341 GPIO 0-7, not BCM.",
       "connection_type": "usb",
       "radio_type": "sx1262_ch341",
@@ -261,6 +261,33 @@
       "dio3_tcxo_voltage": 1.8,
       "preamble_length": 32,
       "is_waveshare": false
+    },
+    "pinedio": {
+      "name": "PineDio CH341 + SX1262",
+      "description": "PineDio CH341 variant for SX1262 over USB-to-SPI. NOTE: pin numbers are CH341 GPIO 0-11, not BCM.",
+      "connection_type": "usb",
+      "radio_type": "sx1262_ch341",
+      "vid": 6790,
+      "pid": 21778,
+      "bus_id": 0,
+      "cs_id": 0,
+      "cs_pin": 0,
+      "reset_pin": -1,
+      "busy_pin": 11,
+      "irq_pin": 10,
+      "txen_pin": -1,
+      "rxen_pin": -1,
+      "txled_pin": -1,
+      "rxled_pin": -1,
+      "frequency": 869618000,
+      "tx_power": 22,
+      "spreading_factor": 8,
+      "bandwidth": 62500,
+      "coding_rate": 8,
+      "preamble_length": 17,
+      "use_dio2_rf": true,
+      "is_waveshare": false,
+      "use_dio3_tcxo": false
     },
     "ultrapeater-e22": {
       "name": "Zindello Industries UltraPeater E22",

@@ -504,7 +504,11 @@ def get_radio_for_board(board_config: dict):
         if not radio_config:
             raise ValueError("Missing 'radio' section in configuration file")
 
-        # CH341 integration: swap SPI transport + GPIO backend to CH341
+        # CH341 integration: per-radio USB adapter selection.
+        # For multi-radio, pass distinct bus/address/serial_number so each
+        # SX1262Radio owns its own CH341 SPI+GPIO pair (no process singleton).
+        ch341_spi = None
+        ch341_gpio = None
         if radio_type == "sx1262_ch341":
             ch341_cfg = board_config.get("ch341")
             if not ch341_cfg:
@@ -515,10 +519,32 @@ def get_radio_for_board(board_config: dict):
 
             vid = _parse_int(ch341_cfg.get("vid"), default=0x1A86)
             pid = _parse_int(ch341_cfg.get("pid"), default=0x5512)
+            bus = _parse_int(ch341_cfg.get("bus"), default=None)
+            address = _parse_int(
+                ch341_cfg.get("address", ch341_cfg.get("device_address")),
+                default=None,
+            )
+            serial_number = ch341_cfg.get("serial_number") or ch341_cfg.get("serial")
+            if serial_number is not None:
+                serial_number = str(serial_number).strip() or None
 
-            # Create CH341 transport (also configures CH341 GPIO manager globally)
-            ch341_spi = CH341SPITransport(vid=vid, pid=pid, auto_setup_gpio=True)
-            set_spi_transport(ch341_spi)
+            # Multi-radio entries should not stomp the process-global defaults.
+            # Legacy single-radio keeps global install for older code paths.
+            multi_context = bool(board_config.get("_radio_id")) or bool(
+                board_config.get("_ch341_per_instance")
+            )
+            ch341_spi = CH341SPITransport(
+                vid=vid,
+                pid=pid,
+                bus=bus,
+                address=address,
+                serial_number=serial_number,
+                auto_setup_gpio=True,
+                set_as_global_gpio=not multi_context,
+            )
+            ch341_gpio = ch341_spi.gpio_manager
+            if not multi_context:
+                set_spi_transport(ch341_spi)
 
         combined_config = {
             "bus_id": _parse_int(spi_config["bus_id"]),
@@ -560,7 +586,13 @@ def get_radio_for_board(board_config: dict):
         if "radio_timing_delay" in spi_config:
             combined_config["radio_timing_delay"] = float(spi_config["radio_timing_delay"])
 
-        radio = SX1262Radio.get_instance(**combined_config)
+        # Always construct a fresh instance so multi-radio configs do not
+        # share/reuse a singleton SX1262 handle.
+        if ch341_spi is not None:
+            combined_config["spi_transport"] = ch341_spi
+        if ch341_gpio is not None:
+            combined_config["gpio_manager"] = ch341_gpio
+        radio = SX1262Radio(**combined_config)
 
         if hasattr(radio, "_initialized") and not radio._initialized:
             try:
@@ -719,3 +751,164 @@ def get_radio_for_board(board_config: dict):
         f"Unknown radio type: {radio_type}. "
         "Supported: sx1262, sx1262_ch341, kiss (or kiss-modem), pymc_tcp, pymc_usb"
     )
+
+
+def _merge_radio_entry(global_config: dict, entry: dict) -> dict:
+    """Build a board_config dict for one radios[] entry.
+
+    Entry may override radio_type and hardware sections; shared top-level
+    ``radio`` air settings are inherited unless the entry supplies its own.
+    """
+    if not isinstance(entry, dict):
+        raise ValueError("each radios[] entry must be a mapping")
+
+    radio_id = entry.get("id") or entry.get("radio_id")
+    if not radio_id:
+        raise ValueError("each radios[] entry requires an 'id'")
+
+    merged = dict(global_config)
+    for key in (
+        "radio_type",
+        "radio",
+        "sx1262",
+        "ch341",
+        "kiss",
+        "pymc_tcp",
+        "pymc_usb",
+    ):
+        if key in entry:
+            merged[key] = entry[key]
+
+    if "radio_type" not in entry and "radio_type" not in global_config:
+        raise ValueError(f"radios[] entry {radio_id!r} missing radio_type")
+
+    merged["_radio_id"] = str(radio_id)
+    # Hint for CH341 path: do not install process-global SPI/GPIO defaults.
+    merged["_ch341_per_instance"] = True
+    return merged
+
+
+def _apply_fabric_tx_mode(fabric, mode: str) -> None:
+    """Map simple tx_mode strings onto RFFabric.set_tx_selector.
+
+    Modes:
+    - default: always TX ``default_radio`` (or first registered).
+    - sticky:  TX on the radio that last received (reply on same band).
+    - bridge:  TX on a *different* radio than last RX (dual-freq backhaul).
+               Designed for two radios (local <-> link). With 3+ radios, uses
+               the first other id in registration order. With no prior RX,
+               falls back to default_radio.
+    """
+    mode_l = (mode or "default").strip().lower()
+    if mode_l in ("", "default"):
+        fabric.set_tx_selector(None)
+        return
+
+    if mode_l == "sticky":
+
+        def _sticky(_data: bytes):
+            rid = getattr(fabric, "_last_rx_radio_id", None)
+            if rid and rid in fabric.radios:
+                return rid
+            return fabric.default_radio_id
+
+        fabric.set_tx_selector(_sticky)
+        return
+
+    if mode_l == "bridge":
+
+        def _bridge(_data: bytes):
+            ids = list(fabric.radios.keys())
+            if len(ids) < 2:
+                return fabric.default_radio_id
+            last = getattr(fabric, "_last_rx_radio_id", None)
+            if last and last in fabric.radios:
+                for rid in ids:
+                    if rid != last:
+                        return rid
+            return fabric.default_radio_id
+
+        fabric.set_tx_selector(_bridge)
+        return
+
+    raise ValueError(f"Unknown fabric.tx_mode={mode!r}. Supported: default, sticky, bridge")
+
+
+def build_radio_stack(config: dict):
+    """Build single- or multi-radio stack for the repeater.
+
+    - No ``radios:`` -> legacy ``get_radio_for_board(config)``.
+    - ``radios:`` list -> FabricRadio over N physical radios.
+    - ``fabric:`` knobs: default_radio, tx_mode (default|sticky|bridge), use_fabric.
+
+    Returns (radio, meta).
+    """
+    radios_cfg = config.get("radios")
+    fabric_cfg = config.get("fabric") if isinstance(config.get("fabric"), dict) else {}
+    use_fabric = bool(fabric_cfg.get("use_fabric", False))
+    tx_mode = str(fabric_cfg.get("tx_mode", "default"))
+    default_radio = fabric_cfg.get("default_radio") or fabric_cfg.get("default_radio_id")
+
+    meta = {
+        "mode": "single",
+        "radio_ids": [],
+        "default_radio": None,
+        "tx_mode": tx_mode,
+        "fabric": False,
+    }
+
+    if isinstance(radios_cfg, list) and len(radios_cfg) > 0:
+        try:
+            from openhop_core.rf_fabric import FabricRadio
+        except ImportError as exc:
+            raise RuntimeError(
+                "radios: requires openhop-core with RF Fabric support. "
+                "Install/upgrade openhop-core (Phase 2+)."
+            ) from exc
+
+        pairs = []
+        for entry in radios_cfg:
+            merged = _merge_radio_entry(config, entry)
+            rid = merged.pop("_radio_id")
+            physical = get_radio_for_board(merged)
+            pairs.append((physical, rid))
+
+        default_id = str(default_radio) if default_radio else pairs[0][1]
+        radio = FabricRadio(radios=pairs, default_radio_id=default_id)
+        _apply_fabric_tx_mode(radio.fabric, tx_mode)
+
+        meta.update(
+            {
+                "mode": "multi",
+                "radio_ids": [rid for _, rid in pairs],
+                "default_radio": default_id,
+                "fabric": True,
+            }
+        )
+        return radio, meta
+
+    physical = get_radio_for_board(config)
+    meta["radio_ids"] = ["radio0"]
+    meta["default_radio"] = "radio0"
+
+    if use_fabric:
+        try:
+            from openhop_core.rf_fabric import FabricRadio
+        except ImportError as exc:
+            raise RuntimeError(
+                "fabric.use_fabric requires openhop-core with RF Fabric support."
+            ) from exc
+        rid = str(default_radio or "radio0")
+        radio = FabricRadio(radio=physical, radio_id=rid, default_radio_id=rid)
+        _apply_fabric_tx_mode(radio.fabric, tx_mode)
+        meta.update(
+            {
+                "mode": "single_fabric",
+                "radio_ids": [rid],
+                "default_radio": rid,
+                "fabric": True,
+            }
+        )
+        return radio, meta
+
+    return physical, meta

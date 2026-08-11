@@ -280,6 +280,9 @@ class RepeaterHandler(BaseHandler):
             else None,
             "rssi": metadata.get("rssi", 0),
             "snr": metadata.get("snr", 0.0),
+            "rx_radio_id": metadata.get("rx_radio_id")
+            or getattr(packet, "_rx_radio_id", None)
+            or getattr(packet, "rx_radio_id", None),
             "local_transmission": local_transmission,
             "mode": mode,
         }
@@ -311,9 +314,16 @@ class RepeaterHandler(BaseHandler):
         transmitted = False
         tx_delay_ms = 0.0
         drop_reason = None
+        tx_radio_id = None
         lbt_attempts = 0
         lbt_backoff_delays_ms = None
         lbt_channel_busy = False
+        rx_radio_id = (
+            metadata.get("rx_radio_id")
+            or getattr(packet, "_rx_radio_id", None)
+            or getattr(packet, "rx_radio_id", None)
+        )
+        preferred_tx_radio_id = self._resolve_bridge_pair_tx_radio(rx_radio_id)
 
         original_path_hashes = packet.get_path_hashes_hex()
         path_hash_size = packet.get_path_hash_size()
@@ -375,7 +385,12 @@ class RepeaterHandler(BaseHandler):
             for extra_pkt, extra_delay in getattr(result, "extras", ()):
                 extra_airtime_ms = self.airtime_mgr.calculate_airtime(extra_pkt.get_raw_length())
                 extra_tx_tasks.append(
-                    await self.schedule_retransmit(extra_pkt, extra_delay, extra_airtime_ms)
+                    await self.schedule_retransmit(
+                        extra_pkt,
+                        extra_delay,
+                        extra_airtime_ms,
+                        preferred_tx_radio_id=preferred_tx_radio_id,
+                    )
                 )
 
             # Check duty-cycle before scheduling TX
@@ -398,7 +413,11 @@ class RepeaterHandler(BaseHandler):
                         f"(airtime={airtime_ms:.1f}ms)"
                     )
                     tx_task = await self.schedule_retransmit(
-                        fwd_pkt, deferred_delay, airtime_ms, local_transmission=True
+                        fwd_pkt,
+                        deferred_delay,
+                        airtime_ms,
+                        local_transmission=True,
+                        preferred_tx_radio_id=preferred_tx_radio_id,
                     )
                     try:
                         tx_success = await tx_task
@@ -416,6 +435,7 @@ class RepeaterHandler(BaseHandler):
                         transmitted = True
                     tx_metadata = getattr(fwd_pkt, "_tx_metadata", None)
                     if tx_metadata:
+                        tx_radio_id = tx_metadata.get("radio_id") or tx_metadata.get("tx_radio_id")
                         lbt_attempts = tx_metadata.get("lbt_attempts", 0)
                         lbt_backoff_delays_ms = tx_metadata.get("lbt_backoff_delays_ms", [])
                         lbt_channel_busy = tx_metadata.get("lbt_channel_busy", False)
@@ -435,7 +455,11 @@ class RepeaterHandler(BaseHandler):
                     drop_reason = DropReason.DUTY_CYCLE_LIMIT
             else:
                 tx_task = await self.schedule_retransmit(
-                    fwd_pkt, delay, airtime_ms, local_transmission=local_transmission
+                    fwd_pkt,
+                    delay,
+                    airtime_ms,
+                    local_transmission=local_transmission,
+                    preferred_tx_radio_id=preferred_tx_radio_id,
                 )
                 try:
                     tx_success = await tx_task
@@ -453,6 +477,7 @@ class RepeaterHandler(BaseHandler):
                     transmitted = True
                 tx_metadata = getattr(fwd_pkt, "_tx_metadata", None)
                 if tx_metadata:
+                    tx_radio_id = tx_metadata.get("radio_id") or tx_metadata.get("tx_radio_id")
                     lbt_attempts = tx_metadata.get("lbt_attempts", 0)
                     lbt_backoff_delays_ms = tx_metadata.get("lbt_backoff_delays_ms", [])
                     lbt_channel_busy = tx_metadata.get("lbt_channel_busy", False)
@@ -544,6 +569,8 @@ class RepeaterHandler(BaseHandler):
             is_duplicate=is_dupe,
             forwarded_path=forwarded_path_hashes,
             tx_delay_ms=tx_delay_ms,
+            rx_radio_id=rx_radio_id,
+            tx_radio_id=tx_radio_id,
             lbt_attempts=lbt_attempts,
             lbt_backoff_delays_ms=lbt_backoff_delays_ms,
             lbt_channel_busy=lbt_channel_busy,
@@ -643,6 +670,11 @@ class RepeaterHandler(BaseHandler):
             path_hash,
             src_hash,
             dst_hash,
+            rx_radio_id=(
+                metadata.get("rx_radio_id")
+                or getattr(packet, "_rx_radio_id", None)
+                or getattr(packet, "rx_radio_id", None)
+            ),
             packet_hash=packet.calculate_packet_hash().hex().upper(),
         )
         try:
@@ -710,6 +742,9 @@ class RepeaterHandler(BaseHandler):
             transmitted=False,
             drop_reason=DropReason.DUPLICATE,
             is_duplicate=True,
+            rx_radio_id=(
+                getattr(packet, "_rx_radio_id", None) or getattr(packet, "rx_radio_id", None)
+            ),
             packet_hash=pkt_hash_full,
         )
 
@@ -784,6 +819,8 @@ class RepeaterHandler(BaseHandler):
         is_duplicate: bool = False,
         forwarded_path=None,
         tx_delay_ms: float = 0.0,
+        rx_radio_id: Optional[str] = None,
+        tx_radio_id: Optional[str] = None,
         lbt_attempts: int = 0,
         lbt_backoff_delays_ms=None,
         lbt_channel_busy: bool = False,
@@ -837,6 +874,10 @@ class RepeaterHandler(BaseHandler):
                 self.radio_config["preamble_length"],
             ).score,
             "tx_delay_ms": tx_delay_ms,
+            "rx_radio_id": rx_radio_id
+            or getattr(packet, "_rx_radio_id", None)
+            or getattr(packet, "rx_radio_id", None),
+            "tx_radio_id": tx_radio_id,
             "airtime_ms": airtime_ms,
             "transmitted": transmitted,
             "is_duplicate": is_duplicate,
@@ -1476,6 +1517,7 @@ class RepeaterHandler(BaseHandler):
         delay: float,
         airtime_ms: float = 0.0,
         local_transmission: bool = False,
+        preferred_tx_radio_id: Optional[str] = None,
     ):
         """Schedule a packet retransmission with delay and return the task.
 
@@ -1522,7 +1564,19 @@ class RepeaterHandler(BaseHandler):
                             return False
 
                     try:
-                        sent = await self.dispatcher.send_packet(fwd_pkt, wait_for_ack=False)
+                        if preferred_tx_radio_id:
+                            try:
+                                sent = await self.dispatcher.send_packet(
+                                    fwd_pkt,
+                                    wait_for_ack=False,
+                                    radio_id=preferred_tx_radio_id,
+                                )
+                            except TypeError:
+                                sent = await self.dispatcher.send_packet(
+                                    fwd_pkt, wait_for_ack=False
+                                )
+                        else:
+                            sent = await self.dispatcher.send_packet(fwd_pkt, wait_for_ack=False)
                         if not sent:
                             logger.warning(
                                 "Retransmit failed (attempt %d): dispatcher returned false",
@@ -1549,6 +1603,36 @@ class RepeaterHandler(BaseHandler):
             return False
 
         return asyncio.create_task(delayed_send())
+
+    def _resolve_bridge_pair_tx_radio(self, rx_radio_id: Optional[str]) -> Optional[str]:
+        """Return deterministic pair TX radio for bridge mode (A->B, B->A).
+
+        This applies only when fabric.tx_mode=bridge and exactly two radios are
+        registered. For all other layouts, return None and let the dispatcher/
+        fabric choose via existing logic.
+        """
+        fabric_cfg = self.config.get("fabric")
+        if not isinstance(fabric_cfg, dict):
+            return None
+        if str(fabric_cfg.get("tx_mode", "default")).strip().lower() != "bridge":
+            return None
+        if not rx_radio_id:
+            return None
+
+        radio = getattr(self.dispatcher, "radio", None)
+        fabric = getattr(radio, "fabric", None)
+        radios = getattr(fabric, "radios", None)
+        if radios is None:
+            return None
+
+        ids = list(radios.keys())
+        if len(ids) != 2:
+            return None
+
+        rx_id = str(rx_radio_id)
+        if rx_id not in ids:
+            return None
+        return ids[1] if ids[0] == rx_id else ids[0]
 
     def _record_packet_sent(self, packet: Packet) -> None:
         """Record a packet send for flood/direct stats (forwarded and originated)."""
@@ -1648,6 +1732,14 @@ class RepeaterHandler(BaseHandler):
                 "radio": self.config.get(
                     "radio", {}
                 ),  # Read from live config, not cached radio_config
+                "radios": self.config.get("radios") or [],
+                "fabric": self.config.get("fabric") or {},
+                "radio_type": self.config.get("radio_type"),
+                "sx1262": self.config.get("sx1262", {}),
+                "ch341": self.config.get("ch341", {}),
+                "kiss": self.config.get("kiss", {}),
+                "pymc_usb": self.config.get("pymc_usb", {}),
+                "pymc_tcp": self.config.get("pymc_tcp", {}),
                 "duty_cycle": {
                     "max_airtime_percent": max_duty_cycle_percent,
                     "enforcement_enabled": duty_cycle_config.get("enforcement_enabled", True),

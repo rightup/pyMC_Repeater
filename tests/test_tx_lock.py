@@ -19,7 +19,6 @@ import time
 import unittest
 from unittest.mock import AsyncMock, MagicMock
 
-
 # ---------------------------------------------------------------------------
 # Minimal handler factory
 # ---------------------------------------------------------------------------
@@ -261,6 +260,28 @@ class TestTxLockSerialisation(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             send_calls[0], 1, "send_packet called on retry despite duty-cycle rejection"
         )
+
+    # ── Test 6: explicit bridge radio_id is honoured ──────────────────────
+
+    async def test_preferred_tx_radio_id_passed_to_dispatcher(self):
+        """When a packet carries _preferred_tx_radio_id, TX call uses radio_id."""
+        h = _make_handler()
+        pkt = _make_packet()
+
+        task = await h.schedule_retransmit(
+            pkt,
+            delay=0.0,
+            airtime_ms=0,
+            local_transmission=False,
+            preferred_tx_radio_id="link",
+        )
+        result = await task
+
+        self.assertTrue(result)
+        self.assertEqual(h.dispatcher.send_packet.call_count, 1)
+        _, kwargs = h.dispatcher.send_packet.call_args
+        self.assertEqual(kwargs.get("radio_id"), "link")
+        self.assertEqual(kwargs.get("wait_for_ack"), False)
 
 
 if __name__ == "__main__":

@@ -21,7 +21,12 @@ from repeater.companion.utils import (
     parse_companion_bridge_kwargs,
     validate_companion_node_name,
 )
-from repeater.config import NullRadio, get_radio_for_board, load_config, save_config
+from repeater.config import (
+    NullRadio,
+    build_radio_stack,
+    load_config,
+    save_config,
+)
 from repeater.config_manager import ConfigManager
 from repeater.data_acquisition.glass_handler import GlassHandler
 from repeater.data_acquisition.gps_service import GPSService
@@ -318,9 +323,27 @@ class RepeaterDaemon:
             )
             logger.info(f"Initializing radio hardware... (radio_type={radio_type})")
             try:
-                self.radio = get_radio_for_board(self.config)
+                self.radio, self.radio_stack_meta = build_radio_stack(self.config)
+                meta = getattr(self, "radio_stack_meta", {}) or {}
+                if meta.get("fabric"):
+                    logger.info(
+                        "RF fabric active: mode=%s radios=%s default=%s tx_mode=%s",
+                        meta.get("mode"),
+                        meta.get("radio_ids"),
+                        meta.get("default_radio"),
+                        meta.get("tx_mode"),
+                    )
 
-                if isinstance(self.radio, NullRadio):
+                # Physical radios for per-device setup (CAD, event loop).
+                root = getattr(self.radio, "_radio", self.radio)
+                fabric = getattr(root, "fabric", None)
+                if fabric is not None and getattr(fabric, "radios", None):
+                    physicals = list(fabric.radios.values())
+                else:
+                    physicals = [root]
+
+                if all(isinstance(r, NullRadio) for r in physicals):
+                    self.radio = physicals[0] if physicals else NullRadio()
                     self.radio_status = "disabled" if radio_explicitly_disabled else "degraded"
                     if self.radio_status == "disabled":
                         self.radio_error = None
@@ -333,30 +356,36 @@ class RepeaterDaemon:
                     self.radio_status = "ok"
                     self.radio_error = None
 
-                # KISS modem: schedule RX callbacks on the event loop for thread safety
-                if hasattr(self.radio, "set_event_loop"):
-                    self.radio.set_event_loop(asyncio.get_running_loop())
+                # KISS modem / multi-radio: schedule RX on the event loop.
+                loop = asyncio.get_running_loop()
+                for r in physicals:
+                    if hasattr(r, "set_event_loop"):
+                        r.set_event_loop(loop)
 
-                if hasattr(self.radio, "set_custom_cad_thresholds"):
-                    # Load CAD settings from config, with defaults
-                    cad_config = self.config.get("radio", {}).get("cad", {})
-                    peak_threshold = cad_config.get("peak_threshold", 23)
-                    min_threshold = cad_config.get("min_threshold", 11)
-                    symbol_num = cad_config.get("symbol_num", 2)
-                    try:
-                        symbol_num = int(symbol_num)
-                    except (TypeError, ValueError):
-                        symbol_num = 2
-                    if symbol_num not in {1, 2, 4, 8, 16}:
-                        logger.warning(
-                            "Invalid CAD symbol_num in config (%s); defaulting to 2",
-                            symbol_num,
-                        )
-                        symbol_num = 2
+                # CAD from global radio.cad defaults applied to each physical radio.
+                cad_config = self.config.get("radio", {}).get("cad", {})
+                peak_threshold = cad_config.get("peak_threshold", 23)
+                min_threshold = cad_config.get("min_threshold", 11)
+                symbol_num = cad_config.get("symbol_num", 2)
+                try:
+                    symbol_num = int(symbol_num)
+                except (TypeError, ValueError):
+                    symbol_num = 2
+                if symbol_num not in {1, 2, 4, 8, 16}:
+                    logger.warning(
+                        "Invalid CAD symbol_num in config (%s); defaulting to 2",
+                        symbol_num,
+                    )
+                    symbol_num = 2
 
-                    self.radio.set_custom_cad_thresholds(peak=peak_threshold, min_val=min_threshold)
-                    if hasattr(self.radio, "set_custom_cad_symbol_num"):
-                        self.radio.set_custom_cad_symbol_num(symbol_num)
+                cad_applied = False
+                for r in physicals:
+                    if hasattr(r, "set_custom_cad_thresholds"):
+                        r.set_custom_cad_thresholds(peak=peak_threshold, min_val=min_threshold)
+                        if hasattr(r, "set_custom_cad_symbol_num"):
+                            r.set_custom_cad_symbol_num(symbol_num)
+                        cad_applied = True
+                if cad_applied:
                     logger.info(
                         "CAD settings set from config: peak=%s, min=%s, symbols=%s",
                         peak_threshold,
