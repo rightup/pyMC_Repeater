@@ -159,7 +159,8 @@ class SQLiteHandler:
                         snr REAL,
                         advert_count INTEGER NOT NULL DEFAULT 1,
                         is_new_neighbor BOOLEAN NOT NULL,
-                        zero_hop BOOLEAN NOT NULL DEFAULT FALSE
+                        zero_hop BOOLEAN NOT NULL DEFAULT FALSE,
+                        last_zero_hop_seen REAL
                     )
                 """
                 )
@@ -817,6 +818,37 @@ class SQLiteHandler:
                     )
                     logger.info(f"Migration '{migration_name}' applied successfully")
 
+                # Migration 17: When a node was last heard DIRECTLY. The zero_hop
+                # flag is sticky by design (it also guards the preserved zero-hop
+                # rssi/snr), but last_seen refreshes on every advert including
+                # relayed ones, so "zero_hop AND fresh last_seen" cannot express
+                # "currently a zero-hop neighbour" — a node heard directly once
+                # stays in that cohort for as long as its multi-hop floods keep
+                # arriving. This column is the timestamp the flag was missing.
+                # Backfilled from last_seen for existing zero_hop rows (the best
+                # information available); stale entries age out within one
+                # max_neighbor_age window instead of being dropped on upgrade.
+                migration_name = "add_last_zero_hop_seen_to_adverts"
+                existing = conn.execute(
+                    "SELECT migration_name FROM migrations WHERE migration_name = ?",
+                    (migration_name,),
+                ).fetchone()
+                if not existing:
+                    cursor = conn.execute("PRAGMA table_info(adverts)")
+                    columns = [column[1] for column in cursor.fetchall()]
+                    if "last_zero_hop_seen" not in columns:
+                        conn.execute("ALTER TABLE adverts ADD COLUMN last_zero_hop_seen REAL")
+                        logger.info("Added last_zero_hop_seen column to adverts table")
+                    conn.execute(
+                        "UPDATE adverts SET last_zero_hop_seen = last_seen "
+                        "WHERE zero_hop = 1 AND last_zero_hop_seen IS NULL"
+                    )
+                    conn.execute(
+                        "INSERT INTO migrations (migration_name, applied_at) VALUES (?, ?)",
+                        (migration_name, time.time()),
+                    )
+                    logger.info(f"Migration '{migration_name}' applied successfully")
+
                 conn.commit()
 
         except Exception as e:
@@ -1090,7 +1122,9 @@ class SQLiteHandler:
             with self._connect() as conn:
                 conn.row_factory = sqlite3.Row
                 existing = conn.execute(
-                    "SELECT pubkey, first_seen, advert_count, zero_hop, rssi, snr FROM adverts WHERE pubkey = ? ORDER BY last_seen DESC LIMIT 1",
+                    "SELECT pubkey, first_seen, advert_count, zero_hop, rssi, snr, "
+                    "last_zero_hop_seen FROM adverts WHERE pubkey = ? "
+                    "ORDER BY last_seen DESC LIMIT 1",
                     (record.get("pubkey", ""),),
                 ).fetchone()
 
@@ -1105,18 +1139,25 @@ class SQLiteHandler:
                     # - If incoming is zero-hop: ALWAYS store incoming rssi/snr (most recent zero-hop measurement)
                     # - If incoming is multi-hop and existing was zero-hop: preserve existing (don't overwrite zero-hop with multi-hop)
                     # - If both are multi-hop: signal measurements are not applicable
+                    # last_zero_hop_seen advances only on direct receptions, so
+                    # "currently a zero-hop neighbour" stays answerable even
+                    # though zero_hop is sticky and last_seen refreshes on
+                    # relayed adverts too.
                     if incoming_zero_hop:
                         rssi_to_store = record.get("rssi")
                         snr_to_store = record.get("snr")
                         zero_hop_to_store = True
+                        last_zero_hop_seen = current_time
                     elif existing_zero_hop:
                         rssi_to_store = existing["rssi"]
                         snr_to_store = existing["snr"]
                         zero_hop_to_store = True
+                        last_zero_hop_seen = existing["last_zero_hop_seen"]
                     else:
                         rssi_to_store = None
                         snr_to_store = None
                         zero_hop_to_store = False
+                        last_zero_hop_seen = None
 
                     conn.execute(
                         """
@@ -1124,7 +1165,7 @@ class SQLiteHandler:
                         SET timestamp = ?, node_name = ?, is_repeater = ?, route_type = ?,
                             contact_type = ?, latitude = ?, longitude = ?, last_seen = ?,
                             rssi = ?, snr = ?, advert_count = advert_count + 1, is_new_neighbor = 0,
-                            zero_hop = ?
+                            zero_hop = ?, last_zero_hop_seen = ?
                         WHERE pubkey = ?
                     """,
                         (
@@ -1139,6 +1180,7 @@ class SQLiteHandler:
                             rssi_to_store,
                             snr_to_store,
                             zero_hop_to_store,
+                            last_zero_hop_seen,
                             record.get("pubkey", ""),
                         ),
                     )
@@ -1148,8 +1190,8 @@ class SQLiteHandler:
                         INSERT INTO adverts (
                             timestamp, pubkey, node_name, is_repeater, route_type, contact_type,
                             latitude, longitude, first_seen, last_seen, rssi, snr, advert_count,
-                            is_new_neighbor, zero_hop
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            is_new_neighbor, zero_hop, last_zero_hop_seen
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                         (
                             current_time,
@@ -1167,6 +1209,7 @@ class SQLiteHandler:
                             1,
                             True,
                             record.get("zero_hop", False),
+                            current_time if record.get("zero_hop", False) else None,
                         ),
                     )
 
@@ -2555,11 +2598,13 @@ class SQLiteHandler:
                 neighbors = conn.execute(
                     """
                     SELECT pubkey, node_name, is_repeater, route_type, contact_type,
-                           latitude, longitude, first_seen, last_seen, rssi, snr, advert_count, zero_hop
+                           latitude, longitude, first_seen, last_seen, rssi, snr, advert_count,
+                           zero_hop, last_zero_hop_seen
                     FROM (
                         SELECT
                             pubkey, node_name, is_repeater, route_type, contact_type,
-                            latitude, longitude, first_seen, last_seen, rssi, snr, advert_count, zero_hop,
+                            latitude, longitude, first_seen, last_seen, rssi, snr, advert_count,
+                            zero_hop, last_zero_hop_seen,
                             ROW_NUMBER() OVER (PARTITION BY pubkey ORDER BY last_seen DESC) AS rn
                         FROM adverts
                     ) latest
@@ -2583,6 +2628,7 @@ class SQLiteHandler:
                         "snr": row["snr"],
                         "advert_count": row["advert_count"],
                         "zero_hop": bool(row["zero_hop"]),
+                        "last_zero_hop_seen": row["last_zero_hop_seen"],
                     }
 
                 self._neighbors_cache = {"timestamp": now, "value": result}

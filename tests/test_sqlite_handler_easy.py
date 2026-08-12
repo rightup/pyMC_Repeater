@@ -419,7 +419,8 @@ def test_store_advert_zero_hop_signal_handling(tmp_path):
     )
     with h._connect() as conn:
         row = conn.execute(
-            "SELECT rssi, snr, zero_hop, advert_count FROM adverts WHERE pubkey = ?",
+            "SELECT rssi, snr, zero_hop, advert_count, last_seen, last_zero_hop_seen "
+            "FROM adverts WHERE pubkey = ?",
             ("pk-z",),
         ).fetchone()
     assert row is not None
@@ -427,6 +428,10 @@ def test_store_advert_zero_hop_signal_handling(tmp_path):
     assert row[1] == 5.0
     assert bool(row[2]) is True
     assert row[3] == 2
+    # last_seen follows every advert; last_zero_hop_seen only direct ones. This
+    # pair is what lets consumers tell a current neighbour from a sticky flag.
+    assert row[4] == 20.0
+    assert row[5] == 10.0
 
     # New zero-hop update should refresh signal quality.
     h.store_advert(
@@ -445,7 +450,8 @@ def test_store_advert_zero_hop_signal_handling(tmp_path):
     )
     with h._connect() as conn:
         row2 = conn.execute(
-            "SELECT rssi, snr, zero_hop, advert_count FROM adverts WHERE pubkey = ?",
+            "SELECT rssi, snr, zero_hop, advert_count, last_zero_hop_seen "
+            "FROM adverts WHERE pubkey = ?",
             ("pk-z",),
         ).fetchone()
     assert row2 is not None
@@ -453,6 +459,49 @@ def test_store_advert_zero_hop_signal_handling(tmp_path):
     assert row2[1] == 6.5
     assert bool(row2[2]) is True
     assert row2[3] == 3
+    assert row2[4] == 30.0  # direct reception advances the timestamp
+
+    # get_neighbors must expose the column for the neighbours publisher.
+    neighbors = h.get_neighbors()
+    assert neighbors["pk-z"]["last_zero_hop_seen"] == 30.0
+
+
+def test_migration_backfills_last_zero_hop_seen(tmp_path):
+    """Upgrading a DB with sticky zero_hop rows seeds last_zero_hop_seen from
+    last_seen (best information available), so existing genuine neighbours are
+    not dropped from the publisher table on upgrade."""
+    h = _make_handler(tmp_path)
+
+    h.store_advert(
+        {
+            "timestamp": 10.0,
+            "pubkey": "pk-m",
+            "node_name": "node-m",
+            "is_repeater": True,
+            "route_type": 1,
+            "contact_type": "repeater",
+            "is_new_neighbor": True,
+            "zero_hop": True,
+        }
+    )
+
+    # Simulate a pre-column database: null the value and forget the migration.
+    with h._connect() as conn:
+        conn.execute("UPDATE adverts SET last_zero_hop_seen = NULL")
+        conn.execute(
+            "DELETE FROM migrations WHERE migration_name = 'add_last_zero_hop_seen_to_adverts'"
+        )
+        conn.commit()
+
+    h._run_migrations()
+
+    with h._connect() as conn:
+        row = conn.execute(
+            "SELECT last_seen, last_zero_hop_seen FROM adverts WHERE pubkey = ?",
+            ("pk-m",),
+        ).fetchone()
+    assert row is not None
+    assert row[1] == row[0]  # backfilled from last_seen
 
 
 def test_sync_transport_keys_validation_and_tree_apply(tmp_path, monkeypatch):

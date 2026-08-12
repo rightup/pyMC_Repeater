@@ -711,7 +711,12 @@ class NeighborsPublisher:
                         continue
                     return NeighborSnapshot(
                         pubkey=pubkey,
-                        last_seen=float(info.get("last_seen") or 0.0),
+                        # Same source the cycle snapshot uses: the last DIRECT
+                        # reception when known, so both paths describe the
+                        # neighbour identically.
+                        last_seen=float(
+                            info.get("last_zero_hop_seen") or info.get("last_seen") or 0.0
+                        ),
                         snr=float(info.get("snr") or 0.0),
                     )
             except Exception as e:
@@ -785,6 +790,11 @@ class NeighborsPublisher:
         table does) merged with this cycle's discovery responses, which win on
         ``last_seen``/``snr`` because they are first-hand and the table read is
         served from a cache the advert write does not invalidate.
+
+        "Heard via advert" means heard DIRECTLY via advert: freshness is judged
+        on ``last_zero_hop_seen``, so a formerly-direct neighbour whose relayed
+        floods keep refreshing ``last_seen`` ages out of this table like it does
+        out of the firmware's (whose entries only ever update on direct events).
         """
         storage = self._storage()
         neighbors = {}
@@ -806,10 +816,21 @@ class NeighborsPublisher:
             if len(key) != 64:
                 # Scope queries need the full key for ECDH; a prefix cannot be used.
                 continue
-            last_seen = float(info.get("last_seen") or 0.0)
-            if last_seen <= 0 or (now - last_seen) > max_age:
+            # Freshness is judged on the last DIRECT reception, not last_seen:
+            # zero_hop is sticky and last_seen refreshes on relayed adverts too,
+            # so a node heard directly once would otherwise stay in the table
+            # for as long as its multi-hop floods keep arriving — published with
+            # a fresh-looking heard_secs_ago next to a months-old snr. Falls
+            # back to last_seen when the value is absent OR null — null covers
+            # zero_hop rows written by a downgraded binary after the migration
+            # already ran, and matches the fallback GET_NEIGHBOURS and the CLI
+            # use, so the three views agree on such rows.
+            direct_seen = float(info.get("last_zero_hop_seen") or info.get("last_seen") or 0.0)
+            if direct_seen <= 0 or (now - direct_seen) > max_age:
                 continue
-            merged[key] = {"last_seen": last_seen, "snr": float(info.get("snr") or 0.0)}
+            # heard_secs_ago and the ordering derive from this too, keeping the
+            # published row self-consistent with its zero-hop-only snr.
+            merged[key] = {"last_seen": direct_seen, "snr": float(info.get("snr") or 0.0)}
 
         for key, seen in (self._discovery_seen or {}).items():
             merged[key] = dict(seen)

@@ -717,6 +717,26 @@ def test_snapshot_filters_to_fresh_zero_hop_repeaters():
                 "snr": 9.0,
             },
             "ee": {"is_repeater": True, "zero_hop": True, "last_seen": now, "snr": 9.0},
+            # The sticky-flag ghost: heard directly once long ago, and its
+            # relayed floods keep refreshing last_seen. zero_hop stays True by
+            # design, so only last_zero_hop_seen can age it out of this table.
+            "ff" * 32: {
+                "is_repeater": True,
+                "zero_hop": True,
+                "last_seen": now,
+                "last_zero_hop_seen": now - 100000,
+                "snr": 9.0,
+            },
+            # Null timestamp (e.g. a row written by a downgraded binary after
+            # the migration already ran): falls back to last_seen like a row
+            # without the column, consistently with GET_NEIGHBOURS and the CLI.
+            "99" * 32: {
+                "is_repeater": True,
+                "zero_hop": True,
+                "last_seen": now,
+                "last_zero_hop_seen": None,
+                "snr": 3.0,
+            },
             local_key: {"is_repeater": True, "zero_hop": True, "last_seen": now, "snr": 9.0},
         }
     )
@@ -724,8 +744,33 @@ def test_snapshot_filters_to_fresh_zero_hop_repeaters():
 
     snapshot = publisher._snapshot_neighbors()
 
-    # Multi-hop, non-repeater, stale, short-key and self rows are all excluded.
-    assert [s.pubkey for s in snapshot] == ["aa" * 32]
+    # Multi-hop, non-repeater, stale, short-key, stale-direct and self rows
+    # are all excluded. Rows without last_zero_hop_seen (aa) or with a null
+    # one (99) fall back to last_seen, which is the pre-column behavior.
+    assert [s.pubkey for s in snapshot] == ["aa" * 32, "99" * 32]
+
+
+def test_snapshot_heard_time_is_the_last_direct_reception():
+    """heard_secs_ago must describe the last DIRECT contact, consistent with
+    the zero-hop-only snr beside it, not the multi-hop-refreshed last_seen."""
+    now = time.time()
+    storage = SimpleNamespace(
+        get_neighbors=lambda: {
+            "aa" * 32: {
+                "is_repeater": True,
+                "zero_hop": True,
+                "last_seen": now,  # refreshed by a relayed flood
+                "last_zero_hop_seen": now - 700,  # last direct reception
+                "snr": 4.0,
+            }
+        }
+    )
+    publisher = _publisher({"mqtt_brokers": {}}, storage=storage)
+
+    snapshot = publisher._snapshot_neighbors()
+
+    assert len(snapshot) == 1
+    assert snapshot[0].last_seen == now - 700
 
 
 def test_snapshot_merges_this_cycle_discovery_over_the_cached_table():
