@@ -1191,7 +1191,10 @@ class MeshCLI:
 
             lines = []
             for pubkey, info in filtered_neighbors.items():
-                last_seen = info.get("last_seen", 0)
+                # Time since the last DIRECT reception (firmware parity: its
+                # table only updates on direct events); falls back to
+                # last_seen for rows without the column.
+                last_seen = info.get("last_zero_hop_seen") or info.get("last_seen", 0)
                 seconds_ago = int(current_time - last_seen)
 
                 # Get first 4 bytes of pubkey as hex (match C++ format)

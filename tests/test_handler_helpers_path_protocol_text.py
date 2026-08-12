@@ -408,6 +408,38 @@ def test_protocol_request_get_neighbours_sort_and_pagination():
     assert returned == 2
 
 
+def test_protocol_request_get_neighbours_heard_ago_is_last_direct_reception():
+    """heard_seconds_ago mirrors the firmware neighbours[] table, which only
+    updates on direct events: a sticky zero_hop row whose relayed floods keep
+    refreshing last_seen must not read as freshly heard."""
+    now = time.time()
+    neighbors = {
+        "AA" * 16: {
+            "is_repeater": True,
+            "zero_hop": True,
+            "last_seen": now - 1,  # refreshed by a relayed flood
+            "last_zero_hop_seen": now - 1000,  # last direct reception
+            "snr": 5.0,
+        },
+    }
+    storage = SimpleNamespace(get_neighbors=lambda: neighbors)
+    helper = ProtocolRequestHelper(
+        identity_manager=MagicMock(),
+        packet_injector=AsyncMock(),
+        neighbor_tracker=SimpleNamespace(storage=storage),
+    )
+
+    # version=0, count=1, offset=0, order_by=0(newest), pubkey_prefix_len=4, random=0
+    req = bytes([0, 1]) + struct.pack("<H", 0) + bytes([0, 4]) + b"\x00\x00\x00\x00"
+    out = helper._handle_get_neighbours(client=None, timestamp=0, req_data=req)
+
+    total, returned = struct.unpack_from("<HH", out, 0)
+    assert (total, returned) == (1, 1)
+    # Entry layout: pubkey_prefix(4) + heard_seconds_ago(4 LE) + snr(1)
+    heard_ago = struct.unpack_from("<I", out, 4 + 4)[0]
+    assert 995 <= heard_ago <= 1005
+
+
 def test_protocol_request_owner_info_fallback_version():
     helper = ProtocolRequestHelper(
         identity_manager=MagicMock(),

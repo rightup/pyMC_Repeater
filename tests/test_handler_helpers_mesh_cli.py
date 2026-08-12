@@ -154,11 +154,21 @@ def test_cmd_get_public_key_and_neighbor_branches():
             "last_seen": 21,
             "snr": 6.3,
         },
+        # Sticky-flag row: last_seen refreshed by a relayed flood, but the
+        # last DIRECT reception is old — the listing must report the latter.
+        "55667788ccdd": {
+            "is_repeater": True,
+            "zero_hop": True,
+            "last_seen": 29,
+            "last_zero_hop_seen": 5,
+            "snr": 2.0,
+        },
     }
     with patch("time.time", return_value=30):
         out = cli._cmd_neighbors()
 
     assert "99aabbcc:9:6" in out
+    assert "55667788:25:2" in out  # 30 - last_zero_hop_seen, not 30 - last_seen
     assert "abcdef12:20:4" not in out
     assert "11223344:10:1" not in out
 

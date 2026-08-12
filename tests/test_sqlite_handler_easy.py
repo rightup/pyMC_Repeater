@@ -466,6 +466,42 @@ def test_store_advert_zero_hop_signal_handling(tmp_path):
     assert neighbors["pk-z"]["last_zero_hop_seen"] == 30.0
 
 
+def test_adverts_by_contact_type_exposes_last_zero_hop_seen(tmp_path):
+    """The web map draws RF-adjacency lines from this endpoint's rows, so it
+    needs the last-direct timestamp alongside the sticky zero_hop flag."""
+    h = _make_handler(tmp_path)
+
+    h.store_advert(
+        {
+            "timestamp": 10.0,
+            "pubkey": "pk-a",
+            "node_name": "node-a",
+            "is_repeater": True,
+            "route_type": 1,
+            "contact_type": "Repeater",
+            "is_new_neighbor": True,
+            "zero_hop": True,
+        }
+    )
+    h.store_advert(
+        {
+            "timestamp": 20.0,
+            "pubkey": "pk-a",
+            "node_name": "node-a",
+            "is_repeater": True,
+            "route_type": 2,
+            "contact_type": "Repeater",
+            "is_new_neighbor": False,
+            "zero_hop": False,
+        }
+    )
+
+    rows = h.get_adverts_by_contact_type("Repeater")
+    assert len(rows) == 1
+    assert rows[0]["last_seen"] == 20.0
+    assert rows[0]["last_zero_hop_seen"] == 10.0
+
+
 def test_migration_backfills_last_zero_hop_seen(tmp_path):
     """Upgrading a DB with sticky zero_hop rows seeds last_zero_hop_seen from
     last_seen (best information available), so existing genuine neighbours are

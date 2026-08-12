@@ -467,7 +467,13 @@ class ProtocolRequestHelper:
             if not (is_repeater and zero_hop):
                 continue
 
-            last_seen = info.get("last_seen", 0) or 0
+            # heard_seconds_ago is the time since the last DIRECT reception,
+            # like the firmware table this response mirrors (its neighbours[]
+            # entries only ever update on direct events). last_seen refreshes
+            # on relayed adverts too, which would present a long-gone
+            # neighbour as freshly heard next to its old zero-hop snr.
+            # Falls back to last_seen for rows without the column.
+            last_seen = info.get("last_zero_hop_seen") or info.get("last_seen", 0) or 0
             heard_ago = max(0, int(now - last_seen))
             snr_raw = info.get("snr", 0) or 0
             # Store SNR as int8 (firmware stores snr * 4 as int8)

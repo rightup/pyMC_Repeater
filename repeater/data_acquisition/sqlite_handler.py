@@ -2960,7 +2960,8 @@ class SQLiteHandler:
                 query = """
                     SELECT id, timestamp, pubkey, node_name, is_repeater, route_type,
                            contact_type, latitude, longitude, first_seen, last_seen,
-                           rssi, snr, advert_count, is_new_neighbor, zero_hop
+                           rssi, snr, advert_count, is_new_neighbor, zero_hop,
+                           last_zero_hop_seen
                     FROM adverts
                     WHERE contact_type = ?
                 """
@@ -2999,6 +3000,7 @@ class SQLiteHandler:
                         "advert_count": row["advert_count"],
                         "is_new_neighbor": bool(row["is_new_neighbor"]),
                         "zero_hop": bool(row["zero_hop"]),
+                        "last_zero_hop_seen": row["last_zero_hop_seen"],
                     }
                     adverts.append(advert)
 
