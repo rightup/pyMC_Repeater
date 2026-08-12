@@ -20,6 +20,7 @@ from openhop_core.node.handlers.protocol_request import (
 )
 from openhop_core.protocol.cayenne_lpp import (
     TELEM_CHANNEL_SELF,
+    encode_barometric_pressure,
     encode_current,
     encode_power,
     encode_relative_humidity,
@@ -384,10 +385,10 @@ class ProtocolRequestHelper:
 
     @staticmethod
     def _encode_environment_reading(channel: int, reading) -> bytes:
-        """Encode a temperature/humidity reading as CayenneLPP, or b"" if none.
+        """Encode a temperature/humidity/pressure reading as CayenneLPP, or b"" if none.
 
-        Follows the firmware SHT/BME query order: temperature then relative
-        humidity on the same channel.
+        Follows the firmware SHT/BME query order: temperature, relative
+        humidity, then barometric pressure, all on the same channel.
         """
         if not reading.get("ok"):
             return b""
@@ -403,6 +404,12 @@ class ProtocolRequestHelper:
         if humidity is not None:
             try:
                 out.extend(encode_relative_humidity(channel, float(humidity)))
+            except (TypeError, ValueError):
+                pass
+        pressure = data.get("pressure_hpa")
+        if pressure is not None:
+            try:
+                out.extend(encode_barometric_pressure(channel, float(pressure)))
             except (TypeError, ValueError):
                 pass
         return bytes(out)
