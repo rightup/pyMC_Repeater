@@ -1363,7 +1363,7 @@ UPGRADEEOF
 
     local container_note=""
     if [ -f /run/host/container-manager ] || [ -n "${container:-}" ] || grep -qsai 'container=' /proc/1/environ 2>/dev/null || [ -f /.dockerenv ]; then
-        container_note="\n\n⚠ CONTAINER DETECTED:\nUSB udev rules must be set on the HOST, not here.\nSee documentation for CH341 host-side setup."
+        container_note="\n\n⚠ CONTAINER DETECTED:\nUSB udev rules must be set on the HOST, not here.\nCH341 host-side setup: https://docs.openhop.dev/projects/openhop-repeater/hardware-setup/#ch341-usb-spi-hosts"
     fi
 
     if [[ "$silent" == "true" ]]; then
