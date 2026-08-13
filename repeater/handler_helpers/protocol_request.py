@@ -20,6 +20,7 @@ from openhop_core.node.handlers.protocol_request import (
 )
 from openhop_core.protocol.cayenne_lpp import (
     TELEM_CHANNEL_SELF,
+    encode_barometric_pressure,
     encode_current,
     encode_power,
     encode_relative_humidity,
@@ -287,23 +288,13 @@ class ProtocolRequestHelper:
         # else 0.0 V (voltage-only floor, mirroring the companion self-telemetry).
         lpp = bytearray(encode_voltage(TELEM_CHANNEL_SELF, self._battery_voltage(readings)))
 
-        # INA219 power telemetry and environment sensors: the power telemetry
-        # channels are emitted first, then environment sensors continue on the
-        # next available channel.
+        # One channel per sensor reading (matches firmware channel assignment).
         if perm_mask & TELEM_PERM_ENVIRONMENT:
             channel = TELEM_CHANNEL_SELF + 1
-            if self._has_sensor_data(readings, "bus_voltage_v"):
-                lpp.extend(encode_voltage(channel, self._battery_voltage(readings)))
-                channel += 1
-            if self._has_sensor_data(readings, "current_ma"):
-                lpp.extend(encode_current(channel, self._battery_current(readings)))
-                channel += 1
-            if self._has_sensor_data(readings, "power_mw"):
-                lpp.extend(encode_power(channel, self._battery_power(readings)))
-                channel += 1
-
             for reading in readings:
-                entry = self._encode_environment_reading(channel, reading)
+                entry = self._encode_power_reading(
+                    channel, reading
+                ) + self._encode_environment_reading(channel, reading)
                 if entry:
                     lpp.extend(entry)
                     channel += 1
@@ -342,52 +333,42 @@ class ProtocolRequestHelper:
         return 0.0
 
     @staticmethod
-    def _has_sensor_data(readings, key: str) -> bool:
-        """Return True when any reading exposes the requested sensor field."""
-        for reading in readings:
-            if not reading.get("ok"):
-                continue
-            data = reading.get("data") or {}
-            if data.get(key) is not None:
-                return True
-        return False
+    def _encode_power_reading(channel: int, reading) -> bytes:
+        """Encode a voltage/current/power reading as CayenneLPP, or b"" if none.
 
-    @staticmethod
-    def _battery_current(readings) -> float:
-        """First configured sensor's current in amps, else 0.000A."""
-        for reading in readings:
-            if not reading.get("ok"):
-                continue
-            data = reading.get("data") or {}
-            current = data.get("current_ma")
-            if current is not None:
-                try:
-                    return float(current) / 1000.0
-                except (TypeError, ValueError):
-                    continue
-        return 0.000
-
-    @staticmethod
-    def _battery_power(readings) -> int:
-        """First configured sensor's power in watts, else 0W."""
-        for reading in readings:
-            if not reading.get("ok"):
-                continue
-            data = reading.get("data") or {}
-            power = data.get("power_mw")
-            if power is not None:
-                try:
-                    return int(float(power) / 1000.0)
-                except (TypeError, ValueError):
-                    continue
-        return 0
+        TODO: a multi-rail sensor (e.g. INA3221) would need one channel per
+        rail here, not one channel for the whole reading.
+        """
+        if not reading.get("ok"):
+            return b""
+        data = reading.get("data") or {}
+        out = bytearray()
+        voltage = data.get("bus_voltage_v")
+        if voltage is not None:
+            try:
+                out.extend(encode_voltage(channel, float(voltage)))
+            except (TypeError, ValueError):
+                pass
+        current = data.get("current_ma")
+        if current is not None:
+            try:
+                out.extend(encode_current(channel, float(current) / 1000.0))
+            except (TypeError, ValueError):
+                pass
+        power = data.get("power_mw")
+        if power is not None:
+            try:
+                out.extend(encode_power(channel, int(float(power) / 1000.0)))
+            except (TypeError, ValueError):
+                pass
+        return bytes(out)
 
     @staticmethod
     def _encode_environment_reading(channel: int, reading) -> bytes:
-        """Encode a temperature/humidity reading as CayenneLPP, or b"" if none.
+        """Encode a temperature/humidity/pressure reading as CayenneLPP, or b"" if none.
 
-        Follows the firmware SHT/BME query order: temperature then relative
-        humidity on the same channel.
+        Follows the firmware SHT/BME query order: temperature, relative
+        humidity, then barometric pressure, all on the same channel.
         """
         if not reading.get("ok"):
             return b""
@@ -403,6 +384,12 @@ class ProtocolRequestHelper:
         if humidity is not None:
             try:
                 out.extend(encode_relative_humidity(channel, float(humidity)))
+            except (TypeError, ValueError):
+                pass
+        pressure = data.get("pressure_hpa")
+        if pressure is not None:
+            try:
+                out.extend(encode_barometric_pressure(channel, float(pressure)))
             except (TypeError, ValueError):
                 pass
         return bytes(out)

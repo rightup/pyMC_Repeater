@@ -70,3 +70,4 @@ syncpi.sh
 # Docker
 /data
 Installing
+syncproxmox.sh

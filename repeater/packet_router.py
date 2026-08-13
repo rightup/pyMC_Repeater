@@ -244,6 +244,9 @@ class PacketRouter:
             else None,
             "rssi": metadata.get("rssi", getattr(packet, "rssi", 0)),
             "snr": metadata.get("snr", getattr(packet, "snr", 0.0)),
+            "rx_radio_id": metadata.get("rx_radio_id")
+            or getattr(packet, "_rx_radio_id", None)
+            or getattr(packet, "rx_radio_id", None),
             "local_transmission": False,
             "mode": mode,
         }
@@ -398,9 +401,12 @@ class PacketRouter:
     ):
         try:
             metadata = {
-                "rssi": getattr(packet, "rssi", 0),
-                "snr": getattr(packet, "snr", 0.0),
+                "rssi": getattr(packet, "rssi", 0) or getattr(packet, "_rssi", 0),
+                "snr": getattr(packet, "snr", 0.0) or getattr(packet, "_snr", 0.0),
                 "timestamp": getattr(packet, "timestamp", 0),
+                "rx_radio_id": (
+                    getattr(packet, "_rx_radio_id", None) or getattr(packet, "rx_radio_id", None)
+                ),
             }
 
             # Tag the originating companion before anything reaches the air: enqueue()
@@ -535,9 +541,12 @@ class PacketRouter:
         payload_type = packet.get_payload_type()
         processed_by_injection = False
         metadata = {
-            "rssi": getattr(packet, "rssi", 0),
-            "snr": getattr(packet, "snr", 0.0),
+            "rssi": getattr(packet, "rssi", 0) or getattr(packet, "_rssi", 0),
+            "snr": getattr(packet, "snr", 0.0) or getattr(packet, "_snr", 0.0),
             "timestamp": getattr(packet, "timestamp", 0),
+            "rx_radio_id": (
+                getattr(packet, "_rx_radio_id", None) or getattr(packet, "rx_radio_id", None)
+            ),
         }
 
         # MeshCore routes direct packets with remaining hops before normal

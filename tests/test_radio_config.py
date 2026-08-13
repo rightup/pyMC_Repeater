@@ -13,11 +13,9 @@ class _DummyRadio:
 def test_get_radio_for_board_passes_en_pins(monkeypatch):
     captured_kwargs = {}
 
-    class _DummySX1262Radio:
-        @classmethod
-        def get_instance(cls, **kwargs):
+    class _DummySX1262Radio(_DummyRadio):
+        def __init__(self, **kwargs):
             captured_kwargs.update(kwargs)
-            return _DummyRadio()
 
     monkeypatch.setattr(
         "openhop_core.hardware.sx1262_wrapper.SX1262Radio",

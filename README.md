@@ -12,18 +12,18 @@ integrations.
 
 ## Contents
 
-- [Overview](#overview)
-- [Screenshots](#screenshots)
-- [Supported Hardware](#supported-hardware)
-- [Installation](#installation)
-- [Configuration](#configuration)
-- [Policy Engine](#policy-engine)
-- [Upgrading](#upgrading)
-- [Proxmox LXC Installation](#proxmox-lxc-installation)
-- [Uninstallation](#uninstallation)
-- [Docker Compose](#docker-compose)
+- [Overview](https://docs.openhop.dev/projects/openhop-repeater/what-is-openhop-repeater/)
+- [Screenshots and dashboard](https://docs.openhop.dev/projects/openhop-repeater/web-dashboard/)
+- [Supported Hardware](https://docs.openhop.dev/projects/openhop-repeater/hardware-setup/)
+- [Installation](https://docs.openhop.dev/projects/openhop-repeater/installation/)
+- [Configuration](https://docs.openhop.dev/projects/openhop-repeater/config-file/)
+- [Policy Engine](https://docs.openhop.dev/projects/openhop-repeater/web-dashboard/)
+- [Upgrading](https://docs.openhop.dev/projects/openhop-repeater/installation/#upgrading-an-older-pymc-installation)
+- [Proxmox LXC Installation](https://docs.openhop.dev/projects/openhop-repeater/installation/#proxmox-lxc-with-ch341)
+- [Uninstallation](https://docs.openhop.dev/projects/openhop-repeater/uninstallation/)
+- [Docker Compose](https://docs.openhop.dev/projects/openhop-repeater/docker/)
 - [Roadmap](#roadmap)
-- [Contributing](#contributing)
+- [Contributing](https://docs.openhop.dev/projects/openhop-repeater/development/)
 - [Support](#support)
 - [Disclaimer](#disclaimer)
 - [License](#license)
@@ -381,18 +381,19 @@ The installer also enables `use_dio3_tcxo` and `use_dio2_rf` for E22 modules.
 
 ## Uninstallation
 
+Read the [Uninstallation guide](https://docs.openhop.dev/projects/openhop-repeater/uninstallation/)
+and make a durable backup before continuing. The native uninstaller performs a
+complete removal after one confirmation: it deletes the current and legacy
+installation, configuration, logs, data, and the `repeater` service user.
+
 ```bash
 sudo bash ./manage.sh uninstall
 ```
 
-The uninstaller will:
-
-- Stop and disable the systemd service
-- Remove the installation directory
-- Optionally remove configuration, logs, and user data
-- Optionally remove the service user account
-
-The script prompts before each optional removal step.
+The script attempts a best-effort configuration-only backup under `/tmp`, but that
+is not a durable or complete backup and may be removed automatically. It does not
+prompt separately for individual paths. Docker Compose removal and persistent
+volume cleanup are separate operations covered by the guide.
 
 ## Docker Compose
 

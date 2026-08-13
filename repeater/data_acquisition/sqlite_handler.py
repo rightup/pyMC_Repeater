@@ -131,6 +131,8 @@ class SQLiteHandler:
                         payload TEXT,
                         payload_length INTEGER,
                         tx_delay_ms REAL,
+                        rx_radio_id TEXT,
+                        tx_radio_id TEXT,
                         packet_hash TEXT,
                         original_path TEXT,
                         forwarded_path TEXT,
@@ -790,6 +792,31 @@ class SQLiteHandler:
                     )
                     logger.info(f"Migration '{migration_name}' applied successfully")
 
+                # Migration 16: Persist per-packet multi-radio provenance for
+                # dashboard visibility and troubleshooting.
+                migration_name = "add_packet_radio_ids"
+                existing = conn.execute(
+                    "SELECT migration_name FROM migrations WHERE migration_name = ?",
+                    (migration_name,),
+                ).fetchone()
+                if not existing:
+                    cursor = conn.execute("PRAGMA table_info(packets)")
+                    columns = [column[1] for column in cursor.fetchall()]
+
+                    if "rx_radio_id" not in columns:
+                        conn.execute("ALTER TABLE packets ADD COLUMN rx_radio_id TEXT")
+                        logger.info("Added rx_radio_id column to packets table")
+
+                    if "tx_radio_id" not in columns:
+                        conn.execute("ALTER TABLE packets ADD COLUMN tx_radio_id TEXT")
+                        logger.info("Added tx_radio_id column to packets table")
+
+                    conn.execute(
+                        "INSERT INTO migrations (migration_name, applied_at) VALUES (?, ?)",
+                        (migration_name, time.time()),
+                    )
+                    logger.info(f"Migration '{migration_name}' applied successfully")
+
                 conn.commit()
 
         except Exception as e:
@@ -1011,9 +1038,10 @@ class SQLiteHandler:
                         transmitted, is_duplicate, drop_reason, src_hash, dst_hash, path_hash,
                         upstream_hash, upstream_hash_size,
                         header, transport_codes, payload, payload_length,
-                        tx_delay_ms, packet_hash, original_path, forwarded_path, raw_packet,
+                        tx_delay_ms, rx_radio_id, tx_radio_id,
+                        packet_hash, original_path, forwarded_path, raw_packet,
                         lbt_attempts, lbt_backoff_delays_ms, lbt_channel_busy
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                     (
                         record.get("timestamp", time.time()),
@@ -1036,6 +1064,8 @@ class SQLiteHandler:
                         record.get("payload"),
                         record.get("payload_length"),
                         record.get("tx_delay_ms"),
+                        record.get("rx_radio_id"),
+                        record.get("tx_radio_id"),
                         record.get("packet_hash"),
                         orig_path_val,
                         fwd_path_val,
@@ -2060,7 +2090,8 @@ class SQLiteHandler:
                         transmitted, is_duplicate, drop_reason, src_hash, dst_hash, path_hash,
                         upstream_hash, upstream_hash_size,
                         transport_codes, payload, payload_length,
-                        tx_delay_ms, packet_hash, original_path, forwarded_path,
+                        tx_delay_ms, rx_radio_id, tx_radio_id,
+                        packet_hash, original_path, forwarded_path,
                         lbt_attempts, lbt_channel_busy
                     FROM packets
                     ORDER BY timestamp DESC
@@ -2114,7 +2145,8 @@ class SQLiteHandler:
                         transmitted, is_duplicate, drop_reason, src_hash, dst_hash, path_hash,
                         upstream_hash, upstream_hash_size,
                         transport_codes, payload, payload_length,
-                        tx_delay_ms, packet_hash, original_path, forwarded_path,
+                        tx_delay_ms, rx_radio_id, tx_radio_id,
+                        packet_hash, original_path, forwarded_path,
                         lbt_attempts, lbt_channel_busy
                     FROM packets
                 """
@@ -2248,7 +2280,8 @@ class SQLiteHandler:
                         transmitted, is_duplicate, drop_reason, src_hash, dst_hash, path_hash,
                         upstream_hash, upstream_hash_size,
                         header, transport_codes, payload, payload_length,
-                        tx_delay_ms, packet_hash, original_path, forwarded_path, raw_packet,
+                        tx_delay_ms, rx_radio_id, tx_radio_id,
+                        packet_hash, original_path, forwarded_path, raw_packet,
                         lbt_attempts, lbt_backoff_delays_ms, lbt_channel_busy
                     FROM packets
                     WHERE packet_hash = ?
@@ -2275,7 +2308,8 @@ class SQLiteHandler:
                         transmitted, is_duplicate, drop_reason, src_hash, dst_hash, path_hash,
                         upstream_hash, upstream_hash_size,
                         header, transport_codes, payload, payload_length,
-                        tx_delay_ms, packet_hash, original_path, forwarded_path, raw_packet,
+                        tx_delay_ms, rx_radio_id, tx_radio_id,
+                        packet_hash, original_path, forwarded_path, raw_packet,
                         lbt_attempts, lbt_backoff_delays_ms, lbt_channel_busy
                     FROM packets
                     WHERE id = ?
