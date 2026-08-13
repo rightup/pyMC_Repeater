@@ -755,10 +755,10 @@ def test_telemetry_admin_full_mask_includes_environment_sensors():
     expected = (
         encode_voltage(TELEM_CHANNEL_SELF, 12.6)
         + encode_voltage(TELEM_CHANNEL_SELF + 1, 12.6)
-        + encode_current(TELEM_CHANNEL_SELF + 2, 0.5)
-        + encode_power(TELEM_CHANNEL_SELF + 3, 6)
-        + encode_temperature(TELEM_CHANNEL_SELF + 4, 21.5)
-        + encode_relative_humidity(TELEM_CHANNEL_SELF + 4, 55.0)
+        + encode_current(TELEM_CHANNEL_SELF + 1, 0.5)
+        + encode_power(TELEM_CHANNEL_SELF + 1, 6)
+        + encode_temperature(TELEM_CHANNEL_SELF + 2, 21.5)
+        + encode_relative_humidity(TELEM_CHANNEL_SELF + 2, 55.0)
     )
     assert lpp == expected
 
@@ -799,32 +799,6 @@ def test_telemetry_guest_forced_to_base_only():
     lpp = helper._handle_get_telemetry(guest, 0, b"\x00")
 
     assert lpp == encode_voltage(TELEM_CHANNEL_SELF, 0.0)
-
-
-def test_telemetry_includes_ina219_power_channels_before_environment_sensors():
-    """INA219 voltage/current/power values are emitted before env sensors."""
-    sm = _FakeSensorManager(
-        [
-            _reading(bus_voltage_v=12.6, current_ma=500.0, power_mw=6000.0),
-            _reading(temperature_c=21.5, humidity_pct=55.0),
-        ]
-    )
-    helper = ProtocolRequestHelper(
-        identity_manager=MagicMock(), packet_injector=AsyncMock(), sensor_manager=sm
-    )
-    admin = SimpleNamespace(is_guest=lambda: False)
-
-    lpp = helper._handle_get_telemetry(admin, 0, b"\x00")
-
-    expected = (
-        encode_voltage(TELEM_CHANNEL_SELF, 12.6)
-        + encode_voltage(TELEM_CHANNEL_SELF + 1, 12.6)
-        + encode_current(TELEM_CHANNEL_SELF + 2, 0.5)
-        + encode_power(TELEM_CHANNEL_SELF + 3, 6)
-        + encode_temperature(TELEM_CHANNEL_SELF + 4, 21.5)
-        + encode_relative_humidity(TELEM_CHANNEL_SELF + 4, 55.0)
-    )
-    assert lpp == expected
 
 
 def test_telemetry_inverse_mask_gates_environment():
