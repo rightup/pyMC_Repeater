@@ -2625,7 +2625,9 @@ class TestEngineTransmissionAndBackgroundLifecycle:
             completed = loop.create_future()
             completed.set_result(True)
 
-            async def _fake_schedule(packet, delay, airtime_ms, local_transmission=False):
+            async def _fake_schedule(
+                packet, delay, airtime_ms, local_transmission=False, **_kwargs
+            ):
                 packet._tx_metadata = {
                     "lbt_attempts": 2,
                     "lbt_backoff_delays_ms": [10, 20],

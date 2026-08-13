@@ -314,8 +314,9 @@ class APIEndpoints:
 
         jwt_handler = cherrypy.config.get("jwt_handler")
         token_manager = cherrypy.config.get("token_manager")
+        request_headers = getattr(cherrypy.request, "headers", None) or {}
 
-        auth_header = cherrypy.request.headers.get("Authorization", "")
+        auth_header = request_headers.get("Authorization", "")
         if jwt_handler and auth_header.startswith("Bearer "):
             payload = jwt_handler.verify_jwt(auth_header[7:])
             if payload:
@@ -344,7 +345,7 @@ class APIEndpoints:
                     pass
                 return user
 
-        api_key = cherrypy.request.headers.get("X-API-Key", "")
+        api_key = request_headers.get("X-API-Key", "")
         if token_manager and api_key:
             token_info = token_manager.verify_token(api_key)
             if token_info:

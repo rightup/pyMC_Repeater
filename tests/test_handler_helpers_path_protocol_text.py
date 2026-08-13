@@ -4,7 +4,6 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-
 from openhop_core.node.handlers.result import HandlerResult
 from openhop_core.protocol import Identity, LocalIdentity
 from openhop_core.protocol.packet_builder import PacketBuilder
@@ -769,9 +768,7 @@ def test_telemetry_bme280_emits_temperature_humidity_and_pressure_on_one_channel
     Mirrors the firmware's query_bme280 order: temperature, relative humidity,
     then barometric pressure.
     """
-    sm = _FakeSensorManager(
-        [_reading(temperature_c=21.5, humidity_pct=55.0, pressure_hpa=1013.25)]
-    )
+    sm = _FakeSensorManager([_reading(temperature_c=21.5, humidity_pct=55.0, pressure_hpa=1013.25)])
     helper = ProtocolRequestHelper(
         identity_manager=MagicMock(), packet_injector=AsyncMock(), sensor_manager=sm
     )
