@@ -339,10 +339,8 @@ class APIEndpoints:
                     "auth_type": "jwt_query",
                 }
                 cherrypy.request.user = user
-                try:
-                    del cherrypy.request.params["token"]
-                except Exception:
-                    pass
+                if hasattr(request_params, "pop"):
+                    request_params.pop("token", None)
                 return user
 
         api_key = request_headers.get("X-API-Key", "")
