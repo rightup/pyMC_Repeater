@@ -286,6 +286,15 @@ sensors:
     #     i2c_address: 0x70
     #     bus_number: 1
 
+    # Example BME280 temperature/pressure/humidity sensor (commented out by default)
+    # - type: bme280
+    #   name: ambient
+    #   enabled: true
+    #   auto_install_packages: false
+    #   settings:
+    #     i2c_address: 0x76     # 0x77 when SDO is tied high
+    #     bus_number: 1         # I2C bus number (1 for Raspberry Pi default)
+
     # Example Waveshare UPS D Hat 
     # - type: waveshare_ups_d
     #   name: battery

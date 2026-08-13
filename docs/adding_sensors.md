@@ -169,3 +169,4 @@ def test_my_sensor_loads_and_reads():
 | `hardware_stats` | `repeater/sensors/hardware_stats.py` | Host CPU / memory / disk / network (via `psutil`) |
 | `ina219` | `repeater/sensors/ina219.py` | INA219 I²C current/voltage/power monitor |
 | `ens210` | `repeater/sensors/ens210.py` | ENS210 I²C relative humidity and temperature sensor |
+| `bme280` | `repeater/sensors/bme280.py` | BME280 I²C temperature, humidity and barometric pressure sensor |
