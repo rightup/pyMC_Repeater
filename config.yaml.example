@@ -394,7 +394,75 @@ identities:
     #     tcp_port: 5001
     #     tcp_timeout: 120   # seconds; default 120 when omitted; 0 = disable (no timeout)
 
-# Radio hardware type
+# ---------------------------------------------------------------------------
+# Multi-radio / LoRa backhaul (optional)
+# ---------------------------------------------------------------------------
+# Leave ``radios:`` unset to keep the legacy single-radio config below.
+# When present, each entry is built with the same fields as the top-level
+# single-radio config (radio_type + radio air settings + hardware section).
+# Different entries may use different frequency / SF / modem type.
+#
+# fabric:
+#   default_radio: local          # TX default (first entry if omitted)
+#   tx_mode: bridge               # default | sticky | bridge
+#     # default: always TX default_radio
+#     # sticky:  TX on the radio that last received (same-band reply)
+#     # bridge:  TX on the *other* radio (dual-freq LoRa backhaul)
+#     #          RX local -> TX link, RX link -> TX local
+#
+# Dual CH341 USB adapters example (different USB bus/address per radio):
+# radios:
+#   - id: local
+#     radio_type: sx1262_ch341
+#     radio: { frequency: 869618000, tx_power: 14, bandwidth: 62500, spreading_factor: 8, coding_rate: 8, preamble_length: 32 }
+#     sx1262: { bus_id: 0, cs_id: 0, cs_pin: 0, reset_pin: 1, busy_pin: 2, irq_pin: 3, txen_pin: -1, rxen_pin: -1 }
+#     ch341: { vid: 0x1A86, pid: 0x5512, bus: 1, address: 5 }
+#   - id: link
+#     radio_type: sx1262_ch341
+#     radio: { frequency: 864200000, tx_power: 22, bandwidth: 62500, spreading_factor: 11, coding_rate: 8, preamble_length: 32 }
+#     sx1262: { bus_id: 0, cs_id: 0, cs_pin: 0, reset_pin: 1, busy_pin: 2, irq_pin: 3, txen_pin: -1, rxen_pin: -1 }
+#     ch341: { vid: 0x1A86, pid: 0x5512, bus: 1, address: 8 }
+#   use_fabric: false             # true wraps even a single radio in FabricRadio
+#
+# radios:
+#   - id: local
+#     radio_type: sx1262
+#     radio:
+#       frequency: 869618000
+#       tx_power: 14
+#       bandwidth: 62500
+#       spreading_factor: 8
+#       coding_rate: 8
+#       preamble_length: 32
+#     sx1262:
+#       bus_id: 0
+#       cs_id: 0
+#       cs_pin: 21
+#       reset_pin: 18
+#       busy_pin: 20
+#       irq_pin: 16
+#       txen_pin: -1
+#       rxen_pin: -1
+#   - id: link
+#     radio_type: sx1262
+#     radio:
+#       frequency: 864200000      # different freq = LoRa backhaul band
+#       tx_power: 22
+#       bandwidth: 62500
+#       spreading_factor: 11       # different SF ok
+#       coding_rate: 8
+#       preamble_length: 32
+#     sx1262:
+#       bus_id: 0
+#       cs_id: 1                  # distinct CS / pins from local
+#       cs_pin: 7
+#       reset_pin: 5
+#       busy_pin: 6
+#       irq_pin: 12
+#       txen_pin: -1
+#       rxen_pin: -1
+#
+# Radio hardware type (legacy single-radio; ignored for construction when radios: is set)
 # Supported:
 #   - sx1262        (Linux spidev + system GPIO)
 #   - sx1262_ch341  (CH341 USB-to-SPI + CH341 GPIO 0-7)
@@ -406,9 +474,16 @@ radio_type: null
 
 # CH341 USB-to-SPI adapter settings (only used when radio_type: sx1262_ch341)
 # NOTE: VID/PID are integers. Hex is also accepted in YAML, e.g. 0x1A86.
+# With two+ CH341 adapters, select each device by USB location and/or serial:
+#   bus / address  - from `lsusb -t` or `python -c "from openhop_core.hardware.ch341 import CH341Async; print(CH341Async.list_devices())"`
+#   serial_number  - USB iSerial if the adapter exposes one
+# Single-adapter setups may omit bus/address/serial_number.
 ch341:
   vid: 6790   # 0x1A86
   pid: 21778  # 0x5512
+  # bus: 1
+  # address: 5
+  # serial_number: "ABC123"
 
 radio:
   # Frequency in Hz (869.618 MHz for EU)

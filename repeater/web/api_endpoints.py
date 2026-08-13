@@ -300,6 +300,65 @@ class APIEndpoints:
             cherrypy.response.headers["Allow"] = "POST"
             raise cherrypy.HTTPError(405, "Method not allowed. This endpoint requires POST.")
 
+    def _resolve_optional_request_user(self):
+        """Resolve JWT/API credentials when tools.require_auth is disabled.
+
+        Some endpoints (notably config_import) are intentionally public during
+        first-run setup. After setup they still need to accept authenticated
+        UI/API calls, so parse Authorization / X-API-Key here and set
+        cherrypy.request.user when valid.
+        """
+        existing = getattr(cherrypy.request, "user", None)
+        if existing:
+            return existing
+
+        jwt_handler = cherrypy.config.get("jwt_handler")
+        token_manager = cherrypy.config.get("token_manager")
+
+        auth_header = cherrypy.request.headers.get("Authorization", "")
+        if jwt_handler and auth_header.startswith("Bearer "):
+            payload = jwt_handler.verify_jwt(auth_header[7:])
+            if payload:
+                user = {
+                    "username": payload.get("sub"),
+                    "client_id": payload.get("client_id"),
+                    "auth_type": "jwt",
+                }
+                cherrypy.request.user = user
+                return user
+
+        request_params = getattr(cherrypy.request, "params", None) or {}
+        query_token = request_params.get("token")
+        if jwt_handler and query_token:
+            payload = jwt_handler.verify_jwt(query_token)
+            if payload:
+                user = {
+                    "username": payload.get("sub"),
+                    "client_id": payload.get("client_id"),
+                    "auth_type": "jwt_query",
+                }
+                cherrypy.request.user = user
+                try:
+                    del cherrypy.request.params["token"]
+                except Exception:
+                    pass
+                return user
+
+        api_key = cherrypy.request.headers.get("X-API-Key", "")
+        if token_manager and api_key:
+            token_info = token_manager.verify_token(api_key)
+            if token_info:
+                user = {
+                    "username": "api_token",
+                    "token_name": token_info.get("name"),
+                    "token_id": token_info.get("id"),
+                    "auth_type": "api_token",
+                }
+                cherrypy.request.user = user
+                return user
+
+        return None
+
     def _fmt_hash(self, pubkey: bytes) -> str:
         """Format a node hash as a hex string respecting the configured path_hash_mode.
 
@@ -1693,6 +1752,13 @@ class APIEndpoints:
             stats["kiss"] = self.config.get("kiss", {})
             stats["pymc_usb"] = self.config.get("pymc_usb", {})
             stats["pymc_tcp"] = self.config.get("pymc_tcp", {})
+            stats["radios"] = self.config.get("radios") or []
+            stats["fabric"] = self.config.get("fabric") or {}
+            meta = {}
+            daemon = getattr(self, "daemon_instance", None)
+            if daemon is not None:
+                meta = getattr(daemon, "radio_stack_meta", None) or {}
+            stats["radio_stack"] = meta
             stats["site_name"] = self.config.get("web", {}).get("site_name", "")
             stats["version"] = __version__
             try:
@@ -4335,12 +4401,55 @@ class APIEndpoints:
             if "mesh" not in self.config:
                 self.config["mesh"] = {}
 
+            # Optional multi-radio target. When radios[] exists and radio_id is
+            # provided, LoRa air settings are written into that entry's radio{}
+            # instead of (or in addition to) the legacy top-level radio{}.
+            target_radio_id = data.get("radio_id")
+            radios_list = self.config.get("radios")
+            target_radio_cfg = self.config["radio"]
+            target_entry = None
+            if isinstance(radios_list, list) and target_radio_id:
+                for entry in radios_list:
+                    if not isinstance(entry, dict):
+                        continue
+                    rid = entry.get("id") or entry.get("radio_id")
+                    if str(rid) == str(target_radio_id):
+                        target_entry = entry
+                        if not isinstance(entry.get("radio"), dict):
+                            entry["radio"] = {}
+                        target_radio_cfg = entry["radio"]
+                        break
+                if target_entry is None:
+                    return self._error(f"Unknown radio_id={target_radio_id!r}")
+
+            def _set_radio_param(key, value):
+                target_radio_cfg[key] = value
+                # Keep legacy top-level radio in sync when editing default/first
+                # radio or when no radios[] list is active.
+                if target_entry is None:
+                    self.config["radio"][key] = value
+                else:
+                    default_id = None
+                    fabric = (
+                        self.config.get("fabric")
+                        if isinstance(self.config.get("fabric"), dict)
+                        else {}
+                    )
+                    default_id = fabric.get("default_radio") or fabric.get("default_radio_id")
+                    if default_id is None and radios_list:
+                        first = radios_list[0] if isinstance(radios_list[0], dict) else {}
+                        default_id = first.get("id") or first.get("radio_id")
+                    if default_id is not None and str(default_id) == str(target_radio_id):
+                        if "radio" not in self.config or not isinstance(self.config["radio"], dict):
+                            self.config["radio"] = {}
+                        self.config["radio"][key] = value
+
             # Update TX power (up to 30 dBm for high-power radios)
             if "tx_power" in data:
                 power = int(data["tx_power"])
                 if power < 2 or power > 30:
                     return self._error("TX power must be 2-30 dBm")
-                self.config["radio"]["tx_power"] = power
+                _set_radio_param("tx_power", power)
                 applied.append(f"power={power}dBm")
 
             # Update frequency (in Hz)
@@ -4348,7 +4457,7 @@ class APIEndpoints:
                 freq = float(data["frequency"])
                 if freq < 100_000_000 or freq > 1_000_000_000:
                     return self._error("Frequency must be 100-1000 MHz")
-                self.config["radio"]["frequency"] = freq
+                _set_radio_param("frequency", freq)
                 applied.append(f"freq={freq / 1_000_000:.3f}MHz")
 
             # Update bandwidth (in Hz)
@@ -4359,7 +4468,7 @@ class APIEndpoints:
                     return self._error(
                         f"Bandwidth must be one of {[b / 1000 for b in valid_bw]} kHz"
                     )
-                self.config["radio"]["bandwidth"] = bw
+                _set_radio_param("bandwidth", bw)
                 applied.append(f"bw={bw / 1000}kHz")
 
             # Update spreading factor
@@ -4367,7 +4476,7 @@ class APIEndpoints:
                 sf = int(data["spreading_factor"])
                 if sf < 5 or sf > 12:
                     return self._error("Spreading factor must be 5-12")
-                self.config["radio"]["spreading_factor"] = sf
+                _set_radio_param("spreading_factor", sf)
                 applied.append(f"sf={sf}")
 
             # Update coding rate
@@ -4375,7 +4484,7 @@ class APIEndpoints:
                 cr = int(data["coding_rate"])
                 if cr < 5 or cr > 8:
                     return self._error("Coding rate must be 5-8 (for 4/5 to 4/8)")
-                self.config["radio"]["coding_rate"] = cr
+                _set_radio_param("coding_rate", cr)
                 applied.append(f"cr=4/{cr}")
 
             # Update TX delay factor
@@ -4495,6 +4604,8 @@ class APIEndpoints:
                 return self._error("No valid settings provided")
 
             live_sections = ["repeater", "delays", "radio"]
+            if target_entry is not None:
+                live_sections.append("radios")
             if "mesh" in self.config and any(k in data for k in ("path_hash_mode", "loop_detect")):
                 live_sections.append("mesh")
             if "kiss" in self.config:
@@ -7647,9 +7758,11 @@ class APIEndpoints:
         try:
             self._require_post()
 
-            # Allow unauthenticated config restore only during first-run setup.
-            # Authenticated users may import config at any time.
-            request_user = getattr(cherrypy.request, "user", None)
+            # /api/config_import intentionally has tools.require_auth.off so the
+            # first-run setup wizard can restore a config without a JWT. After
+            # setup completes we must still accept the UI's Bearer/API token by
+            # resolving credentials here (the global auth tool never ran).
+            request_user = self._resolve_optional_request_user()
             if not request_user:
                 try:
                     current_config = self.config
@@ -7684,6 +7797,8 @@ class APIEndpoints:
                 "repeater",
                 "mesh",
                 "radio",
+                "radios",
+                "fabric",
                 "sx1262",
                 "ch341",
                 "kiss",
@@ -7746,6 +7861,8 @@ class APIEndpoints:
 
                 if section in {
                     "radio",
+                    "radios",
+                    "fabric",
                     "sx1262",
                     "ch341",
                     "kiss",
@@ -7760,6 +7877,16 @@ class APIEndpoints:
                 if section == "radio_type":
                     # radio_type is a top-level scalar, not a dict
                     self.config[section] = value
+                elif section == "radios":
+                    # Multi-radio list must replace wholesale (never dict-merge).
+                    # Allow null/[] to clear multi-radio mode and fall back to
+                    # legacy top-level radio_type/radio/sx1262/....
+                    if value is None:
+                        self.config.pop("radios", None)
+                    elif isinstance(value, list):
+                        self.config["radios"] = value
+                    else:
+                        return self._error("radios must be a list or null")
                 else:
                     if section not in self.config:
                         self.config[section] = {}

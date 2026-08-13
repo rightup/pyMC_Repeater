@@ -797,7 +797,10 @@ paths:
     post:
       tags: [System]
       summary: Update radio configuration
-      description: Update LoRa radio parameters
+      description: |
+        Update LoRa radio parameters. In multi-radio mode, pass radio_id to
+        target a radios[] entry; air settings are written to that entry and
+        mirrored to top-level radio when it is the default radio.
       security:
         - BearerAuth: []
         - ApiKeyAuth: []
@@ -807,6 +810,22 @@ paths:
           application/json:
             schema:
               type: object
+              properties:
+                radio_id:
+                  type: string
+                  description: Optional multi-radio id from config.radios[].id
+                frequency:
+                  type: number
+                bandwidth:
+                  type: number
+                spreading_factor:
+                  type: integer
+                coding_rate:
+                  type: integer
+                tx_power:
+                  type: number
+                preamble_length:
+                  type: integer
       responses:
         '200':
           description: Radio config updated
