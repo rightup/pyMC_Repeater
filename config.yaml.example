@@ -518,7 +518,10 @@ radio:
 
 # KISS modem (when radio_type: kiss). Requires openhop-core with KISS support.
 # kiss:
-#   port: "/dev/ttyUSB0"
+#   port: "/dev/ttyUSB0"        # 99-openhop-modem.rules symlinks to /dev/openhop-modem.
+#                               # Prefer that over /dev/serial/by-id/ in Docker: an
+#                               # ESP32-S3 by-id name contains colons and Docker reads
+#                               # those as its host:container separator.
 #   baud_rate: 9600
 #   # Optional KISS key-up / CSMA tuning, forwarded to the modem firmware.
 #   # Omit to keep the wrapper/firmware defaults. For a host-managed repeater the

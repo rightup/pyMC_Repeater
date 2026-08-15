@@ -11,6 +11,12 @@ services:
       - /dev/gpiochip0
       # USB DEVICES (Your path may differ)
       - /dev/bus/usb/002:/dev/bus/usb/002
+      # USB SERIAL MODEM (KISS / openHop USB). Do NOT use a /dev/serial/by-id/
+      # path here: ESP32-S3 boards report their MAC as the USB serial number, so
+      # the name contains colons and Docker reads those as the host:container
+      # separator. Install 99-openhop-modem.rules on the host and map the
+      # symlink it creates instead. See README, "USB serial modems".
+      # - /dev/openhop-modem:/dev/openhop-modem
     # SPI DEVICES PERMISSIONS
     cap_add:
       - SYS_RAWIO

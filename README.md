@@ -457,6 +457,10 @@ services:
       # USB devices. Uncomment/change only if needed.
       # - /dev/bus/usb/002:/dev/bus/usb/002
 
+      # USB serial modem. See "USB serial modems" below before using a
+      # /dev/serial/by-id/ path here.
+      # - /dev/openhop-modem:/dev/openhop-modem
+
     cap_add:
       - SYS_RAWIO
 
@@ -474,6 +478,52 @@ volumes:
   openhop-repeater-config:
   openhop-repeater-data:
 ```
+
+### USB serial modems
+
+A `/dev/serial/by-id/` path is the stable way to name a USB modem, but it cannot
+always be handed to a container. ESP32-S3 boards that use the chip's native
+USB-Serial-JTAG peripheral report their factory MAC address as the USB serial
+number, colons included, so udev produces a name like:
+
+```
+/dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_60:55:F9:C0:27:18-if00
+```
+
+Docker parses `devices:` entries as `host:container[:permissions]` and has no way
+to escape a colon inside the path, so that name is rejected. `/dev/serial/by-path/`
+does not help either, since those contain PCI addresses with colons of their own.
+
+Two further things to know: `/dev/serial/by-id` is built by udev on the host, and
+udev does not run inside the container, so the directory is not visible in there
+unless you bind-mount it. And a bare `/dev/ttyACM0` is not stable across re-plugs
+or reboots.
+
+Install the udev rule shipped with openHop Core, which creates a colon-free
+symlink that survives re-plugs:
+
+```bash
+sudo cp 99-openhop-modem.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules
+sudo udevadm trigger --subsystem-match=tty --action=change
+```
+
+Then map the symlink and point the config at the same path:
+
+```yaml
+devices:
+  - /dev/openhop-modem:/dev/openhop-modem
+```
+
+```yaml
+kiss:
+  port: "/dev/openhop-modem"
+```
+
+The rule matches USB ID `303a:1001`, which every ESP32-S3 board using native USB
+shares. With more than one attached, pin the rule to a single board's serial
+number — the rules file has a commented example and the `udevadm` command to read
+it.
 
 ## Roadmap
 

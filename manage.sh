@@ -651,6 +651,13 @@ install_repeater() {
         udevadm trigger 2>/dev/null || true
     fi
 
+    echo "59"; echo "# Installing udev rules for USB modems..."
+    if [ -f "$SCRIPT_DIR/../openhop-core/99-openhop-modem.rules" ]; then
+        cp "$SCRIPT_DIR/../openhop-core/99-openhop-modem.rules" /etc/udev/rules.d/99-openhop-modem.rules
+        udevadm control --reload-rules 2>/dev/null || true
+        udevadm trigger --subsystem-match=tty --action=change 2>/dev/null || true
+    fi
+
     echo "65"; echo "# Setting permissions..."
     # Venv stays root-owned (pip runs as root); service user only needs read+execute
     chown -R "$SERVICE_USER:$SERVICE_USER" "$CONFIG_DIR" "$LOG_DIR" "$DATA_DIR"
@@ -1147,6 +1154,14 @@ upgrade_repeater() {
         echo "    ✓ CH341 udev rules updated"
     elif [ -f /etc/udev/rules.d/99-ch341.rules ]; then
         echo "    ✓ CH341 udev rules already present"
+    fi
+    if [ -f "$SCRIPT_DIR/../openhop-core/99-openhop-modem.rules" ]; then
+        cp "$SCRIPT_DIR/../openhop-core/99-openhop-modem.rules" /etc/udev/rules.d/99-openhop-modem.rules
+        udevadm control --reload-rules 2>/dev/null || true
+        udevadm trigger --subsystem-match=tty --action=change 2>/dev/null || true
+        echo "    ✓ USB modem udev rules updated"
+    elif [ -f /etc/udev/rules.d/99-openhop-modem.rules ]; then
+        echo "    ✓ USB modem udev rules already present"
     fi
     echo "    ✓ User groups updated"
 
