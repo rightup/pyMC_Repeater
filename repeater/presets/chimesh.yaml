@@ -11,6 +11,7 @@ brokers:
     use_jwt_auth: true
     format: letsmesh
     retain_status: false
+    neighbors: true
     tls:
       enabled: true
       insecure: false
