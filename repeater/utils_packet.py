@@ -1,5 +1,5 @@
 import logging
-from typing import Optional, Tuple
+from typing import Literal, Optional, Tuple
 
 from openhop_core.protocol import PacketBuilder
 from openhop_core.protocol.constants import ROUTE_TYPE_TRANSPORT_FLOOD
@@ -16,8 +16,9 @@ def create_scoped_advert_packet(
     flags: int,
     default_region,
     scope_label: str,
+    route_type: Literal["flood", "direct"] = "flood",
 ) -> Tuple[object, Optional[str]]:
-    """Create a flood advert packet and apply default-region transport scope when configured."""
+    """Create an advert packet and apply flood scoping when configured."""
     packet = PacketBuilder.create_advert(
         local_identity=local_identity,
         name=node_name,
@@ -26,14 +27,16 @@ def create_scoped_advert_packet(
         feature1=0,
         feature2=0,
         flags=flags,
-        route_type="flood",
+        route_type=route_type,
     )
 
-    scoped_region_name = _apply_default_region_scope(
-        packet=packet,
-        default_region=default_region,
-        scope_label=scope_label,
-    )
+    scoped_region_name = None
+    if route_type == "flood":
+        scoped_region_name = _apply_default_region_scope(
+            packet=packet,
+            default_region=default_region,
+            scope_label=scope_label,
+        )
     return packet, scoped_region_name
 
 

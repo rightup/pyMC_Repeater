@@ -1544,6 +1544,7 @@ class RepeaterDaemon:
 
             mesh_config = self.config.get("mesh", {})
             default_region = mesh_config.get("default_region")
+            advert_route_type = "direct" if advert_kind == "direct" else "flood"
             packet, scoped_region_name = create_scoped_advert_packet(
                 local_identity=identity,
                 node_name=node_name,
@@ -1552,6 +1553,7 @@ class RepeaterDaemon:
                 flags=flags,
                 default_region=default_region,
                 scope_label="room server advert",
+                route_type=advert_route_type,
             )
 
             injector = getattr(getattr(self, "router", None), "inject_packet", None)
@@ -1569,8 +1571,9 @@ class RepeaterDaemon:
                 logger.debug("Marked room server advert '%s' as seen in duplicate cache", node_name)
 
             logger.info(
-                "Sent %s room advert (flood packet) '%s' at (%.6f, %.6f)",
+                "Sent %s room advert (%s packet) '%s' at (%.6f, %.6f)",
                 advert_kind,
+                advert_route_type,
                 node_name,
                 latitude,
                 longitude,
@@ -1733,6 +1736,7 @@ class RepeaterDaemon:
 
             mesh_config = self.config.get("mesh", {})
             default_region = mesh_config.get("default_region")
+            advert_route_type = "direct" if advert_kind == "direct" else "flood"
             packet, scoped_region_name = create_scoped_advert_packet(
                 local_identity=self.local_identity,
                 node_name=node_name,
@@ -1741,6 +1745,7 @@ class RepeaterDaemon:
                 flags=flags,
                 default_region=default_region,
                 scope_label="advert",
+                route_type=advert_route_type,
             )
 
             injector = getattr(getattr(self, "router", None), "inject_packet", None)
@@ -1760,8 +1765,9 @@ class RepeaterDaemon:
                 logger.debug("Marked own advert as seen in duplicate cache")
 
             logger.info(
-                "Sent %s advert (flood packet) '%s' at (%.6f, %.6f) source=%s",
+                "Sent %s advert (%s packet) '%s' at (%.6f, %.6f) source=%s",
                 advert_kind,
+                advert_route_type,
                 node_name,
                 latitude,
                 longitude,

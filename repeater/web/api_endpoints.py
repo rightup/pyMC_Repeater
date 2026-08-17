@@ -1906,6 +1906,7 @@ class APIEndpoints:
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
+    @cherrypy.tools.json_in()
     def send_advert(self):
         # Enable CORS for this endpoint
         self._set_cors_headers()
@@ -1920,12 +1921,26 @@ class APIEndpoints:
                 return self._error("Send advert function not configured")
             if self.event_loop is None:
                 return self._error("Event loop not available")
+
+            data = cherrypy.request.json or {}
+            mode = str(data.get("mode", "flood")).strip().lower()
+            if mode not in ("flood", "direct"):
+                return self._error("Invalid mode. Must be 'flood' or 'direct'")
+
             import asyncio
 
-            future = asyncio.run_coroutine_threadsafe(self.send_advert_func(), self.event_loop)
+            async def _call_send_advert():
+                try:
+                    return await self.send_advert_func(advert_kind=mode)
+                except TypeError:
+                    # Backward compatibility for older callbacks that don't
+                    # accept advert_kind yet.
+                    return await self.send_advert_func()
+
+            future = asyncio.run_coroutine_threadsafe(_call_send_advert(), self.event_loop)
             result = future.result(timeout=10)
             return (
-                self._success("Advert sent successfully")
+                self._success(f"{mode.title()} advert sent successfully")
                 if result
                 else self._error("Failed to send advert")
             )

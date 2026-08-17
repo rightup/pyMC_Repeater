@@ -454,6 +454,18 @@ paths:
       tags: [System]
       summary: Send repeater advertisement
       description: Manually trigger sending a repeater advertisement packet
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                mode:
+                  type: string
+                  enum: [flood, direct]
+                  default: flood
+                  description: Advert send mode label for UI/workflow selection.
       responses:
         '200':
           description: Advertisement sent
