@@ -671,6 +671,13 @@ def _has_update(installed: str, latest: str) -> bool:
 
 
 def _fetch_latest_version(channel: str) -> str:
+    """Return the version currently published on ``channel``.
+
+    Raises when the version cannot be determined. Returning an approximation
+    (such as the newest tag) would be actively harmful: the caller stores this
+    value as the channel's latest version, so a wrong value both misreports
+    the update state and gets baked into the install as the built version.
+    """
 
     base_tag = _get_latest_tag()  # always needed for dynamic branches
 
@@ -680,22 +687,28 @@ def _fetch_latest_version(channel: str) -> str:
             body = _fetch_url(compare_url, timeout=10)
             data = json.loads(body)
             ahead_by = int(data.get("ahead_by", 0))
-            return _next_dev_version(base_tag, ahead_by)
+        except _RateLimitError:
+            raise
         except Exception as exc:
-            logger.debug(f"[Update] Dynamic version compare failed for {channel!r}: {exc}")
-            return base_tag  # fallback: show the tag
+            raise RuntimeError(
+                f"Could not compare {base_tag}...{channel} on GitHub: {exc}"
+            ) from exc
+        return _next_dev_version(base_tag, ahead_by)
 
     # Static version channel — read the pinned version from pyproject.toml on
     # that branch directly, so tags created on other branches don't affect it.
     try:
         toml_url = f"{GITHUB_RAW_BASE}/{channel}/pyproject.toml"
         toml_text = _fetch_url(toml_url, timeout=8)
-        m = re.search(r'^version\s*=\s*["\']([0-9][^"\']*)["\']', toml_text, re.MULTILINE)
-        if m:
-            return m.group(1)
+    except _RateLimitError:
+        raise
     except Exception as exc:
-        logger.debug(f"[Update] Static version lookup failed for {channel!r}: {exc}")
-    return base_tag  # last-resort fallback
+        raise RuntimeError(f"Could not read pyproject.toml from {channel}: {exc}") from exc
+
+    m = re.search(r'^version\s*=\s*["\']([0-9][^"\']*)["\']', toml_text, re.MULTILINE)
+    if not m:
+        raise RuntimeError(f"No pinned version found in pyproject.toml on {channel}")
+    return m.group(1)
 
 
 def _fetch_changelog(channel: str, installed: str, max_commits: int = 50) -> List[dict]:
@@ -932,8 +945,13 @@ def _do_install() -> None:
 
     import os as _os
 
+    # No SETUPTOOLS_SCM_PRETEND_VERSION here: the version reported by the last
+    # check is a prediction, and pip derives the real one from the checkout it
+    # clones. Forcing the predicted value stamped the build with a version that
+    # did not match its code — and when that value was stale (a failed check, or
+    # a channel switch) pip saw the requirement as already satisfied and skipped
+    # the install, pinning the node to a version it could no longer leave.
     env = _os.environ.copy()
-    env["SETUPTOOLS_SCM_PRETEND_VERSION"] = _state.latest_version or "1.0.0"
 
     _VENV_DIR = "/opt/openhop_repeater/venv"
     _VENV_PIP = os.path.join(_VENV_DIR, "bin", "pip")
@@ -991,7 +1009,8 @@ def _do_install() -> None:
     elif _os.path.isfile(_UPGRADE_WRAPPER):
         _state.append_line(f"[pyMC updater] Using sudo wrapper: {_UPGRADE_WRAPPER}")
         # The wrapper handles venv creation/migration internally
-        cmd = [_SUDO_BIN, _UPGRADE_WRAPPER, channel, _state.latest_version or ""]
+        # Second argument (pretend-version) deliberately omitted — see above.
+        cmd = [_SUDO_BIN, _UPGRADE_WRAPPER, channel]
     else:
         msg = (
             f"Upgrade wrapper not found at {_UPGRADE_WRAPPER}. "
