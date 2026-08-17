@@ -826,6 +826,15 @@ paths:
                   type: number
                 preamble_length:
                   type: integer
+                flood_advert_interval_hours:
+                  type: integer
+                  description: Repeater flood advert interval in hours (0 = off, 3-168)
+                advert_interval_minutes:
+                  type: integer
+                  description: Legacy local advert interval in minutes (0 = off, 1-10080)
+                direct_advert_interval_hours:
+                  type: integer
+                  description: Additional repeater advert interval in hours (0 = off, 1-168)
       responses:
         '200':
           description: Radio config updated
@@ -2391,6 +2400,18 @@ paths:
                       type: string
                       description: Advertised node name (companion only; defaults to identity name)
                       example: "My Companion"
+                    flood_advert_interval_hours:
+                      type: integer
+                      minimum: 0
+                      maximum: 168
+                      description: Room-server flood advert interval in hours (0 = off)
+                      example: 6
+                    direct_advert_interval_hours:
+                      type: integer
+                      minimum: 0
+                      maximum: 168
+                      description: Room-server additional advert interval in hours (0 = off)
+                      example: 2
                     tcp_port:
                       type: integer
                       minimum: 1
@@ -2552,7 +2573,7 @@ paths:
                   description: New identity key (optional)
                 settings:
                   type: object
-                  description: Updated settings
+                  description: Updated settings (room server settings may include flood_advert_interval_hours and direct_advert_interval_hours)
       responses:
         '200':
           description: Identity updated

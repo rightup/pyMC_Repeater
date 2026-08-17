@@ -4566,6 +4566,14 @@ class APIEndpoints:
                 self.config["repeater"]["advert_interval_minutes"] = mins
                 applied.append(f"advert.interval={mins}m")
 
+            # Update direct advert interval (hours)
+            if "direct_advert_interval_hours" in data:
+                hours = int(data["direct_advert_interval_hours"])
+                if hours != 0 and (hours < 1 or hours > 168):
+                    return self._error("Direct advert interval must be 0 (off) or 1-168 hours")
+                self.config["repeater"]["direct_advert_interval_hours"] = hours
+                applied.append(f"direct.advert.interval={hours}h")
+
             # Update path hash mode (mesh: 0=1-byte, 1=2-byte, 2=3-byte)
             if "path_hash_mode" in data:
                 phm = int(data["path_hash_mode"])
@@ -5774,6 +5782,19 @@ class APIEndpoints:
             identity_type = data.get("type", "room_server")
             settings = data.get("settings", {})
 
+            if not isinstance(settings, dict):
+                return self._error("settings must be an object")
+
+            def _validate_room_server_advert_intervals(room_settings):
+                for field in ("flood_advert_interval_hours", "direct_advert_interval_hours"):
+                    if field not in room_settings:
+                        continue
+                    hours = int(room_settings[field])
+                    if hours != 0 and (hours < 1 or hours > 168):
+                        return f"{field} must be 0 (off) or 1-168 hours"
+                    room_settings[field] = hours
+                return None
+
             if not name:
                 return self._error("Missing required field: name")
 
@@ -5789,6 +5810,9 @@ class APIEndpoints:
                 guest_pw = settings.get("guest_password")
                 if admin_pw and guest_pw and admin_pw == guest_pw:
                     return self._error("admin_password and guest_password must be different")
+                interval_error = _validate_room_server_advert_intervals(settings)
+                if interval_error:
+                    return self._error(interval_error)
 
             # Auto-generate identity key if not provided
             key_was_generated = False
@@ -6200,6 +6224,13 @@ class APIEndpoints:
                     identity["settings"] = {}
                 identity["settings"].update(data["settings"])
 
+                for field in ("flood_advert_interval_hours", "direct_advert_interval_hours"):
+                    if field in identity["settings"]:
+                        hours = int(identity["settings"][field])
+                        if hours != 0 and (hours < 1 or hours > 168):
+                            return self._error(f"{field} must be 0 (off) or 1-168 hours")
+                        identity["settings"][field] = hours
+
                 # Validate passwords are different if both are now set
                 admin_pw = identity["settings"].get("admin_password")
                 guest_pw = identity["settings"].get("guest_password")
@@ -6511,6 +6542,31 @@ class APIEndpoints:
     ):
         """Send advert for a room server identity"""
         try:
+            if self.daemon_instance and hasattr(self.daemon_instance, "_send_room_server_advert"):
+                identity_manager = getattr(self.daemon_instance, "identity_manager", None)
+                room_name = node_name
+                room_cfg = {
+                    "settings": {
+                        "node_name": node_name,
+                        "latitude": latitude,
+                        "longitude": longitude,
+                    }
+                }
+                if identity_manager is not None:
+                    for n, room_identity, cfg in identity_manager.get_identities_by_type(
+                        "room_server"
+                    ):
+                        if room_identity is identity:
+                            room_name = n
+                            room_cfg = cfg
+                            break
+                return await self.daemon_instance._send_room_server_advert(
+                    room_name=room_name,
+                    identity=identity,
+                    identity_config=room_cfg,
+                    advert_kind="manual",
+                )
+
             from openhop_core.protocol.constants import (
                 ADVERT_FLAG_HAS_NAME,
                 ADVERT_FLAG_IS_ROOM_SERVER,

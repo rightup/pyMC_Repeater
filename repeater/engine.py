@@ -119,6 +119,7 @@ class RepeaterHandler(BaseHandler):
         *,
         local_hash_bytes=None,
         send_advert_func=None,
+        periodic_advert_tick_func=None,
     ):
 
         self.config = config
@@ -126,6 +127,7 @@ class RepeaterHandler(BaseHandler):
         self.local_hash = local_hash
         self.local_hash_bytes = local_hash_bytes or bytes([local_hash])
         self.send_advert_func = send_advert_func
+        self.periodic_advert_tick_func = periodic_advert_tick_func
         self.airtime_mgr = AirtimeManager(config)
         self.policy_engine = PolicyEngine.from_runtime_config(config)
         self.seen_packets = OrderedDict()
@@ -1782,8 +1784,12 @@ class RepeaterHandler(BaseHandler):
                     await self._record_crc_errors_async()
                     self.last_noise_measurement = current_time
 
-                # Check advert sending (every N hours)
-                if self.send_advert_interval_hours > 0 and self.send_advert_func:
+                # Check advert scheduling.
+                # Prefer daemon-managed scheduling so repeater + room-server
+                # intervals can share one loop and stagger transmissions.
+                if self.periodic_advert_tick_func:
+                    await self.periodic_advert_tick_func()
+                elif self.send_advert_interval_hours > 0 and self.send_advert_func:
                     interval_seconds = self.send_advert_interval_hours * 3600
                     if current_time - self.last_advert_time >= interval_seconds:
                         await self._send_periodic_advert_async()

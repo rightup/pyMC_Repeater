@@ -61,6 +61,12 @@ repeater:
   # Recommended: 10 hours for typical deployments
   send_advert_interval_hours: 10
 
+  # Additional periodic advert stream in hours.
+  # Uses the same advert packet type and scheduler loop, but independent cadence.
+  # Set to 0 to disable.
+  # Range: 0 (disabled) or 1-168 hours
+  direct_advert_interval_hours: 0
+
   # Respond to discovery requests from other nodes
   # When enabled, the repeater will automatically respond to discovery packets
   # with its node information (node type 2 - repeater)
@@ -372,6 +378,8 @@ identities:
     #     node_name: "Test BBS Room"
     #     latitude: 0.0
     #     longitude: 0.0
+    #     flood_advert_interval_hours: 6
+    #     direct_advert_interval_hours: 2
     #     admin_password: "room_admin_password"
     #     guest_password: "room_guest_password"
     # Add more room servers as needed
@@ -382,6 +390,8 @@ identities:
     #     node_name: "Social Hub"
     #     latitude: 0.0
     #     longitude: 0.0
+    #     flood_advert_interval_hours: 12
+    #     direct_advert_interval_hours: 0
     #     admin_password: "social_admin_123"
     #     guest_password: "social_guest_123"
 

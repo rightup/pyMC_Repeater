@@ -54,6 +54,7 @@ from repeater.web.http_server import HTTPStatsServer, _log_buffer
 logger = logging.getLogger("RepeaterDaemon")
 
 _COMPANION_LOAD_RETRY_DELAY_SEC = 0.5
+_PERIODIC_ADVERT_STAGGER_SECONDS = 10.0
 
 
 async def _load_companion_rows_verified(
@@ -135,6 +136,7 @@ class RepeaterDaemon:
         self._stop_requested = False
         self.radio_status = "unknown"
         self.radio_error = None
+        self._periodic_advert_last_sent: dict[str, float] = {}
 
         log_level = normalize_log_level(config.get("logging", {}).get("level", "INFO"))
         logging.basicConfig(
@@ -478,6 +480,7 @@ class RepeaterDaemon:
                 self.local_hash,
                 local_hash_bytes=self.local_hash_bytes,
                 send_advert_func=self.send_advert,
+                periodic_advert_tick_func=self.run_periodic_advert_scheduler_tick,
             )
 
             # Storage now exists: build the served-region map and wire it into the
@@ -1487,7 +1490,216 @@ class RepeaterDaemon:
             }
         return {}
 
-    async def send_advert(self) -> bool:
+    @staticmethod
+    def _coerce_interval_hours(raw_value, *, min_enabled: int = 1, max_enabled: int = 168) -> int:
+        """Parse interval hours from config, returning 0 when disabled/invalid."""
+        try:
+            hours = int(raw_value)
+        except (TypeError, ValueError):
+            return 0
+        if hours == 0:
+            return 0
+        if hours < min_enabled or hours > max_enabled:
+            return 0
+        return hours
+
+    def _periodic_advert_due(self, stream_key: str, interval_hours: int, now: float) -> bool:
+        """Return True when this stream should send now.
+
+        Streams start their cadence at daemon start, matching the historical
+        repeater timer behavior (first periodic advert after one full interval).
+        """
+        if interval_hours <= 0:
+            return False
+        interval_seconds = float(interval_hours) * 3600.0
+        last_sent = self._periodic_advert_last_sent.setdefault(stream_key, now)
+        return (now - last_sent) >= interval_seconds
+
+    async def _send_room_server_advert(
+        self,
+        *,
+        room_name: str,
+        identity,
+        identity_config: dict,
+        advert_kind: str,
+    ) -> bool:
+        """Send an advert packet for a room-server identity."""
+        if not self.dispatcher:
+            logger.error("Cannot send room advert: dispatcher not initialized")
+            return False
+
+        try:
+            from openhop_core.protocol.constants import (
+                ADVERT_FLAG_HAS_NAME,
+                ADVERT_FLAG_IS_ROOM_SERVER,
+            )
+
+            settings = (
+                identity_config.get("settings", {}) if isinstance(identity_config, dict) else {}
+            )
+            node_name = settings.get("node_name", room_name)
+            latitude = settings.get("latitude", 0.0)
+            longitude = settings.get("longitude", 0.0)
+            flags = ADVERT_FLAG_IS_ROOM_SERVER | ADVERT_FLAG_HAS_NAME
+
+            mesh_config = self.config.get("mesh", {})
+            default_region = mesh_config.get("default_region")
+            packet, scoped_region_name = create_scoped_advert_packet(
+                local_identity=identity,
+                node_name=node_name,
+                latitude=latitude,
+                longitude=longitude,
+                flags=flags,
+                default_region=default_region,
+                scope_label="room server advert",
+            )
+
+            injector = getattr(getattr(self, "router", None), "inject_packet", None)
+            if callable(injector):
+                sent = await injector(packet, wait_for_ack=False)
+            else:
+                sent = await self.dispatcher.send_packet(packet, wait_for_ack=False)
+
+            if not sent:
+                logger.error("Failed to send room server advert: packet transmission was rejected")
+                return False
+
+            if not callable(injector) and self.repeater_handler:
+                self.repeater_handler.mark_seen(packet)
+                logger.debug("Marked room server advert '%s' as seen in duplicate cache", node_name)
+
+            logger.info(
+                "Sent %s room advert (flood packet) '%s' at (%.6f, %.6f)",
+                advert_kind,
+                node_name,
+                latitude,
+                longitude,
+            )
+            if scoped_region_name:
+                logger.info("Room server advert scoped to default region '%s'", scoped_region_name)
+            return True
+        except Exception as e:
+            logger.error("Failed to send room server advert: %s", e, exc_info=True)
+            return False
+
+    async def run_periodic_advert_scheduler_tick(self) -> None:
+        """Run one scheduler tick for repeater + room-server advert intervals.
+
+        Called from RepeaterHandler's existing background loop every 5 seconds.
+        """
+        mode = self.config.get("repeater", {}).get("mode", "forward")
+        if mode == "no_tx":
+            return
+
+        now = time.time()
+        scheduled = []
+
+        repeater_cfg = self.config.get("repeater", {}) if isinstance(self.config, dict) else {}
+        repeater_flood_hours = self._coerce_interval_hours(
+            repeater_cfg.get("send_advert_interval_hours", 10),
+            min_enabled=3,
+        )
+        if self._periodic_advert_due("repeater:flood", repeater_flood_hours, now):
+            scheduled.append(
+                {
+                    "key": "repeater:flood",
+                    "label": "repeater flood advert",
+                    "sender": lambda: self.send_advert(advert_kind="flood"),
+                }
+            )
+
+        repeater_direct_hours = self._coerce_interval_hours(
+            repeater_cfg.get("direct_advert_interval_hours", 0),
+            min_enabled=1,
+        )
+        if self._periodic_advert_due("repeater:direct", repeater_direct_hours, now):
+            scheduled.append(
+                {
+                    "key": "repeater:direct",
+                    "label": "repeater direct advert",
+                    "sender": lambda: self.send_advert(advert_kind="direct"),
+                }
+            )
+
+        if self.identity_manager is not None:
+            room_identities = sorted(
+                self.identity_manager.get_identities_by_type("room_server"),
+                key=lambda item: str(item[0]).lower(),
+            )
+            for room_name, room_identity, room_cfg in room_identities:
+                settings = room_cfg.get("settings", {}) if isinstance(room_cfg, dict) else {}
+                room_flood_hours = self._coerce_interval_hours(
+                    settings.get("flood_advert_interval_hours", 0),
+                    min_enabled=1,
+                )
+                room_flood_key = f"room:{room_name}:flood"
+                if self._periodic_advert_due(room_flood_key, room_flood_hours, now):
+                    scheduled.append(
+                        {
+                            "key": room_flood_key,
+                            "label": f"room '{room_name}' flood advert",
+                            "sender": (
+                                lambda n=room_name, i=room_identity, c=room_cfg: (
+                                    self._send_room_server_advert(
+                                        room_name=n,
+                                        identity=i,
+                                        identity_config=c,
+                                        advert_kind="flood",
+                                    )
+                                )
+                            ),
+                        }
+                    )
+
+                room_direct_hours = self._coerce_interval_hours(
+                    settings.get("direct_advert_interval_hours", 0),
+                    min_enabled=1,
+                )
+                room_direct_key = f"room:{room_name}:direct"
+                if self._periodic_advert_due(room_direct_key, room_direct_hours, now):
+                    scheduled.append(
+                        {
+                            "key": room_direct_key,
+                            "label": f"room '{room_name}' direct advert",
+                            "sender": (
+                                lambda n=room_name, i=room_identity, c=room_cfg: (
+                                    self._send_room_server_advert(
+                                        room_name=n,
+                                        identity=i,
+                                        identity_config=c,
+                                        advert_kind="direct",
+                                    )
+                                )
+                            ),
+                        }
+                    )
+
+        if not scheduled:
+            return
+
+        logger.info("Periodic advert scheduler: %d advert(s) due", len(scheduled))
+
+        for idx, item in enumerate(scheduled):
+            if idx > 0:
+                await asyncio.sleep(_PERIODIC_ADVERT_STAGGER_SECONDS)
+
+            stream_key = item["key"]
+            self._periodic_advert_last_sent[stream_key] = time.time()
+            try:
+                ok = await item["sender"]()
+                if ok:
+                    logger.info("Periodic advert sent: %s", item["label"])
+                else:
+                    logger.warning("Periodic advert failed: %s", item["label"])
+            except Exception as exc:
+                logger.error(
+                    "Periodic advert raised exception for %s: %s",
+                    item["label"],
+                    exc,
+                    exc_info=True,
+                )
+
+    async def send_advert(self, advert_kind: str = "flood") -> bool:
 
         if not self.dispatcher or not self.local_identity:
             logger.error("Cannot send advert: dispatcher or identity not initialized")
@@ -1548,7 +1760,8 @@ class RepeaterDaemon:
                 logger.debug("Marked own advert as seen in duplicate cache")
 
             logger.info(
-                "Sent flood advert '%s' at (%.6f, %.6f) source=%s",
+                "Sent %s advert (flood packet) '%s' at (%.6f, %.6f) source=%s",
+                advert_kind,
                 node_name,
                 latitude,
                 longitude,
