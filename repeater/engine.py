@@ -149,6 +149,16 @@ class RepeaterHandler(BaseHandler):
         self.use_score_for_tx = config.get("repeater", {}).get("use_score_for_tx", False)
         self.score_threshold = config.get("repeater", {}).get("score_threshold", 0.3)
         self.multi_acks = self._normalize_multi_acks(config)
+        # Relayed packets held back until the airtime budget admits them, rather
+        # than dropped on the spot.  Bounded like MeshCore bounds its outbound
+        # queue (StaticPoolPacketManager(32) in the repeater firmware, dropping
+        # once full): a deferred relay occupies one of PacketRouter's in-flight
+        # slots for the whole wait, and those slots also carry packets meant for
+        # local consumption, so the cap stays well under _max_in_flight (30).
+        self.max_deferred_relays = max(
+            0, int(config.get("duty_cycle", {}).get("max_deferred_relays", 8))
+        )
+        self._deferred_relays = 0
         self.max_flood_hops = config.get("repeater", {}).get("max_flood_hops", 64)
         self.send_advert_interval_hours = config.get("repeater", {}).get(
             "send_advert_interval_hours", 10
@@ -406,28 +416,42 @@ class RepeaterHandler(BaseHandler):
             lbt_backoff_delays_ms = None
             lbt_channel_busy = False
 
+            defer_relay = (
+                not local_transmission
+                and not can_tx
+                and self._deferred_relays < self.max_deferred_relays
+            )
             if not can_tx:
-                if local_transmission:
-                    # Defer local TX until duty cycle allows instead of dropping
+                if local_transmission or defer_relay:
+                    # Hold the packet until the airtime budget admits it instead
+                    # of dropping it: MeshCore's checkSend() reschedules its next
+                    # TX and leaves the packet queued, so congestion costs latency
+                    # rather than the packet.
                     deferred_delay = delay + wait_time
+                    kind = "local" if local_transmission else "relayed"
                     logger.info(
-                        f"Duty-cycle limit: deferring local TX by {wait_time:.1f}s "
+                        f"Duty-cycle limit: deferring {kind} TX by {wait_time:.1f}s "
                         f"(airtime={airtime_ms:.1f}ms)"
                     )
-                    tx_task = await self.schedule_retransmit(
-                        fwd_pkt,
-                        deferred_delay,
-                        airtime_ms,
-                        local_transmission=True,
-                        preferred_tx_radio_id=preferred_tx_radio_id,
-                    )
+                    if defer_relay:
+                        self._deferred_relays += 1
                     try:
+                        tx_task = await self.schedule_retransmit(
+                            fwd_pkt,
+                            deferred_delay,
+                            airtime_ms,
+                            local_transmission=local_transmission,
+                            preferred_tx_radio_id=preferred_tx_radio_id,
+                        )
                         tx_success = await tx_task
                     except Exception as e:
                         transmitted = False
                         drop_reason = "TX failed (deferred)"
-                        logger.warning(f"Deferred local TX failed: {e}")
+                        logger.warning(f"Deferred {kind} TX failed: {e}")
                         raise
+                    finally:
+                        if defer_relay:
+                            self._deferred_relays -= 1
                     if not tx_success:
                         transmitted = False
                         drop_reason = "TX failed (deferred)"
@@ -449,9 +473,13 @@ class RepeaterHandler(BaseHandler):
                                 f"backoffs={lbt_backoff_delays_ms}"
                             )
                 else:
+                    # Nothing left to hold it in: the deferral slots are full,
+                    # the analogue of MeshCore dropping in queueOutbound() once
+                    # its send queue is full.
                     logger.warning(
-                        f"Duty-cycle limit exceeded. Airtime={airtime_ms:.1f}ms, "
-                        f"wait={wait_time:.1f}s before retry"
+                        f"Duty-cycle limit exceeded, no deferral slot free "
+                        f"({self._deferred_relays}/{self.max_deferred_relays}). "
+                        f"Airtime={airtime_ms:.1f}ms, wait={wait_time:.1f}s"
                     )
                     self.dropped_count += 1
                     drop_reason = DropReason.DUTY_CYCLE_LIMIT

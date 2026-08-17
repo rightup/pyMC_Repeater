@@ -2668,7 +2668,9 @@ class TestEngineTransmissionAndBackgroundLifecycle:
 
     @pytest.mark.asyncio
     async def test_non_local_drop_when_duty_cycle_blocked(self, handler):
+        """With no deferral slot free, an over-budget relay is still dropped."""
         pkt = _make_flood_packet(payload=b"\x31\x32")
+        handler.max_deferred_relays = 0
         handler.airtime_mgr.calculate_airtime = MagicMock(return_value=80.0)
         handler.airtime_mgr.can_transmit = MagicMock(return_value=(False, 1.25))
         handler.process_packet = MagicMock(return_value=(pkt, 0.1))
@@ -2935,3 +2937,155 @@ class TestEngineRecordAndCleanupHelpers:
         handler.cleanup()
 
         fake_task.cancel.assert_called_once()
+
+
+# ===================================================================
+# 14. Duty-cycle deferral of relayed packets
+# ===================================================================
+
+
+class TestRelayedDutyCycleDeferral:
+    """Over budget, a relay is held back rather than thrown away.
+
+    Firmware parity: ``Dispatcher::checkSend`` reschedules its next TX and
+    leaves the packet queued when the airtime budget is short, so congestion
+    costs latency, not the packet.  The number of relays waiting at once is
+    capped, mirroring the firmware dropping in ``queueOutbound`` once its send
+    queue is full — here the bound also protects the router's in-flight slots.
+    """
+
+    @staticmethod
+    def _ready(handler, *, deferrals=8):
+        handler.max_deferred_relays = deferrals
+        handler._deferred_relays = 0
+        handler.airtime_mgr.calculate_airtime = MagicMock(return_value=20.0)
+        handler.airtime_mgr.record_tx = MagicMock()
+        handler.airtime_mgr.record_rx = MagicMock()
+        handler.dispatcher.send_packet = AsyncMock(return_value=True)
+
+    @staticmethod
+    async def _deliver(handler, packet):
+        with (
+            patch.object(handler, "_calculate_tx_delay", return_value=0.0),
+            patch("repeater.engine.asyncio.sleep", new_callable=AsyncMock),
+        ):
+            await handler(
+                _inject_from_wire(packet),
+                {"snr": 3.0, "rssi": -80},
+                local_transmission=False,
+            )
+
+    @pytest.mark.asyncio
+    async def test_relay_over_budget_is_deferred_then_sent(self, handler):
+        """Refused upfront, admitted once the budget frees: it must go out."""
+        self._ready(handler)
+        handler.airtime_mgr.can_transmit = MagicMock(side_effect=[(False, 7.5), (True, 0.0)])
+
+        await self._deliver(handler, _make_flood_packet(payload=b"\x21\x22\x23\x24"))
+
+        assert handler.dispatcher.send_packet.await_count == 1
+        assert handler.forwarded_count == 1
+        assert handler.dropped_count == 0
+
+    @pytest.mark.asyncio
+    async def test_deferred_relay_waits_for_the_budget(self, handler):
+        """The wait is the delay the budget asked for, not an immediate retry."""
+        self._ready(handler)
+        handler.airtime_mgr.can_transmit = MagicMock(side_effect=[(False, 7.5), (True, 0.0)])
+        scheduled = []
+
+        async def _capture(pkt, delay, *args, **kwargs):
+            scheduled.append(delay)
+            task = asyncio.get_running_loop().create_future()
+            task.set_result(True)
+            return task
+
+        with (
+            patch.object(handler, "_calculate_tx_delay", return_value=0.0),
+            patch.object(handler, "schedule_retransmit", side_effect=_capture),
+        ):
+            await handler(
+                _inject_from_wire(_make_flood_packet(payload=b"\x25\x26\x27\x28")),
+                {"snr": 3.0, "rssi": -80},
+                local_transmission=False,
+            )
+
+        assert scheduled == [7.5]
+
+    @pytest.mark.asyncio
+    async def test_relay_still_over_budget_at_tx_time_is_dropped_not_retried(self, handler):
+        """One deferral, not a loop: the authoritative gate still decides."""
+        self._ready(handler)
+        handler.airtime_mgr.can_transmit = MagicMock(return_value=(False, 7.5))
+
+        await self._deliver(handler, _make_flood_packet(payload=b"\x29\x2a\x2b\x2c"))
+
+        assert handler.dispatcher.send_packet.await_count == 0
+        assert handler.forwarded_count == 0
+
+    @pytest.mark.asyncio
+    async def test_deferral_slots_are_released_after_the_wait(self, handler):
+        """A leaked slot would silently turn deferral back into dropping."""
+        self._ready(handler)
+        handler.airtime_mgr.can_transmit = MagicMock(
+            side_effect=[(False, 1.0), (True, 0.0), (False, 1.0), (True, 0.0)]
+        )
+
+        await self._deliver(handler, _make_flood_packet(payload=b"\x31\x31\x31\x31"))
+        await self._deliver(handler, _make_flood_packet(payload=b"\x32\x32\x32\x32"))
+
+        assert handler._deferred_relays == 0
+        assert handler.dispatcher.send_packet.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_slot_is_released_even_when_the_deferred_send_raises(self, handler):
+        self._ready(handler)
+        handler.airtime_mgr.can_transmit = MagicMock(side_effect=[(False, 1.0), (True, 0.0)])
+        handler.dispatcher.send_packet = AsyncMock(side_effect=RuntimeError("radio gone"))
+
+        with pytest.raises(RuntimeError):
+            await self._deliver(handler, _make_flood_packet(payload=b"\x33\x33\x33\x33"))
+
+        assert handler._deferred_relays == 0
+
+    @pytest.mark.asyncio
+    async def test_relay_is_dropped_once_every_deferral_slot_is_taken(self, handler):
+        """The bound must actually bite, or a burst outlives the router."""
+        self._ready(handler, deferrals=2)
+        handler._deferred_relays = 2  # both slots already occupied
+        handler.airtime_mgr.can_transmit = MagicMock(return_value=(False, 7.5))
+
+        await self._deliver(handler, _make_flood_packet(payload=b"\x41\x42\x43\x44"))
+
+        assert handler.dispatcher.send_packet.await_count == 0
+        assert handler.dropped_count == 1
+
+    @pytest.mark.asyncio
+    async def test_deferral_can_be_switched_off(self, handler):
+        """max_deferred_relays = 0 keeps the previous drop-on-congestion behaviour."""
+        self._ready(handler, deferrals=0)
+        handler.airtime_mgr.can_transmit = MagicMock(return_value=(False, 7.5))
+
+        await self._deliver(handler, _make_flood_packet(payload=b"\x51\x52\x53\x54"))
+
+        assert handler.dispatcher.send_packet.await_count == 0
+        assert handler.dropped_count == 1
+
+    @pytest.mark.asyncio
+    async def test_local_transmission_never_consumes_a_relay_slot(self, handler):
+        """Local TX had its own deferral before this change and keeps it."""
+        self._ready(handler, deferrals=0)  # relays may not defer at all
+        handler.airtime_mgr.can_transmit = MagicMock(side_effect=[(False, 1.0), (True, 0.0)])
+
+        with (
+            patch.object(handler, "_calculate_tx_delay", return_value=0.0),
+            patch("repeater.engine.asyncio.sleep", new_callable=AsyncMock),
+        ):
+            await handler(
+                _inject_from_wire(_make_flood_packet(payload=b"\x61\x62\x63\x64")),
+                {"snr": 3.0, "rssi": -80},
+                local_transmission=True,
+            )
+
+        assert handler.dispatcher.send_packet.await_count == 1
+        assert handler._deferred_relays == 0

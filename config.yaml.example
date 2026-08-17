@@ -614,6 +614,15 @@ duty_cycle:
   # Maximum airtime per minute in milliseconds
   max_airtime_per_minute: 3600
 
+  # How many relayed packets may wait for the airtime budget at the same time.
+  # Over budget, a relay is held back until the budget admits it instead of
+  # being dropped (firmware behaviour: Dispatcher::checkSend leaves the packet
+  # queued and simply reschedules).  Each waiting relay occupies one router
+  # in-flight slot, so this stays well under that cap; further relays arriving
+  # while every slot is taken are dropped, as the firmware drops once its own
+  # send queue is full.  Set to 0 to drop immediately instead of deferring.
+  max_deferred_relays: 8
+
 # Storage Configuration
 storage:
   # Directory for persistent storage files (SQLite, RRD).
