@@ -2935,3 +2935,166 @@ class TestEngineRecordAndCleanupHelpers:
         handler.cleanup()
 
         fake_task.cancel.assert_called_once()
+
+
+# ===================================================================
+# 13. Seen-table reservation lifetime
+# ===================================================================
+
+
+class TestSeenTableRollback:
+    """The seen-table entry must last exactly as long as the transmission did.
+
+    A forward decision reserves an entry in ``seen_packets`` so the copy
+    echoing back off a neighbour is suppressed.  That reservation is only
+    legitimate once the packet is on the air: if the transmit never happens,
+    holding the entry makes this node drop every later copy of a packet it
+    never relayed — including the neighbour rebroadcast that is its last
+    chance to relay it.
+
+    These assert on observable behaviour — how often the dispatcher is asked
+    to send — rather than on ``seen_packets``, so they keep their meaning if
+    the cache is reworked.
+    """
+
+    @staticmethod
+    async def _deliver(handler, packet):
+        """Feed one received packet through the handler, delays collapsed."""
+        with (
+            patch.object(handler, "_calculate_tx_delay", return_value=0.0),
+            patch("repeater.engine.asyncio.sleep", new_callable=AsyncMock),
+        ):
+            await handler(
+                _inject_from_wire(packet),
+                {"snr": 3.0, "rssi": -80},
+                local_transmission=False,
+            )
+
+    @staticmethod
+    def _ready(handler):
+        handler.airtime_mgr.calculate_airtime = MagicMock(return_value=20.0)
+        handler.airtime_mgr.can_transmit = MagicMock(return_value=(True, 0.0))
+        handler.airtime_mgr.record_tx = MagicMock()
+        handler.airtime_mgr.record_rx = MagicMock()
+        handler.dispatcher.send_packet = AsyncMock(return_value=True)
+
+    # ── the transmit never happened → the packet stays relayable ──────
+
+    @staticmethod
+    def _tx_returns_false(handler):
+        handler.dispatcher.send_packet = AsyncMock(return_value=False)
+
+    @staticmethod
+    def _tx_raises(handler):
+        handler.dispatcher.send_packet = AsyncMock(side_effect=RuntimeError("radio gone"))
+
+    @staticmethod
+    def _duty_cycle_refuses_upfront(handler):
+        handler.airtime_mgr.can_transmit = MagicMock(return_value=(False, 12.0))
+
+    @staticmethod
+    def _duty_cycle_refuses_at_tx_time(handler):
+        """Admitted when scheduled, refused once the TX lock is held."""
+        handler.airtime_mgr.can_transmit = MagicMock(side_effect=[(True, 0.0), (False, 12.0)])
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "make_it_fail",
+        [
+            "_tx_returns_false",
+            "_tx_raises",
+            "_duty_cycle_refuses_upfront",
+            "_duty_cycle_refuses_at_tx_time",
+        ],
+    )
+    async def test_forward_that_never_reached_the_air_is_relayable_again(
+        self, handler, make_it_fail
+    ):
+        self._ready(handler)
+        getattr(self, make_it_fail)(handler)
+
+        try:
+            await self._deliver(handler, _make_flood_packet(payload=b"\x11\x22\x33\x44"))
+        except RuntimeError:
+            pass  # the raising variant propagates; the release must happen anyway
+
+        assert handler.seen_packets == {}, "reservation left behind for a packet never sent"
+
+        # The neighbour's rebroadcast must be forwarded, not swallowed as a dupe.
+        self._ready(handler)
+        await self._deliver(handler, _make_flood_packet(payload=b"\x11\x22\x33\x44"))
+
+        assert handler.dispatcher.send_packet.await_count == 1
+
+    # ── the transmit happened → the echo stays suppressed ─────────────
+
+    @pytest.mark.asyncio
+    async def test_transmitted_packet_suppresses_its_echo(self, handler):
+        self._ready(handler)
+
+        await self._deliver(handler, _make_flood_packet(payload=b"\x55\x66\x77\x88"))
+        await self._deliver(handler, _make_flood_packet(payload=b"\x55\x66\x77\x88"))
+
+        assert handler.dispatcher.send_packet.await_count == 1
+        assert handler.forwarded_count == 1
+
+    @pytest.mark.asyncio
+    async def test_duplicate_does_not_release_the_reservation_of_the_real_send(self, handler):
+        """The trap: a duplicate is also "not transmitted this time".
+
+        Releasing on that basis would let the third copy be relayed again,
+        turning every echo into a fresh transmission — dedupe would be gone
+        while every other test here still passed.
+        """
+        self._ready(handler)
+        payload = b"\x99\xaa\xbb\xcc"
+
+        await self._deliver(handler, _make_flood_packet(payload=payload))  # relayed
+        await self._deliver(handler, _make_flood_packet(payload=payload))  # duplicate
+        await self._deliver(handler, _make_flood_packet(payload=payload))  # still a duplicate
+
+        assert handler.dispatcher.send_packet.await_count == 1
+        assert handler.seen_packets, "the transmitted packet lost its reservation"
+
+    @pytest.mark.asyncio
+    async def test_failed_send_does_not_release_an_unrelated_reservation(self, handler):
+        """Releasing must be keyed, not a blanket clear of recent state."""
+        self._ready(handler)
+        await self._deliver(handler, _make_flood_packet(payload=b"\x01\x01\x01\x01"))
+        kept = dict(handler.seen_packets)
+
+        self._tx_returns_false(handler)
+        await self._deliver(handler, _make_flood_packet(payload=b"\x02\x02\x02\x02"))
+
+        assert handler.seen_packets == kept
+
+    # ── every forward branch must report the key it marked ────────────
+
+    @pytest.mark.parametrize(
+        "make_packet",
+        [
+            lambda: _make_flood_packet(payload=b"\x31\x32\x33\x34"),
+            lambda: _make_direct_packet(payload=b"\x41\x42\x43\x44"),
+            lambda: _make_direct_ack_packet(path=bytes([LOCAL_HASH, 0xCC])),
+            lambda: _make_multipart_ack_packet(path=bytes([LOCAL_HASH, 0xCC])),
+        ],
+        ids=["flood", "direct", "routed_ack", "multipart_ack"],
+    )
+    def test_every_forward_branch_reports_the_key_it_marked(self, handler, make_packet):
+        """Structural counterpart to the behavioural tests above.
+
+        A branch that marks the table but returns no ``seen_key`` leaks its
+        reservation on every failed send, and no behavioural test would exist
+        yet for a newly added branch.  The multipart branch marks a recomputed
+        key of its own, so the incoming packet hash cannot be assumed.
+        """
+        packet = _inject_from_wire(make_packet())
+        packet_hash = packet.calculate_packet_hash().hex().upper()
+
+        result = handler.process_packet(packet, snr=3.0, packet_hash=packet_hash)
+
+        assert result is not None, "packet was not forwarded; test setup no longer valid"
+        seen_key = getattr(result, "seen_key", None)
+        assert seen_key is not None, "branch marked the table without reporting a key"
+        assert seen_key in handler.seen_packets, "reported key is not the one marked"
+        assert set(handler.seen_packets) == {seen_key}

@@ -97,11 +97,17 @@ class ForwardResult(tuple):
     optional multi-ack redundancy copies ahead of the plain ACK at the same
     scheduled time, so the caller must create the extra TX tasks before the
     primary one.
+
+    ``seen_key`` is the seen-table entry this decision reserved, so ``__call__``
+    can release it if the transmit never happens.  It must be the exact key the
+    branch marked with: a TRACE packet folds path_len into its hash, so a key
+    recomputed after the path is appended no longer matches.
     """
 
-    def __new__(cls, packet: Packet, delay_s: float, extras=()):
+    def __new__(cls, packet: Packet, delay_s: float, extras=(), seen_key=None):
         result = super().__new__(cls, (packet, delay_s))
         result.extras = tuple(extras)
+        result.seen_key = seen_key
         return result
 
 
@@ -362,10 +368,14 @@ class RepeaterHandler(BaseHandler):
         )
         forwarded_path_hashes = None
 
+        # Seen-table entry reserved by the forward decision below, released again
+        # if the transmit never happens (see the rollback after the TX block).
+        seen_key = getattr(result, "seen_key", None)
+
         # For local transmissions, create a direct transmission result (if local TX allowed)
         if local_transmission and allow_local_tx:
             # Mark local packet as seen to prevent duplicate processing when received back
-            self.mark_seen(packet, packet_hash=pkt_hash_full)
+            seen_key = self.mark_seen(packet, packet_hash=pkt_hash_full)
             # Calculate transmission delay for local packets
             delay = self._calculate_tx_delay(packet, snr)
             result = (packet, delay)
@@ -373,64 +383,113 @@ class RepeaterHandler(BaseHandler):
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug(f"Local transmission: calculated delay {delay:.3f}s")
 
-        if result:
-            fwd_pkt, delay = result
-            tx_delay_ms = delay * 1000.0
+        # One release point for every way the block below can end — return,
+        # drop, or exception — so a new failure path cannot forget it.
+        try:
+            if result:
+                fwd_pkt, delay = result
+                tx_delay_ms = delay * 1000.0
 
-            # Capture the forwarded path (after modification)
-            forwarded_path_hashes = fwd_pkt.get_path_hashes_hex()
+                # Capture the forwarded path (after modification)
+                forwarded_path_hashes = fwd_pkt.get_path_hashes_hex()
 
-            # MeshCore queues multi-ack redundancy copies ahead of the primary
-            # ACK at the same scheduled time, so create their TX tasks first.
-            # Each task re-checks the duty-cycle gate before transmitting.
-            extra_tx_tasks = []
-            for extra_pkt, extra_delay in getattr(result, "extras", ()):
-                extra_airtime_ms = self.airtime_mgr.calculate_airtime(extra_pkt.get_raw_length())
-                extra_tx_tasks.append(
-                    await self.schedule_retransmit(
-                        extra_pkt,
-                        extra_delay,
-                        extra_airtime_ms,
-                        preferred_tx_radio_id=preferred_tx_radio_id,
+                # MeshCore queues multi-ack redundancy copies ahead of the primary
+                # ACK at the same scheduled time, so create their TX tasks first.
+                # Each task re-checks the duty-cycle gate before transmitting.
+                extra_tx_tasks = []
+                for extra_pkt, extra_delay in getattr(result, "extras", ()):
+                    extra_airtime_ms = self.airtime_mgr.calculate_airtime(
+                        extra_pkt.get_raw_length()
                     )
-                )
-
-            # Check duty-cycle before scheduling TX
-            airtime_ms = self.airtime_mgr.calculate_airtime(fwd_pkt.get_raw_length())
-
-            can_tx, wait_time = self.airtime_mgr.can_transmit(airtime_ms)
-
-            # LBT metadata (set after any TX path that awaits send)
-            tx_metadata = None
-            lbt_attempts = 0
-            lbt_backoff_delays_ms = None
-            lbt_channel_busy = False
-
-            if not can_tx:
-                if local_transmission:
-                    # Defer local TX until duty cycle allows instead of dropping
-                    deferred_delay = delay + wait_time
-                    logger.info(
-                        f"Duty-cycle limit: deferring local TX by {wait_time:.1f}s "
-                        f"(airtime={airtime_ms:.1f}ms)"
+                    extra_tx_tasks.append(
+                        await self.schedule_retransmit(
+                            extra_pkt,
+                            extra_delay,
+                            extra_airtime_ms,
+                            preferred_tx_radio_id=preferred_tx_radio_id,
+                        )
                     )
+
+                # Check duty-cycle before scheduling TX
+                airtime_ms = self.airtime_mgr.calculate_airtime(fwd_pkt.get_raw_length())
+
+                can_tx, wait_time = self.airtime_mgr.can_transmit(airtime_ms)
+
+                # LBT metadata (set after any TX path that awaits send)
+                tx_metadata = None
+                lbt_attempts = 0
+                lbt_backoff_delays_ms = None
+                lbt_channel_busy = False
+
+                if not can_tx:
+                    if local_transmission:
+                        # Defer local TX until duty cycle allows instead of dropping
+                        deferred_delay = delay + wait_time
+                        logger.info(
+                            f"Duty-cycle limit: deferring local TX by {wait_time:.1f}s "
+                            f"(airtime={airtime_ms:.1f}ms)"
+                        )
+                        tx_task = await self.schedule_retransmit(
+                            fwd_pkt,
+                            deferred_delay,
+                            airtime_ms,
+                            local_transmission=True,
+                            preferred_tx_radio_id=preferred_tx_radio_id,
+                        )
+                        try:
+                            tx_success = await tx_task
+                        except Exception as e:
+                            transmitted = False
+                            drop_reason = "TX failed (deferred)"
+                            logger.warning(f"Deferred local TX failed: {e}")
+                            raise
+                        if not tx_success:
+                            transmitted = False
+                            drop_reason = "TX failed (deferred)"
+                            self.dropped_count += 1
+                        else:
+                            self.forwarded_count += 1
+                            transmitted = True
+                        tx_metadata = getattr(fwd_pkt, "_tx_metadata", None)
+                        if tx_metadata:
+                            tx_radio_id = tx_metadata.get("radio_id") or tx_metadata.get(
+                                "tx_radio_id"
+                            )
+                            lbt_attempts = tx_metadata.get("lbt_attempts", 0)
+                            lbt_backoff_delays_ms = tx_metadata.get("lbt_backoff_delays_ms", [])
+                            lbt_channel_busy = tx_metadata.get("lbt_channel_busy", False)
+                            if lbt_attempts > 0:
+                                total_lbt_delay = sum(lbt_backoff_delays_ms)
+                                logger.info(
+                                    f"LBT: {lbt_attempts} attempts, "
+                                    f"{total_lbt_delay:.0f}ms delay, "
+                                    f"backoffs={lbt_backoff_delays_ms}"
+                                )
+                    else:
+                        logger.warning(
+                            f"Duty-cycle limit exceeded. Airtime={airtime_ms:.1f}ms, "
+                            f"wait={wait_time:.1f}s before retry"
+                        )
+                        self.dropped_count += 1
+                        drop_reason = DropReason.DUTY_CYCLE_LIMIT
+                else:
                     tx_task = await self.schedule_retransmit(
                         fwd_pkt,
-                        deferred_delay,
+                        delay,
                         airtime_ms,
-                        local_transmission=True,
+                        local_transmission=local_transmission,
                         preferred_tx_radio_id=preferred_tx_radio_id,
                     )
                     try:
                         tx_success = await tx_task
                     except Exception as e:
                         transmitted = False
-                        drop_reason = "TX failed (deferred)"
-                        logger.warning(f"Deferred local TX failed: {e}")
+                        drop_reason = "TX failed"
+                        logger.warning(f"Local TX failed: {e}")
                         raise
                     if not tx_success:
                         transmitted = False
-                        drop_reason = "TX failed (deferred)"
+                        drop_reason = "TX failed"
                         self.dropped_count += 1
                     else:
                         self.forwarded_count += 1
@@ -441,78 +500,48 @@ class RepeaterHandler(BaseHandler):
                         lbt_attempts = tx_metadata.get("lbt_attempts", 0)
                         lbt_backoff_delays_ms = tx_metadata.get("lbt_backoff_delays_ms", [])
                         lbt_channel_busy = tx_metadata.get("lbt_channel_busy", False)
+
                         if lbt_attempts > 0:
                             total_lbt_delay = sum(lbt_backoff_delays_ms)
                             logger.info(
-                                f"LBT: {lbt_attempts} attempts, "
-                                f"{total_lbt_delay:.0f}ms delay, "
+                                f"LBT: {lbt_attempts} attempts, {total_lbt_delay:.0f}ms delay, "
                                 f"backoffs={lbt_backoff_delays_ms}"
                             )
+
+                # Redundancy copies ride alongside the primary result: collect them
+                # without letting a failed extra change the primary outcome.
+                for extra_task in extra_tx_tasks:
+                    try:
+                        if await extra_task:
+                            self.forwarded_count += 1
+                    except Exception as e:
+                        logger.warning(f"Multi-ack redundancy TX failed: {e}")
+            else:
+                self.dropped_count += 1
+                # Determine drop reason
+                if local_transmission and not allow_local_tx:
+                    drop_reason = policy_reason or DropReason.NO_TX_MODE
+                elif not allow_forward:
+                    drop_reason = policy_reason or DropReason.REPEAT_DISABLED
                 else:
-                    logger.warning(
-                        f"Duty-cycle limit exceeded. Airtime={airtime_ms:.1f}ms, "
-                        f"wait={wait_time:.1f}s before retry"
+                    # Check if packet has a specific drop reason set by handlers
+                    drop_reason = processed_packet.drop_reason or self._get_drop_reason(
+                        processed_packet, packet_hash=pkt_hash_full
                     )
-                    self.dropped_count += 1
-                    drop_reason = DropReason.DUTY_CYCLE_LIMIT
-            else:
-                tx_task = await self.schedule_retransmit(
-                    fwd_pkt,
-                    delay,
-                    airtime_ms,
-                    local_transmission=local_transmission,
-                    preferred_tx_radio_id=preferred_tx_radio_id,
-                )
-                try:
-                    tx_success = await tx_task
-                except Exception as e:
-                    transmitted = False
-                    drop_reason = "TX failed"
-                    logger.warning(f"Local TX failed: {e}")
-                    raise
-                if not tx_success:
-                    transmitted = False
-                    drop_reason = "TX failed"
-                    self.dropped_count += 1
-                else:
-                    self.forwarded_count += 1
-                    transmitted = True
-                tx_metadata = getattr(fwd_pkt, "_tx_metadata", None)
-                if tx_metadata:
-                    tx_radio_id = tx_metadata.get("radio_id") or tx_metadata.get("tx_radio_id")
-                    lbt_attempts = tx_metadata.get("lbt_attempts", 0)
-                    lbt_backoff_delays_ms = tx_metadata.get("lbt_backoff_delays_ms", [])
-                    lbt_channel_busy = tx_metadata.get("lbt_channel_busy", False)
-
-                    if lbt_attempts > 0:
-                        total_lbt_delay = sum(lbt_backoff_delays_ms)
-                        logger.info(
-                            f"LBT: {lbt_attempts} attempts, {total_lbt_delay:.0f}ms delay, "
-                            f"backoffs={lbt_backoff_delays_ms}"
-                        )
-
-            # Redundancy copies ride alongside the primary result: collect them
-            # without letting a failed extra change the primary outcome.
-            for extra_task in extra_tx_tasks:
-                try:
-                    if await extra_task:
-                        self.forwarded_count += 1
-                except Exception as e:
-                    logger.warning(f"Multi-ack redundancy TX failed: {e}")
-        else:
-            self.dropped_count += 1
-            # Determine drop reason
-            if local_transmission and not allow_local_tx:
-                drop_reason = policy_reason or DropReason.NO_TX_MODE
-            elif not allow_forward:
-                drop_reason = policy_reason or DropReason.REPEAT_DISABLED
-            else:
-                # Check if packet has a specific drop reason set by handlers
-                drop_reason = processed_packet.drop_reason or self._get_drop_reason(
-                    processed_packet, packet_hash=pkt_hash_full
-                )
-                if logger.isEnabledFor(logging.DEBUG):
-                    logger.debug(f"Packet not forwarded: {drop_reason}")
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(f"Packet not forwarded: {drop_reason}")
+        finally:
+            # Release the seen-table entry when the forward decision did not
+            # reach the air (duty cycle, radio error, a modem refusing the
+            # channel for the whole LBT budget). The entry exists to suppress
+            # our own echo; holding it for a packet we never relayed would
+            # silently drop every later copy of it — including a neighbour's
+            # rebroadcast, the only way this node could still relay it — until
+            # the cache TTL expires. Only an entry reserved by THIS call is
+            # released: a genuine duplicate yields no forward decision, so the
+            # entry left by the transmission that did happen stays put.
+            if seen_key is not None and not transmitted:
+                self.unmark_seen(seen_key)
 
         # Extract packet type and route from header
         if not hasattr(packet, "header") or packet.header is None:
@@ -959,13 +988,23 @@ class RepeaterHandler(BaseHandler):
         pkt_hash = packet_hash or packet.calculate_packet_hash().hex().upper()
         return pkt_hash in self.seen_packets
 
-    def mark_seen(self, packet: Packet, packet_hash: Optional[str] = None):
-
+    def mark_seen(self, packet: Packet, packet_hash: Optional[str] = None) -> str:
+        """Record the packet as seen and return the key used."""
         pkt_hash = packet_hash or packet.calculate_packet_hash().hex().upper()
         self.seen_packets[pkt_hash] = time.time()
 
         if len(self.seen_packets) > self.max_cache_size:
             self.seen_packets.popitem(last=False)
+        return pkt_hash
+
+    def unmark_seen(self, packet_hash: str) -> None:
+        """Release a seen-table entry reserved by a forward decision.
+
+        Only ever call this for an entry marked by the same packet handling that
+        then failed to transmit: releasing an entry marked by an earlier, real
+        transmission would let its echo be relayed a second time.
+        """
+        self.seen_packets.pop(packet_hash, None)
 
     def validate_packet(self, packet: Packet) -> Tuple[bool, str]:
 
@@ -1315,7 +1354,7 @@ class RepeaterHandler(BaseHandler):
         if self.is_duplicate(packet, packet_hash=seen_key):
             packet.drop_reason = DropReason.DUPLICATE
             return None
-        self.mark_seen(packet, packet_hash=seen_key)
+        seen_key = self.mark_seen(packet, packet_hash=seen_key)
 
         # Rebuild the received wrapper as the plain DIRECT ACK MeshCore would emit:
         # drop the multipart header byte and force the ACK payload/route type, then
@@ -1330,7 +1369,7 @@ class RepeaterHandler(BaseHandler):
         extras, delay_ms = self._multi_ack_extras(
             packet, float((remaining + 1) * self.MULTIPART_ACK_SPACING_MS), snr
         )
-        return ForwardResult(packet, delay_ms / 1000.0, extras)
+        return ForwardResult(packet, delay_ms / 1000.0, extras, seen_key=seen_key)
 
     def _multi_ack_extras(
         self, ack_packet: Packet, base_delay_ms: float, snr: float
@@ -1404,7 +1443,7 @@ class RepeaterHandler(BaseHandler):
         if self.is_duplicate(packet, packet_hash=packet_hash):
             packet.drop_reason = DropReason.DUPLICATE
             return None
-        self.mark_seen(packet, packet_hash=packet_hash)
+        seen_key = self.mark_seen(packet, packet_hash=packet_hash)
 
         packet.header = (PAYLOAD_TYPE_ACK << PH_TYPE_SHIFT) | ROUTE_TYPE_DIRECT
         packet.transport_codes = [0, 0]
@@ -1412,7 +1451,7 @@ class RepeaterHandler(BaseHandler):
         packet.path_len = PathUtils.encode_path_len(hash_size, hop_count - 1)
 
         extras, delay_ms = self._multi_ack_extras(packet, 0.0, snr)
-        return ForwardResult(packet, delay_ms / 1000.0, extras)
+        return ForwardResult(packet, delay_ms / 1000.0, extras, seen_key=seen_key)
 
     @staticmethod
     def calculate_packet_score(snr: float, packet_len: int, spreading_factor: int = 8) -> float:
@@ -1495,19 +1534,23 @@ class RepeaterHandler(BaseHandler):
         ):
             return self.forward_routed_ack(packet, snr, packet_hash=packet_hash)
 
+        # ``packet_hash`` is the key flood_forward / direct_forward mark with, so
+        # it is what the caller must release if the transmit never happens. Do
+        # not recompute it here: a TRACE packet folds path_len into its hash, and
+        # the forward has already appended this node to the path by then.
         if route_type == ROUTE_TYPE_FLOOD or route_type == ROUTE_TYPE_TRANSPORT_FLOOD:
             fwd_pkt = self.flood_forward(packet, packet_hash=packet_hash)
             if fwd_pkt is None:
                 return None
             delay = self._calculate_tx_delay(fwd_pkt, snr)
-            return fwd_pkt, delay
+            return ForwardResult(fwd_pkt, delay, seen_key=packet_hash)
 
         elif route_type == ROUTE_TYPE_DIRECT or route_type == ROUTE_TYPE_TRANSPORT_DIRECT:
             fwd_pkt = self.direct_forward(packet, packet_hash=packet_hash)
             if fwd_pkt is None:
                 return None
             delay = self._calculate_tx_delay(fwd_pkt, snr)
-            return fwd_pkt, delay
+            return ForwardResult(fwd_pkt, delay, seen_key=packet_hash)
 
         else:
             packet.drop_reason = f"Unknown route type: {route_type}"
