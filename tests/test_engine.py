@@ -1499,6 +1499,7 @@ class TestStatistics:
         assert "dropped_count" in stats
         assert "local_hash" in stats
         assert "uptime_seconds" in stats
+        assert stats["config"]["repeater"]["direct_advert_interval_hours"] == 0
 
     def test_get_stats_local_hash_format(self, handler):
         with patch.object(handler, "storage", None):

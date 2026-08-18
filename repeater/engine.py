@@ -1723,6 +1723,9 @@ class RepeaterHandler(BaseHandler):
                     "send_advert_interval_hours": repeater_config.get(
                         "send_advert_interval_hours", 10
                     ),
+                    "direct_advert_interval_hours": repeater_config.get(
+                        "direct_advert_interval_hours", 0
+                    ),
                     "latitude": repeater_config.get("latitude", 0.0),
                     "longitude": repeater_config.get("longitude", 0.0),
                     "max_flood_hops": repeater_config.get("max_flood_hops", 64),
