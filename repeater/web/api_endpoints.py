@@ -1436,6 +1436,11 @@ class APIEndpoints:
             for item in devices:
                 dev = item.get("device")
                 if dev and dev not in dedup:
+                    # Docker reads `devices:` entries as host:container[:perms] and
+                    # cannot escape a colon inside the path, so a /dev/serial/by-id/
+                    # name carrying an ESP32-S3 MAC serial is unusable in a
+                    # container. Flag it so the UI can offer a symlink instead.
+                    item["docker_safe"] = ":" not in dev
                     dedup[dev] = item
 
             sorted_devices = sorted(dedup.values(), key=lambda x: x["device"])

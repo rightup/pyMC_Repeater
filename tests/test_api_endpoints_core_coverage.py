@@ -535,6 +535,39 @@ def test_serial_ports_dedupes_duplicate_devices(cherrypy_ctx):
     assert "first" in result["data"][0]["description"]
 
 
+def test_serial_ports_flags_paths_docker_cannot_map(cherrypy_ctx):
+    del cherrypy_ctx
+    api = _make_api()
+
+    # ESP32-S3 boards on the native USB-Serial-JTAG peripheral report their MAC
+    # as the USB serial number, colons included. Docker reads `devices:` as
+    # host:container, so this path cannot be passed into a container.
+    by_id = SimpleNamespace(
+        device="/dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_60:55:F9:C0:27:18-if00",
+        description="USB JTAG/serial debug unit",
+        hwid="USB VID:PID=303A:1001",
+    )
+
+    with patch("serial.tools.list_ports.comports", return_value=[by_id]):
+        result = api.serial_ports()
+
+    assert result["success"] is True
+    assert result["data"][0]["docker_safe"] is False
+
+
+def test_serial_ports_marks_ordinary_paths_docker_safe(cherrypy_ctx):
+    del cherrypy_ctx
+    api = _make_api()
+
+    p1 = SimpleNamespace(device="/dev/ttyACM0", description="USB CDC", hwid="n/a")
+
+    with patch("serial.tools.list_ports.comports", return_value=[p1]):
+        result = api.serial_ports()
+
+    assert result["success"] is True
+    assert result["data"][0]["docker_safe"] is True
+
+
 def test_config_export_redacts_secrets_and_identity_keys(cherrypy_ctx):
     request, _ = cherrypy_ctx
     request.method = "GET"
