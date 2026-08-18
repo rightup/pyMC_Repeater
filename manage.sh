@@ -730,8 +730,11 @@ if ! [[ "$CHANNEL" =~ ^[a-zA-Z0-9._/-]{1,80}$ ]]; then
     exit 1
 fi
 # If caller supplied a version string, tell setuptools_scm to use it (sudo
-# strips env vars so it is passed as a positional argument instead).
-[ -n "$PRETEND_VERSION" ] && export SETUPTOOLS_SCM_PRETEND_VERSION="$PRETEND_VERSION"
+# strips env vars so it is passed as a positional argument instead). Scoped to
+# this distribution: the unscoped variable applies to every setuptools_scm
+# project built in the same pip run, so a dependency built from an sdist
+# instead of a wheel would be stamped with our version too.
+[ -n "$PRETEND_VERSION" ] && export SETUPTOOLS_SCM_PRETEND_VERSION_FOR_OPENHOP_REPEATER="$PRETEND_VERSION"
 # ---- Migration: ensure venv exists (handles upgrades from system-pip era) ----
 if [ ! -x "$VENV_PYTHON" ]; then
     echo "[pymc-do-upgrade] Creating venv at $VENV_DIR ..."
@@ -841,7 +844,7 @@ UPGRADEEOF
     # Only inspect git metadata when this directory is a checkout of the expected repo.
     if is_expected_repo_checkout "$SCRIPT_DIR"; then
         if GIT_VERSION="$(python3 -m setuptools_scm 2>/dev/null)"; then
-            export SETUPTOOLS_SCM_PRETEND_VERSION="$GIT_VERSION"
+            export SETUPTOOLS_SCM_PRETEND_VERSION_FOR_OPENHOP_REPEATER="$GIT_VERSION"
             echo "Installing version: $GIT_VERSION"
         fi
     fi
@@ -1082,7 +1085,7 @@ upgrade_repeater() {
 
     if is_expected_repo_checkout "$SCRIPT_DIR"; then
         if GIT_VERSION="$(python3 -m setuptools_scm 2>/dev/null)"; then
-            export SETUPTOOLS_SCM_PRETEND_VERSION="$GIT_VERSION"
+            export SETUPTOOLS_SCM_PRETEND_VERSION_FOR_OPENHOP_REPEATER="$GIT_VERSION"
             echo "Upgrading to version: $GIT_VERSION"
         fi
     fi
@@ -1227,8 +1230,11 @@ if ! [[ "$CHANNEL" =~ ^[a-zA-Z0-9._/-]{1,80}$ ]]; then
     exit 1
 fi
 # If caller supplied a version string, tell setuptools_scm to use it (sudo
-# strips env vars so it is passed as a positional argument instead).
-[ -n "$PRETEND_VERSION" ] && export SETUPTOOLS_SCM_PRETEND_VERSION="$PRETEND_VERSION"
+# strips env vars so it is passed as a positional argument instead). Scoped to
+# this distribution: the unscoped variable applies to every setuptools_scm
+# project built in the same pip run, so a dependency built from an sdist
+# instead of a wheel would be stamped with our version too.
+[ -n "$PRETEND_VERSION" ] && export SETUPTOOLS_SCM_PRETEND_VERSION_FOR_OPENHOP_REPEATER="$PRETEND_VERSION"
 # ---- Migration: ensure venv exists (handles upgrades from system-pip era) ----
 if [ ! -x "$VENV_PYTHON" ]; then
     echo "[pymc-do-upgrade] Creating venv at $VENV_DIR ..."
