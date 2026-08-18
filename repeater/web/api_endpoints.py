@@ -2822,6 +2822,13 @@ class APIEndpoints:
                         "host": str(b["host"]).strip(),
                         "port": port,
                         "format": str(b["format"]).strip(),
+                        # Custom base topic for legacy `mqtt` format. Persist
+                        # None when blank so the handler can apply defaults.
+                        "base_topic": (
+                            (str(b["base_topic"]).strip() or None)
+                            if "base_topic" in b and b.get("base_topic") is not None
+                            else None
+                        ),
                         "disallowed_packet_types": list(b.get("disallowed_packet_types", [])),
                         "retain_status": bool(b.get("retain_status", False)),
                         # Opt-in per broker; brokers that do not expect the

@@ -2593,13 +2593,22 @@ def test_update_mqtt_config_validation_and_success(cherrypy_ctx):
         "status_interval": 20,
         "brokers": [
             {"preset": "waev"},
-            {"name": "a", "host": "h", "port": 443, "format": "json", "enabled": True},
+            {
+                "name": "a",
+                "host": "h",
+                "port": 443,
+                "format": "mqtt",
+                "enabled": True,
+                "base_topic": "meshcore/custom/base",
+            },
         ],
     }
     api.config_manager.update_and_save.return_value = {"success": True, "saved": True}
     out = api.update_mqtt_config()
     assert out["success"] is True
     assert out["data"]["restart_required"] is True
+    updates = api.config_manager.update_and_save.call_args.kwargs["updates"]["mqtt_brokers"]
+    assert updates["brokers"][1]["base_topic"] == "meshcore/custom/base"
 
     api.config_manager.update_and_save.return_value = {"success": False, "error": "save failed"}
     out2 = api.update_mqtt_config()
