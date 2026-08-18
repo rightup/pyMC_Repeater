@@ -1,0 +1,17 @@
+# Chicagoland Mesh MC2MQTT broker preset.
+display_name: "Chicagoland Mesh"
+website: "https://chicagolandmesh.org"
+brokers:
+  - name: "chimesh"
+    enabled: true
+    host: mqtt.chimesh.org
+    port: 443
+    transport: "websockets"
+    audience: "mqtt.chimesh.org"
+    use_jwt_auth: true
+    format: letsmesh
+    retain_status: false
+    neighbors: true
+    tls:
+      enabled: true
+      insecure: false
