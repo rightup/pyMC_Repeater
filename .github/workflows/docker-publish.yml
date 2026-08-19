@@ -5,6 +5,8 @@ on:
     branches:
       - main
       - dev
+    tags:
+      - "v*"
   workflow_dispatch:
     inputs:
       image_repository:
@@ -101,6 +103,7 @@ jobs:
           tags: |
             type=raw,value=main,enable=${{ github.ref == 'refs/heads/main' }}
             type=raw,value=dev,enable=${{ github.ref == 'refs/heads/dev' }}
+            type=raw,value=v${{ steps.package_version.outputs.version }}
             type=sha,format=short
 
       - name: Build and push
