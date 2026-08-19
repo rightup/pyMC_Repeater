@@ -48,6 +48,10 @@ jobs:
       - name: Compute package version
         id: package_version
         run: |
+          if [ "${{ github.repository }}" != "openhop-dev/openhop_repeater" ]; then
+            git fetch --force https://github.com/openhop-dev/openhop_repeater.git \
+              "refs/tags/*:refs/tags/*"
+          fi
           python -m pip install --disable-pip-version-check setuptools_scm
           version="$(python -m setuptools_scm)"
           echo "version=${version}" >> "$GITHUB_OUTPUT"
