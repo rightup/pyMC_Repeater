@@ -5,8 +5,6 @@ on:
     branches:
       - main
       - dev
-    tags:
-      - "v*"
   workflow_dispatch:
     inputs:
       image_repository:
@@ -69,7 +67,7 @@ jobs:
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.image_repository }}" ]; then
             image_repository="${{ inputs.image_repository }}"
           elif [ "${{ github.repository_owner }}" = "yellowcooln" ]; then
-            image_repository="yellowcooln/pymc-repeater"
+            image_repository="yellowcooln/openhop-repeater"
           else
             image_repository="openhop/openhop-repeater"
           fi
@@ -127,7 +125,9 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Notify Home Assistant add-on repository
-        if: github.repository == 'openhop-dev/openhop_repeater'
+        if: >-
+          github.repository == 'openhop-dev/openhop_repeater' &&
+          (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')
         env:
           DISPATCH_TOKEN: ${{ secrets.HA_ADDON_REPO_DISPATCH_TOKEN }}
           CHANNEL: ${{ github.ref_name }}
