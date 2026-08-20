@@ -65,8 +65,8 @@ openHop Repeater supports these radio backends:
 
 - **SX1262 over Linux SPI**: set `radio_type: sx1262`
 - **SX1262 over CH341 USB-to-SPI**: set `radio_type: sx1262_ch341`
-- **pyMC TCP modem**: set `radio_type: pymc_tcp`
-- **pyMC USB-CDC modem**: set `radio_type: pymc_usb`
+- **openHop Modem over Wi-Fi/Ethernet**: set `radio_type: modem_tcp`
+- **openHop Modem over USB-CDC**: set `radio_type: modem_usb`
 - **KISS serial modem**: set `radio_type: kiss`
 - **No radio hardware**: set `radio_type: null` for setup, testing, or API-only work
 

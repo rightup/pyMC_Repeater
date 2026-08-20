@@ -33,6 +33,7 @@ from openhop_core.protocol.packet_utils import (
 
 from repeater.airtime import AirtimeManager
 from repeater.data_acquisition import StorageCollector
+from repeater.modem_config import normalize_modem_config
 from repeater.neighbour_links import NeighbourLinkTracker
 from repeater.policy_engine import PolicyDecision, PolicyEngine
 
@@ -1659,6 +1660,7 @@ class RepeaterHandler(BaseHandler):
         return self._cached_noise_floor
 
     def get_stats(self) -> dict:
+        runtime_config = normalize_modem_config(self.config, warn=False)
 
         uptime_seconds = time.time() - self.start_time
 
@@ -1737,14 +1739,14 @@ class RepeaterHandler(BaseHandler):
                 "radio": self.config.get(
                     "radio", {}
                 ),  # Read from live config, not cached radio_config
-                "radios": self.config.get("radios") or [],
+                "radios": runtime_config.get("radios") or [],
                 "fabric": self.config.get("fabric") or {},
-                "radio_type": self.config.get("radio_type"),
+                "radio_type": runtime_config.get("radio_type"),
                 "sx1262": self.config.get("sx1262", {}),
                 "ch341": self.config.get("ch341", {}),
                 "kiss": self.config.get("kiss", {}),
-                "pymc_usb": self.config.get("pymc_usb", {}),
-                "pymc_tcp": self.config.get("pymc_tcp", {}),
+                "modem_usb": runtime_config.get("modem_usb", {}),
+                "modem_tcp": runtime_config.get("modem_tcp", {}),
                 "duty_cycle": {
                     "max_airtime_percent": max_duty_cycle_percent,
                     "enforcement_enabled": duty_cycle_config.get("enforcement_enabled", True),

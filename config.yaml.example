@@ -320,10 +320,10 @@ sensors:
     #     bus_number: 1       # I2C bus number (1 for Raspberry Pi default)
     #     low_cell_mv: 3150   # Per-cell warning threshold in mV
 
-    # Example pyMC modem sensor. This reads a networked pyMC modem's
+    # Example openHop Modem sensor. This reads a networked openHop Modem's
     # HTTP /api/stats JSON API for modem diagnostics, including GPS fields
     # when the modem exposes them. If password is set to the same value as
-    # pymc_tcp.token, the repeater can use one shared modem secret.
+    # modem_tcp.token, the repeater can use one shared modem secret.
     # - type: pymc_modem
     #   name: modem
     #   enabled: true
@@ -332,7 +332,7 @@ sensors:
     #     port: 80
     #     endpoint: "/api/stats"
     #     username: "admin"
-    #     password: ""              # modem HTTP password; may match pymc_tcp.token
+    #     password: ""              # modem HTTP password; may match modem_tcp.token
     #     poll_interval_seconds: 60.0  # avoid contending with modem traffic
     #     timeout_seconds: 2.0
 
@@ -486,8 +486,8 @@ identities:
 #   - sx1262        (Linux spidev + system GPIO)
 #   - sx1262_ch341  (CH341 USB-to-SPI + CH341 GPIO 0-7)
 #   - kiss          (KISS-modem over a serial port; alias: kiss-modem)
-#   - pymc_tcp      (pymc_usb firmware modem over Wi-Fi/TCP)
-#   - pymc_usb      (pymc_usb firmware modem over USB-CDC)
+#   - modem_tcp      (openHop Modem over Wi-Fi/Ethernet TCP)
+#   - modem_usb      (openHop Modem over USB-CDC)
 #   - null/none     (disable radio hardware; daemon starts without RF I/O)
 radio_type: null
 
@@ -544,19 +544,19 @@ radio:
 #   # kiss_txtail_ms: 0          # tail after TX (rarely needed)
 #   # kiss_full_duplex: false    # disable carrier-sense/CSMA entirely (not recommended)
 
-# pymc_usb firmware modem over Wi-Fi/TCP (when radio_type: pymc_tcp).
+# openHop Modem over Wi-Fi/Ethernet TCP (when radio_type: modem_tcp).
 # Requires openhop-core with the TCPLoRaRadio driver
-# pymc_tcp:
-#   host: "pymc-3e2834.local"   # modem hostname / mDNS name / LAN IP
+# modem_tcp:
+#   host: "openhop-modem.local" # modem hostname / mDNS name / LAN IP
 #   port: 5055                  # firmware default
 #   token: ""                   # empty = no auth; set to match firmware NVS token
 #   connect_timeout: 5.0        # seconds; deferred-connect retries with backoff on failure
 #   lbt_enabled: true           # Listen-Before-Talk via firmware CAD
 #   lbt_max_attempts: 5
 
-# pymc_usb firmware modem over USB-CDC (when radio_type: pymc_usb).
+# openHop Modem over USB-CDC (when radio_type: modem_usb).
 # Requires openhop-core with the USBLoRaRadio driver
-# pymc_usb:
+# modem_usb:
 #   port: "/dev/ttyACM0"        # USB-CDC device; udev rule may symlink to /dev/lora-modem
 #   baudrate: 921600            # must match firmware monitor_speed
 #   lbt_enabled: true

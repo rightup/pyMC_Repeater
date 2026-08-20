@@ -26,6 +26,7 @@ from repeater.companion.utils import (
     validate_companion_config_capacity,
 )
 from repeater.config import resolve_storage_dir
+from repeater.modem_config import LEGACY_MODEM_RADIO_TYPES, normalize_modem_config
 from repeater.policy_engine import PolicyEngine
 from repeater.service_utils import get_buildroot_image_info
 from repeater.utils_packet import create_scoped_advert_packet
@@ -1431,17 +1432,40 @@ class APIEndpoints:
                     for dev in glob.glob(pattern):
                         devices.append({"device": str(dev), "description": str(dev)})
 
-            # De-duplicate by device path while preserving the first description.
+            # Docker deployments may mount the host device namespace separately.
+            import glob
+
+            if os.path.isdir("/host/dev"):
+                for pattern in (
+                    "/host/dev/ttyACM*",
+                    "/host/dev/ttyUSB*",
+                    "/host/dev/serial/by-id/*",
+                ):
+                    try:
+                        for dev in glob.glob(pattern):
+                            devices.append({"device": str(dev), "description": str(dev)})
+                    except (OSError, PermissionError):
+                        continue
+
+            # De-duplicate by resolved target. Prefer stable host by-id aliases.
             dedup = {}
             for item in devices:
                 dev = item.get("device")
-                if dev and dev not in dedup:
+                if not dev:
+                    continue
+                try:
+                    target = os.path.realpath(dev)
+                except (OSError, PermissionError):
+                    continue
+                preferred = str(dev).startswith("/host/dev/serial/by-id/")
+                existing = dedup.get(target)
+                if existing is None or preferred:
                     # Docker reads `devices:` entries as host:container[:perms] and
                     # cannot escape a colon inside the path, so a /dev/serial/by-id/
                     # name carrying an ESP32-S3 MAC serial is unusable in a
                     # container. Flag it so the UI can offer a symlink instead.
                     item["docker_safe"] = ":" not in dev
-                    dedup[dev] = item
+                    dedup[target] = item
 
             sorted_devices = sorted(dedup.values(), key=lambda x: x["device"])
             return self._success(sorted_devices)
@@ -1483,6 +1507,7 @@ class APIEndpoints:
                 return {"success": False, "error": "Node name too long (max 31 bytes in UTF-8)"}
 
             hardware_key = data.get("hardware_key", "").strip()
+            hardware_key = LEGACY_MODEM_RADIO_TYPES.get(hardware_key, hardware_key)
             if not hardware_key:
                 return {"success": False, "error": "Hardware selection is required"}
 
@@ -1564,47 +1589,58 @@ class APIEndpoints:
                 )
                 if "preamble_length" not in config_yaml["radio"]:
                     config_yaml["radio"]["preamble_length"] = 32
-            elif hardware_key == "pymc_usb":
-                # pymc_usb modem: external SX1262 board over USB-CDC.
-                # Accept pymc_usb_port / pymc_usb_baudrate from the request body
+            elif hardware_key == "modem_usb":
+                # modem_usb modem: external SX1262 board over USB-CDC.
+                # Accept modem_usb_port / modem_usb_baudrate from the request body
                 # (mirrors the KISS pattern) so a future SPA can expose inputs;
                 # fall back to /dev/ttyACM0 at 921600 baud, which matches the
                 # firmware default and the typical USB-CDC modem device on Linux.
-                config_yaml["radio_type"] = "pymc_usb"
-                usb_port = (data.get("pymc_usb_port") or "").strip() or "/dev/ttyACM0"
-                usb_baud = int(data.get("pymc_usb_baudrate", data.get("pymc_usb_baud", 921600)))
-                pymc_usb_section = config_yaml.setdefault("pymc_usb", {})
-                pymc_usb_section["port"] = usb_port
-                pymc_usb_section["baudrate"] = usb_baud
-                pymc_usb_section.setdefault("lbt_enabled", True)
-                pymc_usb_section.setdefault("lbt_max_attempts", 5)
+                config_yaml["radio_type"] = "modem_usb"
+                usb_port = (
+                    data.get("modem_usb_port") or data.get("pymc_usb_port") or ""
+                ).strip() or "/dev/ttyACM0"
+                usb_baud = int(
+                    data.get(
+                        "modem_usb_baudrate",
+                        data.get("pymc_usb_baudrate", data.get("pymc_usb_baud", 921600)),
+                    )
+                )
+                modem_usb_section = config_yaml.setdefault("modem_usb", {})
+                modem_usb_section["port"] = usb_port
+                modem_usb_section["baudrate"] = usb_baud
+                modem_usb_section.setdefault("lbt_enabled", True)
+                modem_usb_section.setdefault("lbt_max_attempts", 5)
                 if tx_power_preset is not None:
                     config_yaml["radio"]["tx_power"] = tx_power_preset
                 elif "tx_power" in hw_config:
                     config_yaml["radio"]["tx_power"] = hw_config.get("tx_power", 22)
                 if "preamble_length" in hw_config:
                     config_yaml["radio"]["preamble_length"] = hw_config.get("preamble_length", 32)
-            elif hardware_key == "pymc_tcp":
-                # pymc_tcp modem: external SX1262 board exposed as TCP over Wi-Fi/Ethernet.
+            elif hardware_key == "modem_tcp":
+                # modem_tcp modem: external SX1262 board exposed as TCP over Wi-Fi/Ethernet.
                 # 'host' has no sensible default — must be the modem's LAN address or
                 # mDNS name. Accept it from the request body if the SPA provides it,
                 # otherwise write a clearly-placeholder hostname so the file is valid
                 # YAML and the user gets a startup error pointing them at the right
                 # section to edit (see config.py: ValueError 'Missing host …').
-                config_yaml["radio_type"] = "pymc_tcp"
-                tcp_host = (data.get("pymc_tcp_host") or "").strip() or "REPLACE_WITH_MODEM_HOST"
-                tcp_port = int(data.get("pymc_tcp_port", 5055))
-                pymc_tcp_section = config_yaml.setdefault("pymc_tcp", {})
-                pymc_tcp_section["host"] = tcp_host
-                pymc_tcp_section["port"] = tcp_port
-                tcp_token = data.get("pymc_tcp_token")
+                config_yaml["radio_type"] = "modem_tcp"
+                tcp_host = (
+                    data.get("modem_tcp_host") or data.get("pymc_tcp_host") or ""
+                ).strip() or "REPLACE_WITH_MODEM_HOST"
+                tcp_port = int(data.get("modem_tcp_port", data.get("pymc_tcp_port", 5055)))
+                modem_tcp_section = config_yaml.setdefault("modem_tcp", {})
+                modem_tcp_section["host"] = tcp_host
+                modem_tcp_section["port"] = tcp_port
+                tcp_token = data.get("modem_tcp_token")
+                if tcp_token is None:
+                    tcp_token = data.get("pymc_tcp_token")
                 if tcp_token is not None:
-                    pymc_tcp_section["token"] = str(tcp_token)
+                    modem_tcp_section["token"] = str(tcp_token)
                 else:
-                    pymc_tcp_section.setdefault("token", "")
-                pymc_tcp_section.setdefault("connect_timeout", 5.0)
-                pymc_tcp_section.setdefault("lbt_enabled", True)
-                pymc_tcp_section.setdefault("lbt_max_attempts", 5)
+                    modem_tcp_section.setdefault("token", "")
+                modem_tcp_section.setdefault("connect_timeout", 5.0)
+                modem_tcp_section.setdefault("lbt_enabled", True)
+                modem_tcp_section.setdefault("lbt_max_attempts", 5)
                 if tx_power_preset is not None:
                     config_yaml["radio"]["tx_power"] = tx_power_preset
                 elif "tx_power" in hw_config:
@@ -1680,7 +1716,8 @@ class APIEndpoints:
                     config_yaml["sx1262"]["use_gpiod_backend"] = hw_config.get(
                         "use_gpiod_backend", False
                     )
-            # Write updated config
+            # Explicit setup writes canonical names only.
+            config_yaml = normalize_modem_config(config_yaml)
             with open(self._config_path, "w") as f:
                 yaml.dump(config_yaml, f, default_flow_style=False, sort_keys=False)
 
@@ -1718,14 +1755,14 @@ class APIEndpoints:
             if hardware_key == "kiss":
                 result_config["kiss_port"] = config_yaml.get("kiss", {}).get("port")
                 result_config["kiss_baud_rate"] = config_yaml.get("kiss", {}).get("baud_rate")
-            elif hardware_key == "pymc_usb":
-                pymc_usb_cfg = config_yaml.get("pymc_usb", {})
-                result_config["pymc_usb_port"] = pymc_usb_cfg.get("port")
-                result_config["pymc_usb_baudrate"] = pymc_usb_cfg.get("baudrate")
-            elif hardware_key == "pymc_tcp":
-                pymc_tcp_cfg = config_yaml.get("pymc_tcp", {})
-                result_config["pymc_tcp_host"] = pymc_tcp_cfg.get("host")
-                result_config["pymc_tcp_port"] = pymc_tcp_cfg.get("port")
+            elif hardware_key == "modem_usb":
+                modem_usb_cfg = config_yaml.get("modem_usb", {})
+                result_config["modem_usb_port"] = modem_usb_cfg.get("port")
+                result_config["modem_usb_baudrate"] = modem_usb_cfg.get("baudrate")
+            elif hardware_key == "modem_tcp":
+                modem_tcp_cfg = config_yaml.get("modem_tcp", {})
+                result_config["modem_tcp_host"] = modem_tcp_cfg.get("host")
+                result_config["modem_tcp_port"] = modem_tcp_cfg.get("port")
                 # token deliberately omitted from response (sensitive)
             return {
                 "success": True,
@@ -1748,15 +1785,16 @@ class APIEndpoints:
     def stats(self):
         try:
             stats = self.stats_getter() if self.stats_getter else {}
+            runtime_config = normalize_modem_config(self.config, warn=False)
             # Include active radio configuration in stats so UI can hydrate
             # directly from this endpoint without additional config fetches.
-            stats["radio_type"] = self.config.get("radio_type")
-            stats["sx1262"] = self.config.get("sx1262", {})
-            stats["ch341"] = self.config.get("ch341", {})
-            stats["kiss"] = self.config.get("kiss", {})
-            stats["pymc_usb"] = self.config.get("pymc_usb", {})
-            stats["pymc_tcp"] = self.config.get("pymc_tcp", {})
-            stats["radios"] = self.config.get("radios") or []
+            stats["radio_type"] = runtime_config.get("radio_type")
+            stats["sx1262"] = runtime_config.get("sx1262", {})
+            stats["ch341"] = runtime_config.get("ch341", {})
+            stats["kiss"] = runtime_config.get("kiss", {})
+            stats["modem_usb"] = runtime_config.get("modem_usb", {})
+            stats["modem_tcp"] = runtime_config.get("modem_tcp", {})
+            stats["radios"] = runtime_config.get("radios") or []
             stats["fabric"] = self.config.get("fabric") or {}
             meta = {}
             daemon = getattr(self, "daemon_instance", None)
@@ -2982,6 +3020,7 @@ class APIEndpoints:
                 config_yaml = None
 
             if isinstance(config_yaml, dict):
+                config_yaml = normalize_modem_config(config_yaml)
                 repeater = config_yaml.get("repeater")
                 if not isinstance(repeater, dict):
                     add_error("repeater", "Missing required section 'repeater'")
@@ -3014,8 +3053,8 @@ class APIEndpoints:
                     "sx1262",
                     "sx1262_ch341",
                     "kiss",
-                    "pymc_tcp",
-                    "pymc_usb",
+                    "modem_tcp",
+                    "modem_usb",
                     "none",
                     "null",
                     "disabled",
@@ -3026,7 +3065,7 @@ class APIEndpoints:
                 if radio_type not in known_radio_types:
                     add_error(
                         "radio_type",
-                        "Unsupported radio_type. Supported: sx1262, sx1262_ch341, kiss, pymc_tcp, pymc_usb, none/null",
+                        "Unsupported radio_type. Supported: sx1262, sx1262_ch341, kiss, modem_tcp, modem_usb, none/null",
                     )
 
                 radio_disabled = radio_type in ("", "none", "null", "disabled", "off", "no_radio")
@@ -3159,45 +3198,45 @@ class APIEndpoints:
                     elif baud <= 0:
                         add_error("kiss.baud_rate", "KISS baud_rate must be greater than zero")
 
-                if radio_type == "pymc_usb":
-                    usb_cfg = config_yaml.get("pymc_usb")
+                if radio_type == "modem_usb":
+                    usb_cfg = config_yaml.get("modem_usb")
                     if not isinstance(usb_cfg, dict):
                         add_error(
-                            "pymc_usb",
-                            "Missing required section 'pymc_usb' for radio_type pymc_usb",
+                            "modem_usb",
+                            "Missing required section 'modem_usb' for radio_type modem_usb",
                         )
                         usb_cfg = {}
                     port = (usb_cfg.get("port") if isinstance(usb_cfg, dict) else "") or ""
                     if not str(port).strip():
-                        add_error("pymc_usb.port", "pymc_usb.port is required")
-                    baud = as_int((usb_cfg or {}).get("baudrate"), "pymc_usb.baudrate")
+                        add_error("modem_usb.port", "modem_usb.port is required")
+                    baud = as_int((usb_cfg or {}).get("baudrate"), "modem_usb.baudrate")
                     if baud is not None and baud <= 0:
                         add_error(
-                            "pymc_usb.baudrate", "pymc_usb.baudrate must be greater than zero"
+                            "modem_usb.baudrate", "modem_usb.baudrate must be greater than zero"
                         )
 
-                if radio_type == "pymc_tcp":
-                    tcp_cfg = config_yaml.get("pymc_tcp")
+                if radio_type == "modem_tcp":
+                    tcp_cfg = config_yaml.get("modem_tcp")
                     if not isinstance(tcp_cfg, dict):
                         add_error(
-                            "pymc_tcp",
-                            "Missing required section 'pymc_tcp' for radio_type pymc_tcp",
+                            "modem_tcp",
+                            "Missing required section 'modem_tcp' for radio_type modem_tcp",
                         )
                         tcp_cfg = {}
                     host = (tcp_cfg.get("host") if isinstance(tcp_cfg, dict) else "") or ""
                     host_str = str(host).strip()
                     if not host_str:
-                        add_error("pymc_tcp.host", "pymc_tcp.host is required")
+                        add_error("modem_tcp.host", "modem_tcp.host is required")
                     elif host_str == "REPLACE_WITH_MODEM_HOST":
                         add_error(
-                            "pymc_tcp.host",
+                            "modem_tcp.host",
                             "Replace placeholder host with your modem hostname or IP",
                         )
-                    port = as_int((tcp_cfg or {}).get("port"), "pymc_tcp.port")
+                    port = as_int((tcp_cfg or {}).get("port"), "modem_tcp.port")
                     if port is None:
-                        add_error("pymc_tcp.port", "pymc_tcp.port is required")
+                        add_error("modem_tcp.port", "modem_tcp.port is required")
                     elif port < 1 or port > 65535:
-                        add_error("pymc_tcp.port", "pymc_tcp.port must be 1-65535")
+                        add_error("modem_tcp.port", "modem_tcp.port must be 1-65535")
 
                 if radio_disabled:
                     add_warning("radio_type", "Radio is disabled (radio_type none/null/off)")
@@ -7756,7 +7795,7 @@ class APIEndpoints:
             import copy
 
             full_backup = str(include_secrets).lower() in ("true", "1", "yes")
-            exported = copy.deepcopy(self.config)
+            exported = normalize_modem_config(copy.deepcopy(self.config))
 
             if full_backup:
                 # Convert binary identity key to hex for JSON serialisation
@@ -7781,6 +7820,16 @@ class APIEndpoints:
                 rep = exported.get("repeater", {})
                 if "identity_key" in rep:
                     del rep["identity_key"]
+
+                tcp_cfg = exported.get("modem_tcp")
+                if isinstance(tcp_cfg, dict) and "token" in tcp_cfg:
+                    tcp_cfg["token"] = "*** REDACTED ***"
+                for radio_entry in exported.get("radios") or []:
+                    if not isinstance(radio_entry, dict):
+                        continue
+                    nested_tcp_cfg = radio_entry.get("modem_tcp")
+                    if isinstance(nested_tcp_cfg, dict) and "token" in nested_tcp_cfg:
+                        nested_tcp_cfg["token"] = "*** REDACTED ***"
 
                 # Redact identity keys in companion / room_server configs
                 for section in ("room_servers", "companions"):
@@ -7874,6 +7923,50 @@ class APIEndpoints:
             if not imported_config or not isinstance(imported_config, dict):
                 return self._error("Missing or invalid 'config' object in request body")
 
+            imported_config = normalize_modem_config(imported_config)
+
+            # Redacted exports are intentionally safe to re-import. Preserve the
+            # currently configured modem token instead of saving the sentinel.
+            current_config = normalize_modem_config(self.config, warn=False)
+            imported_tcp = imported_config.get("modem_tcp")
+            current_tcp = current_config.get("modem_tcp")
+            if isinstance(imported_tcp, dict) and imported_tcp.get("token") == "*** REDACTED ***":
+                if isinstance(current_tcp, dict) and "token" in current_tcp:
+                    imported_tcp["token"] = current_tcp["token"]
+                else:
+                    imported_tcp.pop("token", None)
+
+            current_radios = current_config.get("radios")
+            if not isinstance(current_radios, list):
+                current_radios = []
+            current_radios_by_id = {
+                entry.get("id"): entry
+                for entry in current_radios
+                if isinstance(entry, dict) and entry.get("id") is not None
+            }
+            imported_radios = imported_config.get("radios")
+            if isinstance(imported_radios, list):
+                for index, entry in enumerate(imported_radios):
+                    if not isinstance(entry, dict):
+                        continue
+                    imported_radio_tcp = entry.get("modem_tcp")
+                    if not (
+                        isinstance(imported_radio_tcp, dict)
+                        and imported_radio_tcp.get("token") == "*** REDACTED ***"
+                    ):
+                        continue
+                    current_entry = current_radios_by_id.get(entry.get("id"))
+                    if current_entry is None and index < len(current_radios):
+                        candidate = current_radios[index]
+                        current_entry = candidate if isinstance(candidate, dict) else None
+                    current_radio_tcp = (
+                        current_entry.get("modem_tcp") if isinstance(current_entry, dict) else None
+                    )
+                    if isinstance(current_radio_tcp, dict) and "token" in current_radio_tcp:
+                        imported_radio_tcp["token"] = current_radio_tcp["token"]
+                    else:
+                        imported_radio_tcp.pop("token", None)
+
             # Sections we allow to be imported
             ALLOWED_SECTIONS = {
                 "repeater",
@@ -7884,8 +7977,8 @@ class APIEndpoints:
                 "sx1262",
                 "ch341",
                 "kiss",
-                "pymc_usb",
-                "pymc_tcp",
+                "modem_usb",
+                "modem_tcp",
                 "mqtt_brokers",
                 "mqtt",
                 "identities",
@@ -7948,8 +8041,8 @@ class APIEndpoints:
                     "sx1262",
                     "ch341",
                     "kiss",
-                    "pymc_usb",
-                    "pymc_tcp",
+                    "modem_usb",
+                    "modem_tcp",
                     "radio_type",
                     "mqtt_brokers",
                     "letsmesh",

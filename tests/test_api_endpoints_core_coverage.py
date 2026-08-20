@@ -430,7 +430,7 @@ def test_hardware_options_loads_installed_file(tmp_path):
 
     hardware_file = tmp_path / "radio-settings.json"
     hardware_file.write_text(
-        '{"hardware":{"pymc_usb":{"name":"USB","description":"desc","radio_type":"pymc_usb"}}}',
+        '{"hardware":{"modem_usb":{"name":"openHop Modem (USB-CDC)","description":"desc","radio_type":"modem_usb"}}}',
         encoding="utf-8",
     )
 
@@ -438,8 +438,22 @@ def test_hardware_options_loads_installed_file(tmp_path):
         result = api.hardware_options()
 
     assert len(result["hardware"]) == 1
-    assert result["hardware"][0]["key"] == "pymc_usb"
-    assert result["hardware"][0]["name"] == "USB"
+    assert result["hardware"][0]["key"] == "modem_usb"
+    assert result["hardware"][0]["name"] == "openHop Modem (USB-CDC)"
+
+
+def test_repository_hardware_options_use_canonical_modem_names():
+    import json
+
+    settings = json.loads(
+        (Path(__file__).parents[1] / "radio-settings.json").read_text(encoding="utf-8")
+    )["hardware"]
+
+    assert "modem_usb" in settings and "modem_tcp" in settings
+    assert "pymc_usb" not in settings and "pymc_tcp" not in settings
+    assert settings["modem_usb"]["radio_type"] == "modem_usb"
+    assert settings["modem_usb"]["name"] == "openHop Modem (USB-CDC)"
+    assert settings["modem_tcp"]["name"] == "openHop Modem (Wi-Fi / Ethernet)"
 
 
 def test_radio_presets_returns_error_when_file_missing(tmp_path):
@@ -568,6 +582,48 @@ def test_serial_ports_marks_ordinary_paths_docker_safe(cherrypy_ctx):
     assert result["data"][0]["docker_safe"] is True
 
 
+def test_serial_ports_scans_host_dev_and_prefers_by_id_alias(cherrypy_ctx):
+    del cherrypy_ctx
+    api = _make_api()
+    numbered = "/host/dev/ttyACM0"
+    by_id = "/host/dev/serial/by-id/openhop-modem"
+
+    def fake_glob(pattern):
+        return {
+            "/host/dev/ttyACM*": [numbered],
+            "/host/dev/ttyUSB*": [],
+            "/host/dev/serial/by-id/*": [by_id],
+        }.get(pattern, [])
+
+    with (
+        patch("serial.tools.list_ports.comports", return_value=[]),
+        patch("os.path.isdir", side_effect=lambda path: path == "/host/dev"),
+        patch("glob.glob", side_effect=fake_glob),
+        patch("os.path.realpath", side_effect=lambda path: "/host/dev/ttyACM0"),
+    ):
+        result = api.serial_ports()
+
+    assert result["success"] is True
+    assert [item["device"] for item in result["data"]] == [by_id]
+
+
+def test_serial_ports_tolerates_broken_host_alias(cherrypy_ctx):
+    del cherrypy_ctx
+    api = _make_api()
+    broken = "/host/dev/serial/by-id/broken"
+
+    with (
+        patch("serial.tools.list_ports.comports", return_value=[]),
+        patch("os.path.isdir", return_value=True),
+        patch("glob.glob", side_effect=lambda pattern: [broken] if "by-id" in pattern else []),
+        patch("os.path.realpath", side_effect=OSError("inaccessible")),
+    ):
+        result = api.serial_ports()
+
+    assert result["success"] is True
+    assert result["data"] == []
+
+
 def test_config_export_redacts_secrets_and_identity_keys(cherrypy_ctx):
     request, _ = cherrypy_ctx
     request.method = "GET"
@@ -628,6 +684,37 @@ def test_config_export_full_backup_includes_hex_keys(cherrypy_ctx):
     assert result["data"]["meta"]["includes_secrets"] is True
 
 
+def test_config_export_canonicalizes_modem_keys_and_redacts_token(cherrypy_ctx):
+    request, _ = cherrypy_ctx
+    request.method = "GET"
+    api = _make_api(
+        {
+            "radio_type": "pymc_tcp",
+            "pymc_tcp": {"host": "legacy.local", "token": "tcp-secret"},
+            "radios": [
+                {"id": "usb", "radio_type": "pymc_usb", "pymc_usb": {"port": "/dev/x"}},
+                {
+                    "id": "tcp",
+                    "radio_type": "modem_tcp",
+                    "modem_tcp": {"host": "nested.local", "token": "nested-secret"},
+                },
+            ],
+        }
+    )
+
+    redacted = api.config_export()["data"]["config"]
+    full = api.config_export(include_secrets="true")["data"]["config"]
+
+    assert redacted["radio_type"] == "modem_tcp"
+    assert redacted["modem_tcp"]["token"] == "*** REDACTED ***"
+    assert "pymc_tcp" not in redacted
+    assert redacted["radios"][0]["radio_type"] == "modem_usb"
+    assert "pymc_usb" not in redacted["radios"][0]
+    assert redacted["radios"][1]["modem_tcp"]["token"] == "*** REDACTED ***"
+    assert full["modem_tcp"]["token"] == "tcp-secret"
+    assert full["radios"][1]["modem_tcp"]["token"] == "nested-secret"
+
+
 def test_config_import_rejects_missing_config_object(cherrypy_ctx):
     request, _ = cherrypy_ctx
     request.method = "POST"
@@ -658,6 +745,18 @@ def test_config_import_updates_sections_and_preserves_redacted(cherrypy_ctx):
                     {"name": "c1", "identity_key": bytes.fromhex("C0FFEE")},
                 ]
             },
+            "modem_tcp": {"host": "current.local", "port": 5055, "token": "keep-token"},
+            "radios": [
+                {
+                    "id": "tcp-link",
+                    "radio_type": "modem_tcp",
+                    "modem_tcp": {
+                        "host": "current-nested.local",
+                        "port": 5055,
+                        "token": "keep-nested-token",
+                    },
+                }
+            ],
         }
     )
 
@@ -679,6 +778,22 @@ def test_config_import_updates_sections_and_preserves_redacted(cherrypy_ctx):
             },
             "radio": {"frequency": 915000000},
             "radio_type": "pymc_usb",
+            "pymc_tcp": {
+                "host": "restored.local",
+                "port": 6000,
+                "token": "*** REDACTED ***",
+            },
+            "radios": [
+                {
+                    "id": "tcp-link",
+                    "radio_type": "pymc_tcp",
+                    "pymc_tcp": {
+                        "host": "restored-nested.local",
+                        "port": 6001,
+                        "token": "*** REDACTED ***",
+                    },
+                }
+            ],
             "unknown": {"x": 1},
         }
     }
@@ -690,7 +805,14 @@ def test_config_import_updates_sections_and_preserves_redacted(cherrypy_ctx):
 
     assert result["success"] is True
     assert result["restart_required"] is True
-    assert set(result["sections_updated"]) == {"repeater", "identities", "radio", "radio_type"}
+    assert set(result["sections_updated"]) == {
+        "repeater",
+        "identities",
+        "radio",
+        "radios",
+        "radio_type",
+        "modem_tcp",
+    }
 
     sec = api.config["repeater"]["security"]
     assert sec["admin_password"] == "keep-admin"
@@ -699,6 +821,16 @@ def test_config_import_updates_sections_and_preserves_redacted(cherrypy_ctx):
     assert api.config["repeater"]["identity_key"] == bytes.fromhex("AABBCC")
     assert "identity_file" not in api.config["repeater"]
     assert api.config["identities"]["companions"][0]["identity_key"] == bytes.fromhex("C0FFEE")
+    assert api.config["modem_tcp"] == {
+        "host": "restored.local",
+        "port": 6000,
+        "token": "keep-token",
+    }
+    assert api.config["radios"][0]["modem_tcp"] == {
+        "host": "restored-nested.local",
+        "port": 6001,
+        "token": "keep-nested-token",
+    }
 
 
 def test_openapi_success_sets_content_type(cherrypy_ctx):
@@ -1282,7 +1414,7 @@ radio_type: weird_radio
     assert "radio_type" in paths
 
 
-def test_validate_config_pymc_tcp_placeholder_and_bad_port(cherrypy_ctx, tmp_path):
+def test_validate_config_legacy_tcp_reports_canonical_error_paths(cherrypy_ctx, tmp_path):
     request, _ = cherrypy_ctx
     request.method = "GET"
     api = _make_api()
@@ -1313,8 +1445,8 @@ pymc_tcp:
     assert result["success"] is True
     assert result["data"]["valid"] is False
     paths = {e["path"] for e in result["data"]["errors"]}
-    assert "pymc_tcp.host" in paths
-    assert "pymc_tcp.port" in paths
+    assert "modem_tcp.host" in paths
+    assert "modem_tcp.port" in paths
 
 
 def test_validate_config_sx1262_ch341_missing_sections(cherrypy_ctx, tmp_path):
