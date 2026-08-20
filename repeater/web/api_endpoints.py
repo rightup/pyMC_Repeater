@@ -38,6 +38,7 @@ from .companion_endpoints import CompanionAPIEndpoints
 from .update_endpoints import UpdateAPIEndpoints
 
 logger = logging.getLogger("HTTPServer")
+REDACTED_CONFIG_VALUE = "*** REDACTED ***"
 
 POLICY_GROUP_KINDS = {
     "channel_hash": "channel_hashes",
@@ -7823,13 +7824,13 @@ class APIEndpoints:
 
                 tcp_cfg = exported.get("modem_tcp")
                 if isinstance(tcp_cfg, dict) and "token" in tcp_cfg:
-                    tcp_cfg["token"] = "*** REDACTED ***"
+                    tcp_cfg["token"] = REDACTED_CONFIG_VALUE
                 for radio_entry in exported.get("radios") or []:
                     if not isinstance(radio_entry, dict):
                         continue
                     nested_tcp_cfg = radio_entry.get("modem_tcp")
                     if isinstance(nested_tcp_cfg, dict) and "token" in nested_tcp_cfg:
-                        nested_tcp_cfg["token"] = "*** REDACTED ***"
+                        nested_tcp_cfg["token"] = REDACTED_CONFIG_VALUE
 
                 # Redact identity keys in companion / room_server configs
                 for section in ("room_servers", "companions"):
