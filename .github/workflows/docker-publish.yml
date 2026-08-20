@@ -11,8 +11,8 @@ on:
         description: "Docker image repository to publish to"
         required: false
         default: ""
-      pymc_console_version:
-        description: "PyMC Console release to bundle (latest or a tag such as v0.9.333)"
+      openhop_console_version:
+        description: "openHop Console release to bundle (latest or a tag such as v0.9.333)"
         required: false
         default: "latest"
 
@@ -46,6 +46,10 @@ jobs:
       - name: Compute package version
         id: package_version
         run: |
+          if [ "${{ github.repository }}" != "openhop-dev/openhop_repeater" ]; then
+            git fetch --force https://github.com/openhop-dev/openhop_repeater.git \
+              "refs/tags/*:refs/tags/*"
+          fi
           python -m pip install --disable-pip-version-check setuptools_scm
           version="$(python -m setuptools_scm)"
           echo "version=${version}" >> "$GITHUB_OUTPUT"
@@ -63,7 +67,7 @@ jobs:
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.image_repository }}" ]; then
             image_repository="${{ inputs.image_repository }}"
           elif [ "${{ github.repository_owner }}" = "yellowcooln" ]; then
-            image_repository="yellowcooln/pymc-repeater"
+            image_repository="yellowcooln/openhop-repeater"
           else
             image_repository="openhop/openhop-repeater"
           fi
@@ -71,11 +75,11 @@ jobs:
           echo "Using image repository: ${image_repository}"
           echo "image_repository=${image_repository}" >> "$GITHUB_OUTPUT"
 
-      - name: Resolve bundled Console release
+      - name: Resolve bundled openHop Console release
         id: console_release
         shell: bash
         env:
-          REQUESTED_CONSOLE_VERSION: ${{ inputs.pymc_console_version || 'latest' }}
+          REQUESTED_CONSOLE_VERSION: ${{ inputs.openhop_console_version || 'latest' }}
         run: |
           set -euo pipefail
 
@@ -89,7 +93,7 @@ jobs:
             cache_bust="${REQUESTED_CONSOLE_VERSION}"
           fi
 
-          echo "Bundling PyMC Console ${tag}"
+          echo "Bundling openHop Console ${tag}"
           echo "version=${REQUESTED_CONSOLE_VERSION}" >> "$GITHUB_OUTPUT"
           echo "cache_bust=${cache_bust}" >> "$GITHUB_OUTPUT"
 
@@ -101,6 +105,7 @@ jobs:
           tags: |
             type=raw,value=main,enable=${{ github.ref == 'refs/heads/main' }}
             type=raw,value=dev,enable=${{ github.ref == 'refs/heads/dev' }}
+            type=raw,value=v${{ steps.package_version.outputs.version }}
             type=sha,format=short
 
       - name: Build and push
@@ -112,15 +117,17 @@ jobs:
           push: true
           build-args: |
             PACKAGE_VERSION=${{ steps.package_version.outputs.version }}
-            PYMC_CONSOLE_VERSION=${{ steps.console_release.outputs.version }}
-            PYMC_CONSOLE_CACHE_BUST=${{ steps.console_release.outputs.cache_bust }}
+            OPENHOP_CONSOLE_VERSION=${{ steps.console_release.outputs.version }}
+            OPENHOP_CONSOLE_CACHE_BUST=${{ steps.console_release.outputs.cache_bust }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
       - name: Notify Home Assistant add-on repository
-        if: github.repository == 'openhop-dev/openhop_repeater'
+        if: >-
+          github.repository == 'openhop-dev/openhop_repeater' &&
+          (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')
         env:
           DISPATCH_TOKEN: ${{ secrets.HA_ADDON_REPO_DISPATCH_TOKEN }}
           CHANNEL: ${{ github.ref_name }}
