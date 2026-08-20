@@ -13,6 +13,14 @@ LEGACY_MODEM_RADIO_TYPES = {
     "pymc_usb": "modem_usb",
 }
 
+LEGACY_MODEM_SENSOR_TYPES = {
+    "pymc_modem": "openhop_modem",
+}
+
+LEGACY_MODEM_GPS_SOURCES = {
+    "pymc_modem": "modem_http",
+}
+
 
 def _normalize_board_config(config: dict[str, Any], *, warn: bool) -> None:
     radio_type = config.get("radio_type")
@@ -36,6 +44,31 @@ def _normalize_board_config(config: dict[str, Any], *, warn: bool) -> None:
         del config[legacy_key]
 
 
+def _normalize_sensor_and_gps_aliases(config: dict[str, Any]) -> None:
+    sensors = config.get("sensors")
+    if isinstance(sensors, dict):
+        for definitions_key in ("definitions", "sensors"):
+            definitions = sensors.get(definitions_key)
+            if not isinstance(definitions, list):
+                continue
+            for definition in definitions:
+                if not isinstance(definition, dict):
+                    continue
+                sensor_type = definition.get("type")
+                if isinstance(sensor_type, str):
+                    normalized_type = sensor_type.strip().lower()
+                    definition["type"] = LEGACY_MODEM_SENSOR_TYPES.get(
+                        normalized_type, normalized_type
+                    )
+
+    gps = config.get("gps")
+    if isinstance(gps, dict):
+        source = gps.get("source")
+        if isinstance(source, str):
+            normalized_source = source.strip().lower()
+            gps["source"] = LEGACY_MODEM_GPS_SOURCES.get(normalized_source, normalized_source)
+
+
 def normalize_modem_config_in_place(config: dict, *, warn: bool = True) -> dict:
     """Canonicalize modem transport keys in place without replacing unrelated objects."""
     if not isinstance(config, dict):
@@ -47,6 +80,7 @@ def normalize_modem_config_in_place(config: dict, *, warn: bool = True) -> dict:
         for entry in radios:
             if isinstance(entry, dict):
                 _normalize_board_config(entry, warn=warn)
+    _normalize_sensor_and_gps_aliases(config)
     return config
 
 

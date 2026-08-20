@@ -152,3 +152,21 @@ def test_save_config_serializes_only_canonical_modem_keys(tmp_path):
         "radio_type": "modem_usb",
         "modem_usb": {"port": "/dev/ttyACM0"},
     }
+
+
+def test_sensor_and_gps_aliases_migrate_to_canonical_names():
+    normalized = normalize_modem_config(
+        {
+            "sensors": {
+                "definitions": [
+                    {"name": "modem", "type": "pymc_modem", "settings": {"host": "x"}},
+                    {"name": "system", "type": "hardware_stats"},
+                ]
+            },
+            "gps": {"source": "pymc_modem"},
+        }
+    )
+
+    assert normalized["sensors"]["definitions"][0]["type"] == "openhop_modem"
+    assert normalized["sensors"]["definitions"][1]["type"] == "hardware_stats"
+    assert normalized["gps"]["source"] == "modem_http"

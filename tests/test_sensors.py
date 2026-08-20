@@ -234,7 +234,7 @@ def test_pymc_modem_sensor_reads_modem_stats(monkeypatch):
     assert captured["url"] == "http://192.168.0.205/api/stats"
     assert captured["auth"].startswith("Basic ")
     assert captured["timeout"] == 3.5
-    assert reading["data"]["source"] == "pymc_modem"
+    assert reading["data"]["source"] == "openhop_modem"
     assert reading["data"]["latitude"] == 42.360082
     assert reading["data"]["longitude"] == -71.05888
     assert reading["data"]["altitude_m"] == 12.5
@@ -281,7 +281,7 @@ def test_pymc_modem_sensor_accepts_stats_without_gps_coordinates(monkeypatch):
     ).read()
 
     assert reading["ok"] is True
-    assert reading["data"]["source"] == "pymc_modem"
+    assert reading["data"]["source"] == "openhop_modem"
     assert reading["data"]["battery_voltage_mv"] == 3681
     assert reading["data"]["battery_voltage_v"] == 3.681
     assert reading["data"]["battery_percent"] == 37

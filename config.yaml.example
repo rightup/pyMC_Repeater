@@ -324,7 +324,7 @@ sensors:
     # HTTP /api/stats JSON API for modem diagnostics, including GPS fields
     # when the modem exposes them. If password is set to the same value as
     # modem_tcp.token, the repeater can use one shared modem secret.
-    # - type: pymc_modem
+    # - type: openhop_modem
     #   name: modem
     #   enabled: true
     #   settings:

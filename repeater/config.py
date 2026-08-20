@@ -106,7 +106,7 @@ class NullRadio:
 class BaselineCrcCounterRadio:
     """Radio proxy that exposes CRC errors relative to repeater startup.
 
-    pyMC modem transports report the modem firmware's cumulative CRC counter.
+    openHop Modem transports report the modem firmware's cumulative CRC counter.
     The SX1262 wrapper's counter starts at process startup, which lets the engine
     persist deltas without knowing the radio backend. Mirror that wrapper flow
     here by normalizing the modem's raw counter at the transport boundary.
