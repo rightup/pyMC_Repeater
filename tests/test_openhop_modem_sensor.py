@@ -62,7 +62,7 @@ def test_openhop_modem_sensor_exposes_full_flat_diagnostics(monkeypatch):
             "live": True,
             "current_ip": "192.0.2.10",
             "tcp_port": 5055,
-            "pymc_token_set": True,
+            "token_set": True,
         },
         "gps": {
             "available": True,
@@ -127,6 +127,14 @@ def test_openhop_modem_sensor_exposes_full_flat_diagnostics(monkeypatch):
     assert data["gps_nmea_last_sentence"] == "GGA"
     assert data["battery_voltage_mv"] == 4112
     assert data["solar_charge_rate_percent_per_hour"] == 4.5
+
+
+def test_openhop_modem_sensor_accepts_legacy_token_flag():
+    sensor = OpenHopModemSensor("modem", {"settings": {"base_url": "http://openhop-modem.local"}})
+
+    data = sensor._normalize_payload({"network": {"pymc_token_set": True}})
+
+    assert data["token_configured"] is True
 
 
 def test_legacy_pymc_modem_module_and_registry_create_canonical_sensor():

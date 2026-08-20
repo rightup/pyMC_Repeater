@@ -162,7 +162,9 @@ class OpenHopModemSensor(SensorBase):
             "network_live": self._bool_or_none(network.get("live")),
             "network_current_ip": network.get("current_ip"),
             "tcp_port": self._int(network.get("tcp_port")),
-            "token_configured": self._bool_or_none(network.get("pymc_token_set")),
+            "token_configured": self._bool_or_none(
+                network.get("token_set", network.get("pymc_token_set"))
+            ),
             "gps_available": self._bool_or_none(gps.get("available")),
             "gps_enabled": self._bool_or_none(gps.get("enabled")),
             "gps_seen": self._bool_or_none(gps.get("seen")),
