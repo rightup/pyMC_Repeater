@@ -8,7 +8,12 @@ from openhop_core.node.handlers.result import HandlerResult
 from openhop_core.protocol import Identity, LocalIdentity
 from openhop_core.protocol.packet_builder import PacketBuilder
 
-from repeater.handler_helpers.acl import ACL, PERM_ACL_ADMIN, ClientInfo
+from repeater.handler_helpers.acl import (
+    ACL,
+    PERM_ACL_ADMIN,
+    PERM_ACL_READ_WRITE,
+    ClientInfo,
+)
 from repeater.handler_helpers.path import PathHelper
 from repeater.handler_helpers.protocol_request import ProtocolRequestHelper
 from repeater.handler_helpers.text import TextHelper
@@ -424,13 +429,20 @@ def test_protocol_request_owner_info_fallback_version():
 
 
 def test_text_helper_cli_prefix_and_admin_permission_checks():
+    # 0x21 is ADMIN (role 3). 0x22 is READ_WRITE (role 2) — the case that must
+    # NOT pass the admin gate: the old `permissions & 0x02` test let a
+    # read-write client run admin CLI commands.
     acl = _FakeACL(
         [
             _FakeClient(
-                pubkey=bytes([0x21]) + b"x" * 31, shared_secret=b"k" * 32, permissions=0x02
+                pubkey=bytes([0x21]) + b"x" * 31,
+                shared_secret=b"k" * 32,
+                permissions=PERM_ACL_ADMIN,
             ),
             _FakeClient(
-                pubkey=bytes([0x22]) + b"x" * 31, shared_secret=b"k" * 32, permissions=0x01
+                pubkey=bytes([0x22]) + b"x" * 31,
+                shared_secret=b"k" * 32,
+                permissions=PERM_ACL_READ_WRITE,
             ),
         ]
     )

@@ -419,7 +419,10 @@ class ProtocolRequestHelper:
         result = bytearray()
         for ci in identity_acl.get_all_clients():
             if ci.permissions == 0:
-                continue  # skip deleted entries
+                # Skip deleted entries. Firmware does the same check verbatim,
+                # so plain guests (role 0, no extra bits) are deliberately
+                # absent from the access list on both implementations.
+                continue
             pubkey = ci.id.get_public_key()
             result.extend(pubkey[:6])  # 6-byte pub_key prefix
             result.append(ci.permissions & 0xFF)

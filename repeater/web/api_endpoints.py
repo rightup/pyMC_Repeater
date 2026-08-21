@@ -26,6 +26,7 @@ from repeater.companion.utils import (
     validate_companion_config_capacity,
 )
 from repeater.config import resolve_storage_dir
+from repeater.handler_helpers.acl import role_name as acl_role_name
 from repeater.policy_engine import PolicyEngine
 from repeater.service_utils import get_buildroot_image_info
 from repeater.utils_packet import create_scoped_advert_packet
@@ -6885,7 +6886,13 @@ class APIEndpoints:
                                 "public_key": pub_key[:8].hex() + "..." + pub_key[-4:].hex(),
                                 "public_key_full": pub_key.hex(),
                                 "address": address_bytes.hex(),
-                                "permissions": "admin" if client.is_admin() else "guest",
+                                # Accurate role name: with the guest password
+                                # split (repeater=guest, room server=read_write)
+                                # an "admin or guest" label would hide the
+                                # difference between the non-admin roles.
+                                # Read the byte rather than calling a method:
+                                # ACL clients are duck-typed in several places.
+                                "permissions": acl_role_name(getattr(client, "permissions", 0)),
                                 "last_activity": client.last_activity,
                                 "last_login_success": client.last_login_success,
                                 "last_timestamp": client.last_timestamp,
