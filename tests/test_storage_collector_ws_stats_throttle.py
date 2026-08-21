@@ -82,6 +82,49 @@ def test_broadcast_stats_once_queries_and_broadcasts():
     payload = collector.websocket_broadcast_stats.call_args.args[0]
     assert payload["packet_stats"] == {"total_packets": 1}
     assert "uptime_seconds" in payload["system_stats"]
+    assert payload["system_stats"]["mode"] == "forward"
+
+
+def test_broadcast_decimates_the_packet_stats_aggregate():
+    collector = _make_collector()
+
+    for _ in range(collector.PACKET_STATS_EVERY_N_BEATS + 1):
+        collector._broadcast_stats_once()
+
+    # The heavy 24h aggregate rides the first beat and the (N+1)th, not the
+    # beats in between; the vitals travel on every beat.
+    assert collector.sqlite_handler.get_packet_stats.call_count == 2
+    payloads = [c.args[0] for c in collector.websocket_broadcast_stats.call_args_list]
+    assert all("system_stats" in p for p in payloads)
+    assert [("packet_stats" in p) for p in payloads] == [True] + [False] * (
+        collector.PACKET_STATS_EVERY_N_BEATS - 1
+    ) + [True]
+
+
+def test_broadcast_carries_the_sidebar_vitals():
+    collector = _make_collector()
+    collector.repeater_handler = SimpleNamespace(
+        start_time=0.0,
+        airtime_mgr=SimpleNamespace(get_stats=lambda: {"utilization_percent": 20.0}),
+    )
+    collector._last_noise_floor_dbm = -107.1
+    collector.advert_stats_getter = lambda: {
+        "adaptive": {"current_tier": "NORMAL"},
+        "stats": {"adverts_allowed": 15, "adverts_dropped": 0},
+        "active_penalties": {},
+    }
+
+    collector._broadcast_stats_once()
+
+    vitals = collector.websocket_broadcast_stats.call_args.args[0]["system_stats"]
+    assert vitals["utilization_percent"] == 20.0
+    assert vitals["noise_floor_dbm"] == -107.1
+    assert vitals["advert_tier"] == {
+        "current_tier": "NORMAL",
+        "adverts_allowed": 15,
+        "adverts_dropped": 0,
+        "active_penalties": 0,
+    }
 
 
 def test_stats_loop_broadcasts_when_clients_connected():
