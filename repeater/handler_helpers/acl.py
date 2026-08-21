@@ -5,19 +5,34 @@ from typing import Dict, Optional
 from openhop_core.protocol import Identity
 from openhop_core.protocol.constants import PUB_KEY_SIZE
 
-logger = logging.getLogger("ACL")
+# ACL roles come from openhop_core, which mirrors firmware
+# ``src/helpers/ClientACL.h``: the role is the LOW TWO BITS of the permissions
+# byte and ADMIN is 3 — it is not "the 0x02 bit".
+#
+# This import is deliberately fail-closed. A core without these symbols still
+# builds the login reply's is_admin byte from ``permissions & 0x02``, which
+# also matches READ_WRITE (2); pairing it with this module would silently
+# announce a room server's read-write clients as admins. Refusing to start is
+# the safe failure.
+try:
+    from openhop_core.protocol.constants import (
+        PERM_ACL_ADMIN,
+        PERM_ACL_GUEST,
+        PERM_ACL_READ_ONLY,
+        PERM_ACL_READ_WRITE,
+        PERM_ACL_ROLE_MASK,
+    )
+    from openhop_core.protocol.constants import acl_is_admin as is_admin_permissions
+    from openhop_core.protocol.constants import acl_role as role_of
+except ImportError as exc:  # pragma: no cover - exercised by the install, not tests
+    raise ImportError(
+        "openhop_core is too old: it does not export PERM_ACL_* / acl_is_admin. "
+        "Install openhop_core with the ACL role fix (fix/login-perms or later) — "
+        "an older core encodes admin as the 0x02 bit and would announce "
+        "read-write clients as admins."
+    ) from exc
 
-# ACL roles. Wire values from firmware ``src/helpers/ClientACL.h``, mirrored by
-# ``openhop_core.protocol.constants``. The role is the LOW TWO BITS of the
-# permissions byte and ADMIN is 3 — it is not "the 0x02 bit". Testing 0x02
-# would also match READ_WRITE, and every stock MeshCore client decodes this
-# byte with ``(perms & 3) == 3``, so a non-conforming value makes our admins
-# show up as read-write/guest in third-party apps.
-PERM_ACL_ROLE_MASK = 0x03
-PERM_ACL_GUEST = 0
-PERM_ACL_READ_ONLY = 1
-PERM_ACL_READ_WRITE = 2
-PERM_ACL_ADMIN = 3
+logger = logging.getLogger("ACL")
 
 _ROLE_NAMES = {
     PERM_ACL_GUEST: "guest",
@@ -25,16 +40,6 @@ _ROLE_NAMES = {
     PERM_ACL_READ_WRITE: "read_write",
     PERM_ACL_ADMIN: "admin",
 }
-
-
-def role_of(permissions: int) -> int:
-    """Return the ACL role carried in ``permissions`` (firmware ``perms & 3``)."""
-    return permissions & PERM_ACL_ROLE_MASK
-
-
-def is_admin_permissions(permissions: int) -> bool:
-    """Mirror of firmware ``ClientInfo::isAdmin()`` — the role must equal ADMIN."""
-    return role_of(permissions) == PERM_ACL_ADMIN
 
 
 def role_name(permissions: int) -> str:

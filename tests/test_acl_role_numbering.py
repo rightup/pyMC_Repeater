@@ -51,16 +51,24 @@ def test_role_constants_match_firmware_clientacl_h():
     assert len(roles) == 4
 
 
-def test_role_constants_match_openhop_core():
-    """The wire values core encodes must equal the ones we assign."""
-    constants = pytest.importorskip("openhop_core.protocol.constants")
-    if not hasattr(constants, "PERM_ACL_ADMIN"):
-        pytest.skip("installed openhop_core predates the PERM_ACL_* export")
-    assert constants.PERM_ACL_ROLE_MASK == PERM_ACL_ROLE_MASK
-    assert constants.PERM_ACL_GUEST == PERM_ACL_GUEST
-    assert constants.PERM_ACL_READ_ONLY == PERM_ACL_READ_ONLY
-    assert constants.PERM_ACL_READ_WRITE == PERM_ACL_READ_WRITE
-    assert constants.PERM_ACL_ADMIN == PERM_ACL_ADMIN
+def test_roles_come_from_openhop_core_and_never_diverge():
+    """We re-export core's values rather than keeping a second copy.
+
+    This must not skip on an old core. A core without these symbols encodes
+    the login reply's is_admin byte as ``permissions & 0x02``, which also
+    matches READ_WRITE — pairing it with our numbering would announce a room
+    server's read-write clients as admins. acl.py fails closed at import for
+    exactly that reason, and this asserts the contract it depends on.
+    """
+    from openhop_core.protocol import constants
+
+    assert constants.PERM_ACL_ROLE_MASK is PERM_ACL_ROLE_MASK
+    assert constants.PERM_ACL_GUEST is PERM_ACL_GUEST
+    assert constants.PERM_ACL_READ_ONLY is PERM_ACL_READ_ONLY
+    assert constants.PERM_ACL_READ_WRITE is PERM_ACL_READ_WRITE
+    assert constants.PERM_ACL_ADMIN is PERM_ACL_ADMIN
+    assert is_admin_permissions is constants.acl_is_admin
+    assert role_of is constants.acl_role
 
 
 @pytest.mark.parametrize(
