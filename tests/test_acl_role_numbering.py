@@ -8,7 +8,10 @@ admin being rendered read-write/guest in third-party apps (openhop_repeater
 issue #388).
 """
 
+from pathlib import Path
+
 import pytest
+import yaml
 
 from repeater.handler_helpers.acl import (
     ACL,
@@ -191,3 +194,23 @@ def test_role_change_replaces_the_role_without_touching_reserved_bits():
     assert role_of(perms) == PERM_ACL_GUEST
     assert perms & 0x40  # reserved flag preserved
     assert client.is_admin() is False
+
+
+def test_every_role_name_is_allowed_by_the_openapi_schema():
+    """The ACL client list advertises an enum; every role we emit must be in it.
+
+    The role split added "read_write", which the schema did not previously
+    allow — generated clients and validators reject undeclared values.
+    """
+    spec = yaml.safe_load(
+        (Path(__file__).resolve().parents[1] / "repeater/web/openapi.yaml").read_text()
+    )
+    enum = spec["components"]["schemas"]["ACLClient"]["properties"]["permissions"]["enum"]
+
+    emitted = {
+        role_name(PERM_ACL_GUEST),
+        role_name(PERM_ACL_READ_ONLY),
+        role_name(PERM_ACL_READ_WRITE),
+        role_name(PERM_ACL_ADMIN),
+    }
+    assert emitted <= set(enum), f"roles missing from the OpenAPI enum: {emitted - set(enum)}"
