@@ -1726,15 +1726,34 @@ def test_set_mode_and_set_duty_cycle_paths(cherrypy_ctx):
     invalid = api.set_mode()
     assert invalid["success"] is False
 
+    api.config_manager.update_and_save.return_value = {"saved": True}
     request.json = {"mode": "monitor"}
     ok = api.set_mode()
-    assert ok == {"success": True, "mode": "monitor"}
+    assert ok == {"success": True, "mode": "monitor", "persisted": True}
     assert api.config["repeater"]["mode"] == "monitor"
+    api.config_manager.update_and_save.assert_called_once_with(
+        updates={}, live_update=True, live_update_sections=["repeater"]
+    )
 
     request.json = {"enabled": False}
     duty = api.set_duty_cycle()
     assert duty == {"success": True, "enabled": False}
     assert api.config["duty_cycle"]["enforcement_enabled"] is False
+
+
+def test_set_mode_save_failure_reports_error(cherrypy_ctx):
+    request, _ = cherrypy_ctx
+    api = _make_api({"repeater": {}})
+    api.config_manager.update_and_save.return_value = {"saved": False, "error": "disk full"}
+
+    request.method = "POST"
+    request.json = {"mode": "no_tx"}
+    resp = api.set_mode()
+    assert resp["success"] is False
+    assert "disk full" in resp["error"]
+    # The live switch already happened on the shared dict; only the
+    # persistence failed, and the error says so instead of a silent loss.
+    assert api.config["repeater"]["mode"] == "no_tx"
 
 
 def test_update_duty_cycle_config_branches(cherrypy_ctx):

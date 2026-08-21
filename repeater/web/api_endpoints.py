@@ -1983,8 +1983,18 @@ class APIEndpoints:
             if "repeater" not in self.config:
                 self.config["repeater"] = {}
             self.config["repeater"]["mode"] = new_mode
+
+            # The engine reads the mode live from the shared config dict;
+            # update_and_save writes it to disk so the choice survives a
+            # restart.
+            result = self.config_manager.update_and_save(
+                updates={}, live_update=True, live_update_sections=["repeater"]
+            )
+            if not result.get("saved", False):
+                return self._error(result.get("error", "Failed to save configuration to file"))
+
             logger.info(f"Mode changed to: {new_mode}")
-            return {"success": True, "mode": new_mode}
+            return {"success": True, "mode": new_mode, "persisted": True}
         except cherrypy.HTTPError:
             # Re-raise HTTP errors (like 405 Method Not Allowed) without logging
             raise
