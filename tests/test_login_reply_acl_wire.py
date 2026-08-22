@@ -23,16 +23,23 @@ from openhop_core.protocol.constants import (
     ROUTE_TYPE_FLOOD,
 )
 
-from repeater.handler_helpers.acl import (
-    ACL,
-    PERM_ACL_ADMIN,
-    PERM_ACL_GUEST,
-    PERM_ACL_READ_WRITE,
-)
+from openhop_core.protocol.acl_conformance import OUTBOUND
+
+from repeater.handler_helpers.acl import ACL
 
 ROOM_CFG = {
     "type": "room_server",
     "settings": {"admin_password": "room-admin", "guest_password": "room-guest"},
+}
+
+# How each conformance vector's (server_type, credential) is produced here.
+# The ACL is built with these passwords; "" exercises allow_read_only.
+CREDENTIALS = {
+    ("repeater", "admin_password"): ("rpt-admin", None),
+    ("repeater", "guest_password"): ("rpt-guest", None),
+    ("repeater", "blank_read_only"): ("", None),
+    ("room_server", "admin_password"): ("room-admin", ROOM_CFG),
+    ("room_server", "guest_password"): ("room-guest", ROOM_CFG),
 }
 
 
@@ -101,46 +108,57 @@ async def _login_reply(acl: ACL, password: str, *, room_config: dict = None) -> 
 
 
 @pytest.mark.asyncio
-async def test_repeater_admin_login_is_admin_on_the_wire():
-    """The bug from #388: byte 7 must decode to ADMIN, not READ_WRITE."""
+@pytest.mark.parametrize(
+    "server_type, credential, admin_code, permissions",
+    OUTBOUND,
+    ids=[f"{srv}-{cred}" for srv, cred, _, _ in OUTBOUND],
+)
+async def test_outbound_conformance_vectors(server_type, credential, admin_code, permissions):
+    """The real ACL plus the real core handler must emit the literal bytes.
+
+    This is the only place both halves of the fix meet, and the expectations
+    are literals from openhop_core.protocol.acl_conformance rather than
+    PERM_ACL_* — a symbolic assertion would follow the constants if they ever
+    drift away from the mesh again, which is exactly how #388 stayed hidden.
+    """
+    password, room_config = CREDENTIALS[(server_type, credential)]
+    acl = ACL(
+        admin_password="rpt-admin",
+        guest_password="rpt-guest",
+        allow_read_only=True,
+    )
+    reply = await _login_reply(acl, password, room_config=room_config)
+
+    assert reply[6] == admin_code
+    assert reply[7] == permissions
+
+
+@pytest.mark.asyncio
+async def test_admin_is_role_three_not_the_0x02_bit():
+    """The single assertion that would have caught #388.
+
+    A stock client computes (perms & 3) == 3. Our admin used to be 0x02, which
+    that expression reads as READ_WRITE.
+    """
     acl = ACL(admin_password="rpt-admin", guest_password="rpt-guest")
     reply = await _login_reply(acl, "rpt-admin")
 
-    assert reply[6] == 1  # legacy is_admin flag
-    assert reply[7] == PERM_ACL_ADMIN  # ACL byte modern clients read
-    assert reply[7] & 0x03 == 3  # what a stock client computes
-    assert reply[7] != PERM_ACL_READ_WRITE  # the value we used to send
+    assert reply[7] & 0x03 == 3
+    assert reply[7] != 0x02
 
 
 @pytest.mark.asyncio
-async def test_repeater_guest_login_is_guest_on_the_wire():
-    acl = ACL(admin_password="rpt-admin", guest_password="rpt-guest")
-    reply = await _login_reply(acl, "rpt-guest")
+async def test_repeater_and_room_guests_get_different_roles():
+    """The split is observable on the wire, not just in our own vocabulary.
 
-    assert reply[6] == 0
-    assert reply[7] == PERM_ACL_GUEST
+    GUEST and READ_WRITE were both 0x01 before, so these two logins were
+    indistinguishable to every client.
+    """
+    rpt = await _login_reply(
+        ACL(admin_password="rpt-admin", guest_password="rpt-guest"), "rpt-guest"
+    )
+    room = await _login_reply(ACL(), "room-guest", room_config=ROOM_CFG)
 
-
-@pytest.mark.asyncio
-async def test_room_server_guest_login_is_read_write_on_the_wire():
-    """Room guests post messages, so they must decode as READ_WRITE, not admin."""
-    reply = await _login_reply(ACL(), "room-guest", room_config=ROOM_CFG)
-
-    assert reply[6] == 0  # read-write is not admin
-    assert reply[7] == PERM_ACL_READ_WRITE
-
-
-@pytest.mark.asyncio
-async def test_room_server_admin_login_is_admin_on_the_wire():
-    reply = await _login_reply(ACL(), "room-admin", room_config=ROOM_CFG)
-
-    assert reply[6] == 1
-    assert reply[7] == PERM_ACL_ADMIN
-
-
-@pytest.mark.asyncio
-async def test_blank_password_read_only_login_is_guest_on_the_wire():
-    reply = await _login_reply(ACL(allow_read_only=True), "")
-
-    assert reply[6] == 0
-    assert reply[7] == PERM_ACL_GUEST
+    assert rpt[7] == 0x00
+    assert room[7] == 0x02
+    assert rpt[7] != room[7]

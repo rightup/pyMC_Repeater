@@ -13,6 +13,8 @@ from pathlib import Path
 import pytest
 import yaml
 
+from openhop_core.protocol.acl_conformance import ROLE_MASK, ROLE_VALUES
+
 from repeater.handler_helpers.acl import (
     ACL,
     PERM_ACL_ADMIN,
@@ -41,11 +43,12 @@ class _Id:
 
 
 def test_role_constants_match_firmware_clientacl_h():
-    assert PERM_ACL_ROLE_MASK == 3
-    assert PERM_ACL_GUEST == 0
-    assert PERM_ACL_READ_ONLY == 1
-    assert PERM_ACL_READ_WRITE == 2
-    assert PERM_ACL_ADMIN == 3
+    """Literal pin against the firmware header, via the shared vector table."""
+    assert PERM_ACL_ROLE_MASK == ROLE_MASK == 0x03
+    assert PERM_ACL_GUEST == ROLE_VALUES["guest"] == 0x00
+    assert PERM_ACL_READ_ONLY == ROLE_VALUES["read_only"] == 0x01
+    assert PERM_ACL_READ_WRITE == ROLE_VALUES["read_write"] == 0x02
+    assert PERM_ACL_ADMIN == ROLE_VALUES["admin"] == 0x03
     # Every role must be distinct; GUEST and READ_WRITE used to collide on 0x01.
     roles = {PERM_ACL_GUEST, PERM_ACL_READ_ONLY, PERM_ACL_READ_WRITE, PERM_ACL_ADMIN}
     assert len(roles) == 4
@@ -222,3 +225,56 @@ def test_every_role_name_is_allowed_by_the_openapi_schema():
         role_name(PERM_ACL_ADMIN),
     }
     assert emitted <= set(enum), f"roles missing from the OpenAPI enum: {emitted - set(enum)}"
+
+
+def test_acl_refuses_to_import_against_a_core_without_the_role_constants(monkeypatch):
+    """The fail-closed guard must actually fire, with a message that helps.
+
+    A core lacking these symbols still builds the login reply's admin byte
+    from ``permissions & 0x02``, which would announce a room server's
+    READ_WRITE clients as admins. Refusing to import is the safe failure, and
+    it is worth a test because nothing else exercises that path.
+    """
+    import importlib
+    import sys
+    import types
+
+    import openhop_core.protocol.constants as real_constants
+
+    stub = types.ModuleType("openhop_core.protocol.constants")
+    for name in dir(real_constants):
+        if not name.startswith("__"):
+            setattr(stub, name, getattr(real_constants, name))
+    for missing in (
+        "PERM_ACL_ROLE_MASK",
+        "PERM_ACL_GUEST",
+        "PERM_ACL_READ_ONLY",
+        "PERM_ACL_READ_WRITE",
+        "PERM_ACL_ADMIN",
+        "acl_is_admin",
+        "acl_role",
+    ):
+        delattr(stub, missing)
+
+    monkeypatch.setitem(sys.modules, "openhop_core.protocol.constants", stub)
+    monkeypatch.delitem(sys.modules, "repeater.handler_helpers.acl")
+
+    with pytest.raises(ImportError) as exc:
+        importlib.import_module("repeater.handler_helpers.acl")
+
+    message = str(exc.value)
+    assert "openhop_core is too old" in message
+    assert "fix/login-perms" in message
+
+
+def test_acl_imports_normally_against_the_installed_core():
+    """Companion to the guard test: the happy path must still work.
+
+    Guards that always fire are worse than no guard, and the test above
+    manipulates sys.modules.
+    """
+    import importlib
+
+    module = importlib.import_module("repeater.handler_helpers.acl")
+    assert module.PERM_ACL_ADMIN == 0x03
+    assert module.is_admin_permissions(0x03) is True
