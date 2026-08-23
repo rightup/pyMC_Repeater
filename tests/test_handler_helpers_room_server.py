@@ -234,6 +234,49 @@ async def test_room_server_send_advert_callback_returns_false_on_inject_failure(
     injector.assert_awaited_once()
 
 
+@pytest.mark.asyncio
+async def test_room_server_cli_advert_uses_node_name():
+    """CLI advert must advertise settings.node_name, matching the scheduler.
+
+    The CLI path read only settings.room_name while the daemon scheduler and
+    the HTTP endpoint read settings.node_name -- so a single `advert` from
+    the room CLI renamed the room on the mesh to the identity-name fallback
+    when the two keys differed.
+    """
+    config = {
+        "identities": {
+            "room_servers": [
+                {
+                    "name": "room-alpha",
+                    "settings": {"node_name": "Room Alpha", "latitude": 1.0, "longitude": 2.0},
+                }
+            ]
+        }
+    }
+
+    injector = AsyncMock(return_value=True)
+    rs = RoomServer(
+        room_hash=0x34,
+        room_name="room-alpha",
+        local_identity=_FakeIdentity(b"R" * 32),
+        sqlite_handler=_FakeDB(),
+        packet_injector=injector,
+        acl=_FakeACL(),
+        config_path="/tmp/room.yaml",
+        config=config,
+        config_manager=SimpleNamespace(),
+    )
+
+    packet = SimpleNamespace()
+    with patch(
+        "openhop_core.protocol.PacketBuilder.create_advert", return_value=packet
+    ) as create_advert:
+        ok = await rs.cli.send_advert_callback()
+
+    assert ok is True
+    assert create_advert.call_args.kwargs.get("name") == "Room Alpha"
+
+
 def test_room_server_init_caps_max_posts_to_hard_limit():
     rs = _make_room_server(max_posts=MAX_UNSYNCED_POSTS + 50)
     assert rs.max_posts == MAX_UNSYNCED_POSTS

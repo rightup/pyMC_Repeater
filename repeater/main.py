@@ -1537,7 +1537,7 @@ class RepeaterDaemon:
             settings = (
                 identity_config.get("settings", {}) if isinstance(identity_config, dict) else {}
             )
-            node_name = settings.get("node_name", room_name)
+            node_name = settings.get("node_name", settings.get("room_name", room_name))
             latitude = settings.get("latitude", 0.0)
             longitude = settings.get("longitude", 0.0)
             flags = ADVERT_FLAG_IS_ROOM_SERVER | ADVERT_FLAG_HAS_NAME
