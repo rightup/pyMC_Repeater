@@ -75,6 +75,7 @@ class RepeaterCompanionBridge(CompanionBridge):
         sqlite_handler=None,
         companion_hash: str = "",
         on_prefs_saved: Optional[Callable[[str], None]] = None,
+        path_hash_mode: "int | None" = None,
     ) -> None:
         self._sqlite_handler = sqlite_handler
         self._companion_hash = companion_hash
@@ -93,6 +94,13 @@ class RepeaterCompanionBridge(CompanionBridge):
             radio_settings_getter=radio_settings_getter,
             max_tx_power_getter=max_tx_power_getter,
         )
+        # Config-provided width wins over the persisted pref at startup
+        # (CompanionBase.__init__ above has already run _load_prefs). Not
+        # persisted here on purpose: removing the key from the config hands
+        # control back to the client-set pref instead of freezing the last
+        # configured value.
+        if path_hash_mode is not None:
+            self.prefs.path_hash_mode = path_hash_mode
 
     def _save_prefs(self) -> None:
         """Persist full NodePrefs as JSON to SQLite."""

@@ -106,6 +106,23 @@ def parse_companion_bridge_kwargs(settings: dict) -> Dict[str, int]:
         kwargs["offline_queue_size"] = parse_positive_int(
             settings["offline_queue_size"], "offline_queue_size", minimum=0
         )
+    if "path_hash_mode" in settings:
+        # Origin path hash width for this companion identity: 0=1-byte,
+        # 1=2-byte, 2=3-byte. Applied after the persisted prefs load, so the
+        # config value wins at startup; clients can still change it at
+        # runtime over the companion protocol. Invalid values are ignored
+        # with a warning rather than failing the daemon start.
+        try:
+            mode = int(settings["path_hash_mode"])
+        except (TypeError, ValueError):
+            mode = -1
+        if mode in (0, 1, 2):
+            kwargs["path_hash_mode"] = mode
+        else:
+            logger.warning(
+                "Companion setting path_hash_mode=%r is invalid (must be 0, 1 or 2); ignoring",
+                settings["path_hash_mode"],
+            )
     return kwargs
 
 

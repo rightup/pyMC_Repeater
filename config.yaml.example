@@ -406,6 +406,8 @@ identities:
     #     tcp_port: 5000
     #     bind_address: "0.0.0.0"
     #     tcp_timeout: 120   # seconds; default 120 when omitted; 0 = disable (no timeout)
+    #     path_hash_mode: 1  # origin path hash width: 0=1-byte (default), 1=2-byte,
+    #                        # 2=3-byte; config wins over the client-set pref at startup
     # - name: "BotCompanion"
     #   identity_key: "another_companion_identity_key_hex"
     #   settings:

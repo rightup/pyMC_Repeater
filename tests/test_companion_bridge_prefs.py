@@ -84,3 +84,58 @@ def test_bridge_accepts_host_radio_callbacks(identity):
         "airtime_factor": 1.0,
     }
     assert bridge.get_max_tx_power_dbm() == 20
+
+
+def test_config_path_hash_mode_wins_over_persisted(identity):
+    """settings.path_hash_mode must override the persisted pref at startup."""
+
+    class FakeSqlite:
+        def companion_load_prefs(self, companion_hash: str):
+            return {"path_hash_mode": 0}
+
+        def companion_save_prefs(self, companion_hash: str, prefs: dict) -> bool:
+            return True
+
+    async def inject(pkt, wait_for_ack=False):
+        return True
+
+    bridge = RepeaterCompanionBridge(
+        identity,
+        inject,
+        sqlite_handler=FakeSqlite(),
+        companion_hash="testhash",
+        path_hash_mode=1,
+    )
+    assert bridge.prefs.path_hash_mode == 1
+
+
+def test_persisted_path_hash_mode_survives_without_config_key(identity):
+    """Without the config key, the client-set persisted pref stays in charge."""
+
+    class FakeSqlite:
+        def companion_load_prefs(self, companion_hash: str):
+            return {"path_hash_mode": 2}
+
+        def companion_save_prefs(self, companion_hash: str, prefs: dict) -> bool:
+            return True
+
+    async def inject(pkt, wait_for_ack=False):
+        return True
+
+    bridge = RepeaterCompanionBridge(
+        identity,
+        inject,
+        sqlite_handler=FakeSqlite(),
+        companion_hash="testhash",
+    )
+    assert bridge.prefs.path_hash_mode == 2
+
+
+def test_parse_companion_bridge_kwargs_path_hash_mode():
+    """Parser accepts 0/1/2 and ignores invalid values instead of raising."""
+    from repeater.companion.utils import parse_companion_bridge_kwargs
+
+    assert parse_companion_bridge_kwargs({"path_hash_mode": 1}) == {"path_hash_mode": 1}
+    assert parse_companion_bridge_kwargs({"path_hash_mode": "2"}) == {"path_hash_mode": 2}
+    assert parse_companion_bridge_kwargs({"path_hash_mode": 5}) == {}
+    assert parse_companion_bridge_kwargs({"path_hash_mode": "junk"}) == {}
