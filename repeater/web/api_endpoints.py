@@ -26,6 +26,7 @@ from repeater.companion.utils import (
     validate_companion_config_capacity,
 )
 from repeater.config import resolve_storage_dir
+from repeater.handler_helpers.acl import role_name as acl_role_name
 from repeater.modem_config import LEGACY_MODEM_RADIO_TYPES, normalize_modem_config
 from repeater.policy_engine import PolicyEngine
 from repeater.service_utils import get_buildroot_image_info
@@ -6925,7 +6926,13 @@ class APIEndpoints:
                                 "public_key": pub_key[:8].hex() + "..." + pub_key[-4:].hex(),
                                 "public_key_full": pub_key.hex(),
                                 "address": address_bytes.hex(),
-                                "permissions": "admin" if client.is_admin() else "guest",
+                                # Accurate role name: with the guest password
+                                # split (repeater=guest, room server=read_write)
+                                # an "admin or guest" label would hide the
+                                # difference between the non-admin roles.
+                                # Read the byte rather than calling a method:
+                                # ACL clients are duck-typed in several places.
+                                "permissions": acl_role_name(getattr(client, "permissions", 0)),
                                 "last_activity": client.last_activity,
                                 "last_login_success": client.last_login_success,
                                 "last_timestamp": client.last_timestamp,
@@ -7926,12 +7933,16 @@ class APIEndpoints:
 
             imported_config = normalize_modem_config(imported_config)
 
-            # Redacted exports are intentionally safe to re-import. Preserve the
-            # currently configured modem token instead of saving the sentinel.
+            # Redacted exports and browser-originated partial modem updates are
+            # intentionally safe to re-import. Preserve the currently configured
+            # token when the incoming section carries the sentinel or omits the
+            # field; a real incoming token still replaces it.
             current_config = normalize_modem_config(self.config, warn=False)
             imported_tcp = imported_config.get("modem_tcp")
             current_tcp = current_config.get("modem_tcp")
-            if isinstance(imported_tcp, dict) and imported_tcp.get("token") == "*** REDACTED ***":
+            if isinstance(imported_tcp, dict) and (
+                "token" not in imported_tcp or imported_tcp.get("token") == REDACTED_CONFIG_VALUE
+            ):
                 if isinstance(current_tcp, dict) and "token" in current_tcp:
                     imported_tcp["token"] = current_tcp["token"]
                 else:
@@ -7951,9 +7962,9 @@ class APIEndpoints:
                     if not isinstance(entry, dict):
                         continue
                     imported_radio_tcp = entry.get("modem_tcp")
-                    if not (
-                        isinstance(imported_radio_tcp, dict)
-                        and imported_radio_tcp.get("token") == "*** REDACTED ***"
+                    if not isinstance(imported_radio_tcp, dict) or (
+                        "token" in imported_radio_tcp
+                        and imported_radio_tcp.get("token") != REDACTED_CONFIG_VALUE
                     ):
                         continue
                     current_entry = current_radios_by_id.get(entry.get("id"))

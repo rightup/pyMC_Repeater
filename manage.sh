@@ -148,6 +148,30 @@ cleanup_stale_source_trees() {
     fi
 }
 
+cleanup_broken_distribution_metadata() {
+    local site_packages_dir
+    local removed=0
+
+    for site_packages_dir in "$VENV_DIR"/lib/python*/site-packages; do
+        [ -d "$site_packages_dir" ] || continue
+
+        while IFS= read -r path; do
+            [ -n "$path" ] || continue
+            rm -rf "$path"
+            removed=1
+            echo "    ✓ Removed broken package metadata at $path"
+        done < <(
+            find "$site_packages_dir" \
+                \( -type d -name '~*dist-info' -o -type d -name '~*egg-info' -o -type f -name '~*.pth' \) \
+                -print 2>/dev/null | sort
+        )
+    done
+
+    if [ "$removed" -eq 0 ]; then
+        echo "    ✓ No broken package metadata found"
+    fi
+}
+
 migrate_legacy_paths() {
     local timestamp legacy current label backup_path
     timestamp="$(date +%Y%m%d_%H%M%S)"
@@ -225,6 +249,8 @@ ensure_venv() {
         fi
         python3 -m venv --system-site-packages "$VENV_DIR"
     fi
+
+    cleanup_broken_distribution_metadata
 
     # Always use python -m pip so we don't rely on a potentially stale pip wrapper.
     if ! "$VENV_PYTHON" -m pip install --upgrade pip setuptools wheel; then
@@ -415,6 +441,28 @@ disable_legacy_services() {
     if [ "$removed_unit" -eq 1 ]; then
         systemctl daemon-reload >/dev/null 2>&1 || true
     fi
+}
+
+wait_for_service_active() {
+    local timeout_seconds="${1:-15}"
+    local elapsed=0
+
+    while (( elapsed < timeout_seconds )); do
+        if systemctl is-active --quiet "$SERVICE_NAME"; then
+            return 0
+        fi
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+
+    return 1
+}
+
+print_service_failure_diagnostics() {
+    echo "    --- ${SERVICE_NAME} status ---"
+    systemctl --no-pager --full status "$SERVICE_NAME" 2>/dev/null || true
+    echo "    --- recent journal ---"
+    journalctl --no-pager -u "$SERVICE_NAME" -n 40 -o cat 2>/dev/null || true
 }
 
 # Function to get current version
@@ -1365,13 +1413,14 @@ UPGRADEEOF
         if ! systemctl restart "$SERVICE_NAME"; then
             restart_service_after_failure
             error "Failed to restart ${SERVICE_NAME}"
+            print_service_failure_diagnostics
             return 1
         fi
 
-        sleep 3
-        if ! is_running; then
+        if ! wait_for_service_active 15; then
             restart_service_after_failure
             error "Service restart completed but ${SERVICE_NAME} is not active"
+            print_service_failure_diagnostics
             return 1
         fi
         echo "    ✓ Service restarted and active"

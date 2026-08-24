@@ -13,6 +13,7 @@ import time
 from openhop_core.node.handlers.text import TextMessageHandler
 from openhop_core.protocol import CryptoUtils, Identity
 
+from .acl import is_admin_permissions
 from .mesh_cli import MeshCLI
 from .room_server import RoomServer
 
@@ -521,17 +522,16 @@ class TextHelper:
                 pubkey = client_info.id.get_public_key()
                 if pubkey[0] == src_hash:
                     permissions = getattr(client_info, "permissions", 0)
-                    PERM_ACL_ADMIN = 0x02
-                    return (permissions & 0x02) == PERM_ACL_ADMIN
+                    return is_admin_permissions(permissions)
             return False
 
         sender_pubkey = sender_client.id.get_public_key()
         for client_info in identity_acl.get_all_clients():
             if client_info.id.get_public_key() == sender_pubkey:
-                # Check admin bit (0x02 = PERM_ACL_ADMIN)
+                # Role is the low two bits with ADMIN == 3; a 0x02 bit test
+                # would also let READ_WRITE clients run admin CLI commands.
                 permissions = getattr(client_info, "permissions", 0)
-                PERM_ACL_ADMIN = 0x02
-                return (permissions & 0x02) == PERM_ACL_ADMIN
+                return is_admin_permissions(permissions)
 
         return False
 

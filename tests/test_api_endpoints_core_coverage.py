@@ -7,6 +7,11 @@ from unittest.mock import AsyncMock, MagicMock, mock_open, patch
 import cherrypy
 import pytest
 
+from repeater.handler_helpers.acl import (
+    PERM_ACL_ADMIN,
+    PERM_ACL_GUEST,
+    PERM_ACL_READ_WRITE,
+)
 from repeater.web.api_endpoints import APIEndpoints
 
 
@@ -831,6 +836,58 @@ def test_config_import_updates_sections_and_preserves_redacted(cherrypy_ctx):
         "port": 6001,
         "token": "keep-nested-token",
     }
+
+
+def test_config_import_preserves_omitted_modem_tokens_but_accepts_replacements(cherrypy_ctx):
+    request, _ = cherrypy_ctx
+    request.method = "POST"
+    api = _make_api(
+        {
+            "modem_tcp": {"host": "old.local", "port": 5055, "token": "root-secret"},
+            "radios": [
+                {
+                    "id": "keep",
+                    "radio_type": "modem_tcp",
+                    "modem_tcp": {"host": "old-keep.local", "token": "keep-secret"},
+                },
+                {
+                    "id": "replace",
+                    "radio_type": "modem_tcp",
+                    "modem_tcp": {"host": "old-replace.local", "token": "old-secret"},
+                },
+            ],
+        }
+    )
+    request.json = {
+        "config": {
+            "modem_tcp": {"host": "new.local", "port": 6000},
+            "radios": [
+                {
+                    "id": "keep",
+                    "radio_type": "modem_tcp",
+                    "modem_tcp": {"host": "new-keep.local", "port": 6001},
+                },
+                {
+                    "id": "replace",
+                    "radio_type": "modem_tcp",
+                    "modem_tcp": {
+                        "host": "new-replace.local",
+                        "port": 6002,
+                        "token": "new-secret",
+                    },
+                },
+            ],
+        }
+    }
+    api.config_manager.update_and_save.return_value = {"ok": True}
+    api.config_manager.save_to_file.return_value = True
+
+    result = api.config_import()
+
+    assert result["success"] is True
+    assert api.config["modem_tcp"]["token"] == "root-secret"
+    assert api.config["radios"][0]["modem_tcp"]["token"] == "keep-secret"
+    assert api.config["radios"][1]["modem_tcp"]["token"] == "new-secret"
 
 
 def test_openapi_success_sets_content_type(cherrypy_ctx):
@@ -2448,15 +2505,15 @@ class _FakeIdentityObj:
 
 
 class _FakeClient:
-    def __init__(self, key_hex: str, admin: bool):
+    def __init__(self, key_hex: str, permissions: int):
         self.id = SimpleNamespace(get_public_key=lambda: bytes.fromhex(key_hex))
-        self._admin = admin
+        self.permissions = permissions
         self.last_activity = 1.0
         self.last_login_success = 2.0
         self.last_timestamp = 3.0
 
     def is_admin(self):
-        return self._admin
+        return (self.permissions & 0x03) == PERM_ACL_ADMIN
 
 
 class _FakeACL:
@@ -2594,7 +2651,11 @@ def test_acl_endpoints_paths(cherrypy_ctx):
     request.method = "GET"
     assert api.acl_info()["success"] is False
 
-    clients = [_FakeClient("aa" * 32, True), _FakeClient("bb" * 32, False)]
+    clients = [
+        _FakeClient("aa" * 32, PERM_ACL_ADMIN),
+        _FakeClient("bb" * 32, PERM_ACL_READ_WRITE),
+        _FakeClient("cc" * 32, PERM_ACL_GUEST),
+    ]
     acl = _FakeACL(clients)
     login_helper = SimpleNamespace(get_acl_dict=lambda: {0x42: acl, 0x51: _FakeACL([])})
     id_mgr = SimpleNamespace(
@@ -2624,6 +2685,12 @@ def test_acl_endpoints_paths(cherrypy_ctx):
     all_clients = api.acl_clients()
     assert all_clients["success"] is True
     assert all_clients["data"]["count"] >= 1
+    # The label is the real role. Collapsing it to "admin or guest" would hide
+    # a room server's read-write clients behind the guest label.
+    labels = {c["public_key_full"][:2]: c["permissions"] for c in all_clients["data"]["clients"]}
+    assert labels["aa"] == "admin"
+    assert labels["bb"] == "read_write"
+    assert labels["cc"] == "guest"
     assert api.acl_clients(identity_hash="bad")["success"] is False
     assert api.acl_clients(identity_name="missing")["success"] is False
 
