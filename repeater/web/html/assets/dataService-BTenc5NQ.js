@@ -1,0 +1,1 @@
+import{t as e}from"./dataService-Cf_Rq982.js";export{e as useDataService};
