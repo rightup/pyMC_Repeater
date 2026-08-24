@@ -3,7 +3,7 @@ import concurrent.futures
 import logging
 import threading
 import time
-from typing import Optional
+from typing import Any, Dict, Optional
 
 from repeater.config import resolve_storage_dir
 
@@ -88,6 +88,11 @@ class StorageCollector:
         # Initialize WebSocket handler for real-time updates
         self.websocket_available = False
         self.websocket_has_connected_clients = lambda: False
+        # Wired by the daemon once the advert helper exists; returns the
+        # rate-limit stats dict the sidebar's advert tier reads.
+        self.advert_stats_getter = None
+        self._last_noise_floor_dbm: Optional[float] = None
+        self._stats_broadcast_seq = 0
         self._ws_stats_broadcast_interval_sec: float = 5.0
         self._stats_stop_event = threading.Event()
         self._stats_thread: Optional[threading.Thread] = None
@@ -256,18 +261,49 @@ class StorageCollector:
 
         self._publish_packet_to_mqtt(packet_record)
 
+    # The heavy 24h SQL aggregate rides one beat in six (30s at the 5s
+    # default): nobody reads a 24h cumulative at 5s resolution, and the
+    # sidebar vitals it used to travel with are cheap in-memory scalars.
+    PACKET_STATS_EVERY_N_BEATS = 6
+
     def _broadcast_stats_once(self) -> None:
-        """Compute the 24h aggregate and broadcast it to WebSocket clients."""
-        packet_stats_24h = self.sqlite_handler.get_packet_stats(hours=24)
-        uptime_seconds = (
-            time.time() - self.repeater_handler.start_time if self.repeater_handler else 0
-        )
-        self.websocket_broadcast_stats(
-            {
-                "packet_stats": packet_stats_24h,
-                "system_stats": {"uptime_seconds": uptime_seconds},
-            }
-        )
+        """Broadcast the sidebar vitals; the 24h aggregate is decimated.
+
+        The beat carries scalars only — a few hundred bytes — so the
+        dashboard sidebar can read every vital live on any page. Series
+        (noise-floor history, charts) stay on their own slow HTTP paths.
+        """
+        system_stats: Dict[str, Any] = {
+            "uptime_seconds": (
+                time.time() - self.repeater_handler.start_time if self.repeater_handler else 0
+            ),
+            "mode": self.config.get("repeater", {}).get("mode", "forward"),
+        }
+        airtime_mgr = getattr(self.repeater_handler, "airtime_mgr", None)
+        if airtime_mgr is not None:
+            airtime_stats = airtime_mgr.get_stats()
+            if airtime_stats:
+                system_stats["utilization_percent"] = airtime_stats["utilization_percent"]
+        if self._last_noise_floor_dbm is not None:
+            system_stats["noise_floor_dbm"] = self._last_noise_floor_dbm
+        if self.advert_stats_getter is not None:
+            try:
+                tier = self.advert_stats_getter()
+                system_stats["advert_tier"] = {
+                    "current_tier": tier.get("adaptive", {}).get("current_tier"),
+                    "adverts_allowed": tier.get("stats", {}).get("adverts_allowed", 0),
+                    "adverts_dropped": tier.get("stats", {}).get("adverts_dropped", 0),
+                    "active_penalties": len(tier.get("active_penalties") or {}),
+                }
+            except Exception as e:
+                logger.debug(f"Advert stats unavailable for broadcast: {e}")
+
+        payload: Dict[str, Any] = {"system_stats": system_stats}
+        if self._stats_broadcast_seq % self.PACKET_STATS_EVERY_N_BEATS == 0:
+            payload["packet_stats"] = self.sqlite_handler.get_packet_stats(hours=24)
+        self._stats_broadcast_seq += 1
+
+        self.websocket_broadcast_stats(payload)
 
     def _stats_broadcast_loop(self) -> None:
         """Broadcast aggregate stats every interval while clients are connected.
@@ -337,6 +373,7 @@ class StorageCollector:
 
     def record_noise_floor(self, noise_floor_dbm: float):
         """Record noise floor to storage and defer network publishing to background tasks."""
+        self._last_noise_floor_dbm = noise_floor_dbm
         noise_record = {"timestamp": time.time(), "noise_floor_dbm": noise_floor_dbm}
         self.sqlite_handler.store_noise_floor(noise_record)
         self._schedule_background(

@@ -532,6 +532,10 @@ class RepeaterDaemon:
                 log_fn=logger.info,
             )
             logger.info("Advert processing helper initialized")
+            if self.repeater_handler and self.repeater_handler.storage:
+                self.repeater_handler.storage.advert_stats_getter = (
+                    self.advert_helper.get_rate_limit_stats
+                )
 
             # Set up discovery handler if enabled
             allow_discovery = self.config.get("repeater", {}).get("allow_discovery", True)
