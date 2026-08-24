@@ -439,7 +439,10 @@ def test_hardware_options_loads_installed_file(tmp_path):
         encoding="utf-8",
     )
 
-    with patch("repeater.web.api_endpoints.resolve_storage_dir", return_value=Path(tmp_path)):
+    # Preset loading moved to repeater.web.hardware_presets — patch it there.
+    with patch(
+        "repeater.web.hardware_presets.resolve_storage_dir", return_value=Path(tmp_path)
+    ):
         result = api.hardware_options()
 
     assert len(result["hardware"]) == 1
