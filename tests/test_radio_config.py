@@ -62,10 +62,10 @@ def test_get_radio_for_board_missing_radio_type_returns_null_radio():
     assert type(radio).__name__ == "NullRadio"
 
 
-# ─── pymc_tcp / pymc_usb branches ────────────────────────────────────
+# ─── modem_tcp / modem_usb branches ────────────────────────────────────
 
 
-def _pymc_radio_cfg():
+def _modem_radio_cfg():
     """Common radio params for the pymc_* tests."""
     return {
         "frequency": 869618000,
@@ -78,7 +78,7 @@ def _pymc_radio_cfg():
     }
 
 
-def test_get_radio_for_board_pymc_tcp(monkeypatch):
+def test_get_radio_for_board_modem_tcp(monkeypatch):
     pytest.importorskip("openhop_core.hardware.tcp_radio")
     captured = {}
 
@@ -92,8 +92,8 @@ def test_get_radio_for_board_pymc_tcp(monkeypatch):
     )
 
     board_config = {
-        "radio_type": "pymc_tcp",
-        "pymc_tcp": {
+        "radio_type": "modem_tcp",
+        "modem_tcp": {
             "host": "pymc-3e2834.local",
             "port": 5055,
             "token": "shared-secret",
@@ -101,7 +101,7 @@ def test_get_radio_for_board_pymc_tcp(monkeypatch):
             "lbt_enabled": False,
             "lbt_max_attempts": 3,
         },
-        "radio": _pymc_radio_cfg(),
+        "radio": _modem_radio_cfg(),
     }
 
     get_radio_for_board(board_config)
@@ -116,7 +116,7 @@ def test_get_radio_for_board_pymc_tcp(monkeypatch):
     assert captured["lbt_max_attempts"] == 3
 
 
-def test_get_radio_for_board_pymc_tcp_requires_host(monkeypatch):
+def test_get_radio_for_board_modem_tcp_requires_host(monkeypatch):
     pytest.importorskip("openhop_core.hardware.tcp_radio")
 
     monkeypatch.setattr(
@@ -125,16 +125,16 @@ def test_get_radio_for_board_pymc_tcp_requires_host(monkeypatch):
     )
 
     board_config = {
-        "radio_type": "pymc_tcp",
-        "pymc_tcp": {"port": 5055},
-        "radio": _pymc_radio_cfg(),
+        "radio_type": "modem_tcp",
+        "modem_tcp": {"port": 5055},
+        "radio": _modem_radio_cfg(),
     }
 
     with pytest.raises(ValueError, match="Missing 'host'"):
         get_radio_for_board(board_config)
 
 
-def test_get_radio_for_board_pymc_usb(monkeypatch):
+def test_get_radio_for_board_modem_usb(monkeypatch):
     pytest.importorskip("openhop_core.hardware.usb_radio")
     captured = {}
 
@@ -148,12 +148,12 @@ def test_get_radio_for_board_pymc_usb(monkeypatch):
     )
 
     board_config = {
-        "radio_type": "pymc_usb",
-        "pymc_usb": {
+        "radio_type": "modem_usb",
+        "modem_usb": {
             "port": "/dev/ttyACM0",
             "baudrate": 921600,
         },
-        "radio": _pymc_radio_cfg(),
+        "radio": _modem_radio_cfg(),
     }
 
     get_radio_for_board(board_config)
@@ -162,12 +162,12 @@ def test_get_radio_for_board_pymc_usb(monkeypatch):
     assert captured["baudrate"] == 921600
     assert captured["frequency"] == 869618000
     assert captured["sync_word"] == 0x12
-    # LBT defaults preserved when omitted from pymc_usb section.
+    # LBT defaults preserved when omitted from modem_usb section.
     assert captured["lbt_enabled"] is True
     assert captured["lbt_max_attempts"] == 5
 
 
-def test_get_radio_for_board_pymc_usb_requires_port(monkeypatch):
+def test_get_radio_for_board_modem_usb_requires_port(monkeypatch):
     pytest.importorskip("openhop_core.hardware.usb_radio")
 
     monkeypatch.setattr(
@@ -176,16 +176,52 @@ def test_get_radio_for_board_pymc_usb_requires_port(monkeypatch):
     )
 
     board_config = {
-        "radio_type": "pymc_usb",
+        "radio_type": "modem_usb",
         # Section present (baudrate set) but `port` deliberately omitted to
         # exercise the inner "Missing 'port'" guard rather than the outer
-        # "Missing 'pymc_usb' section" one.
-        "pymc_usb": {"baudrate": 921600},
-        "radio": _pymc_radio_cfg(),
+        # "Missing 'modem_usb' section" one.
+        "modem_usb": {"baudrate": 921600},
+        "radio": _modem_radio_cfg(),
     }
 
     with pytest.raises(ValueError, match="Missing 'port'"):
         get_radio_for_board(board_config)
+
+
+@pytest.mark.parametrize(
+    ("legacy_type", "legacy_section", "module_name", "class_name", "settings"),
+    [
+        (
+            "pymc_tcp",
+            "pymc_tcp",
+            "openhop_core.hardware.tcp_radio",
+            "TCPLoRaRadio",
+            {"host": "legacy.local"},
+        ),
+        (
+            "pymc_usb",
+            "pymc_usb",
+            "openhop_core.hardware.usb_radio",
+            "USBLoRaRadio",
+            {"port": "/dev/ttyACM0"},
+        ),
+    ],
+)
+def test_legacy_modem_aliases_still_construct_radio(
+    monkeypatch, legacy_type, legacy_section, module_name, class_name, settings
+):
+    pytest.importorskip(module_name)
+    monkeypatch.setattr(f"{module_name}.{class_name}", lambda **kwargs: _DummyRadio())
+
+    radio = get_radio_for_board(
+        {
+            "radio_type": legacy_type,
+            legacy_section: settings,
+            "radio": _modem_radio_cfg(),
+        }
+    )
+
+    assert type(radio).__name__ == "BaselineCrcCounterRadio"
 
 
 # ─── kiss branch: optional CSMA / key-up tuning forwarding ────────────
@@ -220,7 +256,7 @@ def test_get_radio_for_board_kiss_forwards_csma_tuning(monkeypatch):
             "tx_delay_ms": 50,
             "kiss_full_duplex": True,
         },
-        "radio": _pymc_radio_cfg(),
+        "radio": _modem_radio_cfg(),
     }
 
     get_radio_for_board(board_config)
@@ -238,7 +274,7 @@ def test_get_radio_for_board_kiss_omits_unset_tuning(monkeypatch):
     board_config = {
         "radio_type": "kiss",
         "kiss": {"port": "/dev/ttyACM0", "baud_rate": 115200},
-        "radio": _pymc_radio_cfg(),
+        "radio": _modem_radio_cfg(),
     }
 
     get_radio_for_board(board_config)

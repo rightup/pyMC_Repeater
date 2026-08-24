@@ -1506,6 +1506,24 @@ class TestStatistics:
             stats = handler.get_stats()
         assert stats["local_hash"] == f"0x{LOCAL_HASH:02x}"
 
+    def test_get_stats_redacts_top_level_and_multi_radio_modem_tokens(self, handler):
+        handler.config["modem_tcp"] = {"host": "root.local", "token": "root-secret"}
+        handler.config["radios"] = [
+            {
+                "id": "tcp",
+                "radio_type": "modem_tcp",
+                "modem_tcp": {"host": "nested.local", "token": "nested-secret"},
+            }
+        ]
+
+        with patch.object(handler, "storage", None):
+            stats = handler.get_stats()
+
+        assert stats["config"]["modem_tcp"] == {"host": "root.local"}
+        assert stats["config"]["radios"][0]["modem_tcp"] == {"host": "nested.local"}
+        assert handler.config["modem_tcp"]["token"] == "root-secret"
+        assert handler.config["radios"][0]["modem_tcp"]["token"] == "nested-secret"
+
 
 @pytest.mark.asyncio
 class TestNeighbourLinkObservation:

@@ -61,15 +61,15 @@ def test_merge_radio_entry_inherits_and_overrides():
     }
     entry = {
         "id": "link",
-        "radio_type": "pymc_usb",
+        "radio_type": "modem_usb",
         "radio": {"frequency": 2, "tx_power": 22},
-        "pymc_usb": {"port": "/dev/ttyACM0"},
+        "modem_usb": {"port": "/dev/ttyACM0"},
     }
     merged = _merge_radio_entry(global_cfg, entry)
     assert merged["_radio_id"] == "link"
-    assert merged["radio_type"] == "pymc_usb"
+    assert merged["radio_type"] == "modem_usb"
     assert merged["radio"]["frequency"] == 2
-    assert merged["pymc_usb"]["port"] == "/dev/ttyACM0"
+    assert merged["modem_usb"]["port"] == "/dev/ttyACM0"
     assert "sx1262" in merged  # inherited leftover ok; factory uses radio_type
 
 

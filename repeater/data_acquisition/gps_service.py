@@ -283,7 +283,7 @@ class NMEAParser:
             self.ingest_sentence(line)
 
     def ingest_modem_payload(self, payload: Dict[str, Any]) -> bool:
-        """Ingest a generic pyMC modem HTTP GPS payload.
+        """Ingest a generic openHop Modem HTTP GPS payload.
 
         This is for modems that expose parsed GPS JSON instead of raw NMEA.
         The payload may be the whole /api/stats response or the nested gps dict.

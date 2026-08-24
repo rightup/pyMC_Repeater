@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional
 import yaml
 
 from repeater.logging_utils import normalize_log_level
+from repeater.modem_config import normalize_modem_config_in_place
 
 logger = logging.getLogger("ConfigManager")
 
@@ -242,6 +243,7 @@ class ConfigManager:
             True if successful, False otherwise
         """
         try:
+            normalize_modem_config_in_place(self.config)
             os.makedirs(os.path.dirname(self.config_path), exist_ok=True)
             with open(self.config_path, "w") as f:
                 # Use safe_dump with explicit width to prevent line wrapping

@@ -7,6 +7,7 @@ from typing import Any, Dict, Optional, overload
 import yaml
 
 from repeater.exceptions import ConfigurationError
+from repeater.modem_config import normalize_modem_config
 from repeater.policy_engine import default_policy_engine_config
 
 logger = logging.getLogger("Config")
@@ -105,7 +106,7 @@ class NullRadio:
 class BaselineCrcCounterRadio:
     """Radio proxy that exposes CRC errors relative to repeater startup.
 
-    pyMC modem transports report the modem firmware's cumulative CRC counter.
+    openHop Modem transports report the modem firmware's cumulative CRC counter.
     The SX1262 wrapper's counter starts at process startup, which lets the engine
     persist deltas without knowing the radio backend. Mirror that wrapper flow
     here by normalizing the modem's raw counter at the transport boundary.
@@ -214,6 +215,7 @@ def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
     try:
         with open(config_path) as f:
             config = yaml.safe_load(f) or {}
+            config = normalize_modem_config(config)
             logger.info(f"Loaded config from {config_path}")
     except Exception as e:
         raise ConfigurationError(f"Failed to load configuration from {config_path}: {e}") from e
@@ -341,6 +343,7 @@ def save_config(config_data: Dict[str, Any], config_path: Optional[str] = None) 
         )
 
     try:
+        config_data = normalize_modem_config(config_data)
         # Create backup of existing config
         config_file = Path(config_path)
         if config_file.exists():
@@ -449,6 +452,7 @@ def _load_or_create_identity_key(path: Optional[str] = None) -> bytes:
 
 
 def get_radio_for_board(board_config: dict):
+    board_config = normalize_modem_config(board_config)
 
     @overload
     def _parse_int(value, *, default: None = None) -> Optional[int]: ...
@@ -661,25 +665,25 @@ def get_radio_for_board(board_config: dict):
 
         return radio
 
-    elif radio_type == "pymc_tcp":
+    elif radio_type == "modem_tcp":
         try:
             from openhop_core.hardware.tcp_radio import TCPLoRaRadio
         except ImportError:
             raise RuntimeError(
-                "pymc_tcp radio requires openhop-core >= the release that includes "
+                "modem_tcp radio requires openhop-core >= the release that includes "
                 "the openhop-core release with TCP modem support. "
                 "Reinstall the [hardware] extra to pick it up."
             ) from None
 
-        tcp_cfg = board_config.get("pymc_tcp")
+        tcp_cfg = board_config.get("modem_tcp")
         if not tcp_cfg:
             raise ValueError(
-                "Missing 'pymc_tcp' section in configuration file for radio_type: pymc_tcp"
+                "Missing 'modem_tcp' section in configuration file for radio_type: modem_tcp"
             )
 
         host = tcp_cfg.get("host")
         if not host:
-            raise ValueError("Missing 'host' in 'pymc_tcp' section (modem hostname or LAN IP)")
+            raise ValueError("Missing 'host' in 'modem_tcp' section (modem hostname or LAN IP)")
 
         radio_cfg = board_config.get("radio") or {}
         radio = TCPLoRaRadio(
@@ -701,29 +705,29 @@ def get_radio_for_board(board_config: dict):
         try:
             radio.begin()
         except Exception as e:
-            raise RuntimeError(f"Failed to initialize pymc_tcp radio: {e}") from e
+            raise RuntimeError(f"Failed to initialize modem_tcp radio: {e}") from e
 
         return BaselineCrcCounterRadio(radio)
 
-    elif radio_type == "pymc_usb":
+    elif radio_type == "modem_usb":
         try:
             from openhop_core.hardware.usb_radio import USBLoRaRadio
         except ImportError:
             raise RuntimeError(
-                "pymc_usb radio requires openhop-core >= the release that includes "
+                "modem_usb radio requires openhop-core >= the release that includes "
                 "the openhop-core release with TCP modem support. "
                 "Reinstall the [hardware] extra to pick it up."
             ) from None
 
-        usb_cfg = board_config.get("pymc_usb")
+        usb_cfg = board_config.get("modem_usb")
         if not usb_cfg:
             raise ValueError(
-                "Missing 'pymc_usb' section in configuration file for radio_type: pymc_usb"
+                "Missing 'modem_usb' section in configuration file for radio_type: modem_usb"
             )
 
         port = usb_cfg.get("port")
         if not port:
-            raise ValueError("Missing 'port' in 'pymc_usb' section (e.g. /dev/ttyACM0)")
+            raise ValueError("Missing 'port' in 'modem_usb' section (e.g. /dev/ttyACM0)")
 
         radio_cfg = board_config.get("radio") or {}
         radio = USBLoRaRadio(
@@ -743,13 +747,13 @@ def get_radio_for_board(board_config: dict):
         try:
             radio.begin()
         except Exception as e:
-            raise RuntimeError(f"Failed to initialize pymc_usb radio: {e}") from e
+            raise RuntimeError(f"Failed to initialize modem_usb radio: {e}") from e
 
         return BaselineCrcCounterRadio(radio)
 
     raise RuntimeError(
         f"Unknown radio type: {radio_type}. "
-        "Supported: sx1262, sx1262_ch341, kiss (or kiss-modem), pymc_tcp, pymc_usb"
+        "Supported: sx1262, sx1262_ch341, kiss (or kiss-modem), modem_tcp, modem_usb"
     )
 
 
@@ -773,8 +777,8 @@ def _merge_radio_entry(global_config: dict, entry: dict) -> dict:
         "sx1262",
         "ch341",
         "kiss",
-        "pymc_tcp",
-        "pymc_usb",
+        "modem_tcp",
+        "modem_usb",
     ):
         if key in entry:
             merged[key] = entry[key]

@@ -1,4 +1,4 @@
-"""Tests for setup_wizard pymc_usb / pymc_tcp branches.
+"""Tests for setup_wizard modem_usb / modem_tcp branches.
 
 These verify that when the first-run /setup wizard is finished with one of
 the two pymc_* hardware tiles selected, api_endpoints.setup_wizard() writes
@@ -44,15 +44,15 @@ def wizard_env(tmp_path, monkeypatch):
 
     radio_settings = {
         "hardware": {
-            "pymc_usb": {
-                "name": "pymc_usb modem (USB-CDC)",
-                "radio_type": "pymc_usb",
+            "modem_usb": {
+                "name": "openHop Modem (USB-CDC)",
+                "radio_type": "modem_usb",
                 "tx_power": 22,
                 "preamble_length": 16,
             },
-            "pymc_tcp": {
-                "name": "pymc_tcp modem (Wi-Fi / Ethernet)",
-                "radio_type": "pymc_tcp",
+            "modem_tcp": {
+                "name": "openHop Modem (Wi-Fi / Ethernet)",
+                "radio_type": "modem_tcp",
                 "tx_power": 22,
                 "preamble_length": 16,
             },
@@ -91,42 +91,42 @@ def _read_yaml(path):
         return yaml.safe_load(f)
 
 
-# ─── pymc_usb ─────────────────────────────────────────────────────────
+# ─── modem_usb ─────────────────────────────────────────────────────────
 
 
-def test_wizard_pymc_usb_defaults(wizard_env):
+def test_wizard_modem_usb_defaults(wizard_env):
     tmp_path, config_path, endpoints, set_request = wizard_env
 
-    body = dict(_BASE_REQUEST, hardware_key="pymc_usb")
+    body = dict(_BASE_REQUEST, hardware_key="modem_usb")
     set_request(body)
 
     result = endpoints.setup_wizard()
 
     assert result["success"] is True
-    assert result["config"]["radio_type"] == "pymc_usb"
-    assert result["config"]["pymc_usb_port"] == "/dev/ttyACM0"
-    assert result["config"]["pymc_usb_baudrate"] == 921600
+    assert result["config"]["radio_type"] == "modem_usb"
+    assert result["config"]["modem_usb_port"] == "/dev/ttyACM0"
+    assert result["config"]["modem_usb_baudrate"] == 921600
 
     written = _read_yaml(config_path)
-    assert written["radio_type"] == "pymc_usb"
-    assert written["pymc_usb"]["port"] == "/dev/ttyACM0"
-    assert written["pymc_usb"]["baudrate"] == 921600
-    assert written["pymc_usb"]["lbt_enabled"] is True
-    assert written["pymc_usb"]["lbt_max_attempts"] == 5
+    assert written["radio_type"] == "modem_usb"
+    assert written["modem_usb"]["port"] == "/dev/ttyACM0"
+    assert written["modem_usb"]["baudrate"] == 921600
+    assert written["modem_usb"]["lbt_enabled"] is True
+    assert written["modem_usb"]["lbt_max_attempts"] == 5
     assert written["radio"]["tx_power"] == 22
     assert written["radio"]["preamble_length"] == 16
-    # config.py rejects pymc_usb if 'sx1262' / 'ch341' keys leak in — none here.
+    # config.py rejects modem_usb if 'sx1262' / 'ch341' keys leak in — none here.
     assert "sx1262" not in written
 
 
-def test_wizard_pymc_usb_overrides_from_request(wizard_env):
+def test_wizard_modem_usb_overrides_from_request(wizard_env):
     tmp_path, config_path, endpoints, set_request = wizard_env
 
     body = dict(
         _BASE_REQUEST,
-        hardware_key="pymc_usb",
-        pymc_usb_port="/dev/ttyUSB0",
-        pymc_usb_baudrate=115200,
+        hardware_key="modem_usb",
+        modem_usb_port="/dev/ttyUSB0",
+        modem_usb_baudrate=115200,
     )
     set_request(body)
 
@@ -134,48 +134,48 @@ def test_wizard_pymc_usb_overrides_from_request(wizard_env):
 
     assert result["success"] is True
     written = _read_yaml(config_path)
-    assert written["pymc_usb"]["port"] == "/dev/ttyUSB0"
-    assert written["pymc_usb"]["baudrate"] == 115200
+    assert written["modem_usb"]["port"] == "/dev/ttyUSB0"
+    assert written["modem_usb"]["baudrate"] == 115200
 
 
-# ─── pymc_tcp ─────────────────────────────────────────────────────────
+# ─── modem_tcp ─────────────────────────────────────────────────────────
 
 
-def test_wizard_pymc_tcp_placeholder(wizard_env):
+def test_wizard_modem_tcp_placeholder(wizard_env):
     """No host in request → wizard writes a sentinel placeholder. config.py
-    will then refuse to start with a clear error pointing at pymc_tcp.host."""
+    will then refuse to start with a clear error pointing at modem_tcp.host."""
     tmp_path, config_path, endpoints, set_request = wizard_env
 
-    body = dict(_BASE_REQUEST, hardware_key="pymc_tcp")
+    body = dict(_BASE_REQUEST, hardware_key="modem_tcp")
     set_request(body)
 
     result = endpoints.setup_wizard()
 
     assert result["success"] is True
-    assert result["config"]["radio_type"] == "pymc_tcp"
-    assert result["config"]["pymc_tcp_host"] == "REPLACE_WITH_MODEM_HOST"
-    assert result["config"]["pymc_tcp_port"] == 5055
+    assert result["config"]["radio_type"] == "modem_tcp"
+    assert result["config"]["modem_tcp_host"] == "REPLACE_WITH_MODEM_HOST"
+    assert result["config"]["modem_tcp_port"] == 5055
 
     written = _read_yaml(config_path)
-    assert written["radio_type"] == "pymc_tcp"
-    assert written["pymc_tcp"]["host"] == "REPLACE_WITH_MODEM_HOST"
-    assert written["pymc_tcp"]["port"] == 5055
-    assert written["pymc_tcp"]["token"] == ""
-    assert written["pymc_tcp"]["connect_timeout"] == 5.0
-    assert written["pymc_tcp"]["lbt_enabled"] is True
+    assert written["radio_type"] == "modem_tcp"
+    assert written["modem_tcp"]["host"] == "REPLACE_WITH_MODEM_HOST"
+    assert written["modem_tcp"]["port"] == 5055
+    assert written["modem_tcp"]["token"] == ""
+    assert written["modem_tcp"]["connect_timeout"] == 5.0
+    assert written["modem_tcp"]["lbt_enabled"] is True
     # token deliberately stripped from response.
-    assert "pymc_tcp_token" not in result["config"]
+    assert "modem_tcp_token" not in result["config"]
 
 
-def test_wizard_pymc_tcp_full_fields(wizard_env):
+def test_wizard_modem_tcp_full_fields(wizard_env):
     tmp_path, config_path, endpoints, set_request = wizard_env
 
     body = dict(
         _BASE_REQUEST,
-        hardware_key="pymc_tcp",
-        pymc_tcp_host="pymc-3e2834.local",
-        pymc_tcp_port=6000,
-        pymc_tcp_token="hunter2",
+        hardware_key="modem_tcp",
+        modem_tcp_host="pymc-3e2834.local",
+        modem_tcp_port=6000,
+        modem_tcp_token="hunter2",
     )
     set_request(body)
 
@@ -183,9 +183,35 @@ def test_wizard_pymc_tcp_full_fields(wizard_env):
 
     assert result["success"] is True
     written = _read_yaml(config_path)
-    assert written["pymc_tcp"]["host"] == "pymc-3e2834.local"
-    assert written["pymc_tcp"]["port"] == 6000
-    assert written["pymc_tcp"]["token"] == "hunter2"
+    assert written["modem_tcp"]["host"] == "pymc-3e2834.local"
+    assert written["modem_tcp"]["port"] == 6000
+    assert written["modem_tcp"]["token"] == "hunter2"
+    assert "modem_tcp_token" not in result["config"]
+    assert "hunter2" not in str(result)
+
+
+def test_wizard_accepts_legacy_tcp_fields_but_emits_canonical_config(wizard_env):
+    _tmp_path, config_path, endpoints, set_request = wizard_env
+    set_request(
+        dict(
+            _BASE_REQUEST,
+            hardware_key="pymc_tcp",
+            pymc_tcp_host="legacy.local",
+            pymc_tcp_port=6001,
+            pymc_tcp_token="legacy-secret",
+        )
+    )
+
+    result = endpoints.setup_wizard()
+
+    written = _read_yaml(config_path)
+    assert result["success"] is True
+    assert result["config"]["hardware"] == "modem_tcp"
+    assert result["config"]["radio_type"] == "modem_tcp"
+    assert result["config"]["modem_tcp_host"] == "legacy.local"
+    assert "pymc_tcp" not in written
+    assert written["modem_tcp"]["token"] == "legacy-secret"
+    assert "legacy-secret" not in str(result)
 
 
 # ─── KISS regression guard ────────────────────────────────────────────
@@ -213,7 +239,7 @@ def test_wizard_rejected_after_setup_complete(wizard_env):
 
     configured = {
         "repeater": {"node_name": "already-set", "security": {"admin_password": "verysecret"}},
-        "radio_type": "pymc_tcp",
+        "radio_type": "modem_tcp",
         "radio": {
             "frequency": 869618000,
             "spreading_factor": 8,
@@ -224,7 +250,7 @@ def test_wizard_rejected_after_setup_complete(wizard_env):
     with open(config_path, "w") as f:
         yaml.safe_dump(configured, f)
 
-    body = dict(_BASE_REQUEST, hardware_key="pymc_tcp", pymc_tcp_host="modem.local")
+    body = dict(_BASE_REQUEST, hardware_key="modem_tcp", modem_tcp_host="modem.local")
     set_request(body)
 
     result = endpoints.setup_wizard()
@@ -236,7 +262,7 @@ def test_wizard_rejected_after_setup_complete(wizard_env):
 def test_wizard_rejects_short_admin_password(wizard_env):
     _tmp_path, _config_path, endpoints, set_request = wizard_env
 
-    body = dict(_BASE_REQUEST, hardware_key="pymc_tcp", admin_password="short7")
+    body = dict(_BASE_REQUEST, hardware_key="modem_tcp", admin_password="short7")
     set_request(body)
 
     result = endpoints.setup_wizard()

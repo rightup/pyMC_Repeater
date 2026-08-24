@@ -440,19 +440,19 @@
       "dio3_tcxo_voltage": 1.8,
       "preamble_length": 32
     },
-    "pymc_usb": {
-      "name": "pymc_usb modem (USB-CDC)",
-      "description": "ESP32-S3 / nRF52 board running pymc_usb firmware as a USB-CDC LoRa modem. Pick this if the modem is plugged into the host's USB port (e.g. /dev/ttyACM0). Edit the 'pymc_usb' section after first-run to point at the right serial device.",
+    "modem_usb": {
+      "name": "openHop Modem (USB-CDC)",
+      "description": "ESP32-S3 / nRF52 openHop Modem connected over USB-CDC. Pick this if the modem is plugged into the host's USB port (e.g. /dev/ttyACM0). Edit the 'modem_usb' section after first-run to point at the right serial device.",
       "connection_type": "usb",
-      "radio_type": "pymc_usb",
+      "radio_type": "modem_usb",
       "tx_power": 22,
       "preamble_length": 32
     },
-    "pymc_tcp": {
-      "name": "pymc_tcp modem (Wi-Fi / Ethernet)",
-      "description": "ESP32 board running pymc_usb firmware exposed as a TCP server over Wi-Fi or Ethernet. After first-run, set 'pymc_tcp.host' to the modem's LAN address or mDNS name (e.g. pymc-3e2834.local).",
+    "modem_tcp": {
+      "name": "openHop Modem (Wi-Fi / Ethernet)",
+      "description": "openHop Modem exposed as a TCP server over Wi-Fi or Ethernet. After first-run, set 'modem_tcp.host' to the modem's LAN address or mDNS name (e.g. openhop-modem.local).",
       "connection_type": "network",
-      "radio_type": "pymc_tcp",
+      "radio_type": "modem_tcp",
       "tx_power": 22,
       "preamble_length": 32
     },
