@@ -617,16 +617,20 @@ def test_serial_ports_tolerates_broken_host_alias(cherrypy_ctx):
     api = _make_api()
     broken = "/host/dev/serial/by-id/broken"
 
+    realpath = MagicMock(return_value="/host/dev/missing-target")
     with (
         patch("serial.tools.list_ports.comports", return_value=[]),
         patch("os.path.isdir", return_value=True),
         patch("glob.glob", side_effect=lambda pattern: [broken] if "by-id" in pattern else []),
-        patch("os.path.realpath", side_effect=OSError("inaccessible")),
+        patch("os.path.islink", side_effect=lambda path: path == broken),
+        patch("os.path.exists", return_value=False),
+        patch("os.path.realpath", realpath),
     ):
         result = api.serial_ports()
 
     assert result["success"] is True
     assert result["data"] == []
+    realpath.assert_not_called()
 
 
 def test_config_export_redacts_secrets_and_identity_keys(cherrypy_ctx):
@@ -687,6 +691,29 @@ def test_config_export_full_backup_includes_hex_keys(cherrypy_ctx):
     assert exported["identities"]["companions"][0]["identity_key"] == "0102"
     assert exported["identities"]["room_servers"][0]["identity_key"] == "0304"
     assert result["data"]["meta"]["includes_secrets"] is True
+
+
+def test_stats_omits_top_level_and_multi_radio_modem_tokens(cherrypy_ctx):
+    del cherrypy_ctx
+    config = {
+        "modem_tcp": {"host": "root.local", "token": "root-secret"},
+        "radios": [
+            {
+                "id": "tcp",
+                "radio_type": "modem_tcp",
+                "modem_tcp": {"host": "nested.local", "token": "nested-secret"},
+            }
+        ],
+    }
+    api = _make_api(config)
+    api.stats_getter = lambda: {}
+
+    result = api.stats()
+
+    assert result["modem_tcp"] == {"host": "root.local"}
+    assert result["radios"][0]["modem_tcp"] == {"host": "nested.local"}
+    assert config["modem_tcp"]["token"] == "root-secret"
+    assert config["radios"][0]["modem_tcp"]["token"] == "nested-secret"
 
 
 def test_config_export_canonicalizes_modem_keys_and_redacts_token(cherrypy_ctx):
@@ -782,6 +809,12 @@ def test_config_import_updates_sections_and_preserves_redacted(cherrypy_ctx):
                 ]
             },
             "radio": {"frequency": 915000000},
+            "sensors": {
+                "definitions": [
+                    {"name": "modem", "type": "pymc_modem", "settings": {"host": "m.local"}}
+                ]
+            },
+            "gps": {"source": "pymc_modem", "host": "m.local"},
             "radio_type": "pymc_usb",
             "pymc_tcp": {
                 "host": "restored.local",
@@ -814,6 +847,8 @@ def test_config_import_updates_sections_and_preserves_redacted(cherrypy_ctx):
         "repeater",
         "identities",
         "radio",
+        "sensors",
+        "gps",
         "radios",
         "radio_type",
         "modem_tcp",
@@ -836,6 +871,8 @@ def test_config_import_updates_sections_and_preserves_redacted(cherrypy_ctx):
         "port": 6001,
         "token": "keep-nested-token",
     }
+    assert api.config["sensors"]["definitions"][0]["type"] == "openhop_modem"
+    assert api.config["gps"] == {"source": "modem_http", "host": "m.local"}
 
 
 def test_config_import_preserves_omitted_modem_tokens_but_accepts_replacements(cherrypy_ctx):

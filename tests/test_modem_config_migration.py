@@ -3,7 +3,7 @@ import logging
 
 import yaml
 
-from repeater.modem_config import normalize_modem_config
+from repeater.modem_config import normalize_modem_config, redact_modem_tokens_in_place
 
 
 def test_canonical_modem_config_is_unchanged_and_input_is_not_mutated():
@@ -170,3 +170,44 @@ def test_sensor_and_gps_aliases_migrate_to_canonical_names():
     assert normalized["sensors"]["definitions"][0]["type"] == "openhop_modem"
     assert normalized["sensors"]["definitions"][1]["type"] == "hardware_stats"
     assert normalized["gps"]["source"] == "modem_http"
+
+
+def test_unrelated_sensor_and_gps_names_keep_original_spelling():
+    normalized = normalize_modem_config(
+        {
+            "sensors": {"definitions": [{"name": "custom", "type": "Vendor_Custom"}]},
+            "gps": {"source": "Vendor_Source"},
+        }
+    )
+
+    assert normalized["sensors"]["definitions"][0]["type"] == "Vendor_Custom"
+    assert normalized["gps"]["source"] == "Vendor_Source"
+
+
+def test_redact_modem_tokens_handles_top_level_and_multi_radio_without_mutating_others():
+    config = {
+        "modem_tcp": {"host": "root.local", "token": "root-secret"},
+        "radios": [
+            {"id": "tcp", "modem_tcp": {"host": "nested.local", "token": "nested-secret"}},
+            {"id": "usb", "modem_usb": {"port": "/dev/ttyACM0"}},
+            "malformed",
+        ],
+    }
+
+    redact_modem_tokens_in_place(config)
+
+    assert config["modem_tcp"] == {"host": "root.local"}
+    assert config["radios"][0]["modem_tcp"] == {"host": "nested.local"}
+    assert config["radios"][1]["modem_usb"] == {"port": "/dev/ttyACM0"}
+
+
+def test_redact_modem_tokens_can_replace_tokens_with_export_sentinel():
+    config = {
+        "modem_tcp": {"token": "root-secret"},
+        "radios": [{"modem_tcp": {"token": "nested-secret"}}],
+    }
+
+    redact_modem_tokens_in_place(config, replacement="*** REDACTED ***")
+
+    assert config["modem_tcp"]["token"] == "*** REDACTED ***"
+    assert config["radios"][0]["modem_tcp"]["token"] == "*** REDACTED ***"

@@ -57,16 +57,38 @@ def _normalize_sensor_and_gps_aliases(config: dict[str, Any]) -> None:
                 sensor_type = definition.get("type")
                 if isinstance(sensor_type, str):
                     normalized_type = sensor_type.strip().lower()
-                    definition["type"] = LEGACY_MODEM_SENSOR_TYPES.get(
-                        normalized_type, normalized_type
-                    )
+                    canonical_type = LEGACY_MODEM_SENSOR_TYPES.get(normalized_type)
+                    if canonical_type is not None:
+                        definition["type"] = canonical_type
 
     gps = config.get("gps")
     if isinstance(gps, dict):
         source = gps.get("source")
         if isinstance(source, str):
             normalized_source = source.strip().lower()
-            gps["source"] = LEGACY_MODEM_GPS_SOURCES.get(normalized_source, normalized_source)
+            canonical_source = LEGACY_MODEM_GPS_SOURCES.get(normalized_source)
+            if canonical_source is not None:
+                gps["source"] = canonical_source
+
+
+def redact_modem_tokens_in_place(config: dict, *, replacement: Any = None) -> dict:
+    """Remove or replace modem TCP tokens in top-level and multi-radio sections."""
+    if not isinstance(config, dict):
+        return config
+
+    sections = [config.get("modem_tcp")]
+    radios = config.get("radios")
+    if isinstance(radios, list):
+        sections.extend(entry.get("modem_tcp") for entry in radios if isinstance(entry, dict))
+
+    for section in sections:
+        if not isinstance(section, dict) or "token" not in section:
+            continue
+        if replacement is None:
+            section.pop("token", None)
+        else:
+            section["token"] = replacement
+    return config
 
 
 def normalize_modem_config_in_place(config: dict, *, warn: bool = True) -> dict:

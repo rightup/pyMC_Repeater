@@ -29,6 +29,10 @@ services:
     volumes:
       - ${OPENHOP_CONFIG_VOLUME:-${PYMC_CONFIG_VOLUME:-openhop-repeater-config}}:/etc/openhop_repeater
       - ${OPENHOP_DATA_VOLUME:-${PYMC_DATA_VOLUME:-openhop-repeater-data}}:/var/lib/openhop_repeater
+      # Optional host-device discovery for the setup UI. This read-only mount
+      # only exposes names under /host/dev; the selected serial device must
+      # still be granted under `devices:` above before the container can open it.
+      # - /dev:/host/dev:ro
 
 volumes:
   openhop-repeater-config:

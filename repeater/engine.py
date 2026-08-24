@@ -33,7 +33,7 @@ from openhop_core.protocol.packet_utils import (
 
 from repeater.airtime import AirtimeManager
 from repeater.data_acquisition import StorageCollector
-from repeater.modem_config import normalize_modem_config
+from repeater.modem_config import normalize_modem_config, redact_modem_tokens_in_place
 from repeater.neighbour_links import NeighbourLinkTracker
 from repeater.policy_engine import PolicyDecision, PolicyEngine
 
@@ -1661,6 +1661,7 @@ class RepeaterHandler(BaseHandler):
 
     def get_stats(self) -> dict:
         runtime_config = normalize_modem_config(self.config, warn=False)
+        redact_modem_tokens_in_place(runtime_config)
 
         uptime_seconds = time.time() - self.start_time
 

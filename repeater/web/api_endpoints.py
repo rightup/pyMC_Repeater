@@ -27,7 +27,11 @@ from repeater.companion.utils import (
 )
 from repeater.config import resolve_storage_dir
 from repeater.handler_helpers.acl import role_name as acl_role_name
-from repeater.modem_config import LEGACY_MODEM_RADIO_TYPES, normalize_modem_config
+from repeater.modem_config import (
+    LEGACY_MODEM_RADIO_TYPES,
+    normalize_modem_config,
+    redact_modem_tokens_in_place,
+)
 from repeater.policy_engine import PolicyEngine
 from repeater.service_utils import get_buildroot_image_info
 from repeater.utils_packet import create_scoped_advert_packet
@@ -1453,7 +1457,7 @@ class APIEndpoints:
             dedup = {}
             for item in devices:
                 dev = item.get("device")
-                if not dev:
+                if not dev or (os.path.islink(dev) and not os.path.exists(dev)):
                     continue
                 try:
                     target = os.path.realpath(dev)
@@ -1788,6 +1792,7 @@ class APIEndpoints:
         try:
             stats = self.stats_getter() if self.stats_getter else {}
             runtime_config = normalize_modem_config(self.config, warn=False)
+            redact_modem_tokens_in_place(runtime_config)
             # Include active radio configuration in stats so UI can hydrate
             # directly from this endpoint without additional config fetches.
             stats["radio_type"] = runtime_config.get("radio_type")
@@ -7829,15 +7834,7 @@ class APIEndpoints:
                 if "identity_key" in rep:
                     del rep["identity_key"]
 
-                tcp_cfg = exported.get("modem_tcp")
-                if isinstance(tcp_cfg, dict) and "token" in tcp_cfg:
-                    tcp_cfg["token"] = REDACTED_CONFIG_VALUE
-                for radio_entry in exported.get("radios") or []:
-                    if not isinstance(radio_entry, dict):
-                        continue
-                    nested_tcp_cfg = radio_entry.get("modem_tcp")
-                    if isinstance(nested_tcp_cfg, dict) and "token" in nested_tcp_cfg:
-                        nested_tcp_cfg["token"] = REDACTED_CONFIG_VALUE
+                redact_modem_tokens_in_place(exported, replacement=REDACTED_CONFIG_VALUE)
 
                 # Redact identity keys in companion / room_server configs
                 for section in ("room_servers", "companions"):
@@ -7991,6 +7988,8 @@ class APIEndpoints:
                 "kiss",
                 "modem_usb",
                 "modem_tcp",
+                "sensors",
+                "gps",
                 "mqtt_brokers",
                 "mqtt",
                 "identities",
@@ -8055,6 +8054,8 @@ class APIEndpoints:
                     "kiss",
                     "modem_usb",
                     "modem_tcp",
+                    "sensors",
+                    "gps",
                     "radio_type",
                     "mqtt_brokers",
                     "letsmesh",
