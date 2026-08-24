@@ -12,6 +12,13 @@ from repeater.config import (
     build_radio_stack,
 )
 
+try:
+    from openhop_core.rf_fabric import RFFabric
+
+    _CORE_HAS_ORIGIN_TX = hasattr(RFFabric, "set_origin_tx")
+except ImportError:  # pragma: no cover - core is a hard dependency
+    _CORE_HAS_ORIGIN_TX = False
+
 
 class _FakeRadio:
     def __init__(self, name="r"):
@@ -230,3 +237,73 @@ def test_merge_radio_entry_preserves_per_radio_ch341():
     merged = _merge_radio_entry(global_cfg, entry)
     assert merged["ch341"]["address"] == 8
     assert merged["_ch341_per_instance"] is True
+
+
+def _two_radio_cfg(fabric_cfg):
+    return {
+        "fabric": fabric_cfg,
+        "radios": [
+            {
+                "id": "local",
+                "radio_type": "sx1262",
+                "radio": {"frequency": 111},
+                "sx1262": {"bus_id": 0},
+            },
+            {
+                "id": "link",
+                "radio_type": "sx1262",
+                "radio": {"frequency": 222},
+                "sx1262": {"bus_id": 0},
+            },
+        ],
+    }
+
+
+@pytest.mark.skipif(
+    not _CORE_HAS_ORIGIN_TX,
+    reason="needs openhop-core with fabric origin_tx support",
+)
+def test_origin_tx_all_applied_to_fabric():
+    a = _FakeRadio("a")
+    b = _FakeRadio("b")
+
+    def fake_get(board):
+        freq = (board.get("radio") or {}).get("frequency")
+        return a if freq == 111 else b
+
+    cfg = _two_radio_cfg({"default_radio": "local", "tx_mode": "bridge", "origin_tx": "all"})
+    with patch("repeater.config.get_radio_for_board", side_effect=fake_get):
+        radio, meta = build_radio_stack(cfg)
+
+    assert meta["origin_tx"] == "all"
+    assert radio.fabric.origin_tx == "all"
+
+
+def test_origin_tx_defaults_to_default():
+    a = _FakeRadio("a")
+    b = _FakeRadio("b")
+
+    def fake_get(board):
+        freq = (board.get("radio") or {}).get("frequency")
+        return a if freq == 111 else b
+
+    cfg = _two_radio_cfg({"default_radio": "local"})
+    with patch("repeater.config.get_radio_for_board", side_effect=fake_get):
+        radio, meta = build_radio_stack(cfg)
+
+    assert meta["origin_tx"] == "default"
+    assert getattr(radio.fabric, "origin_tx", "default") == "default"
+
+
+def test_origin_tx_invalid_rejected():
+    a = _FakeRadio("a")
+    b = _FakeRadio("b")
+
+    def fake_get(board):
+        freq = (board.get("radio") or {}).get("frequency")
+        return a if freq == 111 else b
+
+    cfg = _two_radio_cfg({"origin_tx": "broadcast"})
+    with patch("repeater.config.get_radio_for_board", side_effect=fake_get):
+        with pytest.raises(ValueError):
+            build_radio_stack(cfg)

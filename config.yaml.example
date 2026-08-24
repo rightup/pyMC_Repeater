@@ -428,6 +428,11 @@ identities:
 #     # sticky:  TX on the radio that last received (same-band reply)
 #     # bridge:  TX on the *other* radio (dual-freq LoRa backhaul)
 #     #          RX local -> TX link, RX link -> TX local
+#   origin_tx: default            # default | all
+#     # default: locally originated packets TX default_radio only
+#     # all:     fan origins out to every radio, sequentially in config
+#     #          order (bridge topologies: tx_mode steers forwards, but an
+#     #          origin has no RX side and would never cross the link)
 #
 # Dual CH341 USB adapters example (different USB bus/address per radio):
 # radios:
