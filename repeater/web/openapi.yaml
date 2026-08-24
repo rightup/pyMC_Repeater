@@ -5243,12 +5243,14 @@ components:
           example: "e1"
         permissions:
           type: string
-          enum: [admin, guest, read_only]
+          enum: [admin, read_write, read_only, guest]
           description: |
-            Client permission level:
-            - admin: Full access
-            - guest: Limited access
+            Client ACL role (low two bits of the permissions byte, matching
+            MeshCore ClientACL.h):
+            - admin: Full access, including settings and CLI
+            - read_write: May send and receive messages (room server guests)
             - read_only: Read-only access
+            - guest: Base telemetry only (repeater guests, read-only logins)
           example: "admin"
         last_activity:
           type: integer
