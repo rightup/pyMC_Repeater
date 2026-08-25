@@ -122,7 +122,7 @@ repeater:
   # Security settings for login/authentication (shared across all identities)
   security:
     # Maximum number of authenticated clients (across all identities)
-    max_clients: 1
+    max_clients: 5
 
     # Admin password for full access
     admin_password: "admin123"
