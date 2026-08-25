@@ -793,3 +793,42 @@ def test_policy_engine_channel_decryptable_uses_channel_hash_group_secret():
 
     assert decision.matched is True
     assert decision.action == "drop"
+
+
+def test_policy_engine_channel_decrypt_cache_not_keyed_by_id():
+    channel_secret = (b"cache-secret" + b"\x00" * 32)[:32].hex()
+    other_secret = (b"cache-other" + b"\x00" * 32)[:32].hex()
+    decryptable = PacketBuilder.create_group_datagram(
+        group_name="ops",
+        local_identity=LocalIdentity(),
+        message="hello from cache test",
+        sender_name="Alice",
+        channels_config=[{"name": "ops", "secret": channel_secret}],
+    )
+    undecryptable = PacketBuilder.create_group_datagram(
+        group_name="ops",
+        local_identity=LocalIdentity(),
+        message="different payload",
+        sender_name="Eve",
+        channels_config=[{"name": "ops", "secret": other_secret}],
+    )
+
+    engine = PolicyEngine(
+        {
+            "enabled": True,
+            "default_action": "allow",
+            "objects": {"channels": {"ops": {"secret": channel_secret}}},
+            "rules": [],
+        }
+    )
+
+    # Python reuses id() once old Packet objects are freed, so an id()-keyed
+    # cache can serve a stale undecryptable entry for an unrelated later
+    # packet. Force both packets to report the same id() to expose that the
+    # cache must actually be keyed by content.
+    with patch("repeater.policy_engine.id", return_value=424242):
+        engine._get_channel_decrypt_info(undecryptable)
+        info = engine._get_channel_decrypt_info(decryptable)
+
+    assert info["decryptable"] is True
+    assert info["sender"] == "Alice"
