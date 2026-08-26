@@ -1395,9 +1395,7 @@ class RepeaterDaemon:
                 and packet.payload
                 and len(packet.payload) >= 4
             ):
-                await self._on_ack_for_companions(
-                    int.from_bytes(packet.payload[:4], "little")
-                )
+                await self._on_ack_for_companions(int.from_bytes(packet.payload[:4], "little"))
         except Exception as e:
             logger.warning("ACK companion notify failed: %s", e)
 
