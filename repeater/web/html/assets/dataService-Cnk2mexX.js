@@ -1,0 +1,1 @@
+import{t as e}from"./dataService-CX8WACnr.js";export{e as useDataService};
