@@ -795,6 +795,11 @@ web:
   # Allows web frontends from different origins to access the API
   cors_enabled: false
 
+  # Optional CARTO Basemaps API key for theme-matched light and dark map tiles.
+  # The key is sent to CARTO by each browser; do not treat it as a server-side secret.
+  # When unset, the web interface uses light OpenStreetMap tiles in both themes.
+  carto_api_key: ""
+
   # Custom path to web frontend files (optional)
   # If not specified, uses the default built-in path
   # Example: /opt/custom-web-ui or /home/user/my-frontend
