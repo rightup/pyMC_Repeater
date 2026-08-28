@@ -9,9 +9,12 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from .bulk_cancellation import BulkQueryCancelled
-
 logger = logging.getLogger("SQLiteHandler")
+
+
+class BulkQueryCancelled(RuntimeError):
+    def __init__(self):
+        super().__init__("Packet history request cancelled")
 
 
 class SQLiteHandler:

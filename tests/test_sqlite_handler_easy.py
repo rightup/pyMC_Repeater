@@ -8,8 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from repeater.data_acquisition.sqlite_handler import SQLiteHandler
-from repeater.data_acquisition.bulk_cancellation import BulkQueryCancelled
+from repeater.data_acquisition.sqlite_handler import BulkQueryCancelled, SQLiteHandler
 from repeater.data_acquisition.storage_collector import StorageCollector
 
 

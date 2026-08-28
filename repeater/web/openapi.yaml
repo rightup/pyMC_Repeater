@@ -3671,7 +3671,7 @@ paths:
       tags: [Packets]
       summary: Fetch packets in bulk
       description: |
-        Supply a fresh UUIDv4 request_id to allow this query to be cancelled by
+        Supply a fresh request_id to allow this query to be cancelled by
         the same JWT client or API token via /bulk_packets_cancel. Requests
         without request_id retain the existing behavior.
       security:
@@ -3680,10 +3680,10 @@ paths:
       parameters:
         - name: request_id
           in: query
-          description: Unique UUIDv4 for this request; do not reuse for retries.
+          description: Opaque, case-sensitive ID; use a fresh value for each request, including retries.
           schema:
             type: string
-            format: uuid
+            minLength: 1
         - name: limit
           in: query
           schema:
@@ -3717,8 +3717,6 @@ paths:
           description: |
             Query cancelled (success=false, cancelled=true), or request_id is
             already active for this owner (success=false, no cancelled flag).
-        '429':
-          description: Too many pending cancellable packet queries
 
   /bulk_packets_cancel:
     get:
@@ -3748,14 +3746,16 @@ paths:
       tags: [Packets]
       summary: Cancel this client's bulk packet query
       description: |
-        Marks the request for cooperative cancellation; acknowledgement does
+        Marks an active request for cooperative cancellation; acknowledgement does
         not mean the query has already stopped. The owner is the JWT username
         and client_id, or the API token ID. Other clients' queries and writes
-        are unaffected. Repeated cancellation is safe and does not disclose
-        whether a query exists. Cancellation received before the GET starts is
-        retained for 120 seconds; active queries do not expire. The registry is
-        limited to 256 active or pending entries. Disconnecting alone does not
-        cancel a query: send this POST independently of the aborted GET.
+        are unaffected. Returns cancelled=true when an active query belonging
+        to this owner was signalled; otherwise cancelled=false. Unknown or
+        completed IDs are a no-op and are not retained. A cancellation arriving
+        before the GET registers will not cancel that later query. Repeated
+        cancellation is safe; use a fresh ID for every GET so a late POST cannot
+        cancel a newer request. Disconnecting alone does not cancel a query:
+        send this POST independently of the aborted GET.
 
         SQLite progress and row-fetch checks stop query work. Lock waits,
         blocking I/O, and JSON/compression already underway may still finish.
@@ -3769,16 +3769,15 @@ paths:
           application/json:
             schema:
               type: object
-              additionalProperties: false
               required: [request_id]
               properties:
                 request_id:
                   type: string
-                  format: uuid
-                  description: UUIDv4 sent with the bulk GET.
+                  minLength: 1
+                  description: Exact request_id sent with the bulk GET.
       responses:
         '200':
-          description: Cancellation recorded
+          description: Active query signalled, or no matching active query
           content:
             application/json:
               schema:
@@ -3790,7 +3789,6 @@ paths:
                     enum: [true]
                   cancelled:
                     type: boolean
-                    enum: [true]
         '400':
           description: Invalid JSON object or request_id
         '401':
@@ -3803,8 +3801,6 @@ paths:
           description: Request body exceeds 1024 bytes
         '415':
           description: JSON content type required
-        '429':
-          description: Too many pending cancellable packet queries
 
   /airtime_data:
     get:

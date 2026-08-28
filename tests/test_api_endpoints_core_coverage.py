@@ -2,8 +2,10 @@ import asyncio
 import gzip
 import io
 import json
+import threading
 import uuid
 from concurrent.futures import TimeoutError as FutureTimeoutError
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, mock_open, patch
@@ -18,7 +20,6 @@ from repeater.handler_helpers.acl import (
     PERM_ACL_READ_WRITE,
 )
 from repeater.web.api_endpoints import APIEndpoints
-from repeater.data_acquisition.bulk_cancellation import BulkQueryRegistry
 from repeater.web.auth.cherrypy_tool import register_require_auth_tool
 from repeater.web.auth.jwt_handler import JWTHandler
 
@@ -30,7 +31,8 @@ def _make_api(config=None):
     api.send_advert_func = None
     api.event_loop = None
     api.stats_getter = None
-    api._bulk_queries = BulkQueryRegistry()
+    api._bulk_queries = {}
+    api._bulk_queries_lock = threading.Lock()
     api._config_path = "/tmp/test-config.yaml"
     api.config_manager = MagicMock()
     return api
@@ -1074,8 +1076,8 @@ def test_recent_packets_and_bulk_packets(cherrypy_ctx):
         {"auth_type": "api_token", "token_id": 1},
     ],
 )
-def test_bulk_cancel_discovery_and_cancel_before_query(cherrypy_ctx, user):
-    request, response = cherrypy_ctx
+def test_bulk_cancel_discovery_and_unknown_id_is_noop(cherrypy_ctx, user):
+    request, _ = cherrypy_ctx
     request.user = user
     api = _make_api()
     storage = SimpleNamespace(get_filtered_packets=MagicMock(return_value=[]))
@@ -1084,48 +1086,87 @@ def test_bulk_cancel_discovery_and_cancel_before_query(cherrypy_ctx, user):
 
     request_id = str(uuid.uuid4())
     request.method = "POST"
-    request.json = {"request_id": request_id.upper()}
-    assert api.bulk_packets_cancel() == {"success": True, "cancelled": True}
+    request.json = {"request_id": request_id}
+    assert api.bulk_packets_cancel() == {"success": True, "cancelled": False}
+    assert api._bulk_queries == {}
     request.method = "GET"
     result = api.bulk_packets(request_id=request_id)
-    assert response.status == 409
-    assert result["cancelled"] is True
-    storage.get_filtered_packets.assert_not_called()
-
-    request.user = {"auth_type": "jwt", "username": "operator", "client_id": "browser-b"}
-    assert api.bulk_packets(request_id=request_id)["success"] is True
+    assert result["success"] is True
     assert not storage.get_filtered_packets.call_args.kwargs["cancel_event"].is_set()
 
+    request.method = "POST"
+    assert api.bulk_packets_cancel() == {"success": True, "cancelled": False}
+    request.method = "GET"
+    assert api.bulk_packets(request_id=request_id)["success"] is True
 
-def test_bulk_cancel_during_query_and_success_cleanup(cherrypy_ctx):
-    request, response = cherrypy_ctx
+
+def test_bulk_query_accepts_opaque_request_id(cherrypy_ctx):
+    request, _ = cherrypy_ctx
     request.user = {"auth_type": "jwt", "username": "operator", "client_id": "browser-a"}
     api = _make_api()
-    request_id = str(uuid.uuid4())
+    storage = SimpleNamespace(get_filtered_packets=MagicMock(return_value=[]))
+    _attach_storage(api, storage)
+    assert api.bulk_packets(request_id="history-page-1")["success"] is True
+    storage.get_filtered_packets.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "owner, other",
+    [
+        (
+            {"auth_type": "jwt", "username": "operator", "client_id": "browser-a"},
+            {"auth_type": "jwt", "username": "operator", "client_id": "browser-b"},
+        ),
+        (
+            {"auth_type": "jwt", "username": "operator", "client_id": "browser-a"},
+            {"auth_type": "jwt", "username": "another", "client_id": "browser-a"},
+        ),
+        (
+            {"auth_type": "api_token", "token_id": 1},
+            {"auth_type": "api_token", "token_id": 2},
+        ),
+    ],
+)
+def test_bulk_cancel_during_query_is_owner_scoped_and_cleans_up(cherrypy_ctx, owner, other):
+    request, response = cherrypy_ctx
+    request.user = owner
+    api = _make_api()
+    request_id = "history-page-1"
 
     def cancel_while_reading(**kwargs):
-        api._bulk_queries.cancel(api._bulk_request_owner(), request_id)
+        request.method = "POST"
+        request.json = {"request_id": request_id}
+        request.user = other
+        assert api.bulk_packets_cancel() == {"success": True, "cancelled": False}
+        assert not kwargs["cancel_event"].is_set()
+        request.user = owner
+        assert api.bulk_packets_cancel() == {"success": True, "cancelled": True}
+        assert api.bulk_packets_cancel() == {"success": True, "cancelled": True}
         assert kwargs["cancel_event"].is_set()
+        request.method = "GET"
         return []
 
     storage = SimpleNamespace(get_filtered_packets=MagicMock(side_effect=cancel_while_reading))
     _attach_storage(api, storage)
     assert api.bulk_packets(request_id=request_id)["cancelled"] is True
     assert response.status == 409
+    assert api._bulk_queries == {}
 
     # Success and storage failures both release the registered request.
     for result in ([], RuntimeError("storage failure")):
-        request_id = str(uuid.uuid4())
         storage.get_filtered_packets = MagicMock(return_value=result)
         if isinstance(result, Exception):
             storage.get_filtered_packets.side_effect = result
-        api.bulk_packets(request_id=request_id)
-        event = api._bulk_queries.register(api._bulk_request_owner(), request_id)
-        assert not event.is_set()
-        api._bulk_queries.finish(api._bulk_request_owner(), request_id, event)
+        response.status = 200
+        outcome = api.bulk_packets(request_id=request_id)
+        assert outcome["success"] is (not isinstance(result, Exception))
+        storage.get_filtered_packets.assert_called_once()
+        assert api._bulk_queries == {}
+    api.bulk_packets(request_id=request_id, limit="bad")
+    assert api._bulk_queries == {}
 
 
-def test_bulk_cancel_validation_auth_conflicts_and_capacity(cherrypy_ctx):
+def test_bulk_cancel_validation_and_auth(cherrypy_ctx):
     request, response = cherrypy_ctx
     api = _make_api()
     request_id = str(uuid.uuid4())
@@ -1135,28 +1176,40 @@ def test_bulk_cancel_validation_auth_conflicts_and_capacity(cherrypy_ctx):
         assert error.value.status == 401
     request.user = {"auth_type": "jwt", "username": "operator", "client_id": "browser-a"}
     request.method = "POST"
-    for body in ([], {}, {"request_id": "bad"}, {"request_id": request_id, "extra": True}):
+    for body in ([], {}, {"request_id": ""}, {"request_id": []}, {"request_id": 1}):
         request.json = body
         assert api.bulk_packets_cancel()["success"] is False
         assert response.status == 400
-    assert api.bulk_packets(request_id="bad")["success"] is False
-    assert response.status == 400
+    for request_id in ("", [], 1):
+        assert api.bulk_packets(request_id=request_id)["success"] is False
+        assert response.status == 400
     request.method = "DELETE"
     with pytest.raises(cherrypy.HTTPError) as error:
         api.bulk_packets_cancel()
     assert error.value.status == 405
     assert response.headers["Allow"] == "GET, POST"
 
-    api._bulk_queries = BulkQueryRegistry(max_entries=1)
-    api._bulk_queries.register(api._bulk_request_owner(), request_id)
-    assert api.bulk_packets(request_id=request_id)["success"] is False
-    assert response.status == 409
-    assert api.bulk_packets(request_id=str(uuid.uuid4()))["success"] is False
-    assert response.status == 429
-    request.method = "POST"
-    request.json = {"request_id": str(uuid.uuid4())}
-    assert api.bulk_packets_cancel()["success"] is False
-    assert response.status == 429
+
+def test_bulk_duplicate_id_does_not_replace_or_remove_active_query(cherrypy_ctx):
+    request, response = cherrypy_ctx
+    request.user = {"auth_type": "jwt", "username": "operator", "client_id": "browser-a"}
+    api = _make_api()
+
+    def cancel_after_duplicate(**kwargs):
+        duplicate = api.bulk_packets(request_id="same-id")
+        assert duplicate["success"] is False and "cancelled" not in duplicate
+        assert response.status == 409
+        request.method = "POST"
+        request.json = {"request_id": "same-id"}
+        assert api.bulk_packets_cancel()["cancelled"] is True
+        assert kwargs["cancel_event"].is_set()
+        return []
+
+    storage = SimpleNamespace(get_filtered_packets=MagicMock(side_effect=cancel_after_duplicate))
+    _attach_storage(api, storage)
+    assert api.bulk_packets(request_id="same-id")["cancelled"] is True
+    storage.get_filtered_packets.assert_called_once()
+    assert api._bulk_queries == {}
 
 
 def test_bulk_cancel_cherrypy_auth_json_limits_and_gzip(monkeypatch):
@@ -1225,15 +1278,32 @@ def test_bulk_cancel_cherrypy_auth_json_limits_and_gzip(monkeypatch):
     request_id = str(uuid.uuid4())
     assert request("POST", cancel_path, json.dumps({"request_id": request_id}))[:2] == (
         200,
-        {"success": True, "cancelled": True},
+        {"success": True, "cancelled": False},
     )
     path = "/api/bulk_packets?request_id=" + request_id
-    status, result, _ = request("GET", path)
-    assert status == 409 and result["cancelled"] is True
     status, result, headers = request("GET", path, token=token_b)
     assert status == 200 and result["data"] == packets
     assert headers["Content-Encoding"] == "gzip"
     assert request("GET", "/api/bulk_packets")[1]["data"] == packets
+
+    started = threading.Event()
+
+    def wait_for_cancellation(**kwargs):
+        started.set()
+        assert kwargs["cancel_event"].wait(5), "Active query did not receive cancellation"
+        return []
+
+    _attach_storage(api, SimpleNamespace(get_filtered_packets=wait_for_cancellation))
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(request, "GET", path)
+        assert started.wait(5), "Bulk query did not start"
+        body = json.dumps({"request_id": request_id})
+        assert request("POST", cancel_path, body, token=token_b)[1]["cancelled"] is False
+        assert request("GET", path)[0] == 409
+        assert request("POST", cancel_path, body)[1]["cancelled"] is True
+        status, result, _ = future.result(timeout=5)
+        assert status == 409 and result["cancelled"] is True
+    assert request("POST", cancel_path, body)[1]["cancelled"] is False
 
 
 def test_filtered_packets_options_and_success(cherrypy_ctx):

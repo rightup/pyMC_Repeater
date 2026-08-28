@@ -3,6 +3,7 @@ import logging
 import os
 import re
 import secrets
+import threading
 import time
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from datetime import datetime, timezone
@@ -26,13 +27,7 @@ from repeater.companion.utils import (
     validate_companion_config_capacity,
 )
 from repeater.config import resolve_storage_dir
-from repeater.data_acquisition.bulk_cancellation import (
-    BulkQueryCancelled,
-    BulkQueryCapacity,
-    BulkQueryConflict,
-    BulkQueryRegistry,
-    normalize_bulk_request_id,
-)
+from repeater.data_acquisition.sqlite_handler import BulkQueryCancelled
 from repeater.handler_helpers.acl import role_name as acl_role_name
 from repeater.modem_config import (
     LEGACY_MODEM_RADIO_TYPES,
@@ -228,7 +223,8 @@ class APIEndpoints:
         self.event_loop = event_loop
         self.daemon_instance = daemon_instance
         self._config_path = config_path or "/etc/openhop_repeater/config.yaml"
-        self._bulk_queries = BulkQueryRegistry()
+        self._bulk_queries = {}
+        self._bulk_queries_lock = threading.Lock()
         self.cad_calibration = CADCalibrationEngine(daemon_instance, event_loop)
 
         # Initialize ConfigManager for centralized config management
@@ -3688,20 +3684,15 @@ class APIEndpoints:
             cherrypy.response.headers["Allow"] = "GET, POST"
             raise cherrypy.HTTPError(405, "GET or POST required")
         body = cherrypy.request.json
-        if not isinstance(body, dict) or set(body) != {"request_id"}:
+        request_id = body.get("request_id") if isinstance(body, dict) else None
+        if not isinstance(request_id, str) or not request_id:
             cherrypy.response.status = 400
-            return self._error("Expected a JSON object containing only request_id")
-        try:
-            request_id = normalize_bulk_request_id(body["request_id"])
-            self._bulk_queries.cancel(owner, request_id)
-            # Do not disclose whether the ID was active, finished, or not yet registered.
-            return {"success": True, "cancelled": True}
-        except ValueError as e:
-            cherrypy.response.status = 400
-            return self._error(e)
-        except BulkQueryCapacity as e:
-            cherrypy.response.status = 429
-            return self._error(e)
+            return self._error("request_id must be a non-empty string")
+        with self._bulk_queries_lock:
+            event = self._bulk_queries.get((owner, request_id))
+            if event is not None:
+                event.set()
+        return {"success": True, "cancelled": event is not None}
 
     @cherrypy.expose
     @cherrypy.tools.gzip(compress_level=6)
@@ -3716,13 +3707,16 @@ class APIEndpoints:
         owner = None
         try:
             if request_id is not None:
-                try:
-                    request_id = normalize_bulk_request_id(request_id)
-                except ValueError as e:
+                if not isinstance(request_id, str) or not request_id:
                     cherrypy.response.status = 400
-                    return self._error(e)
+                    return self._error("request_id must be a non-empty string")
                 owner = self._bulk_request_owner()
-                cancel_event = self._bulk_queries.register(owner, request_id)
+                with self._bulk_queries_lock:
+                    if (owner, request_id) in self._bulk_queries:
+                        cherrypy.response.status = 409
+                        return self._error("Packet history request_id is already active")
+                    cancel_event = threading.Event()
+                    self._bulk_queries[(owner, request_id)] = cancel_event
             # Enforce reasonable limits
             limit = min(int(limit), 10000)
             offset = max(int(offset), 0)
@@ -3758,12 +3752,6 @@ class APIEndpoints:
         except BulkQueryCancelled as e:
             cherrypy.response.status = 409
             return {"success": False, "cancelled": True, "error": str(e)}
-        except BulkQueryConflict as e:
-            cherrypy.response.status = 409
-            return self._error(e)
-        except BulkQueryCapacity as e:
-            cherrypy.response.status = 429
-            return self._error(e)
         except cherrypy.HTTPError:
             raise
         except Exception as e:
@@ -3771,7 +3759,8 @@ class APIEndpoints:
             return self._error(e)
         finally:
             if cancel_event is not None:
-                self._bulk_queries.finish(owner, request_id, cancel_event)
+                with self._bulk_queries_lock:
+                    del self._bulk_queries[(owner, request_id)]
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
