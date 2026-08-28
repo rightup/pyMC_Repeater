@@ -10,13 +10,36 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import re
 from collections.abc import Mapping
+from contextvars import ContextVar
 from enum import Enum
 from typing import Any, Callable, Optional
 
 from openhop_core.companion import CompanionBridge
+from openhop_core.protocol.constants import MAX_TEXT_LEN, PAYLOAD_TYPE_GRP_TXT, ROUTE_TYPE_FLOOD
+from openhop_core.protocol.packet import Packet
+from openhop_core.protocol.transport_keys import get_auto_key_for
 
 logger = logging.getLogger("RepeaterCompanionBridge")
+
+# One packet only: consumed before Core invokes the transport or any callbacks.
+_channel_region_scope: ContextVar[Optional[tuple[object, bytes]]] = ContextVar(
+    "companion_channel_region_scope", default=None
+)
+
+
+def normalize_region_name(value: str) -> str:
+    """Normalize a public auto-hashtag region, never arbitrary key material."""
+    if not isinstance(value, str):
+        raise ValueError("region must be a string")
+    region = value.strip().removeprefix("#")
+    if not region.isascii():
+        raise ValueError("region must contain only ASCII characters")
+    region = region.lower()
+    if re.fullmatch(r"[a-z0-9-]{1,30}", region, flags=re.ASCII) is None:
+        raise ValueError("region must contain 1-30 ASCII letters, digits, or hyphens")
+    return region
 
 
 def _prefs_bytes_from_json(value: Any) -> bytes:
@@ -93,6 +116,62 @@ class RepeaterCompanionBridge(CompanionBridge):
             radio_settings_getter=radio_settings_getter,
             max_tx_power_getter=max_tx_power_getter,
         )
+
+    def _apply_flood_scope(self, pkt: Packet) -> None:
+        pending = _channel_region_scope.get()
+        if pending is None or pending[0] is not self:
+            super()._apply_flood_scope(pkt)
+            return
+        # No shared scope mutation: nested sends and child tasks must not inherit
+        # this intent when the packet injector or a Core callback runs.
+        _channel_region_scope.set(None)
+        if (
+            pkt.get_payload_type() != PAYLOAD_TYPE_GRP_TXT
+            or pkt.get_route_type() != ROUTE_TYPE_FLOOD
+        ):
+            raise ValueError("region override requires a flood channel text packet")
+        self._scope_packet(pkt, pending[1])
+        pkt._flood_scope_applied = True
+
+    async def send_channel_message(
+        self,
+        channel_idx: int,
+        text: str,
+        timestamp: Optional[int] = None,
+        *,
+        region: Optional[str] = None,
+    ) -> bool:
+        """Optionally scope one channel message without changing radio defaults."""
+        if region is None:
+            return await super().send_channel_message(channel_idx, text, timestamp=timestamp)
+        region_key = get_auto_key_for(normalize_region_name(region))
+        if (
+            not isinstance(channel_idx, int)
+            or isinstance(channel_idx, bool)
+            or not 0 <= channel_idx <= 255
+        ):
+            raise ValueError("invalid channel index")
+        if not isinstance(text, str) or not text.strip() or "\x00" in text:
+            raise ValueError("text must be nonempty and contain no NUL characters")
+        if timestamp is not None and (
+            not isinstance(timestamp, int)
+            or isinstance(timestamp, bool)
+            or not 0 <= timestamp <= 0xFFFFFFFF
+        ):
+            raise ValueError("invalid channel timestamp")
+        # Keep this adjacent to Core's builder, with no await before it reads the
+        # sender name. New scoped sends reject truncation; legacy sends keep it.
+        max_bytes = max(0, MAX_TEXT_LEN - len(f"{self.prefs.node_name}: ".encode("utf-8")))
+        if len(text.encode("utf-8")) > max_bytes:
+            raise ValueError(f"text exceeds {max_bytes} UTF-8 bytes for the channel sender name")
+        token = _channel_region_scope.set((self, region_key))
+        try:
+            # Retain Core's full channel-secret encryption and echo tracking.
+            return await super().send_channel_message(channel_idx, text, timestamp=timestamp)
+        finally:
+            # Also clear intents when a channel is missing, construction fails,
+            # or transport cancellation interrupts the send.
+            _channel_region_scope.reset(token)
 
     def _save_prefs(self) -> None:
         """Persist full NodePrefs as JSON to SQLite."""
