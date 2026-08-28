@@ -462,9 +462,16 @@ class StorageCollector:
         end_timestamp: Optional[float] = None,
         limit: int = 1000,
         offset: int = 0,
+        cancel_event: Optional[threading.Event] = None,
     ) -> list:
         return self.sqlite_handler.get_filtered_packets(
-            packet_type, route, start_timestamp, end_timestamp, limit, offset
+            packet_type,
+            route,
+            start_timestamp,
+            end_timestamp,
+            limit,
+            offset,
+            cancel_event=cancel_event,
         )
 
     def get_airtime_data(

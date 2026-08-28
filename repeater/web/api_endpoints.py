@@ -26,6 +26,13 @@ from repeater.companion.utils import (
     validate_companion_config_capacity,
 )
 from repeater.config import resolve_storage_dir
+from repeater.data_acquisition.bulk_cancellation import (
+    BulkQueryCancelled,
+    BulkQueryCapacity,
+    BulkQueryConflict,
+    BulkQueryRegistry,
+    normalize_bulk_request_id,
+)
 from repeater.handler_helpers.acl import role_name as acl_role_name
 from repeater.modem_config import (
     LEGACY_MODEM_RADIO_TYPES,
@@ -221,6 +228,7 @@ class APIEndpoints:
         self.event_loop = event_loop
         self.daemon_instance = daemon_instance
         self._config_path = config_path or "/etc/openhop_repeater/config.yaml"
+        self._bulk_queries = BulkQueryRegistry()
         self.cad_calibration = CADCalibrationEngine(daemon_instance, event_loop)
 
         # Initialize ConfigManager for centralized config management
@@ -3654,14 +3662,67 @@ class APIEndpoints:
             logger.error(f"Error getting recent packets: {e}")
             return self._error(e)
 
+    def _bulk_request_owner(self):
+        # The existing /api auth tool validates these claims before dispatch.
+        user = getattr(cherrypy.request, "user", None) or {}
+        if user.get("auth_type") == "api_token" and user.get("token_id") is not None:
+            return ("api_token", user["token_id"])
+        if (
+            user.get("auth_type") in ("jwt", "jwt_query")
+            and user.get("username")
+            and user.get("client_id")
+        ):
+            return ("jwt", user["username"], user["client_id"])
+        raise cherrypy.HTTPError(401, "Authentication required")
+
+    @cherrypy.expose
+    @cherrypy.config(**{"request.body.maxbytes": 1024})
+    @cherrypy.tools.json_in()
+    @cherrypy.tools.json_out()
+    def bulk_packets_cancel(self):
+        """Discover support or cancel an authenticated owner's bulk query."""
+        owner = self._bulk_request_owner()
+        if cherrypy.request.method == "GET":
+            return {"success": True, "supported": True}
+        if cherrypy.request.method != "POST":
+            cherrypy.response.headers["Allow"] = "GET, POST"
+            raise cherrypy.HTTPError(405, "GET or POST required")
+        body = cherrypy.request.json
+        if not isinstance(body, dict) or set(body) != {"request_id"}:
+            cherrypy.response.status = 400
+            return self._error("Expected a JSON object containing only request_id")
+        try:
+            request_id = normalize_bulk_request_id(body["request_id"])
+            self._bulk_queries.cancel(owner, request_id)
+            # Do not disclose whether the ID was active, finished, or not yet registered.
+            return {"success": True, "cancelled": True}
+        except ValueError as e:
+            cherrypy.response.status = 400
+            return self._error(e)
+        except BulkQueryCapacity as e:
+            cherrypy.response.status = 429
+            return self._error(e)
+
     @cherrypy.expose
     @cherrypy.tools.gzip(compress_level=6)
     @cherrypy.tools.json_out()
-    def bulk_packets(self, limit=1000, offset=0, start_timestamp=None, end_timestamp=None):
+    def bulk_packets(
+        self, limit=1000, offset=0, start_timestamp=None, end_timestamp=None, request_id=None
+    ):
         """
         Optimized bulk packet retrieval with gzip compression and DB-level pagination.
         """
+        cancel_event = None
+        owner = None
         try:
+            if request_id is not None:
+                try:
+                    request_id = normalize_bulk_request_id(request_id)
+                except ValueError as e:
+                    cherrypy.response.status = 400
+                    return self._error(e)
+                owner = self._bulk_request_owner()
+                cancel_event = self._bulk_queries.register(owner, request_id)
             # Enforce reasonable limits
             limit = min(int(limit), 10000)
             offset = max(int(offset), 0)
@@ -3669,7 +3730,7 @@ class APIEndpoints:
             # Get packets from storage with TRUE DB-level pagination
             # Uses SQL "LIMIT ? OFFSET ?" - no Python slicing needed!
             storage = self._get_storage()
-            packets = storage.get_filtered_packets(
+            arguments = dict(
                 packet_type=None,
                 route=None,
                 start_timestamp=float(start_timestamp) if start_timestamp else None,
@@ -3677,6 +3738,11 @@ class APIEndpoints:
                 limit=limit,
                 offset=offset,
             )
+            if cancel_event is not None:
+                arguments["cancel_event"] = cancel_event
+            packets = storage.get_filtered_packets(**arguments)
+            if cancel_event is not None and cancel_event.is_set():
+                raise BulkQueryCancelled()
 
             response = {
                 "success": True,
@@ -3689,9 +3755,23 @@ class APIEndpoints:
 
             return response
 
+        except BulkQueryCancelled as e:
+            cherrypy.response.status = 409
+            return {"success": False, "cancelled": True, "error": str(e)}
+        except BulkQueryConflict as e:
+            cherrypy.response.status = 409
+            return self._error(e)
+        except BulkQueryCapacity as e:
+            cherrypy.response.status = 429
+            return self._error(e)
+        except cherrypy.HTTPError:
+            raise
         except Exception as e:
             logger.error(f"Error getting bulk packets: {e}")
             return self._error(e)
+        finally:
+            if cancel_event is not None:
+                self._bulk_queries.finish(owner, request_id, cancel_event)
 
     @cherrypy.expose
     @cherrypy.tools.json_out()

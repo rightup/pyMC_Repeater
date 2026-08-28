@@ -9,6 +9,8 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from .bulk_cancellation import BulkQueryCancelled
+
 logger = logging.getLogger("SQLiteHandler")
 
 
@@ -2114,8 +2116,11 @@ class SQLiteHandler:
         end_timestamp: Optional[float] = None,
         limit: int = 1000,
         offset: int = 0,
+        cancel_event: Optional[threading.Event] = None,
     ) -> list:
         try:
+            if cancel_event is not None and cancel_event.is_set():
+                raise BulkQueryCancelled()
             with self._connect() as conn:
                 conn.row_factory = sqlite3.Row
 
@@ -2160,11 +2165,35 @@ class SQLiteHandler:
                 params.append(limit)
                 params.append(offset)
 
-                packets = conn.execute(query, params).fetchall()
+                if cancel_event is None:
+                    return [dict(row) for row in conn.execute(query, params).fetchall()]
 
-                return [dict(row) for row in packets]
+                # The HTTP cancel handler only sets an event. The owning thread
+                # stops its SELECT without exposing a reusable connection.
+                conn.set_progress_handler(cancel_event.is_set, 1000)
+                cursor = None
+                try:
+                    cursor = conn.execute(query, params)
+                    packets = []
+                    while True:
+                        if cancel_event.is_set():
+                            raise BulkQueryCancelled()
+                        rows = cursor.fetchmany(128)
+                        if cancel_event.is_set():
+                            raise BulkQueryCancelled()
+                        if not rows:
+                            return packets
+                        packets.extend(dict(row) for row in rows)
+                finally:
+                    conn.set_progress_handler(None, 0)
+                    if cursor is not None:
+                        cursor.close()
 
+        except BulkQueryCancelled:
+            raise
         except Exception as e:
+            if cancel_event is not None and cancel_event.is_set():
+                raise BulkQueryCancelled() from e
             logger.error(f"Failed to get filtered packets: {e}")
             return []
 

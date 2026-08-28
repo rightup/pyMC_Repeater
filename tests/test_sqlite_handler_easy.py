@@ -1,15 +1,130 @@
 import base64
+import sqlite3
 import sys
+import threading
 import types
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
 
 from repeater.data_acquisition.sqlite_handler import SQLiteHandler
+from repeater.data_acquisition.bulk_cancellation import BulkQueryCancelled
+from repeater.data_acquisition.storage_collector import StorageCollector
 
 
 def _make_handler(tmp_path: Path) -> SQLiteHandler:
     return SQLiteHandler(tmp_path)
+
+
+def test_cancelled_packet_query_does_not_return_empty_success(tmp_path):
+    handler = _make_handler(tmp_path)
+    cancel_event = threading.Event()
+    cancel_event.set()
+
+    with pytest.raises(BulkQueryCancelled):
+        handler.get_filtered_packets(cancel_event=cancel_event)
+
+
+def test_running_packet_query_cancels_without_affecting_writer_or_reused_connection(tmp_path):
+    handler = _make_handler(tmp_path)
+    cancel_event = threading.Event()
+    started = threading.Event()
+    writer = handler._connect()
+    writer.execute("CREATE TABLE cancellation_test_writes (value INTEGER)")
+    writer.commit()
+
+    class ObservedConnection(sqlite3.Connection):
+        def set_progress_handler(self, callback, count):
+            if callback is None:
+                return super().set_progress_handler(None, count)
+
+            def progress():
+                started.set()
+                return callback()
+
+            return super().set_progress_handler(progress, count)
+
+    def read_history():
+        conn = sqlite3.connect(handler.sqlite_path, factory=ObservedConnection)
+        handler._local.conn = conn
+        try:
+            # Sort 100M virtual rows using the real packet SELECT, without a large database.
+            columns = [row[1] for row in conn.execute("PRAGMA table_info(packets)")]
+            conn.execute("CREATE TEMP TABLE numbers (n INTEGER)")
+            conn.executemany("INSERT INTO numbers VALUES (?)", [(n,) for n in range(10000)])
+            fields = [
+                f"a.n * 10000 + b.n AS {name}" if name == "timestamp" else f"NULL AS {name}"
+                for name in columns
+            ]
+            conn.execute(
+                "CREATE TEMP VIEW packets AS SELECT "
+                + ", ".join(fields)
+                + " FROM numbers a CROSS JOIN numbers b"
+            )
+            conn.commit()
+            collector = StorageCollector.__new__(StorageCollector)
+            collector.sqlite_handler = handler
+            with pytest.raises(BulkQueryCancelled):
+                collector.get_filtered_packets(cancel_event=cancel_event)
+            # More than 1,000 VM operations: a leaked progress handler would abort this.
+            assert conn.execute("SELECT SUM(n) FROM numbers").fetchone()[0] == 49995000
+            conn.execute("DROP VIEW packets")
+            assert handler.get_filtered_packets(cancel_event=threading.Event()) == []
+        finally:
+            conn.close()
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(read_history)
+        try:
+            assert started.wait(5), "Packet SELECT did not start"
+            cancel_event.set()
+            writer.execute("INSERT INTO cancellation_test_writes VALUES (7)")
+            writer.commit()
+            future.result(timeout=5)
+            assert writer.execute("SELECT value FROM cancellation_test_writes").fetchone()[0] == 7
+        finally:
+            cancel_event.set()
+
+
+def test_packet_query_success_and_legacy_storage_errors_are_unchanged(tmp_path):
+    handler = _make_handler(tmp_path)
+    expected = handler.get_filtered_packets()
+    assert handler.get_filtered_packets(cancel_event=threading.Event()) == expected
+    conn = handler._connect()
+    conn.execute("DROP TABLE packets")
+    assert handler.get_filtered_packets() == []
+    assert handler.get_filtered_packets(cancel_event=threading.Event()) == []
+
+
+def test_cancel_during_row_fetch_closes_cursor_even_if_traceback_is_retained(tmp_path):
+    handler = _make_handler(tmp_path)
+    cancel_event = threading.Event()
+    cursors = []
+
+    class CancelAfterFetch(sqlite3.Cursor):
+        def fetchmany(self, size):
+            rows = super().fetchmany(size)
+            cancel_event.set()
+            return rows
+
+    class Connection(sqlite3.Connection):
+        def execute(self, sql, parameters=()):
+            cursor = self.cursor(factory=CancelAfterFetch)
+            cursors.append(cursor)
+            return cursor.execute(sql, parameters)
+
+    conn = sqlite3.connect(handler.sqlite_path, factory=Connection)
+    handler._local.conn = conn
+    try:
+        # Keep the exception (and its frame's cursor) alive to rule out GC cleanup.
+        with pytest.raises(BulkQueryCancelled) as error:
+            handler.get_filtered_packets(cancel_event=cancel_event)
+        assert error.value.__traceback__ is not None
+        with pytest.raises(sqlite3.ProgrammingError, match="closed cursor"):
+            cursors[0].fetchone()
+    finally:
+        conn.close()
 
 
 def test_api_token_crud_cycle(tmp_path):

@@ -3670,7 +3670,20 @@ paths:
     get:
       tags: [Packets]
       summary: Fetch packets in bulk
+      description: |
+        Supply a fresh UUIDv4 request_id to allow this query to be cancelled by
+        the same JWT client or API token via /bulk_packets_cancel. Requests
+        without request_id retain the existing behavior.
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
       parameters:
+        - name: request_id
+          in: query
+          description: Unique UUIDv4 for this request; do not reuse for retries.
+          schema:
+            type: string
+            format: uuid
         - name: limit
           in: query
           schema:
@@ -3696,6 +3709,102 @@ paths:
             application/json:
               schema:
                 type: object
+        '400':
+          description: Invalid request_id
+        '401':
+          description: Authentication required
+        '409':
+          description: |
+            Query cancelled (success=false, cancelled=true), or request_id is
+            already active for this owner (success=false, no cancelled flag).
+        '429':
+          description: Too many pending cancellable packet queries
+
+  /bulk_packets_cancel:
+    get:
+      tags: [Packets]
+      summary: Discover bulk query cancellation support
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      responses:
+        '200':
+          description: Cancellation is supported
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, supported]
+                properties:
+                  success:
+                    type: boolean
+                    enum: [true]
+                  supported:
+                    type: boolean
+                    enum: [true]
+        '401':
+          description: Authentication required
+    post:
+      tags: [Packets]
+      summary: Cancel this client's bulk packet query
+      description: |
+        Marks the request for cooperative cancellation; acknowledgement does
+        not mean the query has already stopped. The owner is the JWT username
+        and client_id, or the API token ID. Other clients' queries and writes
+        are unaffected. Repeated cancellation is safe and does not disclose
+        whether a query exists. Cancellation received before the GET starts is
+        retained for 120 seconds; active queries do not expire. The registry is
+        limited to 256 active or pending entries. Disconnecting alone does not
+        cancel a query: send this POST independently of the aborted GET.
+
+        SQLite progress and row-fetch checks stop query work. Lock waits,
+        blocking I/O, and JSON/compression already underway may still finish.
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        description: JSON body, at most 1024 bytes.
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [request_id]
+              properties:
+                request_id:
+                  type: string
+                  format: uuid
+                  description: UUIDv4 sent with the bulk GET.
+      responses:
+        '200':
+          description: Cancellation recorded
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, cancelled]
+                properties:
+                  success:
+                    type: boolean
+                    enum: [true]
+                  cancelled:
+                    type: boolean
+                    enum: [true]
+        '400':
+          description: Invalid JSON object or request_id
+        '401':
+          description: Authentication required
+        '405':
+          description: Only GET and POST are supported
+        '411':
+          description: Content-Length required
+        '413':
+          description: Request body exceeds 1024 bytes
+        '415':
+          description: JSON content type required
+        '429':
+          description: Too many pending cancellable packet queries
 
   /airtime_data:
     get:
