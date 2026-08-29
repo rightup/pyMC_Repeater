@@ -52,6 +52,24 @@ def test_git_branch_is_validated_and_not_evaluated_by_a_shell() -> None:
     assert 'bash -c "git clone --branch ${BRANCH}' not in script
 
 
+def test_password_default_meets_proxmox_minimum_length() -> None:
+    script = INSTALLER.read_text()
+
+    assert 'CT_PASSWORD_DEFAULT="openHop1!"' in script
+    assert 'CT_PASSWORD="${CT_PASSWORD:-$CT_PASSWORD_DEFAULT}"' in script
+    assert "Root password [pymc]" not in script
+
+
+def test_optional_vlan_is_validated_and_added_to_net0() -> None:
+    script = INSTALLER.read_text()
+
+    assert "VLAN ID [none]" in script
+    assert "CT_VLAN >= 1 && CT_VLAN <= 4094" in script
+    assert 'CT_NET0+=",tag=${CT_VLAN}"' in script
+    assert '--net0 "$CT_NET0"' in script
+    assert "VLAN: ${VLAN_SUMMARY}" in script
+
+
 def test_installer_fails_when_container_network_never_becomes_ready() -> None:
     script = INSTALLER.read_text()
 

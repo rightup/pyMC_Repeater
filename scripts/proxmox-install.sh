@@ -20,8 +20,10 @@ CT_DISK=4
 CT_CORES=2
 CT_HOSTNAME="openhop-repeater"
 CT_BRIDGE="vmbr0"
+CT_VLAN=""
 CT_STORAGE="local-lvm"
 CT_TEMPLATE_STORAGE="local"
+CT_PASSWORD_DEFAULT="openHop1!"
 CH341_VID="1a86"
 CH341_PID="5512"
 CONSOLE_RELEASE_URL="https://github.com/Treehouse-00/pymc_console-dist/releases/latest/download/pymc-ui-latest.tar.gz"
@@ -117,6 +119,17 @@ read -p "  RAM in MB [${CT_RAM}]: " -r input; CT_RAM="${input:-$CT_RAM}"
 read -p "  Disk in GB [${CT_DISK}]: " -r input; CT_DISK="${input:-$CT_DISK}"
 read -p "  CPU cores [${CT_CORES}]: " -r input; CT_CORES="${input:-$CT_CORES}"
 read -p "  Bridge [${CT_BRIDGE}]: " -r input; CT_BRIDGE="${input:-$CT_BRIDGE}"
+while true; do
+    read -p "  VLAN ID [none]: " -r input
+    CT_VLAN="${input:-}"
+    if [[ -z "$CT_VLAN" ]]; then
+        break
+    fi
+    if [[ "$CT_VLAN" =~ ^[0-9]+$ ]] && (( CT_VLAN >= 1 && CT_VLAN <= 4094 )); then
+        break
+    fi
+    msg_warn "VLAN ID must be blank or a number from 1 to 4094"
+done
 
 AVAILABLE_STORAGES=$(pvesm status -content rootdir 2>/dev/null | awk 'NR>1 {print $1}' || echo "local-lvm")
 echo "  Available storages: ${AVAILABLE_STORAGES}"
@@ -130,11 +143,12 @@ read -p "  Install host-side CH341 udev rule? [y/N]: " -r input
 [[ "${input:-n}" =~ ^[Yy]([Ee][Ss])?$ ]] && INSTALL_CH341_UDEV=true
 read -p "  Install optional openHop Console WebUI? [y/N]: " -r input
 [[ "${input:-n}" =~ ^[Yy]([Ee][Ss])?$ ]] && INSTALL_CONSOLE=true
-read -rsp "  Root password [pymc]: " CT_PASSWORD; echo
-CT_PASSWORD="${CT_PASSWORD:-pymc}"
+read -rsp "  Root password [${CT_PASSWORD_DEFAULT}]: " CT_PASSWORD; echo
+CT_PASSWORD="${CT_PASSWORD:-$CT_PASSWORD_DEFAULT}"
 
 CH341_UDEV_SUMMARY="No"
 CONSOLE_SUMMARY="No"
+VLAN_SUMMARY="${CT_VLAN:-none}"
 if [[ "$INSTALL_CH341_UDEV" == "true" ]]; then
     CH341_UDEV_SUMMARY="Yes"
     if lsusb -d "${CH341_VID}:${CH341_PID}" &>/dev/null; then
@@ -149,7 +163,8 @@ fi
 echo ""
 echo -e "${BLD}Summary:${CL}"
 echo "  CTID: ${CTID}  Host: ${CT_HOSTNAME}  RAM: ${CT_RAM}MB  Disk: ${CT_DISK}GB"
-echo "  Cores: ${CT_CORES}  Storage: ${CT_STORAGE}  Bridge: ${CT_BRIDGE}  Branch: ${BRANCH}"
+echo "  Cores: ${CT_CORES}  Storage: ${CT_STORAGE}  Bridge: ${CT_BRIDGE}  VLAN: ${VLAN_SUMMARY}"
+echo "  Branch: ${BRANCH}"
 echo "  CH341 host udev rule: ${CH341_UDEV_SUMMARY}"
 echo "  openHop Console WebUI: ${CONSOLE_SUMMARY}"
 echo "  Mode: privileged (required for USB passthrough)"
@@ -176,13 +191,17 @@ msg_ok "Template ready"
 
 # ── Create container ──────────────────────────────────────────────────────
 msg_info "Creating LXC container ${CTID}..."
+CT_NET0="name=eth0,bridge=${CT_BRIDGE},ip=dhcp"
+if [[ -n "$CT_VLAN" ]]; then
+    CT_NET0+=",tag=${CT_VLAN}"
+fi
 pct create "$CTID" "${CT_TEMPLATE_STORAGE}:vztmpl/${TEMPLATE_FILE}" \
     --hostname "$CT_HOSTNAME" \
     --memory "$CT_RAM" \
     --swap "$CT_SWAP" \
     --cores "$CT_CORES" \
     --rootfs "${CT_STORAGE}:${CT_DISK}" \
-    --net0 "name=eth0,bridge=${CT_BRIDGE},ip=dhcp" \
+    --net0 "$CT_NET0" \
     --unprivileged 0 \
     --features nesting=1 \
     --onboot 1 \

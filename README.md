@@ -328,8 +328,9 @@ whether to download the optional openHop Console WebUI. It will then:
 | Disk | 4 GB |
 | CPU cores | 2 |
 | Bridge | `vmbr0` |
+| VLAN ID | None |
 | Storage | `local-lvm` |
-| Password | `pymc` |
+| Password | `openHop1!` |
 | Host-side CH341 udev rule | No |
 | openHop Console WebUI | No |
 
