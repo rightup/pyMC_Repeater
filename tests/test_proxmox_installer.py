@@ -87,6 +87,7 @@ def test_console_is_opt_in_installed_after_repeater_and_not_enabled() -> None:
         'msg_ok "manage.sh install completed"'
     )
     assert "pymc-ui-latest.tar.gz" in script
+    assert '"$CONSOLE_REPO" /root/pymc_console' in script
     assert "Console is installed but not enabled" in script
     assert "web.web_path" not in script
 
@@ -115,6 +116,28 @@ def test_update_command_updates_apt_and_current_repeater_branch() -> None:
     assert "bash manage.sh upgrade" in updater
     assert 'install -m 0755 "$REPO_DIR/manage.sh" /opt/openhop_repeater/manage.sh' in updater
     assert 'install -m 0755 "$REPO_DIR/scripts/openhop-update"' in updater
+
+
+def test_update_command_describes_work_and_requires_confirmation() -> None:
+    updater = UPDATER.read_text()
+
+    prompt = 'read -rp "Continue? [y/N]: " reply'
+    assert 'echo "This update will:"' in updater
+    assert prompt in updater
+    assert 'echo "Update cancelled."' in updater
+    assert updater.index(prompt) < updater.index("apt-get update")
+
+
+def test_console_checkout_is_created_and_updated_when_console_is_installed() -> None:
+    installer = INSTALLER.read_text()
+    updater = UPDATER.read_text()
+
+    assert "git clone --branch main --single-branch" in installer
+    assert "/root/pymc_console" in installer
+    assert 'readonly CONSOLE_REPO_DIR="/root/pymc_console"' in updater
+    assert 'git clone --branch main --single-branch "$CONSOLE_REPO_URL"' in updater
+    assert 'git -C "$CONSOLE_REPO_DIR" pull --ff-only' in updater
+    assert "ASSUME_YES=1 NO_COLOR=1 bash manage.sh upgrade" in updater
 
 
 def test_readme_documents_new_installer_behavior() -> None:

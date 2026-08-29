@@ -314,8 +314,10 @@ whether to download the optional openHop Console WebUI. It will then:
 5. Install an `update` command for Debian and openHop Repeater updates.
 6. Run `manage.sh install` inside the container.
 7. Optionally install openHop Console WebUI assets after Repeater installation.
-   Console is not selected as the default frontend, allowing the Repeater setup
-   wizard to be completed first.
+   The public Console distribution repository is cloned to `/root/pymc_console`
+   so it can be inspected and upgraded in the same way as Repeater. Console is
+   not selected as the default frontend, allowing the Repeater setup wizard to
+   be completed first.
 8. Display the dashboard URL.
 
 ### Default Container Settings
@@ -349,7 +351,9 @@ bash manage.sh
 ```
 
 Run `update` inside the LXC to update Debian packages, fast-forward the branch
-selected during installation, and run `manage.sh upgrade`:
+selected during installation, and run `manage.sh upgrade`. The command first
+lists every action and requires a `y/N` confirmation. When Console is installed,
+it also updates `/root/pymc_console` and refreshes the Console assets:
 
 ```bash
 update

@@ -4,6 +4,9 @@
 set -Eeuo pipefail
 
 readonly REPO_DIR="/root/openhop-repeater"
+readonly CONSOLE_REPO_DIR="/root/pymc_console"
+readonly CONSOLE_REPO_URL="https://github.com/Treehouse-00/pymc_console-dist.git"
+readonly CONSOLE_UI_DIR="/opt/pymc_console/web/html"
 
 if [[ "$EUID" -ne 0 ]]; then
     echo "This command must be run as root." >&2
@@ -26,6 +29,30 @@ if [[ -n "$(git -C "$REPO_DIR" status --porcelain)" ]]; then
     exit 1
 fi
 
+CONSOLE_INSTALLED=false
+CONSOLE_CHECKOUT=false
+[[ -f "$CONSOLE_UI_DIR/index.html" ]] && CONSOLE_INSTALLED=true
+[[ -d "$CONSOLE_REPO_DIR/.git" && -f "$CONSOLE_REPO_DIR/manage.sh" ]] \
+    && CONSOLE_CHECKOUT=true
+
+echo "This update will:"
+echo "  - update installed Debian packages"
+echo "  - fast-forward openHop Repeater branch: $BRANCH"
+echo "  - run openHop Repeater manage.sh upgrade"
+if [[ "$CONSOLE_INSTALLED" == "true" && "$CONSOLE_CHECKOUT" == "true" ]]; then
+    echo "  - fast-forward and upgrade openHop Console"
+elif [[ "$CONSOLE_INSTALLED" == "true" ]]; then
+    echo "  - create /root/pymc_console and upgrade openHop Console"
+else
+    echo "  - leave openHop Console unchanged (not installed)"
+fi
+echo ""
+read -rp "Continue? [y/N]: " reply
+if [[ ! "$reply" =~ ^[Yy]([Ee][Ss])?$ ]]; then
+    echo "Update cancelled."
+    exit 0
+fi
+
 echo "==> Checking openHop Repeater branch: $BRANCH"
 git -C "$REPO_DIR" fetch origin --prune
 if ! git -C "$REPO_DIR" show-ref --verify --quiet "refs/remotes/origin/$BRANCH"; then
@@ -35,6 +62,39 @@ fi
 if ! git -C "$REPO_DIR" merge-base --is-ancestor HEAD "origin/$BRANCH"; then
     echo "The local branch cannot be fast-forwarded to origin/$BRANCH; update aborted." >&2
     exit 1
+fi
+
+if [[ "$CONSOLE_INSTALLED" == "true" ]]; then
+    if [[ "$CONSOLE_CHECKOUT" != "true" ]]; then
+        if [[ -e "$CONSOLE_REPO_DIR" ]]; then
+            echo "$CONSOLE_REPO_DIR exists but is not a valid Console checkout; update aborted." >&2
+            exit 1
+        fi
+        echo "==> Creating openHop Console checkout"
+        git clone --branch main --single-branch "$CONSOLE_REPO_URL" "$CONSOLE_REPO_DIR"
+        CONSOLE_CHECKOUT=true
+    fi
+
+    CONSOLE_BRANCH=$(git -C "$CONSOLE_REPO_DIR" branch --show-current)
+    if [[ -z "$CONSOLE_BRANCH" ]]; then
+        echo "The openHop Console checkout is in detached HEAD state; update aborted." >&2
+        exit 1
+    fi
+    if [[ -n "$(git -C "$CONSOLE_REPO_DIR" status --porcelain)" ]]; then
+        echo "The openHop Console checkout has local changes; update aborted." >&2
+        exit 1
+    fi
+    git -C "$CONSOLE_REPO_DIR" fetch origin --prune
+    if ! git -C "$CONSOLE_REPO_DIR" show-ref --verify --quiet \
+        "refs/remotes/origin/$CONSOLE_BRANCH"; then
+        echo "Remote Console branch origin/$CONSOLE_BRANCH does not exist; update aborted." >&2
+        exit 1
+    fi
+    if ! git -C "$CONSOLE_REPO_DIR" merge-base --is-ancestor \
+        HEAD "origin/$CONSOLE_BRANCH"; then
+        echo "The local Console branch cannot be fast-forwarded; update aborted." >&2
+        exit 1
+    fi
 fi
 
 export DEBIAN_FRONTEND=noninteractive
@@ -49,6 +109,14 @@ git -C "$REPO_DIR" pull --ff-only origin "$BRANCH"
 echo "==> Running openHop Repeater upgrade"
 cd "$REPO_DIR"
 OPENHOP_UPGRADE_REF="$BRANCH" TERM="${TERM:-xterm}" bash manage.sh upgrade
+
+if [[ "$CONSOLE_INSTALLED" == "true" ]]; then
+    echo "==> Updating openHop Console branch: $CONSOLE_BRANCH"
+    git -C "$CONSOLE_REPO_DIR" pull --ff-only origin "$CONSOLE_BRANCH"
+    echo "==> Running openHop Console upgrade"
+    cd "$CONSOLE_REPO_DIR"
+    ASSUME_YES=1 NO_COLOR=1 bash manage.sh upgrade
+fi
 
 # Keep the documented management copy in /opt aligned with the source used for
 # this successful upgrade.

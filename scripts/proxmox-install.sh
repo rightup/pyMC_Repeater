@@ -27,6 +27,7 @@ CT_PASSWORD_DEFAULT="openHop1!"
 CH341_VID="1a86"
 CH341_PID="5512"
 CONSOLE_RELEASE_URL="https://github.com/Treehouse-00/pymc_console-dist/releases/latest/download/pymc-ui-latest.tar.gz"
+CONSOLE_REPO="https://github.com/Treehouse-00/pymc_console-dist.git"
 INSTALL_CH341_UDEV=false
 INSTALL_CONSOLE=false
 
@@ -337,6 +338,11 @@ msg_ok "manage.sh install completed"
 
 # ── Optional openHop Console WebUI ─────────────────────────────────────────
 if [[ "$INSTALL_CONSOLE" == "true" ]]; then
+    msg_info "Cloning openHop Console distribution repository..."
+    pct exec "$CTID" -- git clone --branch main --single-branch \
+        "$CONSOLE_REPO" /root/pymc_console
+    msg_ok "Console repository cloned to /root/pymc_console"
+
     msg_info "Installing optional openHop Console WebUI..."
     pct exec "$CTID" -- bash -c "
         set -e
