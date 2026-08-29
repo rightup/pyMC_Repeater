@@ -36,6 +36,16 @@ msg_ok()    { echo -e " ${GN}✓${CL}  ${1}"; }
 msg_warn()  { echo -e " ${YW}⚠${CL}  ${1}"; }
 msg_error() { echo -e " ${RD}✗${CL}  ${1}"; }
 
+is_safe_git_ref() {
+    local ref="${1:-}"
+    [[ "$ref" =~ ^[a-zA-Z0-9][a-zA-Z0-9._/-]{0,79}$ ]] \
+        && [[ "$ref" != *..* ]] \
+        && [[ "$ref" != *//* ]] \
+        && [[ "$ref" != */ ]] \
+        && [[ "$ref" != *. ]] \
+        && [[ "$ref" != *.lock ]]
+}
+
 header() {
     clear
     echo -e "${BLD}"
@@ -105,6 +115,10 @@ AVAILABLE_STORAGES=$(pvesm status -content rootdir 2>/dev/null | awk 'NR>1 {prin
 echo "  Available storages: ${AVAILABLE_STORAGES}"
 read -p "  Storage [${CT_STORAGE}]: " -r input; CT_STORAGE="${input:-$CT_STORAGE}"
 read -p "  Git branch [${BRANCH}]: " -r input; BRANCH="${input:-$BRANCH}"
+if ! is_safe_git_ref "$BRANCH"; then
+    msg_error "Invalid Git branch: ${BRANCH}"
+    exit 1
+fi
 read -p "  Install host-side CH341 udev rule? [y/N]: " -r input
 [[ "${input:-n}" =~ ^[Yy]([Ee][Ss])?$ ]] && INSTALL_CH341_UDEV=true
 read -p "  Install optional openHop Console WebUI? [y/N]: " -r input
@@ -192,10 +206,18 @@ fi
 msg_info "Starting container..."
 pct start "$CTID"
 sleep 3
+NETWORK_READY=false
 for _ in $(seq 1 30); do
-    pct exec "$CTID" -- ping -c1 -W1 8.8.8.8 &>/dev/null && break
+    if pct exec "$CTID" -- ping -c1 -W1 8.8.8.8 &>/dev/null; then
+        NETWORK_READY=true
+        break
+    fi
     sleep 1
 done
+if [[ "$NETWORK_READY" != "true" ]]; then
+    msg_error "Container network did not become ready after 30 seconds"
+    exit 1
+fi
 msg_ok "Container running with network"
 
 # ── Bootstrap: install git, clone repo ────────────────────────────────────
@@ -246,7 +268,7 @@ MOTD
 msg_ok "curl/git installed, locale fixed, console auto-login enabled"
 
 msg_info "Cloning openhop-repeater (branch: ${BRANCH})..."
-pct exec "$CTID" -- bash -c "git clone --branch ${BRANCH} ${REPO} /root/openhop-repeater"
+pct exec "$CTID" -- git clone --branch "$BRANCH" "$REPO" /root/openhop-repeater
 msg_ok "Repository cloned"
 
 msg_info "Installing LXC update command..."

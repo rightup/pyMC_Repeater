@@ -50,6 +50,10 @@ echo "==> Running openHop Repeater upgrade"
 cd "$REPO_DIR"
 OPENHOP_UPGRADE_REF="$BRANCH" TERM="${TERM:-xterm}" bash manage.sh upgrade
 
+# Keep the documented management copy in /opt aligned with the source used for
+# this successful upgrade.
+install -m 0755 "$REPO_DIR/manage.sh" /opt/openhop_repeater/manage.sh
+
 # Refresh the installed helper for the next run without replacing this script
 # until all update steps have completed successfully.
 install -m 0755 "$REPO_DIR/scripts/openhop-update" /usr/local/bin/openhop-update.new
