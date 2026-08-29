@@ -306,7 +306,7 @@ The installer will prompt for container settings (container ID, hostname, RAM,
 disk, bridge, etc.), whether to install the host-side CH341 udev rule, and
 whether to download the optional openHop Console WebUI. It will then:
 
-1. Download a Debian 13 LXC template.
+1. Download a Debian 13 LXC template matching the Proxmox host architecture.
 2. Create a privileged container with USB passthrough.
 3. Install the host-side CH341 udev rule only when selected. This is not needed
    for openHop Modem TCP or USB connections and defaults to No.

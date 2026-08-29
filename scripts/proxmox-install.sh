@@ -84,6 +84,13 @@ fi
 
 msg_ok "Running on Proxmox host as root"
 
+CT_ARCH=$(dpkg --print-architecture)
+if [[ ! "$CT_ARCH" =~ ^(amd64|arm64)$ ]]; then
+    msg_error "Unsupported Proxmox host architecture: ${CT_ARCH}"
+    exit 1
+fi
+msg_ok "Detected Proxmox host architecture: ${CT_ARCH}"
+
 # Default to the next available container ID, but allow the user to choose.
 DEFAULT_CTID=$(pvesh get /cluster/nextid)
 
@@ -154,10 +161,14 @@ read -p "  Proceed? [Y/n]: " -r
 echo ""
 msg_info "Downloading Debian 13 template..."
 TEMPLATE_FILE=$(pveam available -section system 2>/dev/null \
-    | awk -v template="$CT_TEMPLATE" '$2 ~ template {print $2}' \
+    | awk -v template="$CT_TEMPLATE" -v arch="$CT_ARCH" \
+        '$2 ~ ("^" template "_") && $2 ~ ("_" arch "\\.tar\\.") {print $2}' \
     | sort -V \
     | tail -1)
-[ -z "$TEMPLATE_FILE" ] && { msg_error "Template not found. Run: pveam update"; exit 1; }
+[ -z "$TEMPLATE_FILE" ] && {
+    msg_error "Debian 13 template for ${CT_ARCH} not found. Run: pveam update"
+    exit 1
+}
 
 pveam list "$CT_TEMPLATE_STORAGE" 2>/dev/null | grep -q "$TEMPLATE_FILE" || \
     pveam download "$CT_TEMPLATE_STORAGE" "$TEMPLATE_FILE"

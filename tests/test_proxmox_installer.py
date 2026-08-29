@@ -15,6 +15,15 @@ def test_proxmox_installer_uses_debian_13() -> None:
     assert "Debian 12" not in script
 
 
+def test_template_selection_matches_the_proxmox_host_architecture() -> None:
+    script = INSTALLER.read_text()
+
+    assert "CT_ARCH=$(dpkg --print-architecture)" in script
+    assert '[[ ! "$CT_ARCH" =~ ^(amd64|arm64)$ ]]' in script
+    assert '-v arch="$CT_ARCH"' in script
+    assert '$2 ~ ("_" arch "\\\\.tar\\\\.")' in script
+
+
 def test_installer_allows_explicit_repository_and_branch_for_fork_testing() -> None:
     script = INSTALLER.read_text()
 
