@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# Update the Debian LXC and its openHop Repeater installation.
+
+set -Eeuo pipefail
+
+readonly REPO_DIR="/root/openhop-repeater"
+
+if [[ "$EUID" -ne 0 ]]; then
+    echo "This command must be run as root." >&2
+    exit 1
+fi
+
+if [[ ! -d "$REPO_DIR/.git" || ! -f "$REPO_DIR/manage.sh" ]]; then
+    echo "openHop Repeater source checkout not found at $REPO_DIR." >&2
+    exit 1
+fi
+
+BRANCH=$(git -C "$REPO_DIR" branch --show-current)
+if [[ -z "$BRANCH" ]]; then
+    echo "The openHop Repeater checkout is in detached HEAD state; update aborted." >&2
+    exit 1
+fi
+
+if [[ -n "$(git -C "$REPO_DIR" status --porcelain)" ]]; then
+    echo "The openHop Repeater checkout has local changes; update aborted." >&2
+    exit 1
+fi
+
+echo "==> Checking openHop Repeater branch: $BRANCH"
+git -C "$REPO_DIR" fetch origin --prune
+if ! git -C "$REPO_DIR" show-ref --verify --quiet "refs/remotes/origin/$BRANCH"; then
+    echo "Remote branch origin/$BRANCH does not exist; update aborted." >&2
+    exit 1
+fi
+if ! git -C "$REPO_DIR" merge-base --is-ancestor HEAD "origin/$BRANCH"; then
+    echo "The local branch cannot be fast-forwarded to origin/$BRANCH; update aborted." >&2
+    exit 1
+fi
+
+export DEBIAN_FRONTEND=noninteractive
+
+echo "==> Updating Debian packages"
+apt-get update
+apt-get upgrade -y
+
+echo "==> Updating openHop Repeater branch: $BRANCH"
+git -C "$REPO_DIR" pull --ff-only origin "$BRANCH"
+
+echo "==> Running openHop Repeater upgrade"
+cd "$REPO_DIR"
+OPENHOP_UPGRADE_REF="$BRANCH" TERM="${TERM:-xterm}" bash manage.sh upgrade
+
+# Refresh the installed helper for the next run without replacing this script
+# until all update steps have completed successfully.
+install -m 0755 "$REPO_DIR/scripts/openhop-update" /usr/local/bin/openhop-update.new
+mv /usr/local/bin/openhop-update.new /usr/local/bin/openhop-update
+ln -sfn /usr/local/bin/openhop-update /usr/local/bin/update
+
+echo "==> Update complete"

@@ -1,0 +1,74 @@
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+INSTALLER = ROOT / "scripts" / "proxmox-install.sh"
+UPDATER = ROOT / "scripts" / "openhop-update"
+README = ROOT / "README.md"
+
+
+def test_proxmox_installer_uses_debian_13() -> None:
+    script = INSTALLER.read_text()
+
+    assert 'CT_TEMPLATE="debian-13-standard"' in script
+    assert "Downloading Debian 13 template" in script
+    assert "sort -V" in script
+    assert "Debian 12" not in script
+
+
+def test_ch341_host_rule_is_opt_in() -> None:
+    script = INSTALLER.read_text()
+
+    prompt = "Install host-side CH341 udev rule? [y/N]"
+    rule = "/etc/udev/rules.d/99-ch341.rules"
+    conditional = script.index('if [[ "$INSTALL_CH341_UDEV" == "true" ]]; then')
+
+    assert prompt in script
+    assert script.index(rule) > conditional
+    assert "CH341 host udev rule: ${CH341_UDEV_SUMMARY}" in script
+
+
+def test_console_is_opt_in_installed_after_repeater_and_not_enabled() -> None:
+    script = INSTALLER.read_text()
+
+    assert "Install optional openHop Console WebUI? [y/N]" in script
+    assert "openHop Console WebUI: ${CONSOLE_SUMMARY}" in script
+    assert script.index("Installing optional openHop Console WebUI") > script.index(
+        'msg_ok "manage.sh install completed"'
+    )
+    assert "pymc-ui-latest.tar.gz" in script
+    assert "Console is installed but not enabled" in script
+    assert "web.web_path" not in script
+
+
+def test_installer_adds_update_command() -> None:
+    script = INSTALLER.read_text()
+
+    assert (
+        "install -m 0755 /root/openhop-repeater/scripts/openhop-update "
+        "/usr/local/bin/openhop-update"
+    ) in script
+    assert "ln -sfn /usr/local/bin/openhop-update /usr/local/bin/update" in script
+    assert "Update: update" in script
+
+
+def test_update_command_updates_apt_and_current_repeater_branch() -> None:
+    updater = UPDATER.read_text()
+
+    assert "apt-get update" in updater
+    assert "apt-get upgrade -y" in updater
+    assert 'BRANCH=$(git -C "$REPO_DIR" branch --show-current)' in updater
+    assert 'git -C "$REPO_DIR" status --porcelain' in updater
+    assert 'merge-base --is-ancestor HEAD "origin/$BRANCH"' in updater
+    assert 'git -C "$REPO_DIR" pull --ff-only origin "$BRANCH"' in updater
+    assert 'OPENHOP_UPGRADE_REF="$BRANCH"' in updater
+    assert "bash manage.sh upgrade" in updater
+    assert 'install -m 0755 "$REPO_DIR/scripts/openhop-update"' in updater
+
+
+def test_readme_documents_new_installer_behavior() -> None:
+    readme = README.read_text()
+
+    assert "Download a Debian 13 LXC template" in readme
+    assert "host-side CH341 udev rule" in readme
+    assert "openHop Console WebUI" in readme
+    assert "Run `update` inside the LXC" in readme

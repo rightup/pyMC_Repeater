@@ -275,8 +275,8 @@ The upgrade script will:
 ## Proxmox LXC Installation
 
 openHop Repeater can run inside a Proxmox LXC container using a CH341 USB-to-SPI
-adapter or a TCP modem. This is useful for headless, always-on deployments
-without dedicating a full Raspberry Pi.
+adapter or an openHop Modem over TCP or USB. This is useful for headless,
+always-on deployments without dedicating a full Raspberry Pi.
 
 ### Requirements
 
@@ -290,7 +290,7 @@ Hardware, choose one:
 - CH341 USB-to-SPI adapter with VID `1a86` and PID `5512`, connected to the
   Proxmox host and wired to an SX1262-based LoRa module such as an Ebyte
   E22-900M30S
-- TCP modem, such as MeshSmith EtherMesh
+- openHop Modem over TCP or USB, such as MeshSmith EtherMesh
 
 ### One-Line Install
 
@@ -303,14 +303,20 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/openhop-dev/openhop_repe
 Replace `main` in the URL with another branch name if needed.
 
 The installer will prompt for container settings (container ID, hostname, RAM,
-disk, bridge, etc.) and then:
+disk, bridge, etc.), whether to install the host-side CH341 udev rule, and
+whether to download the optional openHop Console WebUI. It will then:
 
-1. Download a Debian 12 LXC template.
+1. Download a Debian 13 LXC template.
 2. Create a privileged container with USB passthrough.
-3. Install a host-side udev rule for the CH341 device.
+3. Install the host-side CH341 udev rule only when selected. This is not needed
+   for openHop Modem TCP or USB connections and defaults to No.
 4. Clone the repository and pre-seed CH341 GPIO pin mappings.
-5. Run `manage.sh install` inside the container.
-6. Display the dashboard URL.
+5. Install an `update` command for Debian and openHop Repeater updates.
+6. Run `manage.sh install` inside the container.
+7. Optionally install openHop Console WebUI assets after Repeater installation.
+   Console is not selected as the default frontend, allowing the Repeater setup
+   wizard to be completed first.
+8. Display the dashboard URL.
 
 ### Default Container Settings
 
@@ -324,6 +330,8 @@ disk, bridge, etc.) and then:
 | Bridge | `vmbr0` |
 | Storage | `local-lvm` |
 | Password | `pymc` |
+| Host-side CH341 udev rule | No |
+| openHop Console WebUI | No |
 
 ### After Installation
 
@@ -338,6 +346,16 @@ journalctl -u openhop-repeater -f
 cd /opt/openhop_repeater
 bash manage.sh
 ```
+
+Run `update` inside the LXC to update Debian packages, fast-forward the branch
+selected during installation, and run `manage.sh upgrade`:
+
+```bash
+update
+```
+
+If openHop Console WebUI was installed, complete the Repeater setup wizard
+before selecting `openHop Console` from Web Settings.
 
 Open the dashboard at:
 

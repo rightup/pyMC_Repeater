@@ -13,7 +13,7 @@ set -euo pipefail
 # ── Defaults ───────────────────────────────────────────────────────────────
 REPO="https://github.com/openhop-dev/openhop_repeater.git"
 BRANCH="dev"
-CT_TEMPLATE="debian-12-standard"
+CT_TEMPLATE="debian-13-standard"
 CT_RAM=1024
 CT_SWAP=512
 CT_DISK=4
@@ -24,6 +24,9 @@ CT_STORAGE="local-lvm"
 CT_TEMPLATE_STORAGE="local"
 CH341_VID="1a86"
 CH341_PID="5512"
+CONSOLE_RELEASE_URL="https://github.com/Treehouse-00/pymc_console-dist/releases/latest/download/pymc-ui-latest.tar.gz"
+INSTALL_CH341_UDEV=false
+INSTALL_CONSOLE=false
 
 # ── Colors ─────────────────────────────────────────────────────────────────
 RD="\033[01;31m" GN="\033[1;92m" YW="\033[33m" BL="\033[36m" BLD="\033[1m" CL="\033[m"
@@ -71,14 +74,6 @@ fi
 
 msg_ok "Running on Proxmox host as root"
 
-# Check for CH341
-echo ""
-if lsusb -d "${CH341_VID}:${CH341_PID}" &>/dev/null; then
-    msg_ok "CH341 USB device detected"
-else
-    msg_warn "CH341 USB device not found — plug it in before starting the repeater"
-fi
-
 # Default to the next available container ID, but allow the user to choose.
 DEFAULT_CTID=$(pvesh get /cluster/nextid)
 
@@ -110,14 +105,32 @@ AVAILABLE_STORAGES=$(pvesm status -content rootdir 2>/dev/null | awk 'NR>1 {prin
 echo "  Available storages: ${AVAILABLE_STORAGES}"
 read -p "  Storage [${CT_STORAGE}]: " -r input; CT_STORAGE="${input:-$CT_STORAGE}"
 read -p "  Git branch [${BRANCH}]: " -r input; BRANCH="${input:-$BRANCH}"
-read -sp "  Root password [pymc]: " CT_PASSWORD; echo
+read -p "  Install host-side CH341 udev rule? [y/N]: " -r input
+[[ "${input:-n}" =~ ^[Yy]([Ee][Ss])?$ ]] && INSTALL_CH341_UDEV=true
+read -p "  Install optional openHop Console WebUI? [y/N]: " -r input
+[[ "${input:-n}" =~ ^[Yy]([Ee][Ss])?$ ]] && INSTALL_CONSOLE=true
+read -rsp "  Root password [pymc]: " CT_PASSWORD; echo
 CT_PASSWORD="${CT_PASSWORD:-pymc}"
+
+CH341_UDEV_SUMMARY="No"
+CONSOLE_SUMMARY="No"
+if [[ "$INSTALL_CH341_UDEV" == "true" ]]; then
+    CH341_UDEV_SUMMARY="Yes"
+    if lsusb -d "${CH341_VID}:${CH341_PID}" &>/dev/null; then
+        msg_ok "CH341 USB device detected"
+    else
+        msg_warn "CH341 USB device not found — plug it in before starting the repeater"
+    fi
+fi
+[[ "$INSTALL_CONSOLE" == "true" ]] && CONSOLE_SUMMARY="Yes"
 
 # ── Confirmation ──────────────────────────────────────────────────────────
 echo ""
 echo -e "${BLD}Summary:${CL}"
 echo "  CTID: ${CTID}  Host: ${CT_HOSTNAME}  RAM: ${CT_RAM}MB  Disk: ${CT_DISK}GB"
 echo "  Cores: ${CT_CORES}  Storage: ${CT_STORAGE}  Bridge: ${CT_BRIDGE}  Branch: ${BRANCH}"
+echo "  CH341 host udev rule: ${CH341_UDEV_SUMMARY}"
+echo "  openHop Console WebUI: ${CONSOLE_SUMMARY}"
 echo "  Mode: privileged (required for USB passthrough)"
 echo ""
 read -p "  Proceed? [Y/n]: " -r
@@ -125,8 +138,11 @@ read -p "  Proceed? [Y/n]: " -r
 
 # ── Download template ─────────────────────────────────────────────────────
 echo ""
-msg_info "Downloading Debian 12 template..."
-TEMPLATE_FILE=$(pveam available -section system 2>/dev/null | grep "${CT_TEMPLATE}" | sort -t- -k4 -V | tail -1 | awk '{print $2}')
+msg_info "Downloading Debian 13 template..."
+TEMPLATE_FILE=$(pveam available -section system 2>/dev/null \
+    | awk -v template="$CT_TEMPLATE" '$2 ~ template {print $2}' \
+    | sort -V \
+    | tail -1)
 [ -z "$TEMPLATE_FILE" ] && { msg_error "Template not found. Run: pveam update"; exit 1; }
 
 pveam list "$CT_TEMPLATE_STORAGE" 2>/dev/null | grep -q "$TEMPLATE_FILE" || \
@@ -161,12 +177,16 @@ EOF
 msg_ok "USB passthrough configured"
 
 # ── Host udev rule ────────────────────────────────────────────────────────
-msg_info "Installing CH341 udev rule on host..."
-echo 'SUBSYSTEM=="usb", ATTR{idVendor}=="1a86", ATTR{idProduct}=="5512", MODE="0666"' \
-    > /etc/udev/rules.d/99-ch341.rules
-udevadm control --reload-rules
-udevadm trigger --subsystem-match=usb --action=change
-msg_ok "Host udev rule installed"
+if [[ "$INSTALL_CH341_UDEV" == "true" ]]; then
+    msg_info "Installing CH341 udev rule on host..."
+    echo 'SUBSYSTEM=="usb", ATTR{idVendor}=="1a86", ATTR{idProduct}=="5512", MODE="0666"' \
+        > /etc/udev/rules.d/99-ch341.rules
+    udevadm control --reload-rules
+    udevadm trigger --subsystem-match=usb --action=change
+    msg_ok "Host udev rule installed"
+else
+    msg_info "Skipping host-side CH341 udev rule"
+fi
 
 # ── Start container & wait for network ────────────────────────────────────
 msg_info "Starting container..."
@@ -218,6 +238,7 @@ echo \"    💡  IP Address: \$IP\"
 echo \"    📡  Dashboard: http://\$IP:8000\"
 echo \"\"
 echo \"    Management: cd /opt/openhop_repeater && bash manage.sh\"
+echo \"    Update: update\"
 echo \"\"
 MOTD
     chmod +x /etc/profile.d/pymc-motd.sh
@@ -227,6 +248,13 @@ msg_ok "curl/git installed, locale fixed, console auto-login enabled"
 msg_info "Cloning openhop-repeater (branch: ${BRANCH})..."
 pct exec "$CTID" -- bash -c "git clone --branch ${BRANCH} ${REPO} /root/openhop-repeater"
 msg_ok "Repository cloned"
+
+msg_info "Installing LXC update command..."
+pct exec "$CTID" -- bash -c "
+    install -m 0755 /root/openhop-repeater/scripts/openhop-update /usr/local/bin/openhop-update
+    ln -sfn /usr/local/bin/openhop-update /usr/local/bin/update
+"
+msg_ok "Update command installed"
 
 # Pre-seed config with CH341 radio type and correct GPIO pins
 pct exec "$CTID" -- bash -c "
@@ -255,6 +283,24 @@ lxc-attach -n "$CTID" -- bash -c "cd /root/openhop-repeater && TERM=xterm bash m
 echo ""
 msg_ok "manage.sh install completed"
 
+# ── Optional openHop Console WebUI ─────────────────────────────────────────
+if [[ "$INSTALL_CONSOLE" == "true" ]]; then
+    msg_info "Installing optional openHop Console WebUI..."
+    pct exec "$CTID" -- bash -c "
+        set -e
+        console_archive=\$(mktemp)
+        trap 'rm -f \"\$console_archive\"' EXIT
+        curl -fL '${CONSOLE_RELEASE_URL}' -o \"\$console_archive\"
+        rm -rf /opt/pymc_console/web/html
+        install -d -m 0755 -o repeater -g repeater /opt/pymc_console/web/html
+        tar -xzf \"\$console_archive\" -C /opt/pymc_console/web/html
+        test -f /opt/pymc_console/web/html/index.html
+        chown -R repeater:repeater /opt/pymc_console
+    "
+    msg_ok "Console is installed but not enabled"
+    msg_info "Complete the Repeater setup wizard before selecting openHop Console in Web Settings"
+fi
+
 # ── Get container IP ──────────────────────────────────────────────────────
 sleep 2
 CT_IP=$(pct exec "$CTID" -- hostname -I 2>/dev/null | awk '{print $1}')
@@ -272,5 +318,9 @@ echo -e "  Dashboard:   ${GN}http://${CT_IP:-<ip>}:8000${CL}"
 echo ""
 echo "  Next: open the dashboard and complete the setup wizard"
 echo "  Management: pct enter ${CTID}, then: cd /opt/openhop_repeater && bash manage.sh"
+echo "  Update: pct enter ${CTID}, then run: update"
+if [[ "$INSTALL_CONSOLE" == "true" ]]; then
+    echo "  Console: installed but not enabled; select it in Web Settings after setup"
+fi
 echo ""
 echo "═══════════════════════════════════════════════════════════════"
