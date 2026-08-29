@@ -11,8 +11,8 @@
 set -euo pipefail
 
 # ── Defaults ───────────────────────────────────────────────────────────────
-REPO="https://github.com/openhop-dev/openhop_repeater.git"
-BRANCH="dev"
+REPO="${OPENHOP_REPO:-https://github.com/openhop-dev/openhop_repeater.git}"
+BRANCH="${OPENHOP_BRANCH:-dev}"
 CT_TEMPLATE="debian-13-standard"
 CT_RAM=1024
 CT_SWAP=512

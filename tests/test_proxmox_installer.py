@@ -15,6 +15,13 @@ def test_proxmox_installer_uses_debian_13() -> None:
     assert "Debian 12" not in script
 
 
+def test_installer_allows_explicit_repository_and_branch_for_fork_testing() -> None:
+    script = INSTALLER.read_text()
+
+    assert 'REPO="${OPENHOP_REPO:-https://github.com/openhop-dev/openhop_repeater.git}"' in script
+    assert 'BRANCH="${OPENHOP_BRANCH:-dev}"' in script
+
+
 def test_ch341_host_rule_is_opt_in() -> None:
     script = INSTALLER.read_text()
 
