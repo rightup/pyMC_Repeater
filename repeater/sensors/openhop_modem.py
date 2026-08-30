@@ -197,11 +197,14 @@ class OpenHopModemSensor(SensorBase):
             "battery_percent",
             "battery_percentage",
             "solar_charge_rate_percent_per_hour",
+            "bus_voltage_v",
+            "current_ma",
+            "power_mw",
         ):
             if key in payload:
                 out[key] = payload[key]
 
-        for key in ("battery_voltage_mv", "battery_voltage_v"):
+        for key in ("battery_voltage_mv", "battery_voltage_v", "current_ma", "power_mw"):
             if out.get(key) is None and system.get(key) is not None:
                 out[key] = system[key]
 
