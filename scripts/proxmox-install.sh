@@ -359,6 +359,103 @@ if [[ "$INSTALL_CONSOLE" == "true" ]]; then
     msg_info "Complete the Repeater setup wizard before selecting openHop Console in Web Settings"
 fi
 
+# ── Container notes ───────────────────────────────────────────────────────
+PROXMOX_NOTES_DIR="/var/lib/pve-manager/notes"
+if [[ -d "$PROXMOX_NOTES_DIR" ]]; then
+    cat > "${PROXMOX_NOTES_DIR}/${CTID}.html" <<'NOTES'
+<div align="center">
+  <a href="https://openhop.dev/" target="_blank" rel="noopener noreferrer">
+    <img
+      src="https://avatars.githubusercontent.com/u/295154237?s=100&v=4"
+      width="100"
+      height="100"
+      alt="openHop Logo"
+    />
+  </a>
+
+  <h2 style="font-size: 24px; margin: 20px 0;">
+    openHop Repeater LXC
+  </h2>
+
+  <p style="margin: 16px 0;">
+    <a
+      href="https://buymeacoffee.com/rightup"
+      target="_blank"
+      rel="noopener noreferrer"
+    >
+      <img
+        src="https://img.shields.io/badge/❤️-Support%20openHop-FF5E5B"
+        alt="Support openHop"
+      />
+    </a>
+  </p>
+
+  <p style="margin: 12px 0;">
+    <a
+      href="https://docs.openhop.dev/projects/openhop-repeater/"
+      target="_blank"
+      rel="noopener noreferrer"
+    >
+      <img
+        src="https://img.shields.io/badge/📡-Open%20Repeater%20Docs-00617f"
+        alt="Open openHop Repeater documentation"
+      />
+    </a>
+  </p>
+
+  <span style="margin: 0 10px;">
+    <i class="fa fa-globe fa-fw" style="color: #f5f5f5;"></i>
+    <a
+      href="https://openhop.dev/"
+      target="_blank"
+      rel="noopener noreferrer"
+      style="text-decoration: none; color: #00617f;"
+    >Website</a>
+  </span>
+
+  <span style="margin: 0 10px;">
+    <i class="fa fa-github fa-fw" style="color: #f5f5f5;"></i>
+    <a
+      href="https://github.com/openhop-dev/openhop_repeater"
+      target="_blank"
+      rel="noopener noreferrer"
+      style="text-decoration: none; color: #00617f;"
+    >GitHub</a>
+  </span>
+
+  <span style="margin: 0 10px;">
+    <i class="fa fa-comments fa-fw" style="color: #f5f5f5;"></i>
+    <a
+      href="https://discord.gg/3s8MMaSTzq"
+      target="_blank"
+      rel="noopener noreferrer"
+      style="text-decoration: none; color: #00617f;"
+    >Discord</a>
+  </span>
+
+  <span style="margin: 0 10px;">
+    <i class="fa fa-comment-o fa-fw" style="color: #f5f5f5;"></i>
+    <a
+      href="https://github.com/openhop-dev/openhop_repeater/discussions"
+      target="_blank"
+      rel="noopener noreferrer"
+      style="text-decoration: none; color: #00617f;"
+    >Discussions</a>
+  </span>
+
+  <span style="margin: 0 10px;">
+    <i class="fa fa-exclamation-circle fa-fw" style="color: #f5f5f5;"></i>
+    <a
+      href="https://github.com/openhop-dev/openhop_repeater/issues"
+      target="_blank"
+      rel="noopener noreferrer"
+      style="text-decoration: none; color: #00617f;"
+    >Issues</a>
+  </span>
+</div>
+NOTES
+fi
+
 # ── Get container IP ──────────────────────────────────────────────────────
 sleep 2
 CT_IP=$(pct exec "$CTID" -- hostname -I 2>/dev/null | awk '{print $1}')
