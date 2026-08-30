@@ -310,15 +310,17 @@ whether to download the optional openHop Console WebUI. It will then:
 2. Create a privileged container with USB passthrough.
 3. Install the host-side CH341 udev rule only when selected. This is not needed
    for openHop Modem TCP or USB connections and defaults to No.
-4. Clone the repository and pre-seed CH341 GPIO pin mappings.
-5. Install an `update` command for Debian and openHop Repeater updates.
-6. Run `manage.sh install` inside the container.
-7. Optionally install openHop Console WebUI assets after Repeater installation.
+4. Start the container, wait for network access, then run a full Debian package
+   update and upgrade.
+5. Clone the repository and pre-seed CH341 GPIO pin mappings.
+6. Install an `update` command for Debian and openHop Repeater updates.
+7. Run `manage.sh install` inside the container.
+8. Optionally install openHop Console WebUI assets after Repeater installation.
    The public Console distribution repository is cloned to `/root/pymc_console`
    so it can be inspected and upgraded in the same way as Repeater. Console is
    not selected as the default frontend, allowing the Repeater setup wizard to
    be completed first.
-8. Display the dashboard URL.
+9. Display the dashboard URL.
 
 ### Default Container Settings
 

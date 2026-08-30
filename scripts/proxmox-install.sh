@@ -249,13 +249,21 @@ if [[ "$NETWORK_READY" != "true" ]]; then
 fi
 msg_ok "Container running with network"
 
+# ── Update Debian before installing Repeater ───────────────────────────────
+msg_info "Updating Debian packages inside container..."
+pct exec "$CTID" -- bash -c "
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get full-upgrade -y
+"
+msg_ok "Debian packages fully updated"
+
 # ── Bootstrap: install git, clone repo ────────────────────────────────────
 msg_info "Installing git inside container..."
 pct exec "$CTID" -- bash -c "
     export DEBIAN_FRONTEND=noninteractive
 
     # Fix locale warnings
-    apt-get update -qq
     apt-get install -y locales >/dev/null 2>&1
     sed -i 's/# en_US.UTF-8/en_US.UTF-8/' /etc/locale.gen
     locale-gen >/dev/null 2>&1

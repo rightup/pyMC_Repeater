@@ -70,6 +70,15 @@ def test_optional_vlan_is_validated_and_added_to_net0() -> None:
     assert "VLAN: ${VLAN_SUMMARY}" in script
 
 
+def test_installer_fully_updates_debian_before_cloning_repeater() -> None:
+    script = INSTALLER.read_text()
+
+    assert "apt-get update" in script
+    assert "apt-get full-upgrade -y" in script
+    assert script.index("apt-get update") < script.index("Cloning openhop-repeater")
+    assert script.index("apt-get full-upgrade -y") < script.index("Cloning openhop-repeater")
+
+
 def test_installer_fails_when_container_network_never_becomes_ready() -> None:
     script = INSTALLER.read_text()
 
