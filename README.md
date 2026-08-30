@@ -282,15 +282,19 @@ always-on deployments without dedicating a full Raspberry Pi.
 
 Software:
 
-- Proxmox VE 7.x or 8.x host
-- Internet access for the container
+- Proxmox VE 8.x or 9.x host; 9.x is recommended for new deployments
+- A matching Debian 13 standard LXC template available through `pveam`
+- Internet access from the container during installation and updates
 
 Hardware, choose one:
 
 - CH341 USB-to-SPI adapter with VID `1a86` and PID `5512`, connected to the
   Proxmox host and wired to an SX1262-based LoRa module such as an Ebyte
-  E22-900M30S
-- openHop Modem over TCP or USB, such as MeshSmith EtherMesh
+  E22-900M30S. Select the optional host-side CH341 udev rule for this setup.
+- openHop Modem over TCP, such as MeshSmith EtherMesh-1W, reachable from the
+  container network. This does not need the CH341 udev rule or a USB device.
+- openHop Modem over USB, connected to the Proxmox host. The installer enables
+  general USB passthrough by default; the CH341 udev rule is not needed.
 
 ### One-Line Install
 

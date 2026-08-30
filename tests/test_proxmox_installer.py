@@ -165,6 +165,10 @@ def test_readme_documents_new_installer_behavior() -> None:
     readme = README.read_text()
 
     assert "Download a Debian 13 LXC template" in readme
+    assert "Proxmox VE 8.x or 9.x host" in readme
+    assert "Proxmox VE 7.x" not in readme
+    assert "MeshSmith EtherMesh-1W" in readme
+    assert "general USB passthrough by default" in readme
     assert "host-side CH341 udev rule" in readme
     assert "openHop Console WebUI" in readme
     assert "Run `update` inside the LXC" in readme
