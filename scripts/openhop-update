@@ -71,7 +71,8 @@ if [[ "$CONSOLE_INSTALLED" == "true" ]]; then
             exit 1
         fi
         echo "==> Creating openHop Console checkout"
-        git clone --branch main --single-branch "$CONSOLE_REPO_URL" "$CONSOLE_REPO_DIR"
+        git clone --depth 1 --single-branch --branch main --no-tags \
+            "$CONSOLE_REPO_URL" "$CONSOLE_REPO_DIR"
         CONSOLE_CHECKOUT=true
     fi
 

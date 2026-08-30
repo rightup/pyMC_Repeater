@@ -151,10 +151,12 @@ def test_console_checkout_is_created_and_updated_when_console_is_installed() -> 
     installer = INSTALLER.read_text()
     updater = UPDATER.read_text()
 
-    assert "git clone --branch main --single-branch" in installer
+    shallow_clone = "git clone --depth 1 --single-branch --branch main --no-tags"
+    assert shallow_clone in installer
     assert "/root/pymc_console" in installer
     assert 'readonly CONSOLE_REPO_DIR="/root/pymc_console"' in updater
-    assert 'git clone --branch main --single-branch "$CONSOLE_REPO_URL"' in updater
+    assert shallow_clone in updater
+    assert '"$CONSOLE_REPO_URL" "$CONSOLE_REPO_DIR"' in updater
     assert 'git -C "$CONSOLE_REPO_DIR" pull --ff-only' in updater
     assert "ASSUME_YES=1 NO_COLOR=1 bash manage.sh upgrade" in updater
 

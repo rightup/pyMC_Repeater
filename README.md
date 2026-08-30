@@ -316,8 +316,9 @@ whether to download the optional openHop Console WebUI. It will then:
 6. Install an `update` command for Debian and openHop Repeater updates.
 7. Run `manage.sh install` inside the container.
 8. Optionally install openHop Console WebUI assets after Repeater installation.
-   The public Console distribution repository is cloned to `/root/pymc_console`
-   so it can be inspected and upgraded in the same way as Repeater. Console is
+   The public Console distribution repository is cloned as a depth-one,
+   single-branch checkout without tags at `/root/pymc_console`, minimizing disk
+   usage while keeping it upgradeable in the same way as Repeater. Console is
    not selected as the default frontend, allowing the Repeater setup wizard to
    be completed first.
 9. Display the dashboard URL.

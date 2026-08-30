@@ -345,7 +345,7 @@ msg_ok "manage.sh install completed"
 # ── Optional openHop Console WebUI ─────────────────────────────────────────
 if [[ "$INSTALL_CONSOLE" == "true" ]]; then
     msg_info "Cloning openHop Console distribution repository..."
-    pct exec "$CTID" -- git clone --branch main --single-branch \
+    pct exec "$CTID" -- git clone --depth 1 --single-branch --branch main --no-tags \
         "$CONSOLE_REPO" /root/pymc_console
     msg_ok "Console repository cloned to /root/pymc_console"
 
