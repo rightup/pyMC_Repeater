@@ -76,3 +76,40 @@ def test_never_raises_when_the_sensor_manager_misbehaves():
     daemon = RepeaterDaemon(_base_config(), radio=object())
     daemon.sensor_manager = SimpleNamespace(get_summary=boom)
     assert daemon._companion_battery_mv() == 0
+
+
+def test_frame_server_reports_battery_and_storage(tmp_path):
+    """The companion BATT_AND_STORAGE hook must return real values, not zeros."""
+    from repeater.companion.frame_server import CompanionFrameServer
+
+    fs = CompanionFrameServer.__new__(CompanionFrameServer)
+    fs.batt_getter = lambda: 4221
+    fs.storage_dir = str(tmp_path)
+
+    mv, used_kb, total_kb = fs._get_batt_and_storage()
+    assert mv == 4221
+    assert total_kb > 0
+    assert 0 <= used_kb <= total_kb
+
+
+def test_frame_server_battery_survives_a_broken_getter(tmp_path):
+    from repeater.companion.frame_server import CompanionFrameServer
+
+    fs = CompanionFrameServer.__new__(CompanionFrameServer)
+
+    def boom():
+        raise RuntimeError("sensor exploded")
+
+    fs.batt_getter = boom
+    fs.storage_dir = str(tmp_path)
+    mv, _, _ = fs._get_batt_and_storage()
+    assert mv == 0
+
+
+def test_frame_server_without_getters_returns_zeros():
+    from repeater.companion.frame_server import CompanionFrameServer
+
+    fs = CompanionFrameServer.__new__(CompanionFrameServer)
+    fs.batt_getter = None
+    fs.storage_dir = None
+    assert fs._get_batt_and_storage() == (0, 0, 0)

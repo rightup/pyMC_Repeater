@@ -957,6 +957,8 @@ class RepeaterDaemon:
                     sqlite_handler=sqlite_handler,
                     local_hash=self.local_hash,
                     stats_getter=self._get_companion_stats,
+                    batt_getter=self._companion_battery_mv,
+                    storage_dir=self._companion_storage_dir(),
                     control_handler=(
                         self.discovery_helper.control_handler if self.discovery_helper else None
                     ),
@@ -1198,6 +1200,8 @@ class RepeaterDaemon:
             sqlite_handler=sqlite_handler,
             local_hash=self.local_hash,
             stats_getter=self._get_companion_stats,
+            batt_getter=self._companion_battery_mv,
+            storage_dir=self._companion_storage_dir(),
             control_handler=(
                 self.discovery_helper.control_handler if self.discovery_helper else None
             ),
@@ -1440,6 +1444,14 @@ class RepeaterDaemon:
             stats["radio_error"] = self.radio_error
 
         return stats
+
+    def _companion_storage_dir(self) -> "str | None":
+        """Filesystem path companion clients should see storage figures for."""
+        try:
+            path = (self.config.get("storage", {}) or {}).get("storage_dir")
+            return path if path and os.path.isdir(path) else None
+        except Exception:  # pragma: no cover - defensive
+            return None
 
     def _companion_battery_mv(self) -> int:
         """Battery voltage in mV for the companion core-stats frame.
