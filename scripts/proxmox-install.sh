@@ -168,7 +168,7 @@ echo "  Cores: ${CT_CORES}  Storage: ${CT_STORAGE}  Bridge: ${CT_BRIDGE}  VLAN: 
 echo "  Branch: ${BRANCH}"
 echo "  CH341 host udev rule: ${CH341_UDEV_SUMMARY}"
 echo "  openHop Console WebUI: ${CONSOLE_SUMMARY}"
-echo "  Mode: privileged (required for USB passthrough)"
+echo "  Mode: privileged"
 echo ""
 read -p "  Proceed? [Y/n]: " -r
 [[ "${REPLY:-Y}" =~ ^[Nn]$ ]] && { msg_warn "Aborted"; exit 0; }
@@ -212,14 +212,18 @@ pct create "$CTID" "${CT_TEMPLATE_STORAGE}:vztmpl/${TEMPLATE_FILE}" \
 msg_ok "Container created"
 
 # ── USB passthrough ───────────────────────────────────────────────────────
-msg_info "Configuring USB passthrough..."
-cat >> "/etc/pve/lxc/${CTID}.conf" <<'EOF'
+if [[ "$INSTALL_CH341_UDEV" == "true" ]]; then
+    msg_info "Configuring USB passthrough..."
+    cat >> "/etc/pve/lxc/${CTID}.conf" <<'EOF'
 
 # CH341 USB passthrough for openHop Repeater
 lxc.cgroup2.devices.allow: c 189:* rwm
 lxc.mount.entry: /dev/bus/usb dev/bus/usb none bind,optional,create=dir 0 0
 EOF
-msg_ok "USB passthrough configured"
+    msg_ok "USB passthrough configured"
+else
+    msg_info "Skipping USB passthrough (CH341 not selected)"
+fi
 
 # ── Host udev rule ────────────────────────────────────────────────────────
 if [[ "$INSTALL_CH341_UDEV" == "true" ]]; then
