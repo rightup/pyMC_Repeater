@@ -92,6 +92,16 @@ def test_console_is_opt_in_installed_after_repeater_and_not_enabled() -> None:
     assert "web.web_path" not in script
 
 
+def test_installer_sets_proxmox_html_description() -> None:
+    script = INSTALLER.read_text()
+
+    assert 'pct set "$CTID" --description "$NOTES_TEXT"' in script
+    assert 'pct set "$CTID" --notes' not in script
+    assert "# USB passthrough for openHop Repeater" not in script
+    assert "openHop Repeater LXC" in script
+    assert "https://docs.openhop.dev/projects/openhop-repeater/" in script
+
+
 def test_installer_adds_update_command() -> None:
     script = INSTALLER.read_text()
 

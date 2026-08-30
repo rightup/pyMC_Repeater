@@ -214,8 +214,6 @@ msg_ok "Container created"
 # ── USB passthrough ───────────────────────────────────────────────────────
 msg_info "Configuring USB passthrough..."
 cat >> "/etc/pve/lxc/${CTID}.conf" <<'EOF'
-
-# USB passthrough for openHop Repeater
 lxc.cgroup2.devices.allow: c 189:* rwm
 lxc.mount.entry: /dev/bus/usb dev/bus/usb none bind,optional,create=dir 0 0
 EOF
@@ -360,9 +358,8 @@ if [[ "$INSTALL_CONSOLE" == "true" ]]; then
 fi
 
 # ── Container notes ───────────────────────────────────────────────────────
-if command -v pct &>/dev/null; then
-    NOTES_TMP=$(mktemp)
-    cat > "$NOTES_TMP" <<'NOTES'
+NOTES_TMP=$(mktemp)
+cat > "$NOTES_TMP" <<'NOTES'
 <div align="center">
   <a href="https://openhop.dev/" target="_blank" rel="noopener noreferrer">
     <img
@@ -454,11 +451,10 @@ if command -v pct &>/dev/null; then
   </span>
 </div>
 NOTES
-    NOTES_TEXT=$(cat "$NOTES_TMP")
-    rm -f "$NOTES_TMP"
-    pct set "$CTID" --notes "$NOTES_TEXT"
-    msg_ok "Container notes set"
-fi
+NOTES_TEXT=$(cat "$NOTES_TMP")
+rm -f "$NOTES_TMP"
+pct set "$CTID" --description "$NOTES_TEXT"
+msg_ok "Container notes set"
 
 # ── Get container IP ──────────────────────────────────────────────────────
 sleep 2
