@@ -212,18 +212,14 @@ pct create "$CTID" "${CT_TEMPLATE_STORAGE}:vztmpl/${TEMPLATE_FILE}" \
 msg_ok "Container created"
 
 # ── USB passthrough ───────────────────────────────────────────────────────
-if [[ "$INSTALL_CH341_UDEV" == "true" ]]; then
-    msg_info "Configuring USB passthrough..."
-    cat >> "/etc/pve/lxc/${CTID}.conf" <<'EOF'
+msg_info "Configuring USB passthrough..."
+cat >> "/etc/pve/lxc/${CTID}.conf" <<'EOF'
 
-# CH341 USB passthrough for openHop Repeater
+# USB passthrough for openHop Repeater
 lxc.cgroup2.devices.allow: c 189:* rwm
 lxc.mount.entry: /dev/bus/usb dev/bus/usb none bind,optional,create=dir 0 0
 EOF
-    msg_ok "USB passthrough configured"
-else
-    msg_info "Skipping USB passthrough (CH341 not selected)"
-fi
+msg_ok "USB passthrough configured"
 
 # ── Host udev rule ────────────────────────────────────────────────────────
 if [[ "$INSTALL_CH341_UDEV" == "true" ]]; then
