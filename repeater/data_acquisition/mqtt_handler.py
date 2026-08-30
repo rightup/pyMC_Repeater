@@ -1082,6 +1082,12 @@ class MeshCoreToMqttPusher:
                             f"Skipped own-TX publish to {conn.broker['name']} "
                             f"(publish_tx={conn.publish_tx})"
                         )
+                        # Record the deliberate skip, matching the disabled-broker
+                        # convention below. Without this a tx record that every
+                        # broker declines leaves ``results`` empty and trips the
+                        # "No active broker connections" warning, which points
+                        # operators at a connectivity problem that does not exist.
+                        results.append((conn.broker["name"], "Skipped: publish_tx"))
                         continue
                     result = conn.publish(subtopic, message, retain=retain, qos=qos)
                     results.append((conn.broker["name"], result))

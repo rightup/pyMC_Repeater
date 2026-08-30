@@ -259,6 +259,30 @@ def test_yaml_bare_on_enables_own_tx_end_to_end():
     assert [p["direction"] for p in _payloads(captured)] == ["rx", "tx"]
 
 
+def test_declined_tx_does_not_look_like_a_connectivity_failure(caplog):
+    """A tx record every broker declines must not warn about broker connections.
+
+    Regression: the skip used to `continue` without recording a result, leaving
+    ``results`` empty and emitting "No active broker connections" -- which sends
+    operators chasing a connectivity problem that does not exist.
+    """
+    pusher = MeshCoreToMqttPusher(
+        local_identity=_FakeIdentity(PUBLIC_KEY_HEX), config=_make_config(publish_tx="off")
+    )
+    conn = pusher.connections[0]
+    _attach_capturing_client(conn)
+
+    tx = PacketRecord.from_packet_record(
+        _packet_record(), origin="n", origin_id=PUBLIC_KEY_HEX.upper(), direction="tx"
+    )
+    with caplog.at_level("WARNING", logger="MQTTHandler"):
+        results = pusher.publish_packet(tx.to_dict())
+
+    assert results, "a deliberate skip must still be reported as a result"
+    assert results[0][1] == "Skipped: publish_tx"
+    assert "No active broker connections" not in caplog.text
+
+
 def test_invalid_publish_tx_falls_back_to_off():
     """A typo must fail closed, never start uplinking unexpectedly."""
     pusher = MeshCoreToMqttPusher(
