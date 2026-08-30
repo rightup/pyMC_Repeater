@@ -33,7 +33,7 @@ class PacketRecord:
 
     @classmethod
     def from_packet_record(
-        cls, packet_record: dict, origin: str, origin_id: str
+        cls, packet_record: dict, origin: str, origin_id: str, direction: str = "rx"
     ) -> Optional["PacketRecord"]:
         """
         Create PacketRecord from internal packet_record format.
@@ -48,11 +48,19 @@ class PacketRecord:
             packet_record: Internal packet record dictionary
             origin: Node name
             origin_id: Public key of the node
+            direction: ``"rx"`` serializes the packet as received. ``"tx"``
+                serializes this node's own transmission of it, using
+                ``raw_packet_tx`` (the forwarded bytes, which carry this node's
+                path hash). A half-duplex radio never receives its own
+                transmission, so the ``tx`` variant is the only way this node's
+                hash can appear in what it publishes.
 
         Returns:
-            PacketRecord instance or None if raw_packet is missing
+            PacketRecord instance or None if the required raw bytes are missing
         """
-        if "raw_packet" not in packet_record or not packet_record["raw_packet"]:
+        raw_key = "raw_packet_tx" if direction == "tx" else "raw_packet"
+        raw_packet = packet_record.get(raw_key)
+        if not raw_packet:
             return None
 
         # Extract timestamp and format date/time
@@ -70,16 +78,18 @@ class PacketRecord:
             origin_id=origin_id,
             timestamp=dt.isoformat(),
             type="PACKET",
-            direction="rx",
+            direction=direction,
             time=dt.strftime("%H:%M:%S"),
             date=dt.strftime("%-d/%-m/%Y"),
-            len=str(len(packet_record["raw_packet"]) // 2),
+            len=str(len(raw_packet) // 2),
             packet_type=str(packet_record.get("type", 0)),
             route=route,
             payload_len=str(packet_record.get("payload_length", 0)),
-            raw=packet_record["raw_packet"],
-            SNR=str(packet_record.get("snr", 0)),
-            RSSI=str(packet_record.get("rssi", 0)),
+            raw=raw_packet,
+            # A node cannot measure the signal of its own transmission, so the
+            # receive-side SNR/RSSI would be misleading on a tx record.
+            SNR="0" if direction == "tx" else str(packet_record.get("snr", 0)),
+            RSSI="0" if direction == "tx" else str(packet_record.get("rssi", 0)),
             score=str(int(packet_record.get("score", 0) * 1000)),
             duration=str(int(round(airtime_ms))),
             hash=packet_record.get("packet_hash", ""),

@@ -347,6 +347,27 @@ class StorageCollector:
             else:
                 logger.debug("Skipped mqtt publish: packet missing raw_packet data")
 
+            # Publish this node's own transmission of the packet as a separate
+            # ``direction: "tx"`` record. The radio is half-duplex, so nothing we
+            # receive can ever contain our own path hash -- without this, relays
+            # performed by this node are invisible to MQTT aggregators unless a
+            # second observer happens to be in range. Opt-in per broker via
+            # ``publish_tx``; brokers that did not opt in drop it in the handler.
+            if (
+                packet_record.get("transmitted")
+                and packet_record.get("raw_packet_tx")
+                and self.mqtt_handler.wants_own_tx()
+            ):
+                tx_packet = PacketRecord.from_packet_record(
+                    packet_record,
+                    origin=node_name,
+                    origin_id=self.mqtt_handler.public_key,
+                    direction="tx",
+                )
+                if tx_packet:
+                    self.mqtt_handler.publish_packet(tx_packet.to_dict())
+                    logger.debug(f"Published own TX of type 0x{packet_type:02X} to mqtt")
+
         except Exception as e:
             logger.error(f"Failed to publish packet to mqtt: {e}", exc_info=True)
 

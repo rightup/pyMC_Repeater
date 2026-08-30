@@ -362,6 +362,7 @@ class RepeaterHandler(BaseHandler):
             else self.process_packet(processed_packet, snr, packet_hash=pkt_hash_full)
         )
         forwarded_path_hashes = None
+        forwarded_raw = None
 
         # For local transmissions, create a direct transmission result (if local TX allowed)
         if local_transmission and allow_local_tx:
@@ -380,6 +381,16 @@ class RepeaterHandler(BaseHandler):
 
             # Capture the forwarded path (after modification)
             forwarded_path_hashes = fwd_pkt.get_path_hashes_hex()
+
+            # Capture the exact bytes we put on the air. These differ from
+            # ``raw_packet`` (as received) because the forwarded packet carries
+            # this node's own path hash. A half-duplex radio never hears its own
+            # transmission, so this is the only record of it that exists.
+            try:
+                forwarded_raw = fwd_pkt.write_to().hex() if hasattr(fwd_pkt, "write_to") else None
+            except Exception as e:
+                logger.debug(f"Could not serialize forwarded packet: {e}")
+                forwarded_raw = None
 
             # MeshCore queues multi-ack redundancy copies ahead of the primary
             # ACK at the same scheduled time, so create their TX tasks first.
@@ -571,6 +582,7 @@ class RepeaterHandler(BaseHandler):
             drop_reason=drop_reason,
             is_duplicate=is_dupe,
             forwarded_path=forwarded_path_hashes,
+            forwarded_raw=forwarded_raw,
             tx_delay_ms=tx_delay_ms,
             rx_radio_id=rx_radio_id,
             tx_radio_id=tx_radio_id,
@@ -821,6 +833,7 @@ class RepeaterHandler(BaseHandler):
         drop_reason: Optional[str] = None,
         is_duplicate: bool = False,
         forwarded_path=None,
+        forwarded_raw: Optional[str] = None,
         tx_delay_ms: float = 0.0,
         rx_radio_id: Optional[str] = None,
         tx_radio_id: Optional[str] = None,
@@ -895,6 +908,9 @@ class RepeaterHandler(BaseHandler):
             "upstream_hash": upstream_hash,
             "upstream_hash_size": upstream_hash_size,
             "raw_packet": packet.write_to().hex() if hasattr(packet, "write_to") else None,
+            # Bytes actually transmitted (includes our own path hash); None when
+            # this packet was not forwarded.
+            "raw_packet_tx": forwarded_raw,
             "lbt_attempts": lbt_attempts,
             "lbt_backoff_delays_ms": lbt_backoff_delays_ms,
             "lbt_channel_busy": lbt_channel_busy,
