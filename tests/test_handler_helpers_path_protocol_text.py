@@ -774,6 +774,41 @@ def test_telemetry_admin_full_mask_includes_environment_sensors():
     assert lpp == expected
 
 
+def test_station_g3_subwatt_power_uses_lpp_one_watt_resolution():
+    sm = _FakeSensorManager([_reading(bus_voltage_v=12.46, current_ma=59.7, power_mw=744.0)])
+    helper = ProtocolRequestHelper(
+        identity_manager=MagicMock(), packet_injector=AsyncMock(), sensor_manager=sm
+    )
+    admin = SimpleNamespace(is_guest=lambda: False)
+
+    lpp = helper._handle_get_telemetry(admin, 0, b"\x00")
+
+    expected = (
+        encode_voltage(TELEM_CHANNEL_SELF, 12.46)
+        + encode_voltage(TELEM_CHANNEL_SELF + 1, 12.46)
+        + encode_current(TELEM_CHANNEL_SELF + 1, 0.0597)
+        + encode_power(TELEM_CHANNEL_SELF + 1, 0)
+    )
+    assert lpp == expected
+
+
+def test_negative_power_is_preserved_as_current_but_omitted_from_unsigned_lpp_power():
+    sm = _FakeSensorManager([_reading(bus_voltage_v=12.46, current_ma=-59.7, power_mw=-744.0)])
+    helper = ProtocolRequestHelper(
+        identity_manager=MagicMock(), packet_injector=AsyncMock(), sensor_manager=sm
+    )
+    admin = SimpleNamespace(is_guest=lambda: False)
+
+    lpp = helper._handle_get_telemetry(admin, 0, b"\x00")
+
+    expected = (
+        encode_voltage(TELEM_CHANNEL_SELF, 12.46)
+        + encode_voltage(TELEM_CHANNEL_SELF + 1, 12.46)
+        + encode_current(TELEM_CHANNEL_SELF + 1, -0.0597)
+    )
+    assert lpp == expected
+
+
 def test_telemetry_bme280_emits_temperature_humidity_and_pressure_on_one_channel():
     """A BME280-shaped reading emits all three measured values on one channel.
 

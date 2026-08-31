@@ -197,16 +197,37 @@ class OpenHopModemSensor(SensorBase):
             "battery_percent",
             "battery_percentage",
             "solar_charge_rate_percent_per_hour",
-            "bus_voltage_v",
-            "current_ma",
-            "power_mw",
         ):
             if key in payload:
                 out[key] = payload[key]
 
-        for key in ("battery_voltage_mv", "battery_voltage_v", "current_ma", "power_mw"):
+        for key in ("bus_voltage_v", "current_ma", "power_mw"):
+            value = self._float(payload.get(key))
+            if value is not None:
+                out[key] = value
+
+        for key in ("battery_voltage_mv", "battery_voltage_v"):
             if out.get(key) is None and system.get(key) is not None:
                 out[key] = system[key]
+
+        station_g3_fallbacks = {
+            "bus_voltage_v": ("bus_voltage_v", "station_g3_input_voltage_v"),
+            "current_ma": ("current_ma", "station_g3_current_ma"),
+            "power_mw": ("power_mw",),
+        }
+        for output_key, system_keys in station_g3_fallbacks.items():
+            if out.get(output_key) is not None:
+                continue
+            for system_key in system_keys:
+                value = self._float(system.get(system_key))
+                if value is not None:
+                    out[output_key] = value
+                    break
+
+        if out.get("power_mw") is None:
+            power_w = self._float(system.get("station_g3_power_w"))
+            if power_w is not None:
+                out["power_mw"] = power_w * 1000.0
 
         if "battery_percent" not in out:
             battery_voltage_v = self._float(out.get("battery_voltage_v"))

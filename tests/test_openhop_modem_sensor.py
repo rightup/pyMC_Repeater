@@ -137,6 +137,69 @@ def test_openhop_modem_sensor_accepts_legacy_token_flag():
     assert data["token_configured"] is True
 
 
+def test_openhop_modem_sensor_prefers_top_level_power_telemetry():
+    sensor = OpenHopModemSensor("modem", {"settings": {"base_url": "http://modem.local"}})
+
+    data = sensor._normalize_payload(
+        {
+            "bus_voltage_v": 12.46,
+            "current_ma": 59.7,
+            "power_mw": 744.0,
+            "system": {
+                "station_g3_input_voltage_v": 11.0,
+                "station_g3_current_ma": 50.0,
+                "station_g3_power_w": 0.55,
+            },
+        }
+    )
+
+    assert data["bus_voltage_v"] == 12.46
+    assert data["current_ma"] == 59.7
+    assert data["power_mw"] == 744.0
+
+
+def test_openhop_modem_sensor_falls_back_to_legacy_station_g3_power_fields():
+    sensor = OpenHopModemSensor("modem", {"settings": {"base_url": "http://modem.local"}})
+
+    data = sensor._normalize_payload(
+        {
+            "bus_voltage_v": None,
+            "current_ma": None,
+            "power_mw": None,
+            "system": {
+                "station_g3_input_voltage_v": "12.46",
+                "station_g3_current_ma": "-59.7",
+                "station_g3_power_w": "-0.744",
+            },
+        }
+    )
+
+    assert data["bus_voltage_v"] == 12.46
+    assert data["current_ma"] == -59.7
+    assert data["power_mw"] == -744.0
+
+
+def test_openhop_modem_sensor_omits_invalid_power_telemetry():
+    sensor = OpenHopModemSensor("modem", {"settings": {"base_url": "http://modem.local"}})
+
+    data = sensor._normalize_payload(
+        {
+            "bus_voltage_v": "invalid",
+            "current_ma": "invalid",
+            "power_mw": "invalid",
+            "system": {
+                "station_g3_input_voltage_v": None,
+                "station_g3_current_ma": None,
+                "station_g3_power_w": None,
+            },
+        }
+    )
+
+    assert "bus_voltage_v" not in data
+    assert "current_ma" not in data
+    assert "power_mw" not in data
+
+
 def test_legacy_pymc_modem_module_and_registry_create_canonical_sensor():
     assert PymcModemSensor is OpenHopModemSensor
     legacy = SensorRegistry.create(
