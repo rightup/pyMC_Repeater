@@ -275,22 +275,26 @@ The upgrade script will:
 ## Proxmox LXC Installation
 
 openHop Repeater can run inside a Proxmox LXC container using a CH341 USB-to-SPI
-adapter or a TCP modem. This is useful for headless, always-on deployments
-without dedicating a full Raspberry Pi.
+adapter or an openHop Modem over TCP or USB. This is useful for headless,
+always-on deployments without dedicating a full Raspberry Pi.
 
 ### Requirements
 
 Software:
 
-- Proxmox VE 7.x or 8.x host
-- Internet access for the container
+- Proxmox VE 8.x or 9.x host; 9.x is recommended for new deployments
+- A matching Debian 13 standard LXC template available through `pveam`
+- Internet access from the container during installation and updates
 
 Hardware, choose one:
 
 - CH341 USB-to-SPI adapter with VID `1a86` and PID `5512`, connected to the
   Proxmox host and wired to an SX1262-based LoRa module such as an Ebyte
-  E22-900M30S
-- TCP modem, such as MeshSmith EtherMesh
+  E22-900M30S. Select the optional host-side CH341 udev rule for this setup.
+- openHop Modem over TCP, such as MeshSmith EtherMesh-1W, reachable from the
+  container network. This does not need the CH341 udev rule or a USB device.
+- openHop Modem over USB, connected to the Proxmox host. The installer enables
+  general USB passthrough by default; the CH341 udev rule is not needed.
 
 ### One-Line Install
 
@@ -303,14 +307,25 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/openhop-dev/openhop_repe
 Replace `main` in the URL with another branch name if needed.
 
 The installer will prompt for container settings (container ID, hostname, RAM,
-disk, bridge, etc.) and then:
+disk, bridge, etc.), whether to install the host-side CH341 udev rule, and
+whether to download the optional openHop Console WebUI. It will then:
 
-1. Download a Debian 12 LXC template.
+1. Download a Debian 13 LXC template matching the Proxmox host architecture.
 2. Create a privileged container with USB passthrough.
-3. Install a host-side udev rule for the CH341 device.
-4. Clone the repository and pre-seed CH341 GPIO pin mappings.
-5. Run `manage.sh install` inside the container.
-6. Display the dashboard URL.
+3. Install the host-side CH341 udev rule only when selected. This is not needed
+   for openHop Modem TCP or USB connections and defaults to No.
+4. Start the container, wait for network access, then run a full Debian package
+   update and upgrade.
+5. Clone the repository and pre-seed CH341 GPIO pin mappings.
+6. Install an `update` command for Debian and openHop Repeater updates.
+7. Run `manage.sh install` inside the container.
+8. Optionally install openHop Console WebUI assets after Repeater installation.
+   The public Console distribution repository is cloned as a depth-one,
+   single-branch checkout without tags at `/root/pymc_console`, minimizing disk
+   usage while keeping it upgradeable in the same way as Repeater. Console is
+   not selected as the default frontend, allowing the Repeater setup wizard to
+   be completed first.
+9. Display the dashboard URL.
 
 ### Default Container Settings
 
@@ -322,8 +337,11 @@ disk, bridge, etc.) and then:
 | Disk | 4 GB |
 | CPU cores | 2 |
 | Bridge | `vmbr0` |
+| VLAN ID | None |
 | Storage | `local-lvm` |
-| Password | `pymc` |
+| Password | `openHop1!` |
+| Host-side CH341 udev rule | No |
+| openHop Console WebUI | No |
 
 ### After Installation
 
@@ -338,6 +356,18 @@ journalctl -u openhop-repeater -f
 cd /opt/openhop_repeater
 bash manage.sh
 ```
+
+Run `update` inside the LXC to update Debian packages, fast-forward the branch
+selected during installation, and run `manage.sh upgrade`. The command first
+lists every action and requires a `y/N` confirmation. When Console is installed,
+it also updates `/root/pymc_console` and refreshes the Console assets:
+
+```bash
+update
+```
+
+If openHop Console WebUI was installed, complete the Repeater setup wizard
+before selecting `openHop Console` from Web Settings.
 
 Open the dashboard at:
 
