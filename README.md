@@ -39,7 +39,7 @@ hackable architecture:
 - Packet routing, policy checks, storage, sensors, GPS, MQTT, and optional
   pyMC_Glass integration are kept in modular components.
 - Hardware support covers direct SPI radios, CH341 USB-to-SPI adapters,
-  pyMC TCP/USB modem firmware, and KISS serial modems.
+  openHop TCP/USB modem firmware, and KISS serial modems.
 
 Real-world deployment feedback is especially welcome. Dense networks, unusual
 hardware, and production-style installations are the best way to find the rough
@@ -81,8 +81,8 @@ openHop Repeater supports these radio backends:
 |-----------|--------|
 | Native SX1262 SPI radio | Supported |
 | CH341 USB-to-SPI bridge | Supported |
-| pyMC TCP modem | Supported |
-| pyMC USB-CDC modem | Supported |
+| openHop TCP modem | Supported |
+| openHop USB-CDC modem | Supported |
 | KISS serial modem | Supported |
 | UART-only HATs | Not supported |
 | SX1302/SX1303 concentrator boards | Not supported |
@@ -612,7 +612,7 @@ Pre-commit hooks will automatically:
 
 ## Support
 
-- [pyMC Core](https://github.com/openhop-dev/openhop_core)
+- [openHop Core](https://github.com/openhop-dev/openhop_core)
 - [MeshCore Discord](https://meshcore.gg)
 
 ## Disclaimer
