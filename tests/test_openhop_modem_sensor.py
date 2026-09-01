@@ -158,14 +158,11 @@ def test_openhop_modem_sensor_prefers_top_level_power_telemetry():
     assert data["power_mw"] == 744.0
 
 
-def test_openhop_modem_sensor_falls_back_to_legacy_station_g3_power_fields():
+def test_openhop_modem_sensor_ignores_legacy_station_g3_power_fields():
     sensor = OpenHopModemSensor("modem", {"settings": {"base_url": "http://modem.local"}})
 
     data = sensor._normalize_payload(
         {
-            "bus_voltage_v": None,
-            "current_ma": None,
-            "power_mw": None,
             "system": {
                 "station_g3_input_voltage_v": "12.46",
                 "station_g3_current_ma": "-59.7",
@@ -174,9 +171,9 @@ def test_openhop_modem_sensor_falls_back_to_legacy_station_g3_power_fields():
         }
     )
 
-    assert data["bus_voltage_v"] == 12.46
-    assert data["current_ma"] == -59.7
-    assert data["power_mw"] == -744.0
+    assert "bus_voltage_v" not in data
+    assert "current_ma" not in data
+    assert "power_mw" not in data
 
 
 def test_openhop_modem_sensor_omits_invalid_power_telemetry():
