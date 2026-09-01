@@ -358,8 +358,11 @@ class ProtocolRequestHelper:
         power = data.get("power_mw")
         if power is not None:
             try:
-                out.extend(encode_power(channel, int(float(power) / 1000.0)))
-            except (TypeError, ValueError):
+                power_mw = float(power)
+                watts = int(power_mw / 1000.0)
+                if power_mw >= 0.0 and watts <= 0xFFFF:
+                    out.extend(encode_power(channel, watts))
+            except (TypeError, ValueError, OverflowError):
                 pass
         return bytes(out)
 

@@ -201,6 +201,11 @@ class OpenHopModemSensor(SensorBase):
             if key in payload:
                 out[key] = payload[key]
 
+        for key in ("bus_voltage_v", "current_ma", "power_mw"):
+            value = self._float(payload.get(key))
+            if value is not None:
+                out[key] = value
+
         for key in ("battery_voltage_mv", "battery_voltage_v"):
             if out.get(key) is None and system.get(key) is not None:
                 out[key] = system[key]
