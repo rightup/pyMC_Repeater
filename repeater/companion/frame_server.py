@@ -10,11 +10,20 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import struct
 from typing import Optional
 
-from openhop_core.companion.constants import RESP_CODE_NO_MORE_MESSAGES
+from openhop_core.companion.constants import (
+    ERR_CODE_ILLEGAL_ARG,
+    ERR_CODE_NOT_FOUND,
+    MAX_FRAME_SIZE,
+    PUB_KEY_SIZE,
+    RESP_CODE_NO_MORE_MESSAGES,
+)
 from openhop_core.companion.frame_server import CompanionFrameServer as _BaseFrameServer
 from openhop_core.companion.models import QueuedMessage
+
+from repeater.companion.bridge import normalize_region_name
 
 logger = logging.getLogger("CompanionFrameServer")
 
@@ -53,6 +62,53 @@ class CompanionFrameServer(_BaseFrameServer):
             control_handler=control_handler,
         )
         self.sqlite_handler = sqlite_handler
+
+    async def _cmd_send_channel_txt_msg(self, data: bytes) -> None:
+        if data and data[0] == 0x81:
+            # A distinct response cannot be confused with an ordinary send's OK.
+            if data != b"\x81\x00\x00\x00\x00\x00":
+                self._write_err(ERR_CODE_ILLEGAL_ARG)
+                return
+            public_key = self.bridge.get_public_key()
+            if len(public_key) != PUB_KEY_SIZE:
+                self._write_err(ERR_CODE_ILLEGAL_ARG)
+                return
+            self._write_frame(b"\xf0OHREG1" + public_key)
+            return
+        if data and data[0] == 0x80:
+            # Count the command byte as part of the upstream Frame payload cap.
+            if len(data) < 9 or len(data) + 1 > MAX_FRAME_SIZE:
+                self._write_err(ERR_CODE_ILLEGAL_ARG)
+                return
+            channel_idx = data[1]
+            timestamp = struct.unpack("<I", data[2:6])[0]
+            region_length = data[6]
+            if not 1 <= region_length <= 30 or len(data) <= 7 + region_length:
+                self._write_err(ERR_CODE_ILLEGAL_ARG)
+                return
+            try:
+                region = data[7 : 7 + region_length].decode("ascii")
+                if normalize_region_name(region) != region:
+                    raise ValueError("wire region must be canonical")
+                text = data[7 + region_length :].decode("utf-8")
+                if not text.strip() or "\x00" in text:
+                    raise ValueError("invalid channel text")
+            except ValueError:
+                self._write_err(ERR_CODE_ILLEGAL_ARG)
+                return
+            if self.bridge.get_channel(channel_idx) is None:
+                self._write_err(ERR_CODE_NOT_FOUND)
+                return
+            try:
+                ok = await self.bridge.send_channel_message(
+                    channel_idx, text, timestamp=timestamp, region=region
+                )
+            except ValueError:
+                self._write_err(ERR_CODE_ILLEGAL_ARG)
+                return
+            self._write_ok() if ok else self._write_err(ERR_CODE_NOT_FOUND)
+            return
+        await super()._cmd_send_channel_txt_msg(data)
 
     async def start(self) -> None:
         """Start persistence before accepting companion client connections."""
