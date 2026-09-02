@@ -89,6 +89,23 @@ def test_never_raises_when_the_sensor_manager_misbehaves():
     assert daemon._companion_battery_mv() == 0
 
 
+def test_companion_storage_dir_uses_default_path():
+    assert _daemon()._companion_storage_dir() == "/var/lib/openhop_repeater"
+
+
+def test_companion_storage_dir_supports_legacy_top_level_setting(tmp_path):
+    daemon = _daemon()
+    daemon.config["storage_dir"] = str(tmp_path)
+    assert daemon._companion_storage_dir() == str(tmp_path)
+
+
+def test_companion_storage_dir_resolves_relative_to_config(tmp_path):
+    daemon = _daemon()
+    daemon.config["storage"] = {"storage_dir": "data"}
+    daemon.__dict__["config_path"] = str(tmp_path / "config.yaml")
+    assert daemon._companion_storage_dir() == str(tmp_path / "data")
+
+
 def test_frame_server_reports_battery_and_storage(tmp_path):
     """The companion BATT_AND_STORAGE hook must return real values, not zeros."""
     from repeater.companion.frame_server import CompanionFrameServer

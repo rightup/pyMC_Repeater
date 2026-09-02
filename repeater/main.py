@@ -26,6 +26,7 @@ from repeater.config import (
     NullRadio,
     build_radio_stack,
     load_config,
+    resolve_storage_dir,
     save_config,
 )
 from repeater.config_manager import ConfigManager
@@ -1449,8 +1450,12 @@ class RepeaterDaemon:
     def _companion_storage_dir(self) -> "str | None":
         """Filesystem path companion clients should see storage figures for."""
         try:
-            path = (self.config.get("storage", {}) or {}).get("storage_dir")
-            return path if path and os.path.isdir(path) else None
+            return str(
+                resolve_storage_dir(
+                    self.config,
+                    config_path=getattr(self, "config_path", None),
+                )
+            )
         except Exception:  # pragma: no cover - defensive
             return None
 
