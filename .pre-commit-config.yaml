@@ -46,7 +46,7 @@ repos:
     hooks:
       - id: openapi-contract-check
         name: OpenAPI contract check
-        entry: python scripts/check_openapi_contract.py
+        entry: python scripts/check_openapi_contract.py --strict-methods
         language: python
         additional_dependencies: [PyYAML]
         pass_filenames: false
