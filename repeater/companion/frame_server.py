@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import shutil
 from typing import Callable, Optional
 
@@ -40,8 +39,8 @@ class CompanionFrameServer(_BaseFrameServer):
         local_hash: Optional[int] = None,
         stats_getter=None,
         control_handler=None,
-        batt_getter: Optional[Callable[[], int]] = None,
-        storage_dir: Optional[str] = None,
+        batt_getter: Callable[[], int] | None = None,
+        storage_dir: str | None = None,
     ):
         super().__init__(
             bridge=bridge,

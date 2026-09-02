@@ -5,7 +5,15 @@ connected device's battery. The repeater used to hardcode 0, so companion apps
 always showed no battery even when a sensor plug-in was reporting one.
 """
 
+import struct
 from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+import pytest
+from openhop_core.companion.constants import (
+    CMD_GET_BATT_AND_STORAGE,
+    RESP_CODE_BATT_AND_STORAGE,
+)
 
 from repeater.main import RepeaterDaemon
 
@@ -65,6 +73,9 @@ def test_ignores_out_of_range_and_unparseable_values():
         {"battery_voltage_mv": 70000},
         {"battery_voltage_mv": "n/a"},
         {"battery_voltage_v": None},
+        {"battery_voltage_mv": float("nan")},
+        {"battery_voltage_mv": float("inf")},
+        {"battery_voltage_v": float("-inf")},
     ):
         assert _daemon([_reading("modem", data)])._companion_battery_mv() == 0
 
@@ -113,3 +124,26 @@ def test_frame_server_without_getters_returns_zeros():
     fs.batt_getter = None
     fs.storage_dir = None
     assert fs._get_batt_and_storage() == (0, 0, 0)
+
+
+@pytest.mark.asyncio
+async def test_get_batt_and_storage_command_dispatches_real_values(tmp_path):
+    """Exercise the real command registry and response-frame encoding path."""
+    from repeater.companion.frame_server import CompanionFrameServer
+
+    fs = CompanionFrameServer(
+        bridge=SimpleNamespace(),
+        companion_hash="test",
+        batt_getter=lambda: 4221,
+        storage_dir=str(tmp_path),
+    )
+    fs._write_frame = MagicMock()
+
+    await fs._handle_cmd(bytes([CMD_GET_BATT_AND_STORAGE]))
+
+    frame = fs._write_frame.call_args.args[0]
+    response_code, millivolts, used_kb, total_kb = struct.unpack("<BHII", frame)
+    assert response_code == RESP_CODE_BATT_AND_STORAGE
+    assert millivolts == 4221
+    assert total_kb > 0
+    assert 0 <= used_kb <= total_kb

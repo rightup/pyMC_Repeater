@@ -1,6 +1,7 @@
 import asyncio
 import functools
 import logging
+import math
 import os
 import signal
 import socket
@@ -1490,9 +1491,12 @@ class RepeaterDaemon:
                 except (TypeError, ValueError):
                     continue
             try:
-                millivolts = round(float(millivolts))
-            except (TypeError, ValueError):
+                millivolts = float(millivolts)
+            except (TypeError, ValueError, OverflowError):
                 continue
+            if not math.isfinite(millivolts):
+                continue
+            millivolts = round(millivolts)
 
             # The core-stats frame packs battery_mv as an unsigned 16-bit int.
             if 0 < millivolts <= 0xFFFF:
