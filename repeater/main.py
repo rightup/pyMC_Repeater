@@ -1,6 +1,7 @@
 import asyncio
 import functools
 import logging
+import math
 import os
 import signal
 import socket
@@ -25,6 +26,7 @@ from repeater.config import (
     NullRadio,
     build_radio_stack,
     load_config,
+    resolve_storage_dir,
     save_config,
 )
 from repeater.config_manager import ConfigManager
@@ -957,6 +959,8 @@ class RepeaterDaemon:
                     sqlite_handler=sqlite_handler,
                     local_hash=self.local_hash,
                     stats_getter=self._get_companion_stats,
+                    batt_getter=self._companion_battery_mv,
+                    storage_dir=self._companion_storage_dir(),
                     control_handler=(
                         self.discovery_helper.control_handler if self.discovery_helper else None
                     ),
@@ -1198,6 +1202,8 @@ class RepeaterDaemon:
             sqlite_handler=sqlite_handler,
             local_hash=self.local_hash,
             stats_getter=self._get_companion_stats,
+            batt_getter=self._companion_battery_mv,
+            storage_dir=self._companion_storage_dir(),
             control_handler=(
                 self.discovery_helper.control_handler if self.discovery_helper else None
             ),
@@ -1441,6 +1447,67 @@ class RepeaterDaemon:
 
         return stats
 
+    def _companion_storage_dir(self) -> "str | None":
+        """Filesystem path companion clients should see storage figures for."""
+        try:
+            return str(
+                resolve_storage_dir(
+                    self.config,
+                    config_path=getattr(self, "config_path", None),
+                )
+            )
+        except Exception:  # pragma: no cover - defensive
+            return None
+
+    def _companion_battery_mv(self) -> int:
+        """Battery voltage in mV for the companion core-stats frame.
+
+        MeshCore companion clients show the battery of the device they are
+        connected to. A Python repeater has no battery of its own, but a sensor
+        plug-in often reports one -- an attached UPS HAT, or the battery of an
+        openHop modem the repeater is driving -- so surface the first sensor
+        publishing a usable voltage instead of always reporting 0.
+
+        Returns 0 when nothing is available, which is what clients already
+        expect for a mains-powered node.
+        """
+        if not self.sensor_manager:
+            return 0
+        try:
+            readings = (self.sensor_manager.get_summary() or {}).get("readings") or []
+        except Exception:  # pragma: no cover - defensive; stats must never raise
+            logger.debug("companion battery lookup failed", exc_info=True)
+            return 0
+
+        for reading in readings:
+            if not isinstance(reading, dict) or not reading.get("ok"):
+                continue
+            data = reading.get("data")
+            if not isinstance(data, dict):
+                continue
+
+            millivolts = data.get("battery_voltage_mv")
+            if millivolts is None:
+                volts = data.get("battery_voltage_v")
+                if volts is None:
+                    continue
+                try:
+                    millivolts = float(volts) * 1000.0
+                except (TypeError, ValueError):
+                    continue
+            try:
+                millivolts = float(millivolts)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if not math.isfinite(millivolts):
+                continue
+            millivolts = round(millivolts)
+
+            # The core-stats frame packs battery_mv as an unsigned 16-bit int.
+            if 0 < millivolts <= 0xFFFF:
+                return millivolts
+        return 0
+
     async def _get_companion_stats(self, stats_type: int) -> dict:
         """Return stats dict for companion CMD_GET_STATS (format expected by frame_server + meshcore_py)."""
         from repeater.companion.constants import (
@@ -1459,7 +1526,7 @@ class RepeaterDaemon:
             queue_len += getattr(getattr(bridge, "message_queue", None), "count", 0) or 0
         if stats_type == STATS_TYPE_CORE:
             return {
-                "battery_mv": 0,
+                "battery_mv": self._companion_battery_mv(),
                 "uptime_secs": uptime_secs,
                 "errors": 0,
                 "queue_len": min(255, queue_len),

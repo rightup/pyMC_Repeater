@@ -10,7 +10,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Optional
+import shutil
+from typing import Callable, Optional
 
 from openhop_core.companion.constants import RESP_CODE_NO_MORE_MESSAGES
 from openhop_core.companion.frame_server import CompanionFrameServer as _BaseFrameServer
@@ -38,6 +39,8 @@ class CompanionFrameServer(_BaseFrameServer):
         local_hash: Optional[int] = None,
         stats_getter=None,
         control_handler=None,
+        batt_getter: Callable[[], int] | None = None,
+        storage_dir: str | None = None,
     ):
         super().__init__(
             bridge=bridge,
@@ -53,6 +56,37 @@ class CompanionFrameServer(_BaseFrameServer):
             control_handler=control_handler,
         )
         self.sqlite_handler = sqlite_handler
+        self.batt_getter = batt_getter
+        self.storage_dir = storage_dir
+
+    def _get_batt_and_storage(self) -> tuple[int, int, int]:
+        """Report battery millivolts and storage usage to companion clients.
+
+        The base-class hook returns zeros, so companion apps show no battery and
+        no storage for a Python repeater. Battery comes from whichever sensor
+        plug-in publishes one (an attached UPS HAT, or the battery of an
+        openHop modem the repeater drives); storage is the filesystem holding
+        the repeater's data directory.
+        """
+        millivolts = 0
+        if self.batt_getter is not None:
+            try:
+                millivolts = int(self.batt_getter() or 0)
+            except Exception:  # pragma: no cover - never break the companion link
+                logger.debug("battery lookup failed", exc_info=True)
+                millivolts = 0
+        if millivolts < 0 or millivolts > 0xFFFF:
+            millivolts = 0
+
+        used_kb = total_kb = 0
+        if self.storage_dir:
+            try:
+                usage = shutil.disk_usage(self.storage_dir)
+                total_kb = min(usage.total // 1024, 0xFFFFFFFF)
+                used_kb = min((usage.total - usage.free) // 1024, 0xFFFFFFFF)
+            except OSError:
+                logger.debug("storage lookup failed for %s", self.storage_dir, exc_info=True)
+        return millivolts, used_kb, total_kb
 
     async def start(self) -> None:
         """Start persistence before accepting companion client connections."""
