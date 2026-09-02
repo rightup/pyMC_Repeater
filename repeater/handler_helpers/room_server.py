@@ -149,7 +149,9 @@ class RoomServer:
                 # match the daemon scheduler and the HTTP endpoint — reading
                 # only room_name here meant one CLI advert renamed the room
                 # on the mesh to the identity-name fallback.
-                node_name = room_settings.get("node_name", room_settings.get("room_name", room_name))
+                node_name = room_settings.get(
+                    "node_name", room_settings.get("room_name", room_name)
+                )
                 latitude = room_settings.get("latitude", 0.0)
                 longitude = room_settings.get("longitude", 0.0)
 
