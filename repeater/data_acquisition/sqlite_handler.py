@@ -3831,6 +3831,30 @@ class SQLiteHandler:
             logger.error(f"Failed to upsert companion contact: {e}")
             return False
 
+    # ``adverts.contact_type`` stores the *display* name written via
+    # handler_helpers.discovery.NODE_TYPE_NAMES ("Chat Node", "Repeater",
+    # "Room Server", "Sensor"). The import API speaks MeshCore's names
+    # ("companion", "repeater", "room_server", "sensor"). Normalising the stored
+    # form once, here, keeps the SQL filter and the adv_type assignment from
+    # drifting apart -- they were previously derived independently, so the
+    # filter compared display names against API names and matched nothing.
+    _ADVERT_TYPE_BY_STORED = {
+        "chat_node": 1,
+        "chat": 1,
+        "client": 1,
+        "companion": 1,
+        "repeater": 2,
+        "room_server": 3,
+        "room": 3,
+        "sensor": 4,
+    }
+    _ADVERT_TYPE_BY_API = {"companion": 1, "repeater": 2, "room_server": 3, "sensor": 4}
+
+    @staticmethod
+    def _normalise_advert_type(raw) -> str:
+        """Fold a stored contact_type to its lookup key ("Chat Node" -> "chat_node")."""
+        return (raw or "").lower().replace(" ", "_").strip()
+
     def companion_import_repeater_contacts(
         self,
         companion_hash: str,
@@ -3844,7 +3868,6 @@ class SQLiteHandler:
         imported first. Optional hours filters to adverts seen within the last N hours;
         optional limit caps how many contacts are imported.
         """
-        type_map = {"companion": 1, "repeater": 2, "room_server": 3, "sensor": 4}
         try:
             with self._connect() as conn:
                 conn.row_factory = sqlite3.Row
@@ -3854,9 +3877,24 @@ class SQLiteHandler:
                 )
                 params: list = []
                 if contact_types:
-                    placeholders = ",".join("?" * len(contact_types))
-                    query += f" AND contact_type IN ({placeholders})"
-                    params.extend(contact_types)
+                    wanted = {
+                        self._ADVERT_TYPE_BY_API[t]
+                        for t in contact_types
+                        if t in self._ADVERT_TYPE_BY_API
+                    }
+                    stored = sorted(
+                        key
+                        for key, adv in self._ADVERT_TYPE_BY_STORED.items()
+                        if adv in wanted
+                    )
+                    if not stored:
+                        return 0
+                    placeholders = ",".join("?" * len(stored))
+                    query += (
+                        " AND LOWER(REPLACE(TRIM(contact_type), ' ', '_')) "
+                        f"IN ({placeholders})"
+                    )
+                    params.extend(stored)
                 if hours is not None:
                     cutoff = time.time() - (hours * 3600)
                     query += " AND last_seen >= ?"
@@ -3871,9 +3909,9 @@ class SQLiteHandler:
             now = time.time()
             contact_rows = []
             for row in rows:
-                raw_type = row["contact_type"] or ""
-                normalized_type = raw_type.lower().replace(" ", "_").strip()
-                adv_type = type_map.get(normalized_type, 0)
+                adv_type = self._ADVERT_TYPE_BY_STORED.get(
+                    self._normalise_advert_type(row["contact_type"]), 0
+                )
                 contact_rows.append(
                     (
                         companion_hash,
