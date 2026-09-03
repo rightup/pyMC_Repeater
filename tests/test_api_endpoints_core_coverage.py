@@ -1852,18 +1852,33 @@ def test_send_advert_paths(cherrypy_ctx):
     api.event_loop = object()
     api.send_advert_func = MagicMock()
     fake_future = SimpleNamespace(result=lambda timeout: True)
-    with patch("asyncio.run_coroutine_threadsafe", return_value=fake_future):
+
+    def _schedule_and_close(coro, _loop):
+        coro.close()
+        return fake_future
+
+    with patch("asyncio.run_coroutine_threadsafe", side_effect=_schedule_and_close):
         ok = api.send_advert()
-    assert ok == {"success": True, "data": "Advert sent successfully"}
+    assert ok == {"success": True, "data": "Flood advert sent successfully"}
 
     fake_future_fail = SimpleNamespace(result=lambda timeout: False)
-    with patch("asyncio.run_coroutine_threadsafe", return_value=fake_future_fail):
+
+    def _schedule_and_close_fail(coro, _loop):
+        coro.close()
+        return fake_future_fail
+
+    with patch("asyncio.run_coroutine_threadsafe", side_effect=_schedule_and_close_fail):
         bad = api.send_advert()
     assert bad["success"] is False
 
     future_timeout = MagicMock()
     future_timeout.result.side_effect = FutureTimeoutError()
-    with patch("asyncio.run_coroutine_threadsafe", return_value=future_timeout):
+
+    def _schedule_and_close_timeout(coro, _loop):
+        coro.close()
+        return future_timeout
+
+    with patch("asyncio.run_coroutine_threadsafe", side_effect=_schedule_and_close_timeout):
         timeout = api.send_advert()
 
     assert timeout["success"] is False
