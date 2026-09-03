@@ -1,0 +1,1 @@
+import{t as e}from"./dataService-viuiAI_Q.js";export{e as useDataService};
