@@ -217,10 +217,11 @@ class SQLiteHandler:
                 )
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_packets_type ON packets(type)")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_packets_hash ON packets(packet_hash)")
-                conn.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_packets_upstream_time "
-                    "ON packets(upstream_hash, upstream_hash_size, timestamp)"
-                )
+                # idx_packets_upstream_time is intentionally NOT created here.
+                # It spans upstream_hash / upstream_hash_size, which only exist
+                # on a pre-existing database once the add_upstream_hash_to_packets
+                # migration has added them -- and migrations run after this. The
+                # migration creates the index itself; see _run_migrations.
                 conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_packets_transmitted ON packets(transmitted)"
                 )
