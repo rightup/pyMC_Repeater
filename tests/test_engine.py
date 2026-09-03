@@ -1525,7 +1525,6 @@ class TestStatistics:
         assert handler.config["radios"][0]["modem_tcp"]["token"] == "nested-secret"
 
 
-@pytest.mark.asyncio
 class TestNeighbourLinkObservation:
     @staticmethod
     def _observe_with_tracker(handler, pkt, *, rssi: float, snr: float, is_duplicate: bool) -> None:
@@ -1546,6 +1545,7 @@ class TestNeighbourLinkObservation:
             is_duplicate=is_duplicate,
         )
 
+    @pytest.mark.asyncio
     async def test_received_flood_with_non_empty_path_creates_link_for_final_hash(self, handler):
         handler.config["repeater"]["mode"] = "monitor"
         pkt = _make_hashed_flood_packet(["11", "22", "33"], hash_size=1)
@@ -1557,6 +1557,7 @@ class TestNeighbourLinkObservation:
         assert snapshot[0]["peer_hash"] == "33"
         assert snapshot[0]["path_hash_size"] == 1
 
+    @pytest.mark.asyncio
     async def test_uses_last_path_element_not_first_for_upstream_peer(self, handler):
         handler.config["repeater"]["mode"] = "monitor"
         pkt = _make_hashed_flood_packet(["AA", "BB", "CC"], hash_size=1)
@@ -1567,6 +1568,7 @@ class TestNeighbourLinkObservation:
         assert snapshot[0]["peer_hash"] == "CC"
         assert snapshot[0]["peer_hash"] != "AA"
 
+    @pytest.mark.asyncio
     async def test_empty_path_flood_creates_no_neighbour_link(self, handler):
         handler.config["repeater"]["mode"] = "monitor"
         pkt = _make_hashed_flood_packet([], hash_size=1)
@@ -1575,6 +1577,7 @@ class TestNeighbourLinkObservation:
 
         assert handler.neighbour_link_tracker.snapshot() == []
 
+    @pytest.mark.asyncio
     async def test_direct_packets_create_no_neighbour_link(self, handler):
         handler.config["repeater"]["mode"] = "monitor"
         pkt = _make_direct_packet(path=bytes([LOCAL_HASH, 0x44]))
@@ -1583,6 +1586,7 @@ class TestNeighbourLinkObservation:
 
         assert handler.neighbour_link_tracker.snapshot() == []
 
+    @pytest.mark.asyncio
     async def test_trace_packets_create_no_neighbour_link(self, handler):
         handler.config["repeater"]["mode"] = "monitor"
         pkt = _make_hashed_flood_packet(["11", "22"], hash_size=1, payload_type=PAYLOAD_TYPE_TRACE)
@@ -1591,6 +1595,7 @@ class TestNeighbourLinkObservation:
 
         assert handler.neighbour_link_tracker.snapshot() == []
 
+    @pytest.mark.asyncio
     async def test_local_transmissions_create_no_neighbour_link(self, handler):
         handler.config["repeater"]["mode"] = "no_tx"
         pkt = _make_hashed_flood_packet(["11", "22"], hash_size=1)
@@ -1599,6 +1604,7 @@ class TestNeighbourLinkObservation:
 
         assert handler.neighbour_link_tracker.snapshot() == []
 
+    @pytest.mark.asyncio
     async def test_transport_flood_is_observed(self, handler):
         handler.config["repeater"]["mode"] = "monitor"
         pkt = _make_hashed_transport_flood_packet(["19", "2A", "3B"], hash_size=1)
@@ -1609,6 +1615,7 @@ class TestNeighbourLinkObservation:
         assert len(snapshot) == 1
         assert snapshot[0]["peer_hash"] == "3B"
 
+    @pytest.mark.asyncio
     async def test_neighbour_link_score_uses_shared_flood_metrics(self, handler):
         handler.config["repeater"]["mode"] = "monitor"
         pkt = _make_hashed_flood_packet(["55"], hash_size=1)

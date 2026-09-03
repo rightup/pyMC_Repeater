@@ -1,0 +1,34 @@
+# Systemd service file template for openHop Plugin Manager.
+# Install as /etc/systemd/system/openhop-plugin-manager.service
+#
+# Supervises installed plugins as child processes. Does not replace
+# openhop-repeater.service. Repeater continues to work if this unit is stopped.
+
+[Unit]
+Description=openHop Plugin Manager
+After=network-online.target openhop-repeater.service
+Wants=network-online.target
+# Soft dependency: manager can start without Repeater, and vice versa
+
+[Service]
+Type=simple
+User=repeater
+Group=repeater
+WorkingDirectory=/var/lib/openhop_repeater
+
+ExecStart=/opt/openhop_repeater/venv/bin/openhop-plugin-manager --config /etc/openhop_repeater/config.yaml
+
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+
+MemoryHigh=256M
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=openhop-plugin-manager
+
+ReadWritePaths=/var/log/openhop_repeater /var/lib/openhop_repeater /etc/openhop_repeater
+
+[Install]
+WantedBy=multi-user.target

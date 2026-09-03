@@ -60,6 +60,7 @@ dev = [
 
 [project.scripts]
 openhop-repeater = "repeater.main:main"
+openhop-plugin-manager = "repeater.plugins.__main__:main"
 pymc-cli = "repeater.local_cli:main"
 
 [tool.setuptools.packages.find]

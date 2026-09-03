@@ -679,6 +679,7 @@ install_repeater() {
     echo "29"; echo "# Installing files..."
     cp "$SCRIPT_DIR/manage.sh" "$INSTALL_DIR/" 2>/dev/null || true
     cp "$SCRIPT_DIR/openhop-repeater.service" "$INSTALL_DIR/" 2>/dev/null || true
+    cp "$SCRIPT_DIR/openhop-plugin-manager.service" "$INSTALL_DIR/" 2>/dev/null || true
     cp "$SCRIPT_DIR/radio-settings.json" "$DATA_DIR/" 2>/dev/null || true
     cp "$SCRIPT_DIR/radio-presets.json" "$DATA_DIR/" 2>/dev/null || true
 
@@ -690,6 +691,9 @@ install_repeater() {
 
     echo "55"; echo "# Installing systemd service..."
     cp "$SCRIPT_DIR/openhop-repeater.service" /etc/systemd/system/
+    if [ -f "$SCRIPT_DIR/openhop-plugin-manager.service" ]; then
+        cp "$SCRIPT_DIR/openhop-plugin-manager.service" /etc/systemd/system/openhop-plugin-manager.service
+    fi
     systemctl daemon-reload
 
     echo "58"; echo "# Installing udev rules for CH341..."
@@ -856,6 +860,9 @@ UPGRADEEOF
 
     echo "75"; echo "# Starting service..."
     systemctl enable "$SERVICE_NAME"
+    if [ -f /etc/systemd/system/openhop-plugin-manager.service ]; then
+        systemctl enable openhop-plugin-manager 2>/dev/null || true
+    fi
 
     echo "90"; echo "# Installation files complete..."
     ) | "$DIALOG" --backtitle "openHop Repeater Management" --title "Installing" --gauge "Setting up openHop Repeater..." 8 70 0
@@ -949,6 +956,10 @@ UPGRADEEOF
     if ! systemctl start "$SERVICE_NAME"; then
         error "Failed to start ${SERVICE_NAME}"
         return 1
+    fi
+    if [ -f /etc/systemd/system/openhop-plugin-manager.service ]; then
+        systemctl enable openhop-plugin-manager >/dev/null 2>&1 || true
+        systemctl start openhop-plugin-manager >/dev/null 2>&1 || true
     fi
 
     # Show final results
@@ -1182,6 +1193,15 @@ upgrade_repeater() {
     echo "[5/9] Installing files..."
     if ! cp "$SCRIPT_DIR/openhop-repeater.service" /etc/systemd/system/; then
         echo "    ⚠ Warning: Failed to update service file – old service file may remain"
+    fi
+    if [ -f "$SCRIPT_DIR/openhop-plugin-manager.service" ]; then
+        if cp "$SCRIPT_DIR/openhop-plugin-manager.service" /etc/systemd/system/openhop-plugin-manager.service; then
+            echo "    ✓ openhop-plugin-manager.service installed"
+        else
+            echo "    ⚠ Warning: Failed to install openhop-plugin-manager.service"
+        fi
+    else
+        echo "    ⚠ openhop-plugin-manager.service not found in $SCRIPT_DIR (skipped)"
     fi
     cp "$SCRIPT_DIR/radio-settings.json" "$DATA_DIR/" 2>/dev/null || true
     cp "$SCRIPT_DIR/radio-presets.json" "$DATA_DIR/" 2>/dev/null || true
@@ -1428,6 +1448,24 @@ UPGRADEEOF
         echo "    ✓ Service was not running/enabled before upgrade; no restart required"
     fi
 
+    # Plugin manager is optional but should be installed/enabled on upgrade when present.
+    # Failures here must not fail the Repeater upgrade.
+    if [ -f /etc/systemd/system/openhop-plugin-manager.service ]; then
+        if systemctl enable openhop-plugin-manager >/dev/null 2>&1; then
+            echo "    ✓ openhop-plugin-manager enabled"
+        else
+            echo "    ⚠ Could not enable openhop-plugin-manager"
+        fi
+        if systemctl restart openhop-plugin-manager >/dev/null 2>&1; then
+            echo "    ✓ openhop-plugin-manager restarted"
+        elif systemctl start openhop-plugin-manager >/dev/null 2>&1; then
+            echo "    ✓ openhop-plugin-manager started"
+        else
+            echo "    ⚠ openhop-plugin-manager installed but failed to start (Repeater still OK)"
+            systemctl status openhop-plugin-manager --no-pager -l 2>/dev/null | head -20 || true
+        fi
+    fi
+
     local new_version
     new_version=$(get_version)
 
@@ -1508,6 +1546,8 @@ uninstall_repeater() {
         echo ""
         
         echo ">>> Stopping and disabling service..."
+        systemctl stop openhop-plugin-manager 2>/dev/null || true
+        systemctl disable openhop-plugin-manager 2>/dev/null || true
         systemctl stop "$SERVICE_NAME" 2>/dev/null || true
         systemctl disable "$SERVICE_NAME" 2>/dev/null || true
 
@@ -1520,6 +1560,7 @@ uninstall_repeater() {
 
         echo "40"; echo "# Removing service files..."
         rm -f /etc/systemd/system/openhop-repeater.service
+        rm -f /etc/systemd/system/openhop-plugin-manager.service
         systemctl daemon-reload
 
         echo "50"; echo "# Removing polkit and sudoers rules..."

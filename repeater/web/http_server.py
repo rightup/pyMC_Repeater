@@ -292,6 +292,74 @@ class StatsApp:
         cherrypy.response.headers["Content-Type"] = guessed_type or "application/octet-stream"
         return target.read_bytes()
 
+    def _serve_plugin_ui(self, plugin_id: str, relative_parts: tuple[str, ...]):
+        """Serve static assets for an enabled application UI plugin."""
+        from repeater.plugins.storage import PluginStorage, resolve_plugins_root, safe_join
+
+        try:
+            plugins_root = resolve_plugins_root(self.config)
+            storage = PluginStorage(plugins_root)
+            state = storage.read_state(plugin_id)
+            if state is None or not state.get("enabled", False):
+                raise cherrypy.NotFound()
+            manifest = storage.load_current_manifest(plugin_id)
+            if manifest is None or manifest.ui is None:
+                raise cherrypy.NotFound()
+            paths = storage.paths_for(plugin_id)
+            if paths.current_link.exists() or paths.current_link.is_symlink():
+                release_root = paths.current_link.resolve()
+            else:
+                version = state.get("version")
+                if not version:
+                    raise cherrypy.NotFound()
+                release_root = paths.release_dir(str(version))
+            if not release_root.is_dir():
+                raise cherrypy.NotFound()
+
+            entry = manifest.ui.entry.replace("\\", "/")
+            entry_parts = tuple(p for p in entry.split("/") if p)
+            if not entry_parts:
+                raise cherrypy.NotFound()
+
+            # Document root is the directory containing the entry file so a
+            # relative Vite base (./assets/...) works at /plugins/{id}/.
+            # Example: entry ui/index.html → doc_root = release/ui
+            if len(entry_parts) > 1:
+                doc_root = safe_join(release_root, *entry_parts[:-1])
+                entry_name = entry_parts[-1]
+            else:
+                doc_root = release_root
+                entry_name = entry_parts[0]
+
+            if not relative_parts:
+                serve_parts = (entry_name,)
+            else:
+                serve_parts = relative_parts
+
+            try:
+                target = safe_join(doc_root, *serve_parts)
+            except ValueError:
+                raise cherrypy.HTTPError(400, "invalid path")
+
+            if target.is_file():
+                guessed_type, _ = mimetypes.guess_type(str(target))
+                cherrypy.response.headers["Content-Type"] = (
+                    guessed_type or "application/octet-stream"
+                )
+                return target.read_bytes()
+
+            # SPA fallback to entry HTML for client-side routes
+            entry_target = safe_join(doc_root, entry_name)
+            if entry_target.is_file():
+                cherrypy.response.headers["Content-Type"] = "text/html; charset=utf-8"
+                return entry_target.read_bytes()
+            raise cherrypy.NotFound()
+        except cherrypy.HTTPError:
+            raise
+        except Exception as exc:
+            logger.debug("Plugin UI serve error for %s: %s", plugin_id, exc)
+            raise cherrypy.NotFound()
+
     @cherrypy.expose
     def favicon_ico(self):
         """Serve the favicon bundled with the compiled frontend."""
@@ -323,6 +391,13 @@ class StatsApp:
         # Let API routes pass through
         if args and args[0] == "api":
             raise cherrypy.NotFound()
+
+        # Application UI plugins: /plugins/{id}/...
+        if args and args[0] == "plugins":
+            if len(args) < 2:
+                raise cherrypy.NotFound()
+            plugin_id = args[1]
+            return self._serve_plugin_ui(plugin_id, tuple(args[2:]))
 
         # Handle WebSocket routes
         if (

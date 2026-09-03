@@ -40,6 +40,7 @@ from .auth.middleware import require_auth
 from .auth_endpoints import AuthAPIEndpoints
 from .cad_calibration_engine import CADCalibrationEngine
 from .companion_endpoints import CompanionAPIEndpoints
+from .plugin_endpoints import PluginAPIEndpoints
 from .update_endpoints import UpdateAPIEndpoints
 
 logger = logging.getLogger("HTTPServer")
@@ -168,6 +169,16 @@ POLICY_GROUP_KINDS = {
 # GET    /api/update/channels        - List available release channels (branches)
 # POST   /api/update/set_channel     - Switch release channel {"channel": "dev"}
 
+# Plugins (managed via local plugin-manager IPC)
+# GET    /api/plugins/               - List installed plugins
+# GET    /api/plugins/{id}           - Plugin status
+# POST   /api/plugins/install        - Install local wheel (multipart or wheel_path)
+# POST   /api/plugins/enable         - Enable plugin {"id"}
+# POST   /api/plugins/disable        - Disable plugin {"id"}
+# POST   /api/plugins/start|stop|restart - Lifecycle {"id"}
+# GET    /api/plugins/logs?id=       - Tail plugin logs
+# DELETE /api/plugins/{id}           - Uninstall (keeps data by default)
+
 # Setup Wizard
 # GET    /api/needs_setup - Check if repeater needs initial setup
 # GET    /api/site_info - Get site identification name (public, no auth required)
@@ -240,6 +251,9 @@ class APIEndpoints:
 
         # Create nested update object for /api/update/* routes
         self.update = UpdateAPIEndpoints()
+
+        # Create nested plugins object for /api/plugins/* routes
+        self.plugins = PluginAPIEndpoints(self.config, self._config_path)
 
     def _is_cors_enabled(self):
         return self.config.get("web", {}).get("cors_enabled", False)

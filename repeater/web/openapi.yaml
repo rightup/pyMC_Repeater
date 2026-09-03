@@ -58,6 +58,8 @@ tags:
     description: Access Control Lists
   - name: Room Server
     description: Room server messaging
+  - name: Plugins
+    description: External plugin install and lifecycle management
 
 paths:
   # ============================================================================
@@ -4549,8 +4551,493 @@ paths:
               schema:
                 type: object
 
+  # ============================================================================
+  # Plugins
+  # ============================================================================
+  /plugins:
+    get:
+      tags: [Plugins]
+      summary: List installed plugins
+      description: |
+        List plugins installed by the local plugin manager.
+        Returns 503 when the plugin manager process is not running.
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      responses:
+        '200':
+          description: Plugin list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  plugins:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/PluginStatus'
+        '503':
+          description: Plugin manager unavailable
+
+  /plugins/catalogue:
+    get:
+      tags:
+        - Plugins
+      summary: List curated plugin catalogue
+      description: >
+        Fetch the curated openHop plugin catalogue and annotate entries with
+        install state and latest stable GitHub Release when available.
+        Failures contacting the catalogue or GitHub do not affect installed plugins.
+      parameters:
+        - name: refresh
+          in: query
+          required: false
+          schema:
+            type: boolean
+          description: Force refresh of catalogue and release caches
+      responses:
+        '200':
+          description: Catalogue entries
+        '502':
+          description: Catalogue unavailable
+        '503':
+          description: Plugin manager unavailable
+  /plugins/catalogue_install:
+    post:
+      tags:
+        - Plugins
+      summary: Install a plugin from the catalogue
+      description: >
+        Resolve the catalogue entry to its GitHub repository, download the latest
+        (or pinned) stable wheel, install via the existing plugin installer, and enable.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id]
+              properties:
+                id:
+                  type: string
+                version:
+                  type: string
+                  description: Optional release version (with or without leading v)
+      responses:
+        '200':
+          description: Installed plugin status
+        '400':
+          description: Invalid request or manifest id mismatch
+        '503':
+          description: Plugin manager unavailable
+  /plugins/updates:
+    get:
+      tags:
+        - Plugins
+      summary: Check plugin update availability
+      parameters:
+        - name: id
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: refresh
+          in: query
+          required: false
+          schema:
+            type: boolean
+      responses:
+        '200':
+          description: Update check result
+        '404':
+          description: Plugin not found
+  /plugins/update:
+    post:
+      tags:
+        - Plugins
+      summary: Update an installed plugin from GitHub Releases
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id]
+              properties:
+                id:
+                  type: string
+                version:
+                  type: string
+      responses:
+        '200':
+          description: Updated plugin status
+        '400':
+          description: Update unavailable or invalid
+  /plugins/settings:
+    get:
+      tags: [Plugins]
+      summary: Get plugin config.json
+      description: Read the opaque plugin-owned data/config.json object.
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      parameters:
+        - name: id
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Config object
+        '404':
+          description: Plugin not found
+        '503':
+          description: Plugin manager unavailable
+    post:
+      tags: [Plugins]
+      summary: Set plugin config.json
+      description: |
+        Replace plugin-owned data/config.json with a JSON object.
+        Optional restart applies to enabled service plugins.
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id, config]
+              properties:
+                id:
+                  type: string
+                config:
+                  type: object
+                  additionalProperties: true
+                restart:
+                  type: boolean
+                  default: false
+      responses:
+        '200':
+          description: Saved
+        '400':
+          description: Invalid config
+        '503':
+          description: Plugin manager unavailable
+
+
+  /plugins/install:
+    post:
+      tags: [Plugins]
+      summary: Install a local plugin wheel
+      description: |
+        Install a Python wheel containing openhop-plugin.json into an isolated
+        virtualenv. Accepts multipart field `wheel` or JSON `wheel_path`.
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                wheel:
+                  type: string
+                  format: binary
+          application/json:
+            schema:
+              type: object
+              properties:
+                wheel_path:
+                  type: string
+                  description: Absolute path to a .whl on the Repeater host
+      responses:
+        '200':
+          description: Installed
+        '400':
+          description: Invalid wheel or manifest
+        '503':
+          description: Plugin manager unavailable
+
+  /plugins/enable:
+    post:
+      tags: [Plugins]
+      summary: Enable a plugin
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id]
+              properties:
+                id:
+                  type: string
+                  example: openhop.nomad
+      responses:
+        '200':
+          description: Enabled
+        '404':
+          description: Not found
+        '503':
+          description: Plugin manager unavailable
+
+  /plugins/disable:
+    post:
+      tags: [Plugins]
+      summary: Disable a plugin
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id]
+              properties:
+                id:
+                  type: string
+      responses:
+        '200':
+          description: Disabled
+        '404':
+          description: Not found
+        '503':
+          description: Plugin manager unavailable
+
+  /plugins/start:
+    post:
+      tags: [Plugins]
+      summary: Start a plugin process
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id]
+              properties:
+                id:
+                  type: string
+      responses:
+        '200':
+          description: Started
+        '409':
+          description: Plugin disabled
+        '503':
+          description: Plugin manager unavailable
+
+  /plugins/stop:
+    post:
+      tags: [Plugins]
+      summary: Stop a plugin process
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id]
+              properties:
+                id:
+                  type: string
+      responses:
+        '200':
+          description: Stopped
+        '503':
+          description: Plugin manager unavailable
+
+  /plugins/restart:
+    post:
+      tags: [Plugins]
+      summary: Restart a plugin process
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id]
+              properties:
+                id:
+                  type: string
+      responses:
+        '200':
+          description: Restarted
+        '503':
+          description: Plugin manager unavailable
+
+  /plugins/logs:
+    get:
+      tags: [Plugins]
+      summary: Tail plugin logs
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      parameters:
+        - name: id
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: tail
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 200
+      responses:
+        '200':
+          description: Log lines
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  id:
+                    type: string
+                  lines:
+                    type: array
+                    items:
+                      type: string
+        '503':
+          description: Plugin manager unavailable
+
+  /plugins/uninstall:
+    post:
+      tags: [Plugins]
+      summary: Uninstall a plugin
+      description: Stops the plugin and removes release code. Keeps data/ unless delete_data is true.
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id]
+              properties:
+                id:
+                  type: string
+                delete_data:
+                  type: boolean
+                  default: false
+      responses:
+        '200':
+          description: Uninstalled
+        '503':
+          description: Plugin manager unavailable
+
+  /plugins/{id}:
+    get:
+      tags: [Plugins]
+      summary: Get plugin status
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Status
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - type: object
+                    properties:
+                      success:
+                        type: boolean
+                  - $ref: '#/components/schemas/PluginStatus'
+        '404':
+          description: Not found
+        '503':
+          description: Plugin manager unavailable
+    delete:
+      tags: [Plugins]
+      summary: Uninstall plugin by id
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: delete_data
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+      responses:
+        '200':
+          description: Uninstalled
+        '503':
+          description: Plugin manager unavailable
+
+
 components:
   schemas:
+
+    PluginStatus:
+      type: object
+      properties:
+        id:
+          type: string
+          example: openhop.nomad
+        name:
+          type: string
+        version:
+          type: string
+        enabled:
+          type: boolean
+        state:
+          type: string
+          enum: [DISABLED, STOPPED, STARTING, RUNNING, STOPPING, FAILED]
+        pid:
+          type: integer
+          nullable: true
+        has_runtime:
+          type: boolean
+        has_ui:
+          type: boolean
+        ui_entry:
+          type: string
+          nullable: true
+        data_dir:
+          type: string
+        description:
+          type: string
     SuccessResponse:
       type: object
       properties:
