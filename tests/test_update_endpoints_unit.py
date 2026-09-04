@@ -440,6 +440,53 @@ def test_do_install_wrapper_success_then_restart_failure(isolated_state, monkeyp
     assert "restart failed" in (st.error_message or "")
 
 
+def test_do_install_restarts_plugin_manager_service_when_present(isolated_state, monkeypatch):
+    st = isolated_state
+    st.channel = "main"
+    st.latest_version = "4.0.0"
+
+    monkeypatch.setattr(ue.os, "geteuid", lambda: 1000)
+    monkeypatch.setattr(ue, "is_buildroot", lambda: False)
+    monkeypatch.setattr(ue, "_cleanup_stale_dist_info", lambda *args, **kwargs: None)
+    monkeypatch.setattr(ue.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(
+        ue.os.path,
+        "isfile",
+        lambda p: (
+            p
+            in {
+                "/usr/local/bin/pymc-do-upgrade",
+                "/etc/systemd/system/openhop-plugin-manager.service",
+            }
+        ),
+    )
+    monkeypatch.setattr("repeater.service_utils.restart_service", lambda: (True, "ok"))
+
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    class _Proc:
+        def __init__(self, cmd):
+            self.cmd = cmd
+            self.stdout = ["ok\n"]
+            self.returncode = 0
+
+        def wait(self):
+            return None
+
+    monkeypatch.setattr(ue.subprocess, "Popen", lambda cmd, **kwargs: _Proc(cmd))
+    monkeypatch.setattr(ue.subprocess, "run", fake_run)
+
+    ue._do_install()
+
+    assert any(cmd[:3] == ["/bin/systemctl", "enable", "openhop-plugin-manager"] for cmd in calls)
+    assert any(cmd[:3] == ["/bin/systemctl", "restart", "openhop-plugin-manager"] for cmd in calls)
+    assert st.state == "complete"
+
+
 def test_do_install_wrapper_success_container_path(isolated_state, monkeypatch):
     st = isolated_state
     st.channel = "main"
@@ -522,6 +569,12 @@ def _capturing_popen(monkeypatch, calls):
             return None
 
     monkeypatch.setattr(ue.subprocess, "Popen", lambda cmd, **kwargs: _Proc(cmd, kwargs.get("env")))
+
+    def fake_run(cmd, **kwargs):
+        calls.append({"cmd": cmd, "env": kwargs.get("env", {}), "run": True})
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(ue.subprocess, "run", fake_run)
 
 
 def test_do_install_root_does_not_force_a_predicted_version(isolated_state, monkeypatch):

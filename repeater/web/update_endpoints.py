@@ -915,6 +915,52 @@ def _disable_legacy_services() -> None:
     subprocess.run([_SYSTEMCTL_BIN, "daemon-reload"], check=False)  # nosec B603
 
 
+def _ensure_plugin_manager_service() -> None:
+    """Install and enable the plugin-manager service unit when present."""
+    service_unit = "/etc/systemd/system/openhop-plugin-manager.service"
+    candidates = [
+        "/root/openhop-repeater/openhop-plugin-manager.service",
+        "/opt/openhop_repeater/openhop-plugin-manager.service",
+        "/opt/openhop_repeater/openhop-repeater/openhop-plugin-manager.service",
+        "/root/scripts/openhop-plugin-manager.service",
+        "/opt/openhop_repeater/openhop-repeater/openhop-plugin-manager.service",
+    ]
+
+    source = next((path for path in candidates if os.path.isfile(path)), None)
+    if source and not os.path.isfile(service_unit):
+        _state.append_line(f"[pyMC updater] Installing plugin-manager service from {source}")
+        try:
+            os.makedirs(os.path.dirname(service_unit), exist_ok=True)
+            shutil.copy2(source, service_unit)
+        except OSError as exc:
+            logger.warning(f"[Update] Could not install plugin-manager unit: {exc}")
+            return
+
+    if not os.path.isfile(service_unit):
+        return
+
+    _state.append_line("[pyMC updater] Ensuring openhop-plugin-manager service is enabled")
+    for cmd in (
+        [_SYSTEMCTL_BIN, "daemon-reload"],
+        [_SYSTEMCTL_BIN, "enable", "openhop-plugin-manager"],
+    ):
+        subprocess.run(cmd, check=False, capture_output=True, text=True)  # nosec B603
+
+    restart = subprocess.run(
+        [_SYSTEMCTL_BIN, "restart", "openhop-plugin-manager"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )  # nosec B603
+    if restart.returncode != 0:
+        subprocess.run(
+            [_SYSTEMCTL_BIN, "start", "openhop-plugin-manager"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )  # nosec B603
+
+
 def _do_install() -> None:
 
     channel = _state.channel
@@ -1023,6 +1069,7 @@ def _do_install() -> None:
 
     if success:
         _cleanup_stale_dist_info()
+        _ensure_plugin_manager_service()
         _state.append_line("[pyMC updater] Restarting service in 3 seconds…")
         time.sleep(3)
         restart_ok = False
