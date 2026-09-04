@@ -93,9 +93,11 @@ class PluginIPCServer:
         self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self._sock.bind(str(self.socket_path))
         try:
-            os.chmod(self.socket_path, 0o660)
-        except OSError:
-            pass
+            # Repeater and the manager may be separate processes in one service
+            # group, so the local IPC socket is intentionally group-writable.
+            os.chmod(self.socket_path, 0o660)  # nosec B103
+        except OSError as exc:
+            logger.debug("Could not set IPC socket permissions: %s", exc)
         self._sock.listen(16)
         self._sock.settimeout(1.0)
         self._stop.clear()
@@ -123,10 +125,13 @@ class PluginIPCServer:
                 pass
 
     def _serve_loop(self) -> None:
-        assert self._sock is not None
+        sock = self._sock
+        if sock is None:
+            logger.error("IPC serve loop started without a socket")
+            return
         while not self._stop.is_set():
             try:
-                conn, _ = self._sock.accept()
+                conn, _ = sock.accept()
             except socket.timeout:
                 continue
             except OSError:

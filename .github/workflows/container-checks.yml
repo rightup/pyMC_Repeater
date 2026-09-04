@@ -8,6 +8,10 @@ on:
       - docker-compose.yml
       - docker-compose.build.yml
       - docker-entrypoint.sh
+      - repeater/plugins/**
+      - scripts/docker-plugin-smoke.sh
+      - tests/test_container_workflow.py
+      - tests/test_plugin_container_supervisor.py
       - .github/workflows/container-checks.yml
   workflow_dispatch:
 
@@ -33,3 +37,9 @@ jobs:
 
       - name: Lint Dockerfile
         run: docker run --rm -i hadolint/hadolint:v2.15.1 hadolint --failure-threshold error - < dockerfile
+
+      - name: Build runtime image
+        run: docker build --build-arg PACKAGE_VERSION=0.0.0.dev0 -t openhop-repeater:plugin-smoke -f dockerfile .
+
+      - name: Exercise plugin runtime in Docker
+        run: scripts/docker-plugin-smoke.sh openhop-repeater:plugin-smoke

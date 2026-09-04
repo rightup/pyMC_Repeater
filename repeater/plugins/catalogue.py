@@ -2,27 +2,34 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import os
 import re
 import ssl
+import tempfile
 import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable, Optional
+from urllib.parse import urlsplit
 
 logger = logging.getLogger("PluginCatalogue")
 
-DEFAULT_CATALOGUE_URL = (
-    "https://raw.githubusercontent.com/openhop-dev/openhop-plugin-catalogue/main/catalogue.json"
-)
+DEFAULT_CATALOGUE_URL = "https://repeater-plugins.openhop.dev/catalogue.json"
 DEFAULT_CACHE_TTL_SECONDS = 600  # 10 minutes
-SUPPORTED_SCHEMA = 1
+SUPPORTED_SCHEMAS = (1, 2)
 USER_AGENT = "openhop-repeater-plugin-manager/1.0"
+GITHUB_RELEASE_ORIGIN = "https://github.com"
+GITHUB_RELEASE_ASSET_HOST = "release-assets.githubusercontent.com"
+MAX_WHEEL_BYTES = 100 * 1024 * 1024
 
 _REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
+_SHA256_RE = re.compile(r"^[a-f0-9]{64}$")
 _ssl_ctx: Optional[ssl.SSLContext] = None
 
 
@@ -39,6 +46,62 @@ def _ssl_context() -> ssl.SSLContext:
     return _ssl_ctx
 
 
+def _validate_approved_wheel_url(repository: str, version: str, wheel_url: str) -> None:
+    parsed = urlsplit(wheel_url)
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    expected_prefix = f"/{repository}/releases/download/"
+    path_tail = (
+        parsed.path[len(expected_prefix) :] if parsed.path.startswith(expected_prefix) else ""
+    )
+    path_parts = path_tail.split("/")
+    filename = path_parts[-1] if path_parts else ""
+    if (
+        origin != GITHUB_RELEASE_ORIGIN
+        or len(path_parts) != 2
+        or not path_parts[0]
+        or not filename.endswith(".whl")
+        or f"-{version}-" not in filename
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise CatalogueError(
+            f"wheel_url must be a version-matched GitHub Release wheel in {repository}",
+            code=400,
+        )
+
+
+def _validate_redirect_target(source_url: str, target_url: str) -> None:
+    source = urlsplit(source_url)
+    target = urlsplit(target_url)
+    same_origin = (
+        source.scheme == "https" and target.scheme == "https" and source.netloc == target.netloc
+    )
+    github_asset_redirect = (
+        source.scheme == "https"
+        and source.hostname in {"github.com", GITHUB_RELEASE_ASSET_HOST}
+        and target.scheme == "https"
+        and target.hostname == GITHUB_RELEASE_ASSET_HOST
+        and target.port is None
+    )
+    if not (same_origin or github_asset_redirect):
+        raise CatalogueError(
+            f"download redirect is not allowed: {source_url} -> {target_url}",
+            code=502,
+        )
+
+
+def _validate_download_response_url(source_url: str, final_url: str) -> None:
+    if final_url == source_url:
+        return
+    _validate_redirect_target(source_url, final_url)
+
+
+class _ApprovedRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        _validate_redirect_target(req.full_url, newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 @dataclass(frozen=True)
 class CataloguePlugin:
     id: str
@@ -47,6 +110,13 @@ class CataloguePlugin:
     repository: str
     category: str = ""
     logo: str = ""
+    version: Optional[str] = None
+    wheel_url: Optional[str] = None
+    sha256: Optional[str] = None
+
+    @property
+    def has_approved_wheel(self) -> bool:
+        return bool(self.version and self.wheel_url and self.sha256)
 
     def to_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {
@@ -59,6 +129,12 @@ class CataloguePlugin:
             out["category"] = self.category
         if self.logo:
             out["logo"] = self.logo
+        if self.version:
+            out["version"] = self.version
+        if self.wheel_url:
+            out["wheel_url"] = self.wheel_url
+        if self.sha256:
+            out["sha256"] = self.sha256
         return out
 
 
@@ -84,9 +160,9 @@ def parse_catalogue(data: Any) -> Catalogue:
     if not isinstance(data, dict):
         raise CatalogueError("catalogue must be a JSON object", code=400)
     schema = data.get("schema")
-    if schema != SUPPORTED_SCHEMA:
+    if schema not in SUPPORTED_SCHEMAS:
         raise CatalogueError(
-            f"unsupported catalogue schema {schema!r}; expected {SUPPORTED_SCHEMA}",
+            f"unsupported catalogue schema {schema!r}; expected one of {SUPPORTED_SCHEMAS}",
             code=400,
         )
     raw_plugins = data.get("plugins")
@@ -96,6 +172,7 @@ def parse_catalogue(data: Any) -> Catalogue:
     plugins: list[CataloguePlugin] = []
     seen_ids: set[str] = set()
     seen_repos: set[str] = set()
+    seen_wheel_urls: set[str] = set()
     for idx, item in enumerate(raw_plugins):
         if not isinstance(item, dict):
             raise CatalogueError(f"plugins[{idx}] must be an object", code=400)
@@ -146,6 +223,33 @@ def parse_catalogue(data: Any) -> Catalogue:
                 code=400,
             )
 
+        version = None
+        wheel_url = None
+        sha256 = None
+        if schema == 2:
+            raw_version = item.get("version")
+            raw_wheel_url = item.get("wheel_url")
+            raw_sha256 = item.get("sha256")
+            if not isinstance(raw_version, str) or not raw_version.strip():
+                raise CatalogueError(f"plugins[{idx}].version is required", code=400)
+            if not isinstance(raw_wheel_url, str) or not raw_wheel_url.strip():
+                raise CatalogueError(f"plugins[{idx}].wheel_url is required", code=400)
+            if not isinstance(raw_sha256, str) or not _SHA256_RE.fullmatch(raw_sha256):
+                raise CatalogueError(
+                    f"plugins[{idx}].sha256 must be a lowercase SHA-256 digest",
+                    code=400,
+                )
+            version = raw_version.strip()
+            wheel_url = raw_wheel_url.strip()
+            sha256 = raw_sha256
+            try:
+                _validate_approved_wheel_url(repository, version, wheel_url)
+            except CatalogueError as exc:
+                raise CatalogueError(f"plugins[{idx}].{exc}", code=exc.code) from exc
+            if wheel_url in seen_wheel_urls:
+                raise CatalogueError(f"duplicate wheel URL: {wheel_url}", code=400)
+            seen_wheel_urls.add(wheel_url)
+
         seen_ids.add(plugin_id)
         seen_repos.add(repository)
         plugins.append(
@@ -156,13 +260,16 @@ def parse_catalogue(data: Any) -> Catalogue:
                 repository=repository,
                 category=category.strip(),
                 logo=logo,
+                version=version,
+                wheel_url=wheel_url,
+                sha256=sha256,
             )
         )
-    return Catalogue(schema=SUPPORTED_SCHEMA, plugins=tuple(plugins))
+    return Catalogue(schema=int(schema), plugins=tuple(plugins))
 
 
 class CatalogueClient:
-    """Fetch and cache the curated plugin catalogue JSON."""
+    """Fetch, cache, and download from the curated plugin catalogue."""
 
     def __init__(
         self,
@@ -180,9 +287,11 @@ class CatalogueClient:
         self._cached: Optional[Catalogue] = None
 
     def _default_open(self, request: urllib.request.Request, timeout: float = 30.0):
-        return urllib.request.urlopen(  # nosec B310 - configured catalogue URL
-            request, timeout=timeout, context=_ssl_context()
+        opener = urllib.request.build_opener(
+            urllib.request.HTTPSHandler(context=_ssl_context()),
+            _ApprovedRedirectHandler(),
         )
+        return opener.open(request, timeout=timeout)  # nosec B310 - validated HTTPS URLs
 
     def clear_cache(self) -> None:
         self._cached = None
@@ -240,3 +349,73 @@ class CatalogueClient:
         if plugin is None:
             raise CatalogueError(f"plugin not in catalogue: {plugin_id}", code=404)
         return plugin
+
+    def download_wheel(self, plugin: CataloguePlugin, dest_dir: Path | str) -> Path:
+        """Download and verify one schema-2 approved GitHub Release wheel."""
+        if not plugin.version or not plugin.wheel_url or not plugin.sha256:
+            raise CatalogueError(
+                f"catalogue entry {plugin.id} does not contain approved wheel metadata",
+                code=400,
+            )
+        _validate_approved_wheel_url(plugin.repository, plugin.version, plugin.wheel_url)
+        if not _SHA256_RE.fullmatch(plugin.sha256):
+            raise CatalogueError(f"invalid approved checksum for {plugin.id}", code=400)
+
+        destination_dir = Path(dest_dir)
+        destination_dir.mkdir(parents=True, exist_ok=True)
+        destination = destination_dir / Path(urlsplit(plugin.wheel_url).path).name
+        fd, temporary_name = tempfile.mkstemp(prefix=".wheel-", dir=str(destination_dir))
+        digest = hashlib.sha256()
+        total = 0
+        request = urllib.request.Request(
+            plugin.wheel_url,
+            headers={
+                "User-Agent": self.user_agent,
+                "Accept": "application/octet-stream",
+            },
+            method="GET",
+        )
+        try:
+            with os.fdopen(fd, "wb") as output:
+                try:
+                    with self._opener(request, timeout=120.0) as response:
+                        final_url = getattr(response, "geturl", lambda: plugin.wheel_url)()
+                        _validate_download_response_url(
+                            plugin.wheel_url,
+                            final_url or plugin.wheel_url,
+                        )
+                        while True:
+                            chunk = response.read(1024 * 1024)
+                            if not chunk:
+                                break
+                            total += len(chunk)
+                            if total > MAX_WHEEL_BYTES:
+                                raise CatalogueError(
+                                    "approved plugin wheel exceeds 100 MiB", code=502
+                                )
+                            digest.update(chunk)
+                            output.write(chunk)
+                except CatalogueError:
+                    raise
+                except urllib.error.HTTPError as exc:
+                    raise CatalogueError(
+                        f"approved plugin wheel is unavailable (HTTP {exc.code})", code=502
+                    ) from exc
+                except urllib.error.URLError as exc:
+                    raise CatalogueError("approved plugin wheel is unavailable", code=502) from exc
+                except Exception as exc:
+                    raise CatalogueError("approved plugin wheel is unavailable", code=502) from exc
+
+            if total == 0:
+                raise CatalogueError("approved plugin wheel is empty", code=502)
+            if digest.hexdigest() != plugin.sha256:
+                raise CatalogueError(
+                    f"approved plugin wheel checksum mismatch for {plugin.id}", code=502
+                )
+            os.replace(temporary_name, destination)
+            return destination
+        finally:
+            try:
+                Path(temporary_name).unlink(missing_ok=True)
+            except OSError as exc:
+                logger.debug("Could not remove temporary wheel %s: %s", temporary_name, exc)

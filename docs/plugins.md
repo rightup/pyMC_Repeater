@@ -22,6 +22,8 @@ Default root (under Repeater storage):
 ```
 
 - Code and virtualenv are **version-specific**.
+- The installed wheel is retained with each release so its virtualenv can be
+  rebuilt automatically if a future container image changes Python versions.
 - `data/` is **not** version-specific and is never interpreted by the manager.
 - IPC socket default: `/var/lib/openhop_repeater/plugin-manager.sock`.
 
@@ -83,6 +85,12 @@ The manager starts enabled service plugins on boot and supervises crashes
 
 Repeater does **not** require the manager. If the socket is missing, plugin API
 calls return HTTP 503 and normal Repeater operation continues.
+
+The Docker image runs Repeater and the manager under a small process supervisor,
+with `tini` as PID 1 to reap orphaned children. It forwards shutdown signals to
+both services and their plugin processes, and restarts the manager if it exits
+unexpectedly while Repeater remains running. Set `OPENHOP_PLUGIN_MANAGER=0` to
+run Repeater without the manager.
 
 ## Install a local wheel
 
@@ -222,44 +230,59 @@ curl -X DELETE -H "Authorization: Bearer $TOKEN" \
 
 1. Build the `openhop-nomad-plugin` wheel.
 2. Install via `/api/plugins/install`.
-3. Write `$OPENHOP_PLUGIN_DATA/config.json` with `nomad_url` / `nomad_model`.
-4. Enable the plugin — `meshcore-nomad-bridge` should report `RUNNING`.
-5. The bridge talks to the Companion frame server (default `127.0.0.1:5001`).
+3. Enable a Repeater Companion frame server reachable from the plugin. In the
+   standard Docker image, `127.0.0.1:5001` reaches the same container.
+4. Write `$OPENHOP_PLUGIN_DATA/config.json` with `nomad_url` / `nomad_model`.
+5. Enable the plugin — `meshcore-nomad-bridge` should report `RUNNING`.
+6. Confirm its logs show a successful Companion connection, not only a running
+   retry loop. A `RUNNING` process can still be reconnecting to a disabled frame
+   server.
 
 ## Future work (not in this version)
 
-- GitHub release installation and catalogue
-- Automatic updates / rollback between versions
 - Web Component dashboard widgets and settings panels
-- Plugin management UI page
 - Permission scopes, signing, non-Python runtimes
 - Plugin SDK
 
 ## Plugin catalogue
 
-Repeater can browse a curated static catalogue and install plugins from GitHub Releases.
+Repeater browses the curated static catalogue from openHop's R2-backed endpoint.
+Update checks read only that catalogue and do not query the GitHub API. When a
+user installs an approved plugin, Repeater downloads the exact wheel directly
+from the plugin's GitHub Release.
 
 Default catalogue URL:
 
 ```text
-https://raw.githubusercontent.com/openhop-dev/openhop-plugin-catalogue/main/catalogue.json
+https://repeater-plugins.openhop.dev/catalogue.json
 ```
 
 Override with:
 
 ```yaml
 plugins:
-  catalogue_url: "https://raw.githubusercontent.com/openhop-dev/openhop-plugin-catalogue/main/catalogue.json"
+  catalogue_url: "https://repeater-plugins.openhop.dev/catalogue.json"
 ```
 
-The catalogue lists plugin **identity and repository only**. Versions and wheel assets come from GitHub Releases on each plugin repo (draft and prerelease tags are ignored by default).
+Catalogue schema 2 records each plugin's currently approved `version`, exact
+GitHub Release `wheel_url`, and lowercase `sha256`. The manager validates that
+the URL belongs to the plugin repository, follows only GitHub's HTTPS release
+asset redirect, verifies the checksum before installation, and confirms the
+wheel manifest ID and version match the catalogue. Publishing a newer GitHub
+Release does not make it available until the catalogue maintainers approve its
+metadata in the R2 catalogue.
+
+Schema 1 repository-only catalogues remain readable for compatibility with
+custom deployments, but the default openHop catalogue uses schema 2 and needs
+no GitHub token.
+
 
 ```bash
 # List catalogue (annotated with installed / latest when available)
 curl -H "Authorization: Bearer $TOKEN" \
   http://127.0.0.1:8000/api/plugins/catalogue
 
-# Install latest stable release of a catalogue plugin (enabled by default)
+# Install the currently approved catalogue version (enabled by default)
 curl -X POST -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"id":"openhop.nomad"}' \
@@ -276,5 +299,6 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
   http://127.0.0.1:8000/api/plugins/update
 ```
 
-Catalogue or GitHub outages do not affect already-installed plugins or Repeater startup. Local `.whl` install continues to work unchanged.
+R2 catalogue or GitHub Release download outages do not affect already-installed
+plugins or Repeater startup. Local `.whl` install continues to work unchanged.
 

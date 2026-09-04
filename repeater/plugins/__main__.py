@@ -104,8 +104,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
             signal.signal(sig, _handle_signal)
-        except Exception:
-            pass
+        except (OSError, ValueError) as exc:
+            logger.debug("Could not register signal %s: %s", sig, exc)
 
     logger.info("Plugin root: %s", plugins_root)
     logger.info("IPC socket: %s", socket_path)
