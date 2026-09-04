@@ -4,13 +4,12 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
 import threading
 from pathlib import Path
 from typing import Any, Optional
 
-import shutil
-
-from .catalogue import CatalogueClient, CatalogueError, DEFAULT_CATALOGUE_URL
+from .catalogue import DEFAULT_CATALOGUE_URL, CatalogueClient, CatalogueError
 from .github_releases import (
     GitHubReleaseClient,
     GitHubReleasesError,
@@ -267,6 +266,25 @@ class PluginManager:
         result = self.get_config(plugin_id)
         result["restarted"] = restarted
         return result
+
+    def get_runtime(self, plugin_id: str) -> dict[str, Any]:
+        """Return plugin runtime snapshot from data/runtime.json for UIs."""
+        state = self.storage.read_state(plugin_id)
+        if state is None:
+            raise PluginManagerError(f"plugin not found: {plugin_id}", 404)
+        paths = self.storage.paths_for(plugin_id)
+        paths.data_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            runtime = self.storage.read_runtime(plugin_id)
+        except ValueError as exc:
+            raise PluginManagerError(str(exc), 500) from exc
+        path = self.storage.runtime_path(plugin_id)
+        return {
+            "id": plugin_id,
+            "path": str(path),
+            "exists": path.is_file(),
+            "runtime": runtime,
+        }
 
     def uninstall(self, plugin_id: str, *, delete_data: bool = False) -> dict[str, Any]:
         with self._lock:

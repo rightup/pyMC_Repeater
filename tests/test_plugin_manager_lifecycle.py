@@ -480,6 +480,32 @@ def test_get_set_config_and_optional_restart(tmp_path: Path):
     assert len(procs) >= 1
 
 
+def test_get_runtime_reads_runtime_snapshot_file(tmp_path: Path):
+    storage = PluginStorage(tmp_path / "plugins")
+    storage.ensure_plugin_layout("openhop.demo", "0.1.0")
+    storage.write_state("openhop.demo", {"version": "0.1.0", "enabled": False})
+    manager = PluginManager(storage)
+
+    payload = {"schema": 1, "running": True, "metrics": {"active_alerts": 3}}
+    storage.runtime_path("openhop.demo").write_text(json.dumps(payload), encoding="utf-8")
+
+    runtime = manager.get_runtime("openhop.demo")
+    assert runtime["exists"] is True
+    assert runtime["runtime"]["schema"] == 1
+    assert runtime["runtime"]["metrics"]["active_alerts"] == 3
+
+
+def test_get_runtime_returns_empty_when_missing(tmp_path: Path):
+    storage = PluginStorage(tmp_path / "plugins")
+    storage.ensure_plugin_layout("openhop.demo", "0.1.0")
+    storage.write_state("openhop.demo", {"version": "0.1.0", "enabled": False})
+    manager = PluginManager(storage)
+
+    runtime = manager.get_runtime("openhop.demo")
+    assert runtime["exists"] is False
+    assert runtime["runtime"] == {}
+
+
 def test_ensure_pip_wheel_filename_rewrites_invalid_temp_name(tmp_path: Path):
     """Uploaded temp names like plugin-XXXX.whl must be rewritten for pip."""
     import zipfile

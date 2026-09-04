@@ -74,6 +74,7 @@ class PluginIPCServer:
             "uninstall": self._op_uninstall,
             "ui_info": self._op_ui_info,
             "get_config": self._op_get_config,
+            "get_runtime": self._op_get_runtime,
             "set_config": self._op_set_config,
             "catalogue": self._op_catalogue,
             "catalogue_install": self._op_catalogue_install,
@@ -244,6 +245,9 @@ class PluginIPCServer:
     def _op_get_config(self, request: dict[str, Any]) -> dict[str, Any]:
         return self.manager.get_config(self._require_id(request))
 
+    def _op_get_runtime(self, request: dict[str, Any]) -> dict[str, Any]:
+        return self.manager.get_runtime(self._require_id(request))
+
     def _op_set_config(self, request: dict[str, Any]) -> dict[str, Any]:
         config = request.get("config")
         if not isinstance(config, dict):
@@ -363,6 +367,9 @@ class PluginIPCClient:
 
     def get_config(self, plugin_id: str) -> dict[str, Any]:
         return self.call("get_config", plugin_id=plugin_id)
+
+    def get_runtime(self, plugin_id: str) -> dict[str, Any]:
+        return self.call("get_runtime", plugin_id=plugin_id)
 
     def set_config(
         self, plugin_id: str, config: dict[str, Any], *, restart: bool = False

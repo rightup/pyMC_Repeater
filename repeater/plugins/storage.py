@@ -225,6 +225,10 @@ class PluginStorage:
         """Path to the plugin-owned config.json under data/."""
         return self.paths_for(plugin_id).data_dir / "config.json"
 
+    def runtime_path(self, plugin_id: str) -> Path:
+        """Path to the plugin runtime snapshot under data/."""
+        return self.paths_for(plugin_id).data_dir / "runtime.json"
+
     def read_config(self, plugin_id: str) -> dict[str, Any]:
         """Read plugin-owned data/config.json. Missing file → {}."""
         path = self.config_path(plugin_id)
@@ -249,6 +253,21 @@ class PluginStorage:
         path = self.config_path(plugin_id)
         self._atomic_write_json(path, config)
         return path
+
+    def read_runtime(self, plugin_id: str) -> dict[str, Any]:
+        """Read plugin-owned data/runtime.json. Missing file -> {}."""
+        path = self.runtime_path(plugin_id)
+        if not path.is_file():
+            return {}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"invalid plugin runtime.json: {exc}") from exc
+        if data is None:
+            return {}
+        if not isinstance(data, dict):
+            raise ValueError("plugin runtime.json must be a JSON object")
+        return data
 
     def tail_log(self, plugin_id: str, lines: int = 200) -> list[str]:
         paths = self.paths_for(plugin_id)

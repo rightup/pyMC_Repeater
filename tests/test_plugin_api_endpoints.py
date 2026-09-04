@@ -51,6 +51,11 @@ def test_list_and_status_via_client_mock(tmp_path, cherrypy_request):
         "enabled": True,
     }
     mock_client.enable.return_value = {"id": "openhop.demo", "enabled": True, "state": "RUNNING"}
+    mock_client.get_runtime.return_value = {
+        "id": "openhop.demo",
+        "exists": True,
+        "runtime": {"schema": 1, "running": True},
+    }
 
     with patch.object(api, "_client_or_raise", return_value=mock_client):
         cherrypy.request.method = "GET"
@@ -66,6 +71,11 @@ def test_list_and_status_via_client_mock(tmp_path, cherrypy_request):
         cherrypy.request.json = {"id": "openhop.demo"}
         enabled = api.enable()
         assert enabled["success"] is True
+
+        cherrypy.request.method = "GET"
+        runtime = api.runtime(id="openhop.demo")
+        assert runtime["success"] is True
+        assert runtime["runtime"]["schema"] == 1
 
 
 def test_ui_serving_index_assets_spa_and_disabled(tmp_path):

@@ -94,6 +94,13 @@ def test_ipc_list_status_start_stop(tmp_path: Path):
         st = client.status("openhop.demo")
         assert st["state"] == "STOPPED"
 
+        runtime_path = manager.storage.runtime_path("openhop.demo")
+        runtime_path.parent.mkdir(parents=True, exist_ok=True)
+        runtime_path.write_text(json.dumps({"schema": 1, "running": True}), encoding="utf-8")
+        runtime = client.get_runtime("openhop.demo")
+        assert runtime["exists"] is True
+        assert runtime["runtime"]["schema"] == 1
+
         with pytest.raises(PluginIPCError):
             client.status("missing.plugin")
     finally:

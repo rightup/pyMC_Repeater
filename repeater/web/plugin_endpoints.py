@@ -343,6 +343,17 @@ class PluginAPIEndpoints:
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
+    def runtime(self, **kwargs):
+        """GET /api/plugins/runtime — read plugin data/runtime.json."""
+        if cherrypy.request.method == "OPTIONS":
+            return ""
+        if cherrypy.request.method not in ("GET", "HEAD"):
+            raise cherrypy.HTTPError(405, "Method Not Allowed")
+        plugin_id = self._plugin_id_from(kwargs)
+        return self._handle_ipc(lambda: self._client_or_raise().get_runtime(plugin_id))
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
     def catalogue(self, **kwargs):
         """GET /api/plugins/catalogue — curated catalogue + install/update hints."""
         if cherrypy.request.method == "OPTIONS":

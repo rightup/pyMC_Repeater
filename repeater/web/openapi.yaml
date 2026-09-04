@@ -4745,6 +4745,28 @@ paths:
         '503':
           description: Plugin manager unavailable
 
+  /plugins/runtime:
+    get:
+      tags: [Plugins]
+      summary: Get plugin runtime.json
+      description: Read the plugin-owned data/runtime.json object.
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      parameters:
+        - name: id
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Runtime object
+        '404':
+          description: Plugin not found
+        '503':
+          description: Plugin manager unavailable
+
 
   /plugins/install:
     post:
