@@ -246,9 +246,10 @@ curl -X DELETE -H "Authorization: Bearer $TOKEN" \
 
 ## Plugin catalogue
 
-Repeater browses a curated static catalogue and installs the exact plugin wheel
-approved there. The catalogue and wheels are hosted on openHop's R2-backed
-origin, so normal installs and update checks do not call the GitHub API.
+Repeater browses the curated static catalogue from openHop's R2-backed endpoint.
+Update checks read only that catalogue and do not query the GitHub API. When a
+user installs an approved plugin, Repeater downloads the exact wheel directly
+from the plugin's GitHub Release.
 
 Default catalogue URL:
 
@@ -264,11 +265,12 @@ plugins:
 ```
 
 Catalogue schema 2 records each plugin's currently approved `version`, exact
-`wheel_url`, and lowercase `sha256`. The manager downloads only from
-`https://repeater-plugins.openhop.dev/plugins/`, verifies the checksum before
-installation, and confirms the wheel manifest ID and version match the
-catalogue. Publishing a newer GitHub Release does not make it available until
-the catalogue maintainers approve and publish that exact wheel.
+GitHub Release `wheel_url`, and lowercase `sha256`. The manager validates that
+the URL belongs to the plugin repository, follows only GitHub's HTTPS release
+asset redirect, verifies the checksum before installation, and confirms the
+wheel manifest ID and version match the catalogue. Publishing a newer GitHub
+Release does not make it available until the catalogue maintainers approve its
+metadata in the R2 catalogue.
 
 Schema 1 repository-only catalogues remain readable for compatibility with
 custom deployments, but the default openHop catalogue uses schema 2 and needs
@@ -297,6 +299,6 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
   http://127.0.0.1:8000/api/plugins/update
 ```
 
-R2 catalogue or wheel outages do not affect already-installed plugins or
-Repeater startup. Local `.whl` install continues to work unchanged.
+R2 catalogue or GitHub Release download outages do not affect already-installed
+plugins or Repeater startup. Local `.whl` install continues to work unchanged.
 

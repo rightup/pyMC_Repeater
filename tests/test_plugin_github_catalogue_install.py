@@ -1,4 +1,4 @@
-"""Approved R2 catalogue install and update flows."""
+"""R2 catalogue lookup with approved GitHub Release install and update flows."""
 
 from __future__ import annotations
 
@@ -63,7 +63,7 @@ def _entry(version: str, wheel: bytes) -> dict:
         "category": "test",
         "version": version,
         "wheel_url": (
-            f"https://repeater-plugins.openhop.dev/plugins/openhop.demo/{version}/"
+            f"https://github.com/openhop-dev/demo-plugin/releases/download/v{version}/"
             f"demo-{version}-py3-none-any.whl"
         ),
         "sha256": hashlib.sha256(wheel).hexdigest(),
@@ -71,7 +71,7 @@ def _entry(version: str, wheel: bytes) -> dict:
 
 
 @pytest.fixture
-def r2_manager(tmp_path: Path):
+def catalogue_manager(tmp_path: Path):
     wheels = {
         "0.1.0": _make_wheel(tmp_path / "demo-0.1.0.whl", "openhop.demo", "0.1.0"),
         "0.2.0": _make_wheel(tmp_path / "demo-0.2.0.whl", "openhop.demo", "0.2.0"),
@@ -94,48 +94,50 @@ def r2_manager(tmp_path: Path):
         catalogue_client=catalogue,
         github_client=github,
     )
-    manager._r2_test_state = state  # type: ignore[attr-defined]
-    manager._r2_test_wheels = wheels  # type: ignore[attr-defined]
+    manager._catalogue_test_state = state  # type: ignore[attr-defined]
+    manager._catalogue_test_wheels = wheels  # type: ignore[attr-defined]
     return manager
 
 
-def test_schema2_install_uses_only_approved_r2_wheel(r2_manager: PluginManager):
-    status = r2_manager.install_from_catalogue("openhop.demo")
+def test_schema2_install_uses_only_approved_github_wheel(catalogue_manager: PluginManager):
+    status = catalogue_manager.install_from_catalogue("openhop.demo")
 
     assert status["version"] == "0.1.0"
     assert status["enabled"] is True
     assert status["source"] == "catalogue"
-    assert all("api.github.com" not in url for url in r2_manager._r2_test_state["requests"])
-    r2_manager.github.latest_stable.assert_not_called()
-    r2_manager.github.download_latest_wheel.assert_not_called()
+    assert all(
+        "api.github.com" not in url for url in catalogue_manager._catalogue_test_state["requests"]
+    )
+    catalogue_manager.github.latest_stable.assert_not_called()
+    catalogue_manager.github.download_latest_wheel.assert_not_called()
 
 
-def test_schema2_catalogue_version_controls_updates(r2_manager: PluginManager):
-    r2_manager.install_from_catalogue("openhop.demo")
-    wheels = r2_manager._r2_test_wheels
-    r2_manager._r2_test_state["entry"] = _entry("0.2.0", wheels["0.2.0"])
-    r2_manager.catalogue.clear_cache()
+def test_schema2_catalogue_version_controls_updates(catalogue_manager: PluginManager):
+    catalogue_manager.install_from_catalogue("openhop.demo")
+    wheels = catalogue_manager._catalogue_test_wheels
+    catalogue_manager._catalogue_test_state["entry"] = _entry("0.2.0", wheels["0.2.0"])
+    catalogue_manager.catalogue.clear_cache()
 
-    check = r2_manager.check_update("openhop.demo", force_refresh=True)
+    check = catalogue_manager.check_update("openhop.demo", force_refresh=True)
     assert check["latestVersion"] == "0.2.0"
     assert check["updateAvailable"] is True
 
-    updated = r2_manager.update_plugin("openhop.demo", force_refresh=True)
+    updated = catalogue_manager.update_plugin("openhop.demo", force_refresh=True)
     assert updated["version"] == "0.2.0"
     assert updated["enabled"] is True
-    r2_manager.github.latest_stable.assert_not_called()
-    r2_manager.github.download_wheel.assert_not_called()
+    catalogue_manager.github.latest_stable.assert_not_called()
+    catalogue_manager.github.download_wheel.assert_not_called()
 
 
-def test_schema2_rejects_unapproved_requested_version(r2_manager: PluginManager):
+def test_schema2_rejects_unapproved_requested_version(catalogue_manager: PluginManager):
     with pytest.raises(PluginManagerError, match="not approved"):
-        r2_manager.install_from_catalogue("openhop.demo", version="9.9.9")
+        catalogue_manager.install_from_catalogue("openhop.demo", version="9.9.9")
 
 
-def test_schema2_checksum_failure_does_not_install(r2_manager: PluginManager):
-    r2_manager._r2_test_state["entry"]["sha256"] = "0" * 64
-    r2_manager.catalogue.clear_cache()
+def test_schema2_checksum_failure_does_not_install(catalogue_manager: PluginManager):
+    catalogue_manager._catalogue_test_state["entry"]["sha256"] = "0" * 64
+    catalogue_manager.catalogue.clear_cache()
 
     with pytest.raises(PluginManagerError, match="checksum"):
-        r2_manager.install_from_catalogue("openhop.demo", force_refresh=True)
-    assert r2_manager.storage.list_plugin_ids() == []
+        catalogue_manager.install_from_catalogue("openhop.demo", force_refresh=True)
+    assert catalogue_manager.storage.list_plugin_ids() == []

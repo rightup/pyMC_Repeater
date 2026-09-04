@@ -14,6 +14,7 @@ from repeater.plugins.catalogue import (
     DEFAULT_CATALOGUE_URL,
     CatalogueClient,
     CatalogueError,
+    _validate_redirect_target,
     parse_catalogue,
 )
 
@@ -42,7 +43,7 @@ VALID_V2 = {
             "repository": "openhop-dev/openhop-nomad-plugin",
             "version": "0.1.0",
             "wheel_url": (
-                "https://repeater-plugins.openhop.dev/plugins/openhop.nomad/0.1.0/"
+                "https://github.com/openhop-dev/openhop-nomad-plugin/releases/download/v0.1.0/"
                 "openhop_nomad_plugin-0.1.0-py3-none-any.whl"
             ),
             "sha256": hashlib.sha256(APPROVED_WHEEL).hexdigest(),
@@ -99,9 +100,26 @@ def test_download_v2_wheel_rejects_redirect_outside_approved_origin(tmp_path):
         return _FakeResp(APPROVED_WHEEL, final_url="https://example.com/plugin.whl")
 
     plugin = parse_catalogue(VALID_V2).plugins[0]
-    with pytest.raises(CatalogueError, match="approved R2"):
+    with pytest.raises(CatalogueError, match="not allowed"):
         CatalogueClient(opener=opener).download_wheel(plugin, tmp_path)
     assert list(tmp_path.iterdir()) == []
+
+
+def test_github_release_asset_redirect_is_allowed():
+    _validate_redirect_target(
+        "https://github.com/openhop-dev/openhop-nomad-plugin/releases/download/v0.1.0/"
+        "openhop_nomad_plugin-0.1.0-py3-none-any.whl",
+        "https://release-assets.githubusercontent.com/github-production-release-asset.whl",
+    )
+
+
+def test_https_downgrade_redirect_is_rejected():
+    with pytest.raises(CatalogueError, match="not allowed"):
+        _validate_redirect_target(
+            "https://github.com/openhop-dev/openhop-nomad-plugin/releases/download/v0.1.0/"
+            "openhop_nomad_plugin-0.1.0-py3-none-any.whl",
+            "http://release-assets.githubusercontent.com/asset.whl",
+        )
 
 
 def test_unsupported_schema():

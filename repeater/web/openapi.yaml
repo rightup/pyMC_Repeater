@@ -4626,8 +4626,8 @@ paths:
         - Plugins
       summary: Install a plugin from the catalogue
       description: >
-        Download the exact R2 wheel approved by catalogue version and SHA-256,
-        verify its manifest, install it, and enable the plugin.
+        Download the exact GitHub Release wheel approved by the R2 catalogue
+        version and SHA-256, verify its manifest, install it, and enable the plugin.
       requestBody:
         required: true
         content:

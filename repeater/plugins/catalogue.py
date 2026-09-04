@@ -23,7 +23,8 @@ DEFAULT_CATALOGUE_URL = "https://repeater-plugins.openhop.dev/catalogue.json"
 DEFAULT_CACHE_TTL_SECONDS = 600  # 10 minutes
 SUPPORTED_SCHEMAS = (1, 2)
 USER_AGENT = "openhop-repeater-plugin-manager/1.0"
-APPROVED_WHEEL_ORIGIN = "https://repeater-plugins.openhop.dev"
+GITHUB_RELEASE_ORIGIN = "https://github.com"
+GITHUB_RELEASE_ASSET_HOST = "release-assets.githubusercontent.com"
 MAX_WHEEL_BYTES = 100 * 1024 * 1024
 
 _REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
@@ -45,22 +46,60 @@ def _ssl_context() -> ssl.SSLContext:
     return _ssl_ctx
 
 
-def _validate_approved_wheel_url(plugin_id: str, version: str, wheel_url: str) -> None:
+def _validate_approved_wheel_url(repository: str, version: str, wheel_url: str) -> None:
     parsed = urlsplit(wheel_url)
     origin = f"{parsed.scheme}://{parsed.netloc}"
-    expected_prefix = f"/plugins/{plugin_id}/{version}/"
+    expected_prefix = f"/{repository}/releases/download/"
+    path_tail = (
+        parsed.path[len(expected_prefix) :] if parsed.path.startswith(expected_prefix) else ""
+    )
+    path_parts = path_tail.split("/")
+    filename = path_parts[-1] if path_parts else ""
     if (
-        origin != APPROVED_WHEEL_ORIGIN
-        or not parsed.path.startswith(expected_prefix)
-        or not parsed.path.endswith(".whl")
+        origin != GITHUB_RELEASE_ORIGIN
+        or len(path_parts) != 2
+        or not path_parts[0]
+        or not filename.endswith(".whl")
+        or f"-{version}-" not in filename
         or parsed.query
         or parsed.fragment
     ):
         raise CatalogueError(
-            f"wheel_url must be an approved R2 wheel under "
-            f"{APPROVED_WHEEL_ORIGIN}{expected_prefix}",
+            f"wheel_url must be a version-matched GitHub Release wheel in {repository}",
             code=400,
         )
+
+
+def _validate_redirect_target(source_url: str, target_url: str) -> None:
+    source = urlsplit(source_url)
+    target = urlsplit(target_url)
+    same_origin = (
+        source.scheme == "https" and target.scheme == "https" and source.netloc == target.netloc
+    )
+    github_asset_redirect = (
+        source.scheme == "https"
+        and source.hostname in {"github.com", GITHUB_RELEASE_ASSET_HOST}
+        and target.scheme == "https"
+        and target.hostname == GITHUB_RELEASE_ASSET_HOST
+        and target.port is None
+    )
+    if not (same_origin or github_asset_redirect):
+        raise CatalogueError(
+            f"download redirect is not allowed: {source_url} -> {target_url}",
+            code=502,
+        )
+
+
+def _validate_download_response_url(source_url: str, final_url: str) -> None:
+    if final_url == source_url:
+        return
+    _validate_redirect_target(source_url, final_url)
+
+
+class _ApprovedRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        _validate_redirect_target(req.full_url, newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
 @dataclass(frozen=True)
@@ -204,7 +243,7 @@ def parse_catalogue(data: Any) -> Catalogue:
             wheel_url = raw_wheel_url.strip()
             sha256 = raw_sha256
             try:
-                _validate_approved_wheel_url(plugin_id, version, wheel_url)
+                _validate_approved_wheel_url(repository, version, wheel_url)
             except CatalogueError as exc:
                 raise CatalogueError(f"plugins[{idx}].{exc}", code=exc.code) from exc
             if wheel_url in seen_wheel_urls:
@@ -248,9 +287,11 @@ class CatalogueClient:
         self._cached: Optional[Catalogue] = None
 
     def _default_open(self, request: urllib.request.Request, timeout: float = 30.0):
-        return urllib.request.urlopen(  # nosec B310 - validated HTTPS URLs
-            request, timeout=timeout, context=_ssl_context()
+        opener = urllib.request.build_opener(
+            urllib.request.HTTPSHandler(context=_ssl_context()),
+            _ApprovedRedirectHandler(),
         )
+        return opener.open(request, timeout=timeout)  # nosec B310 - validated HTTPS URLs
 
     def clear_cache(self) -> None:
         self._cached = None
@@ -310,13 +351,13 @@ class CatalogueClient:
         return plugin
 
     def download_wheel(self, plugin: CataloguePlugin, dest_dir: Path | str) -> Path:
-        """Download and verify one schema-2 approved wheel from R2."""
+        """Download and verify one schema-2 approved GitHub Release wheel."""
         if not plugin.version or not plugin.wheel_url or not plugin.sha256:
             raise CatalogueError(
                 f"catalogue entry {plugin.id} does not contain approved wheel metadata",
                 code=400,
             )
-        _validate_approved_wheel_url(plugin.id, plugin.version, plugin.wheel_url)
+        _validate_approved_wheel_url(plugin.repository, plugin.version, plugin.wheel_url)
         if not _SHA256_RE.fullmatch(plugin.sha256):
             raise CatalogueError(f"invalid approved checksum for {plugin.id}", code=400)
 
@@ -339,9 +380,8 @@ class CatalogueClient:
                 try:
                     with self._opener(request, timeout=120.0) as response:
                         final_url = getattr(response, "geturl", lambda: plugin.wheel_url)()
-                        _validate_approved_wheel_url(
-                            plugin.id,
-                            plugin.version,
+                        _validate_download_response_url(
+                            plugin.wheel_url,
                             final_url or plugin.wheel_url,
                         )
                         while True:
