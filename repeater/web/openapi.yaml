@@ -3435,7 +3435,23 @@ paths:
               schema:
                 type: object
 
+  /web_frontends:
+    get:
+      tags: [System]
+      summary: List selectable primary web frontends
+      description: >
+        Returns built-in Repeater UI, openHop Console (if installed), and enabled
+        application UI plugins that can be selected via web.web_path.
+      responses:
+        '200':
+          description: Frontend catalogue for the Web Frontend switcher
+          content:
+            application/json:
+              schema:
+                type: object
+
   /check_pymc_console:
+
     get:
       tags: [System]
       summary: Check pyMC console availability

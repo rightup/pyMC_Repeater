@@ -2315,10 +2315,109 @@ class APIEndpoints:
             logger.error(f"Error updating advert rate limit config: {e}")
             return self._error(str(e))
 
+    @staticmethod
+    def _read_ui_version(html_dir: str) -> Optional[str]:
+        """Best-effort version for a static UI tree (VERSION / version.json / package.json)."""
+        if not html_dir or not os.path.isdir(html_dir):
+            return None
+        version_file = os.path.join(html_dir, "VERSION")
+        if os.path.isfile(version_file):
+            try:
+                value = open(version_file, "r", encoding="utf-8").read().strip()
+                return value or None
+            except OSError:
+                pass
+        for name in ("version.json", "package.json"):
+            candidate = os.path.join(html_dir, name)
+            if not os.path.isfile(candidate):
+                continue
+            try:
+                import json as _json
+
+                data = _json.loads(open(candidate, "r", encoding="utf-8").read())
+            except (OSError, ValueError):
+                continue
+            if isinstance(data, dict):
+                ver = data.get("version")
+                if isinstance(ver, str) and ver.strip():
+                    return ver.strip()
+            elif isinstance(data, str) and data.strip():
+                return data.strip()
+        return None
+
+    def _plugin_ui_frontends(self) -> list:
+        """Installed application-UI plugins usable as primary web frontends."""
+        out = []
+        try:
+            from repeater.config import resolve_storage_dir
+            from repeater.plugins.storage import PluginStorage, resolve_plugins_root, safe_join
+        except Exception as exc:
+            logger.debug("plugin UI frontends unavailable: %s", exc)
+            return out
+
+        try:
+            storage_dir = resolve_storage_dir(self.config, config_path=self._config_path)
+            plugins_root = resolve_plugins_root(self.config, storage_dir=storage_dir)
+            storage = PluginStorage(plugins_root)
+        except Exception as exc:
+            logger.debug("plugin storage resolve failed: %s", exc)
+            return out
+
+        for plugin_id in storage.list_plugin_ids():
+            try:
+                state = storage.read_state(plugin_id) or {}
+                manifest = storage.load_current_manifest(plugin_id)
+                if manifest is None or manifest.ui is None:
+                    continue
+                paths = storage.paths_for(plugin_id)
+                if paths.current_link.exists() or paths.current_link.is_symlink():
+                    release_root = paths.current_link.resolve()
+                else:
+                    version = state.get("version") or (manifest.version if manifest else None)
+                    if not version:
+                        continue
+                    release_root = paths.release_dir(str(version))
+                if not release_root.is_dir():
+                    continue
+                entry = str(manifest.ui.entry or "").replace("\\", "/")
+                entry_parts = tuple(p for p in entry.split("/") if p)
+                if not entry_parts:
+                    continue
+                if len(entry_parts) > 1:
+                    doc_root = safe_join(release_root, *entry_parts[:-1])
+                    entry_name = entry_parts[-1]
+                else:
+                    doc_root = release_root
+                    entry_name = entry_parts[0]
+                if not doc_root.is_dir():
+                    continue
+                index_path = doc_root / entry_name
+                available = bool(state.get("enabled", False)) and index_path.is_file()
+                version = str(state.get("version") or manifest.version or "") or None
+                out.append(
+                    {
+                        "id": f"plugin:{plugin_id}",
+                        "plugin_id": plugin_id,
+                        "kind": "plugin",
+                        "name": manifest.name or plugin_id,
+                        "description": (manifest.description or "Application UI plugin").strip()
+                        or "Application UI plugin",
+                        "path": str(doc_root),
+                        "version": version,
+                        "enabled": bool(state.get("enabled", False)),
+                        "available": available,
+                        "source": state.get("source") or "local",
+                    }
+                )
+            except Exception as exc:
+                logger.debug("skip plugin frontend %s: %s", plugin_id, exc)
+                continue
+        return out
+
     @cherrypy.expose
     @cherrypy.tools.json_out()
     def check_pymc_console(self):
-        """Check if PyMC Console directory exists."""
+        """Check if openHop Console directory exists (and report version when known)."""
         self._set_cors_headers()
 
         if cherrypy.request.method == "OPTIONS":
@@ -2327,10 +2426,120 @@ class APIEndpoints:
         try:
             pymc_console_path = "/opt/pymc_console/web/html"
             exists = os.path.isdir(pymc_console_path)
+            version = self._read_ui_version(pymc_console_path) if exists else None
 
-            return self._success({"exists": exists, "path": pymc_console_path})
+            return self._success(
+                {
+                    "exists": exists,
+                    "path": pymc_console_path,
+                    "version": version,
+                }
+            )
         except Exception as e:
             logger.error(f"Error checking PyMC Console directory: {e}")
+            return self._error(str(e))
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    def web_frontends(self):
+        """List selectable primary web frontends (built-in, Console, UI plugins)."""
+        self._set_cors_headers()
+
+        if cherrypy.request.method == "OPTIONS":
+            return ""
+        if cherrypy.request.method not in ("GET", "HEAD"):
+            raise cherrypy.HTTPError(405, "Method Not Allowed")
+
+        try:
+            web_cfg = (self.config or {}).get("web") or {}
+            current_path = web_cfg.get("web_path")
+            if isinstance(current_path, str):
+                current_path = current_path.strip() or None
+            else:
+                current_path = None
+
+            try:
+                from repeater import __version__ as repeater_version
+            except Exception:
+                repeater_version = None
+
+            default_html = os.path.join(os.path.dirname(__file__), "html")
+            frontends = [
+                {
+                    "id": "builtin",
+                    "kind": "builtin",
+                    "name": "Default Frontend",
+                    "description": "Built-in Repeater web interface",
+                    "path": None,
+                    "version": repeater_version,
+                    "available": True,
+                    "enabled": True,
+                }
+            ]
+
+            console_path = "/opt/pymc_console/web/html"
+            console_exists = os.path.isdir(console_path)
+            frontends.append(
+                {
+                    "id": "console",
+                    "kind": "console",
+                    "name": "openHop Console",
+                    "description": "Alternative web interface for Repeater",
+                    "path": console_path,
+                    "version": self._read_ui_version(console_path) if console_exists else None,
+                    "available": console_exists,
+                    "enabled": console_exists,
+                }
+            )
+
+            frontends.extend(self._plugin_ui_frontends())
+
+            selected_id = "builtin"
+            if current_path:
+                # Prefer exact path match; fall back to path prefix for console.
+                matched = None
+                for item in frontends:
+                    path = item.get("path")
+                    if not path:
+                        continue
+                    if os.path.abspath(str(path)) == os.path.abspath(str(current_path)):
+                        matched = item["id"]
+                        break
+                if matched is None and (
+                    current_path == console_path
+                    or str(current_path).startswith("/opt/pymc_console/")
+                ):
+                    matched = "console"
+                if matched is None:
+                    # Unknown custom path — surface as selected custom entry
+                    frontends.append(
+                        {
+                            "id": "custom",
+                            "kind": "custom",
+                            "name": "Custom path",
+                            "description": "Configured web_path not matching a known frontend",
+                            "path": current_path,
+                            "version": self._read_ui_version(current_path),
+                            "available": os.path.isdir(current_path),
+                            "enabled": True,
+                        }
+                    )
+                    matched = "custom"
+                selected_id = matched
+
+            for item in frontends:
+                item["selected"] = item["id"] == selected_id
+
+            return self._success(
+                {
+                    "frontends": frontends,
+                    "selected_id": selected_id,
+                    "web_path": current_path,
+                    "default_html_dir": default_html,
+                }
+            )
+        except Exception as e:
+            logger.error(f"Error listing web frontends: {e}")
             return self._error(str(e))
 
     @cherrypy.expose
