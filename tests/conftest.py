@@ -16,6 +16,7 @@ and does not point at the cause.
 The autouse fixture below fails the *responsible* test instead, at the moment it
 leaks the timer.
 """
+
 import threading
 
 import pytest

@@ -16,6 +16,7 @@ packets and doing no RX/TX.
 These tests build a database with the *old* packets schema and assert that a
 handler opens it, ends up with both columns and the index, and can insert.
 """
+
 import os
 import shutil
 import sqlite3
@@ -59,9 +60,7 @@ CREATE TABLE packets (
 def _make_legacy_db(path):
     con = sqlite3.connect(path)
     con.execute(_OLD_PACKETS_SCHEMA)
-    con.execute(
-        "INSERT INTO packets (timestamp, type, length) VALUES (?, ?, ?)", (1.0, 1, 10)
-    )
+    con.execute("INSERT INTO packets (timestamp, type, length) VALUES (?, ?, ?)", (1.0, 1, 10))
     con.commit()
     con.close()
 
@@ -77,10 +76,7 @@ def _columns(path, table="packets"):
 def _indexes(path):
     con = sqlite3.connect(path)
     try:
-        return {
-            r[0]
-            for r in con.execute("SELECT name FROM sqlite_master WHERE type='index'")
-        }
+        return {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='index'")}
     finally:
         con.close()
 
@@ -117,10 +113,7 @@ def test_upstream_index_exists_after_upgrade(legacy_db):
 def _tables(path):
     con = sqlite3.connect(path)
     try:
-        return {
-            r[0]
-            for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")
-        }
+        return {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     finally:
         con.close()
 
@@ -145,8 +138,7 @@ def test_schema_init_runs_to_completion(legacy_db):
     tables = _tables(path)
     for late in ("room_messages", "room_client_sync"):
         assert late in tables, (
-            "%s is missing: _init_database did not run to completion on an "
-            "existing database" % late
+            "%s is missing: _init_database did not run to completion on an existing database" % late
         )
 
 
@@ -159,8 +151,7 @@ def test_recording_works_after_upgrade(legacy_db):
     try:
         before = con.execute("SELECT COUNT(*) FROM packets").fetchone()[0]
         con.execute(
-            "INSERT INTO packets (timestamp, type, length, upstream_hash) "
-            "VALUES (?, ?, ?, ?)",
+            "INSERT INTO packets (timestamp, type, length, upstream_hash) VALUES (?, ?, ?, ?)",
             (2.0, 1, 12, "ABCD"),
         )
         con.commit()

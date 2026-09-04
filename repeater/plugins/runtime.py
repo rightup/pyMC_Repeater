@@ -571,8 +571,8 @@ class PluginRuntime:
                 pass
             try:
                 proc.wait(timeout=2)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("Wait after killing %s failed: %s", plugin_id, exc)
 
         with self._lock:
             self._cleanup_handle(plugin_id)
@@ -593,12 +593,12 @@ class PluginRuntime:
         try:
             if handle.process.poll() is not None:
                 self._exit_codes[plugin_id] = handle.process.returncode
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Could not record exit status for %s: %s", plugin_id, exc)
         try:
             handle.log_fp.close()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Could not close plugin log for %s: %s", plugin_id, exc)
 
     @staticmethod
     def _rotate_log_if_needed(log_file: Path) -> None:

@@ -136,12 +136,9 @@ class PluginAPIEndpoints:
             else:
                 delete_data = bool(raw)
             # JSON body optional
-            try:
-                body = self._json_body()
-                if "delete_data" in body:
-                    delete_data = bool(body.get("delete_data"))
-            except Exception:
-                pass
+            body = self._json_body()
+            if "delete_data" in body:
+                delete_data = bool(body.get("delete_data"))
 
             def _uninstall():
                 return self._client_or_raise().uninstall(plugin_id, delete_data=delete_data)
