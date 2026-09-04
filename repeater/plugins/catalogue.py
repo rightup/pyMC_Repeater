@@ -46,6 +46,7 @@ class CataloguePlugin:
     description: str
     repository: str
     category: str = ""
+    logo: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {
@@ -56,6 +57,8 @@ class CataloguePlugin:
         }
         if self.category:
             out["category"] = self.category
+        if self.logo:
+            out["logo"] = self.logo
         return out
 
 
@@ -131,6 +134,18 @@ def parse_catalogue(data: Any) -> Catalogue:
         if not isinstance(category, str):
             raise CatalogueError(f"plugins[{idx}].category must be a string", code=400)
 
+        logo = item.get("logo", "") or ""
+        if logo is None:
+            logo = ""
+        if not isinstance(logo, str):
+            raise CatalogueError(f"plugins[{idx}].logo must be a string", code=400)
+        logo = logo.strip()
+        if logo and not logo.startswith("https://"):
+            raise CatalogueError(
+                f"plugins[{idx}].logo must be an https:// URL",
+                code=400,
+            )
+
         seen_ids.add(plugin_id)
         seen_repos.add(repository)
         plugins.append(
@@ -140,6 +155,7 @@ def parse_catalogue(data: Any) -> Catalogue:
                 description=description.strip(),
                 repository=repository,
                 category=category.strip(),
+                logo=logo,
             )
         )
     return Catalogue(schema=SUPPORTED_SCHEMA, plugins=tuple(plugins))

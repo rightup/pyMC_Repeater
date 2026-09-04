@@ -1,0 +1,1 @@
+import{t as e}from"./dataService-Cm2SxiMj.js";export{e as useDataService};
