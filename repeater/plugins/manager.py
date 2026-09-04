@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 from pathlib import Path
 from typing import Any, Optional
@@ -48,7 +49,9 @@ class PluginManager:
         self.runtime = runtime or PluginRuntime(storage)
         self._lock = threading.RLock()
         self.catalogue = catalogue_client or CatalogueClient(catalogue_url or DEFAULT_CATALOGUE_URL)
-        self.github = github_client or GitHubReleaseClient()
+        self.github = github_client or GitHubReleaseClient(
+            token=os.environ.get("OPENHOP_PLUGIN_GITHUB_TOKEN")
+        )
 
     def start(self) -> None:
         """Load state and start enabled service plugins."""

@@ -3,6 +3,10 @@ services:
     image: ${OPENHOP_REPEATER_IMAGE:-${PYMC_REPEATER_IMAGE:-openhop/openhop-repeater:main}}
     container_name: openhop-repeater
     restart: unless-stopped
+    environment:
+      # Optional fine-grained, read-only token for catalogue release lookups.
+      # It raises GitHub's API limit; it is never sent to release asset hosts.
+      OPENHOP_PLUGIN_GITHUB_TOKEN: ${OPENHOP_PLUGIN_GITHUB_TOKEN:-}
     ports:
       - 8000:8000
     devices:

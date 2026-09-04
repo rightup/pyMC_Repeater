@@ -127,15 +127,7 @@ fi
 
 merge_config_from_example "${CONFIG_PATH}"
 
-# Optionally start the plugin manager alongside Repeater (same container).
-# Disable with OPENHOP_PLUGIN_MANAGER=0. Failures here must not block Repeater.
-PLUGIN_MANAGER_ENABLED="${OPENHOP_PLUGIN_MANAGER:-1}"
-if [ "${PLUGIN_MANAGER_ENABLED}" != "0" ] && [ "${PLUGIN_MANAGER_ENABLED}" != "false" ]; then
-    if command -v openhop-plugin-manager >/dev/null 2>&1; then
-        openhop-plugin-manager --config "${CONFIG_PATH}" &
-    elif python3 -c 'import repeater.plugins' >/dev/null 2>&1; then
-        python3 -m repeater.plugins --config "${CONFIG_PATH}" &
-    fi
-fi
-
-exec python3 -m repeater.main --config "${CONFIG_PATH}"
+# Keep Repeater and its optional plugin manager under one PID 1 supervisor.
+# The supervisor forwards shutdown signals to both process groups and restarts
+# the plugin manager if it exits while Repeater is still running.
+exec python3 -m repeater.plugins.container_supervisor --config "${CONFIG_PATH}"

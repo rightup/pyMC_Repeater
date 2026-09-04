@@ -148,6 +148,27 @@ def test_download_wheel(tmp_path: Path):
     assert path.name.endswith(".whl")
 
 
+def test_github_token_authenticates_api_but_not_asset_download(tmp_path: Path):
+    payload = [_release("v0.1.0")]
+    seen_headers = []
+
+    def opener(request: Request, timeout: float = 30.0):
+        seen_headers.append((request.full_url, dict(request.header_items())))
+        if "api.github.com" in request.full_url:
+            return _FakeResp(json.dumps(payload).encode())
+        if request.full_url.endswith(".whl"):
+            return _FakeResp(b"wheel-bytes")
+        raise AssertionError(request.full_url)
+
+    client = GitHubReleaseClient(opener=opener, token="test-token")
+    client.download_latest_wheel("org/repo", tmp_path)
+
+    api_headers = next(headers for url, headers in seen_headers if "api.github.com" in url)
+    asset_headers = next(headers for url, headers in seen_headers if url.endswith(".whl"))
+    assert api_headers["Authorization"] == "Bearer test-token"
+    assert "Authorization" not in asset_headers
+
+
 def test_rate_limit():
     def opener(request: Request, timeout: float = 30.0):
         headers = {"X-RateLimit-Remaining": "0"}

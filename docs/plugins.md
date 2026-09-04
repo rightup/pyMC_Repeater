@@ -22,6 +22,8 @@ Default root (under Repeater storage):
 ```
 
 - Code and virtualenv are **version-specific**.
+- The installed wheel is retained with each release so its virtualenv can be
+  rebuilt automatically if a future container image changes Python versions.
 - `data/` is **not** version-specific and is never interpreted by the manager.
 - IPC socket default: `/var/lib/openhop_repeater/plugin-manager.sock`.
 
@@ -83,6 +85,12 @@ The manager starts enabled service plugins on boot and supervises crashes
 
 Repeater does **not** require the manager. If the socket is missing, plugin API
 calls return HTTP 503 and normal Repeater operation continues.
+
+The Docker image runs Repeater and the manager under a small process supervisor,
+with `tini` as PID 1 to reap orphaned children. It forwards shutdown signals to
+both services and their plugin processes, and restarts the manager if it exits
+unexpectedly while Repeater remains running. Set `OPENHOP_PLUGIN_MANAGER=0` to
+run Repeater without the manager.
 
 ## Install a local wheel
 
@@ -222,9 +230,13 @@ curl -X DELETE -H "Authorization: Bearer $TOKEN" \
 
 1. Build the `openhop-nomad-plugin` wheel.
 2. Install via `/api/plugins/install`.
-3. Write `$OPENHOP_PLUGIN_DATA/config.json` with `nomad_url` / `nomad_model`.
-4. Enable the plugin — `meshcore-nomad-bridge` should report `RUNNING`.
-5. The bridge talks to the Companion frame server (default `127.0.0.1:5001`).
+3. Enable a Repeater Companion frame server reachable from the plugin. In the
+   standard Docker image, `127.0.0.1:5001` reaches the same container.
+4. Write `$OPENHOP_PLUGIN_DATA/config.json` with `nomad_url` / `nomad_model`.
+5. Enable the plugin — `meshcore-nomad-bridge` should report `RUNNING`.
+6. Confirm its logs show a successful Companion connection, not only a running
+   retry loop. A `RUNNING` process can still be reconnecting to a disabled frame
+   server.
 
 ## Future work (not in this version)
 
@@ -253,6 +265,12 @@ plugins:
 ```
 
 The catalogue lists plugin **identity and repository only**. Versions and wheel assets come from GitHub Releases on each plugin repo (draft and prerelease tags are ignored by default).
+
+GitHub permits anonymous lookups, but the anonymous API limit is low and may be
+shared by multiple containers behind the same public address. Docker operators
+can set `OPENHOP_PLUGIN_GITHUB_TOKEN` in `.env` to a fine-grained token with
+read-only access to public repository metadata. The token is used only for
+`api.github.com` release lookups and is not sent to release asset URLs.
 
 ```bash
 # List catalogue (annotated with installed / latest when available)

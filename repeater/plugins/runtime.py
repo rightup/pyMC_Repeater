@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 import signal
 import subprocess  # nosec B404 - argument arrays only, never shell=True
 import sys
@@ -89,15 +90,27 @@ class PluginRuntime:
         paths = self.storage.ensure_plugin_layout(plugin_id, version)
         self.storage.write_manifest(plugin_id, version, manifest)
 
+        # Keep the exact install artifact with the release. Container data
+        # volumes outlive the image, so this lets us rebuild the isolated venv
+        # after a future base-image Python minor-version change.
+        release_dir = paths.release_dir(version)
+        archived_wheel = release_dir / wheel_path.name
+        if archived_wheel.resolve() != wheel_path:
+            for previous_wheel in release_dir.glob("*.whl"):
+                previous_wheel.unlink(missing_ok=True)
+            shutil.copy2(wheel_path, archived_wheel)
+        else:
+            archived_wheel = wheel_path
+
         # Extract optional UI assets from the wheel into the release dir
-        self._extract_ui_assets(wheel_path, paths.release_dir(version), manifest)
+        self._extract_ui_assets(archived_wheel, release_dir, manifest)
         # Also extract optional config.default.json next to the manifest if present
-        self._extract_config_default_file(wheel_path, paths.release_dir(version))
+        self._extract_config_default_file(archived_wheel, release_dir)
 
         venv_path = paths.venv_dir(version)
         if manifest.runtime is not None:
             self._create_venv(venv_path)
-            self._pip_install(venv_path, wheel_path)
+            self._pip_install(venv_path, archived_wheel)
 
         # Seed data/config.json from defaults when the user has no saved config yet
         self._seed_config_if_missing(plugin_id, manifest, paths.release_dir(version))
@@ -122,6 +135,58 @@ class PluginRuntime:
             "venv_dir": str(venv_path) if manifest.runtime else None,
             "data_dir": str(paths.data_dir),
         }
+
+    def ensure_venv_compatible(self, plugin_id: str) -> None:
+        """Rebuild a persisted plugin venv when Python's minor version changes."""
+        state = self.storage.read_state(plugin_id)
+        manifest = self.storage.load_current_manifest(plugin_id)
+        if state is None or manifest is None or manifest.runtime is None:
+            return
+
+        version = str(state.get("version") or manifest.version)
+        paths = self.storage.paths_for(plugin_id)
+        venv_path = paths.venv_dir(version)
+        config_path = venv_path / "pyvenv.cfg"
+        if not config_path.is_file():
+            # Legacy/test venvs have no reliable version marker. Let normal
+            # entrypoint validation report a useful error instead of deleting.
+            return
+
+        persisted_version = None
+        try:
+            for line in config_path.read_text(encoding="utf-8").splitlines():
+                key, separator, value = line.partition("=")
+                if separator and key.strip().lower() == "version":
+                    parts = value.strip().split(".")
+                    if len(parts) >= 2:
+                        persisted_version = (int(parts[0]), int(parts[1]))
+                    break
+        except (OSError, ValueError):
+            return
+
+        current_version = (sys.version_info.major, sys.version_info.minor)
+        if persisted_version is None or persisted_version == current_version:
+            return
+
+        wheels = sorted(paths.release_dir(version).glob("*.whl"))
+        if not wheels:
+            raise RuntimeError(
+                f"plugin venv uses Python {persisted_version[0]}.{persisted_version[1]}, "
+                f"but the container uses {current_version[0]}.{current_version[1]}; "
+                "reinstall the plugin to rebuild its environment"
+            )
+
+        logger.warning(
+            "Rebuilding %s venv for Python %s.%s (was %s.%s)",
+            plugin_id,
+            current_version[0],
+            current_version[1],
+            persisted_version[0],
+            persisted_version[1],
+        )
+        shutil.rmtree(venv_path)
+        self._create_venv(venv_path)
+        self._pip_install(venv_path, wheels[0])
 
     def _create_venv(self, venv_path: Path) -> None:
         if venv_path.exists():
@@ -411,6 +476,10 @@ class PluginRuntime:
                 # Allow explicit start only when enabled — callers enable first
                 raise RuntimeError(f"plugin is disabled: {plugin_id}")
 
+            # Persisted Docker volumes can outlive the image's Python minor
+            # version. Rebuild before resolving the installed entrypoint.
+            self.ensure_venv_compatible(plugin_id)
+
             existing = self._handles.get(plugin_id)
             if existing and existing.process.poll() is None:
                 self._runtime_state[plugin_id] = PluginState.RUNNING
@@ -434,6 +503,8 @@ class PluginRuntime:
             log_fp = open(paths.log_file, "a", encoding="utf-8", buffering=1)
 
             env = os.environ.copy()
+            # Manager-only credentials must never become plugin credentials.
+            env.pop("OPENHOP_PLUGIN_GITHUB_TOKEN", None)
             env["OPENHOP_PLUGIN_ID"] = plugin_id
             env["OPENHOP_PLUGIN_DATA"] = str(paths.data_dir)
 

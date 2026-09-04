@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 import zipfile
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -50,6 +52,14 @@ def _make_wheel(path: Path, manifest: dict, ui_files: dict[str, str] | None = No
     return path
 
 
+def test_default_github_client_uses_service_scoped_token(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("OPENHOP_PLUGIN_GITHUB_TOKEN", "service-token")
+
+    manager = PluginManager(PluginStorage(tmp_path / "plugins"))
+
+    assert manager.github.token == "service-token"
+
+
 def test_install_creates_layout_and_isolated_venv(tmp_path: Path, monkeypatch):
     storage = PluginStorage(tmp_path / "plugins")
     calls = []
@@ -92,6 +102,7 @@ def test_install_creates_layout_and_isolated_venv(tmp_path: Path, monkeypatch):
     paths = storage.paths_for("openhop.demo")
     assert paths.data_dir.is_dir()
     assert paths.venv_dir("0.1.0").is_dir()
+    assert (paths.release_dir("0.1.0") / wheel.name).is_file()
     assert any("venv" in c for c in calls)
     assert any("pip" in c for c in calls)
     # Ensure we never invoked the system pip against a non-venv target alone
@@ -100,13 +111,102 @@ def test_install_creates_layout_and_isolated_venv(tmp_path: Path, monkeypatch):
             assert str(paths.venv_dir("0.1.0")) in c[0] or "venv" in "".join(c)
 
 
-def test_enable_start_stop_disable(tmp_path: Path):
+def test_start_rebuilds_incompatible_persisted_venv_from_archived_wheel(tmp_path: Path):
+    storage = PluginStorage(tmp_path / "plugins")
+    plugin_id = "openhop.demo"
+    version = "0.1.0"
+    paths = storage.ensure_plugin_layout(plugin_id, version)
+    storage.write_state(plugin_id, {"version": version, "enabled": True})
+    storage.write_manifest(
+        plugin_id,
+        version,
+        PluginManifest(
+            schema=1,
+            id=plugin_id,
+            name="Demo",
+            version=version,
+            runtime=RuntimeSpec(type="python", entrypoint="demo-cli"),
+        ),
+    )
+    storage.set_current(plugin_id, version)
+    archived_wheel = paths.release_dir(version) / "demo-0.1.0-py3-none-any.whl"
+    _make_wheel(
+        archived_wheel,
+        {
+            "schema": 1,
+            "id": plugin_id,
+            "name": "Demo",
+            "version": version,
+            "runtime": {"type": "python", "entrypoint": "demo-cli"},
+        },
+    )
+    venv = paths.venv_dir(version)
+    (venv / "bin").mkdir(parents=True)
+    (venv / "bin" / "python").write_text("old", encoding="utf-8")
+    (venv / "pyvenv.cfg").write_text("version = 3.11.9\n", encoding="utf-8")
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(list(cmd))
+        if "venv" in cmd:
+            target = Path(cmd[-1])
+            (target / "bin").mkdir(parents=True, exist_ok=True)
+            (target / "bin" / "python").write_text("new", encoding="utf-8")
+            (target / "pyvenv.cfg").write_text(
+                f"version = {sys.version_info.major}.{sys.version_info.minor}.0\n",
+                encoding="utf-8",
+            )
+        if "pip" in cmd:
+            entrypoint = Path(cmd[0]).parent / "demo-cli"
+            entrypoint.write_text("new entrypoint", encoding="utf-8")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    runtime = PluginRuntime(
+        storage,
+        run_factory=fake_run,
+        popen_factory=lambda *args, **kwargs: FakeProc(),
+    )
+    runtime.start(plugin_id)
+
+    assert any("venv" in call for call in calls)
+    assert any("pip" in call for call in calls)
+    assert (venv / "bin" / "python").read_text(encoding="utf-8") == "new"
+
+
+def test_manager_starts_enabled_plugin(tmp_path: Path):
+    storage = PluginStorage(tmp_path / "plugins")
+    storage.ensure_plugin_layout("openhop.demo", "0.1.0")
+    storage.write_state("openhop.demo", {"version": "0.1.0", "enabled": True})
+    storage.write_manifest(
+        "openhop.demo",
+        "0.1.0",
+        PluginManifest(
+            schema=1,
+            id="openhop.demo",
+            name="Demo",
+            version="0.1.0",
+            runtime=RuntimeSpec(type="python", entrypoint="demo-cli"),
+        ),
+    )
+    storage.set_current("openhop.demo", "0.1.0")
+    runtime = MagicMock(spec=PluginRuntime)
+    manager = PluginManager(storage, runtime)
+
+    manager.start()
+
+    runtime.start.assert_called_once_with("openhop.demo")
+
+
+def test_enable_start_stop_disable(tmp_path: Path, monkeypatch):
     storage = PluginStorage(tmp_path / "plugins")
     procs: list[FakeProc] = []
+    child_environments = []
+    monkeypatch.setenv("OPENHOP_PLUGIN_GITHUB_TOKEN", "must-not-reach-plugin")
 
     def fake_popen(cmd, **kwargs):
         p = FakeProc(pid=1000 + len(procs))
         procs.append(p)
+        child_environments.append(kwargs["env"])
         # Write a line to log fd if provided
         log_fp = kwargs.get("stdout")
         if log_fp and hasattr(log_fp, "write"):
@@ -159,6 +259,7 @@ def test_enable_start_stop_disable(tmp_path: Path):
     st = manager.disable("openhop.demo")
     assert st["enabled"] is False
     assert st["state"] == PluginState.DISABLED.value
+    assert all("OPENHOP_PLUGIN_GITHUB_TOKEN" not in env for env in child_environments)
 
     logs = manager.logs("openhop.demo", tail=10)
     assert any("hello" in line for line in logs["lines"])
