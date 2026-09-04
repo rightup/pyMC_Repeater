@@ -10,6 +10,7 @@ from urllib.request import Request
 import pytest
 
 from repeater.plugins.catalogue import (
+    DEFAULT_CATALOGUE_URL,
     CatalogueClient,
     CatalogueError,
     parse_catalogue,
@@ -28,6 +29,10 @@ VALID = {
         }
     ],
 }
+
+
+def test_default_catalogue_uses_openhop_r2_endpoint():
+    assert DEFAULT_CATALOGUE_URL == "https://repeater-plugins.openhop.dev/catalogue.json"
 
 
 def test_parse_valid_catalogue():

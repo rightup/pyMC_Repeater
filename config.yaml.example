@@ -643,8 +643,8 @@ storage:
 #   # root: "/var/lib/openhop_repeater/plugins"
 #   # Unix domain socket used by Repeater HTTP → plugin manager IPC
 #   # socket: "/var/lib/openhop_repeater/plugin-manager.sock"
-  # Optional override for the curated catalogue (default: openhop-dev/openhop-plugin-catalogue)
-  # catalogue_url: "https://raw.githubusercontent.com/openhop-dev/openhop-plugin-catalogue/main/catalogue.json"
+  # Optional override for the curated catalogue hosted on openHop's R2 endpoint
+  # catalogue_url: "https://repeater-plugins.openhop.dev/catalogue.json"
 
 
 

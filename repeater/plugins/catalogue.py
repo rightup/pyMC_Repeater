@@ -14,9 +14,7 @@ from typing import Any, Callable, Optional
 
 logger = logging.getLogger("PluginCatalogue")
 
-DEFAULT_CATALOGUE_URL = (
-    "https://raw.githubusercontent.com/openhop-dev/openhop-plugin-catalogue/main/catalogue.json"
-)
+DEFAULT_CATALOGUE_URL = "https://repeater-plugins.openhop.dev/catalogue.json"
 DEFAULT_CACHE_TTL_SECONDS = 600  # 10 minutes
 SUPPORTED_SCHEMA = 1
 USER_AGENT = "openhop-repeater-plugin-manager/1.0"

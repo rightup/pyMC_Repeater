@@ -254,14 +254,14 @@ Repeater can browse a curated static catalogue and install plugins from GitHub R
 Default catalogue URL:
 
 ```text
-https://raw.githubusercontent.com/openhop-dev/openhop-plugin-catalogue/main/catalogue.json
+https://repeater-plugins.openhop.dev/catalogue.json
 ```
 
 Override with:
 
 ```yaml
 plugins:
-  catalogue_url: "https://raw.githubusercontent.com/openhop-dev/openhop-plugin-catalogue/main/catalogue.json"
+  catalogue_url: "https://repeater-plugins.openhop.dev/catalogue.json"
 ```
 
 The catalogue lists plugin **identity and repository only**. Versions and wheel assets come from GitHub Releases on each plugin repo (draft and prerelease tags are ignored by default).
