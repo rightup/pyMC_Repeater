@@ -240,16 +240,15 @@ curl -X DELETE -H "Authorization: Bearer $TOKEN" \
 
 ## Future work (not in this version)
 
-- GitHub release installation and catalogue
-- Automatic updates / rollback between versions
 - Web Component dashboard widgets and settings panels
-- Plugin management UI page
 - Permission scopes, signing, non-Python runtimes
 - Plugin SDK
 
 ## Plugin catalogue
 
-Repeater can browse a curated static catalogue and install plugins from GitHub Releases.
+Repeater browses a curated static catalogue and installs the exact plugin wheel
+approved there. The catalogue and wheels are hosted on openHop's R2-backed
+origin, so normal installs and update checks do not call the GitHub API.
 
 Default catalogue URL:
 
@@ -264,20 +263,24 @@ plugins:
   catalogue_url: "https://repeater-plugins.openhop.dev/catalogue.json"
 ```
 
-The catalogue lists plugin **identity and repository only**. Versions and wheel assets come from GitHub Releases on each plugin repo (draft and prerelease tags are ignored by default).
+Catalogue schema 2 records each plugin's currently approved `version`, exact
+`wheel_url`, and lowercase `sha256`. The manager downloads only from
+`https://repeater-plugins.openhop.dev/plugins/`, verifies the checksum before
+installation, and confirms the wheel manifest ID and version match the
+catalogue. Publishing a newer GitHub Release does not make it available until
+the catalogue maintainers approve and publish that exact wheel.
 
-GitHub permits anonymous lookups, but the anonymous API limit is low and may be
-shared by multiple containers behind the same public address. Docker operators
-can set `OPENHOP_PLUGIN_GITHUB_TOKEN` in `.env` to a fine-grained token with
-read-only access to public repository metadata. The token is used only for
-`api.github.com` release lookups and is not sent to release asset URLs.
+Schema 1 repository-only catalogues remain readable for compatibility with
+custom deployments, but the default openHop catalogue uses schema 2 and needs
+no GitHub token.
+
 
 ```bash
 # List catalogue (annotated with installed / latest when available)
 curl -H "Authorization: Bearer $TOKEN" \
   http://127.0.0.1:8000/api/plugins/catalogue
 
-# Install latest stable release of a catalogue plugin (enabled by default)
+# Install the currently approved catalogue version (enabled by default)
 curl -X POST -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"id":"openhop.nomad"}' \
@@ -294,5 +297,6 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
   http://127.0.0.1:8000/api/plugins/update
 ```
 
-Catalogue or GitHub outages do not affect already-installed plugins or Repeater startup. Local `.whl` install continues to work unchanged.
+R2 catalogue or wheel outages do not affect already-installed plugins or
+Repeater startup. Local `.whl` install continues to work unchanged.
 

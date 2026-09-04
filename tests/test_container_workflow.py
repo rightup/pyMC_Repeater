@@ -21,12 +21,16 @@ def test_container_smoke_script_checks_install_restart_and_shutdown():
     assert "EXPECTED_PLUGIN_PID" in script
 
 
-def test_compose_exposes_service_scoped_github_token():
-    compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
-    docs = (ROOT / "docs/plugins.md").read_text(encoding="utf-8")
+def test_r2_catalogue_needs_no_github_token():
+    paths = [
+        ROOT / ".env.example",
+        ROOT / "docker-compose.yml",
+        ROOT / "docs/plugins.md",
+        ROOT / "repeater/plugins/manager.py",
+    ]
 
-    assert "OPENHOP_PLUGIN_GITHUB_TOKEN" in compose
-    assert "OPENHOP_PLUGIN_GITHUB_TOKEN" in docs
+    for path in paths:
+        assert "OPENHOP_PLUGIN_GITHUB_TOKEN" not in path.read_text(encoding="utf-8")
 
 
 def test_image_uses_tini_to_reap_orphaned_plugin_processes():

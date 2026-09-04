@@ -125,12 +125,10 @@ class GitHubReleaseClient:
         cache_ttl: float = DEFAULT_CACHE_TTL_SECONDS,
         opener: Optional[Callable[..., Any]] = None,
         user_agent: str = USER_AGENT,
-        token: str | None = None,
     ):
         self.cache_ttl = cache_ttl
         self._opener = opener or self._default_open
         self.user_agent = user_agent
-        self.token = str(token or "").strip() or None
         # repo -> (monotonic_ts, list[PluginRelease])
         self._cache: dict[str, tuple[float, list[PluginRelease]]] = {}
 
@@ -262,15 +260,12 @@ class GitHubReleaseClient:
 
     def _fetch_releases_json(self, repo: str) -> list[Any]:
         url = f"{GITHUB_API_BASE}/repos/{repo}/releases?per_page=30"
-        headers = {
-            "User-Agent": self.user_agent,
-            "Accept": "application/vnd.github+json",
-        }
-        if self.token:
-            headers["Authorization"] = f"Bearer {self.token}"
         request = urllib.request.Request(
             url,
-            headers=headers,
+            headers={
+                "User-Agent": self.user_agent,
+                "Accept": "application/vnd.github+json",
+            },
             method="GET",
         )
         try:

@@ -503,7 +503,8 @@ class PluginRuntime:
             log_fp = open(paths.log_file, "a", encoding="utf-8", buffering=1)
 
             env = os.environ.copy()
-            # Manager-only credentials must never become plugin credentials.
+            # Never expose a stale manager-only credential left behind by an
+            # upgraded deployment to third-party plugin processes.
             env.pop("OPENHOP_PLUGIN_GITHUB_TOKEN", None)
             env["OPENHOP_PLUGIN_ID"] = plugin_id
             env["OPENHOP_PLUGIN_DATA"] = str(paths.data_dir)

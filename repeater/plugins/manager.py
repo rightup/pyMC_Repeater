@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import threading
 from pathlib import Path
 from typing import Any, Optional
@@ -49,9 +48,7 @@ class PluginManager:
         self.runtime = runtime or PluginRuntime(storage)
         self._lock = threading.RLock()
         self.catalogue = catalogue_client or CatalogueClient(catalogue_url or DEFAULT_CATALOGUE_URL)
-        self.github = github_client or GitHubReleaseClient(
-            token=os.environ.get("OPENHOP_PLUGIN_GITHUB_TOKEN")
-        )
+        self.github = github_client or GitHubReleaseClient()
 
     def start(self) -> None:
         """Load state and start enabled service plugins."""
@@ -321,17 +318,24 @@ class PluginManager:
                 "installed": installed,
                 "installedVersion": installed_version if installed else None,
             }
-            # Enrich with latest stable when possible (cached); failures are non-fatal per row
-            latest_version = None
+            # Schema 2 carries the openHop-approved version directly. Schema 1
+            # remains readable for compatibility with custom legacy catalogues.
+            latest_version = entry.version
             update_available = False
-            try:
-                latest = self.github.latest_stable(entry.repository, force_refresh=force_refresh)
-                if latest is not None:
-                    latest_version = latest.version
-                    if installed and installed_version:
-                        update_available = self._version_gt(latest_version, installed_version)
-            except GitHubReleasesError as exc:
-                row["releasesError"] = str(exc)
+            if entry.has_approved_wheel:
+                if installed and installed_version and latest_version:
+                    update_available = self._version_gt(latest_version, installed_version)
+            else:
+                try:
+                    latest = self.github.latest_stable(
+                        entry.repository, force_refresh=force_refresh
+                    )
+                    if latest is not None:
+                        latest_version = latest.version
+                        if installed and installed_version:
+                            update_available = self._version_gt(latest_version, installed_version)
+                except GitHubReleasesError as exc:
+                    row["releasesError"] = str(exc)
             row["latestVersion"] = latest_version
             row["updateAvailable"] = bool(update_available)
             plugins_out.append(row)
@@ -344,7 +348,7 @@ class PluginManager:
         version: Optional[str] = None,
         force_refresh: bool = False,
     ) -> dict[str, Any]:
-        """Download catalogue plugin wheel and install via existing installer."""
+        """Download an approved catalogue wheel and install it."""
         try:
             entry = self.catalogue.get_plugin(plugin_id, force_refresh=force_refresh)
         except CatalogueError as exc:
@@ -353,15 +357,27 @@ class PluginManager:
         download_root = self._download_dir()
         staging = make_download_temp_dir(download_root)
         try:
-            try:
-                release, wheel_path = self.github.download_latest_wheel(
-                    entry.repository,
-                    staging,
-                    version=version,
-                    force_refresh=force_refresh,
-                )
-            except GitHubReleasesError as exc:
-                raise PluginManagerError(str(exc), int(exc.code)) from exc
+            if entry.has_approved_wheel:
+                if version and normalize_version(version) != normalize_version(entry.version or ""):
+                    raise PluginManagerError(
+                        f"version {version!r} is not approved for {entry.id}; "
+                        f"approved version is {entry.version}",
+                        400,
+                    )
+                try:
+                    wheel_path = self.catalogue.download_wheel(entry, staging)
+                except CatalogueError as exc:
+                    raise PluginManagerError(str(exc), int(exc.code)) from exc
+            else:
+                try:
+                    _release, wheel_path = self.github.download_latest_wheel(
+                        entry.repository,
+                        staging,
+                        version=version,
+                        force_refresh=force_refresh,
+                    )
+                except GitHubReleasesError as exc:
+                    raise PluginManagerError(str(exc), int(exc.code)) from exc
 
             try:
                 manifest = load_manifest_from_wheel(wheel_path)
@@ -371,6 +387,12 @@ class PluginManager:
             if manifest.id != entry.id:
                 raise PluginManagerError(
                     f"manifest id {manifest.id!r} does not match catalogue id {entry.id!r}",
+                    400,
+                )
+            if entry.has_approved_wheel and manifest.version != entry.version:
+                raise PluginManagerError(
+                    f"manifest version {manifest.version!r} does not match approved "
+                    f"catalogue version {entry.version!r}",
                     400,
                 )
 
@@ -399,6 +421,30 @@ class PluginManager:
             raise PluginManagerError(f"plugin not found: {plugin_id}", 404)
         installed_version = str(state.get("version") or "")
         repository = state.get("repository")
+
+        if state.get("source") == "catalogue":
+            try:
+                entry = self.catalogue.get_plugin(plugin_id, force_refresh=force_refresh)
+            except CatalogueError as exc:
+                raise PluginManagerError(str(exc), int(exc.code)) from exc
+            if entry.has_approved_wheel:
+                latest_version = entry.version
+                update_available = bool(
+                    latest_version
+                    and installed_version
+                    and self._version_gt(latest_version, installed_version)
+                )
+                return {
+                    "id": plugin_id,
+                    "installedVersion": installed_version or None,
+                    "latestVersion": latest_version,
+                    "updateAvailable": update_available,
+                    "repository": entry.repository,
+                    "releaseNotes": None,
+                    "releaseUrl": None,
+                    "releaseTag": None,
+                }
+
         if not repository:
             return {
                 "id": plugin_id,
@@ -440,7 +486,7 @@ class PluginManager:
         version: Optional[str] = None,
         force_refresh: bool = False,
     ) -> dict[str, Any]:
-        """Download a newer (or pinned) release and reinstall via existing installer."""
+        """Install the newer approved catalogue version when available."""
         state = self.storage.read_state(plugin_id)
         if state is None:
             raise PluginManagerError(f"plugin not found: {plugin_id}", 404)
@@ -455,31 +501,71 @@ class PluginManager:
         installed_version = str(state.get("version") or "")
         was_enabled = bool(state.get("enabled", False))
 
-        # Resolve target release
-        try:
-            if version:
-                release = self.github.find_release(repository, version, force_refresh=force_refresh)
-            else:
-                release = self.github.latest_stable(repository, force_refresh=force_refresh)
-                if release is None:
-                    raise PluginManagerError(f"no stable releases found for {repository}", 404)
-                if installed_version and not self._version_gt(release.version, installed_version):
-                    # Already up to date — return status without changing
+        approved_entry = None
+        release = None
+        if state.get("source") == "catalogue":
+            try:
+                candidate = self.catalogue.get_plugin(plugin_id, force_refresh=force_refresh)
+            except CatalogueError as exc:
+                raise PluginManagerError(str(exc), int(exc.code)) from exc
+            if candidate.has_approved_wheel:
+                approved_entry = candidate
+                if version and normalize_version(version) != normalize_version(
+                    approved_entry.version or ""
+                ):
+                    raise PluginManagerError(
+                        f"version {version!r} is not approved for {plugin_id}; "
+                        f"approved version is {approved_entry.version}",
+                        400,
+                    )
+                if installed_version and not self._version_gt(
+                    approved_entry.version or "", installed_version
+                ):
                     status = self.status(plugin_id)
                     status["updateAvailable"] = False
-                    status["latestVersion"] = release.version
+                    status["latestVersion"] = approved_entry.version
                     status["updated"] = False
                     return status
-        except GitHubReleasesError as exc:
-            raise PluginManagerError(str(exc), int(exc.code)) from exc
+
+        if approved_entry is None:
+            # Legacy schema-1 catalogues continue to resolve GitHub Releases.
+            try:
+                if version:
+                    release = self.github.find_release(
+                        repository, version, force_refresh=force_refresh
+                    )
+                else:
+                    release = self.github.latest_stable(repository, force_refresh=force_refresh)
+                    if release is None:
+                        raise PluginManagerError(f"no stable releases found for {repository}", 404)
+                    if installed_version and not self._version_gt(
+                        release.version, installed_version
+                    ):
+                        status = self.status(plugin_id)
+                        status["updateAvailable"] = False
+                        status["latestVersion"] = release.version
+                        status["updated"] = False
+                        return status
+            except GitHubReleasesError as exc:
+                raise PluginManagerError(str(exc), int(exc.code)) from exc
 
         download_root = self._download_dir()
         staging = make_download_temp_dir(download_root)
         try:
-            try:
-                wheel_path = self.github.download_wheel(release, staging)
-            except GitHubReleasesError as exc:
-                raise PluginManagerError(str(exc), int(exc.code)) from exc
+            if approved_entry is not None:
+                try:
+                    wheel_path = self.catalogue.download_wheel(approved_entry, staging)
+                except CatalogueError as exc:
+                    raise PluginManagerError(str(exc), int(exc.code)) from exc
+                target_version = approved_entry.version
+            else:
+                if release is None:
+                    raise PluginManagerError("could not resolve plugin release", 500)
+                try:
+                    wheel_path = self.github.download_wheel(release, staging)
+                except GitHubReleasesError as exc:
+                    raise PluginManagerError(str(exc), int(exc.code)) from exc
+                target_version = release.version
 
             try:
                 manifest = load_manifest_from_wheel(wheel_path)
@@ -488,6 +574,12 @@ class PluginManager:
             if manifest.id != plugin_id:
                 raise PluginManagerError(
                     f"manifest id {manifest.id!r} does not match installed id {plugin_id!r}",
+                    400,
+                )
+            if approved_entry is not None and manifest.version != approved_entry.version:
+                raise PluginManagerError(
+                    f"manifest version {manifest.version!r} does not match approved "
+                    f"catalogue version {approved_entry.version!r}",
                     400,
                 )
 
@@ -513,7 +605,7 @@ class PluginManager:
                 return self.enable(plugin_id)
             result = self.status(plugin_id)
             result["updated"] = True
-            result["latestVersion"] = release.version
+            result["latestVersion"] = target_version
             return result
         finally:
             shutil.rmtree(staging, ignore_errors=True)

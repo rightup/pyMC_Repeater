@@ -408,7 +408,7 @@ class PluginAPIEndpoints:
     @cherrypy.tools.json_out()
     @cherrypy.tools.json_in(force=False)
     def update(self, **kwargs):
-        """POST /api/plugins/update {id, version?} — update from GitHub Releases."""
+        """POST /api/plugins/update {id, version?} — install approved catalogue update."""
         if cherrypy.request.method == "OPTIONS":
             return ""
         self._require_post()

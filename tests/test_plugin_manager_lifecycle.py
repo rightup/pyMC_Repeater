@@ -52,14 +52,6 @@ def _make_wheel(path: Path, manifest: dict, ui_files: dict[str, str] | None = No
     return path
 
 
-def test_default_github_client_uses_service_scoped_token(tmp_path: Path, monkeypatch):
-    monkeypatch.setenv("OPENHOP_PLUGIN_GITHUB_TOKEN", "service-token")
-
-    manager = PluginManager(PluginStorage(tmp_path / "plugins"))
-
-    assert manager.github.token == "service-token"
-
-
 def test_install_creates_layout_and_isolated_venv(tmp_path: Path, monkeypatch):
     storage = PluginStorage(tmp_path / "plugins")
     calls = []
@@ -200,13 +192,12 @@ def test_manager_starts_enabled_plugin(tmp_path: Path):
 def test_enable_start_stop_disable(tmp_path: Path, monkeypatch):
     storage = PluginStorage(tmp_path / "plugins")
     procs: list[FakeProc] = []
-    child_environments = []
-    monkeypatch.setenv("OPENHOP_PLUGIN_GITHUB_TOKEN", "must-not-reach-plugin")
+    spawn_envs: list[dict[str, str]] = []
 
     def fake_popen(cmd, **kwargs):
+        spawn_envs.append(kwargs["env"])
         p = FakeProc(pid=1000 + len(procs))
         procs.append(p)
-        child_environments.append(kwargs["env"])
         # Write a line to log fd if provided
         log_fp = kwargs.get("stdout")
         if log_fp and hasattr(log_fp, "write"):
@@ -242,10 +233,12 @@ def test_enable_start_stop_disable(tmp_path: Path, monkeypatch):
     )
     manager.install(wheel)
 
+    monkeypatch.setenv("OPENHOP_PLUGIN_GITHUB_TOKEN", "legacy-token")
     st = manager.enable("openhop.demo")
     assert st["enabled"] is True
     assert st["state"] == PluginState.RUNNING.value
     assert len(procs) == 1
+    assert "OPENHOP_PLUGIN_GITHUB_TOKEN" not in spawn_envs[0]
 
     st = manager.stop_plugin("openhop.demo")
     assert st["state"] == PluginState.STOPPED.value
@@ -259,7 +252,6 @@ def test_enable_start_stop_disable(tmp_path: Path, monkeypatch):
     st = manager.disable("openhop.demo")
     assert st["enabled"] is False
     assert st["state"] == PluginState.DISABLED.value
-    assert all("OPENHOP_PLUGIN_GITHUB_TOKEN" not in env for env in child_environments)
 
     logs = manager.logs("openhop.demo", tail=10)
     assert any("hello" in line for line in logs["lines"])

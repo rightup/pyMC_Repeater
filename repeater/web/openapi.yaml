@@ -4604,15 +4604,15 @@ paths:
       summary: List curated plugin catalogue
       description: >
         Fetch the curated openHop plugin catalogue and annotate entries with
-        install state and latest stable GitHub Release when available.
-        Failures contacting the catalogue or GitHub do not affect installed plugins.
+        install state and the currently approved catalogue version.
+        Failures contacting the R2 catalogue do not affect installed plugins.
       parameters:
         - name: refresh
           in: query
           required: false
           schema:
             type: boolean
-          description: Force refresh of catalogue and release caches
+          description: Force refresh of the catalogue cache
       responses:
         '200':
           description: Catalogue entries
@@ -4626,8 +4626,8 @@ paths:
         - Plugins
       summary: Install a plugin from the catalogue
       description: >
-        Resolve the catalogue entry to its GitHub repository, download the latest
-        (or pinned) stable wheel, install via the existing plugin installer, and enable.
+        Download the exact R2 wheel approved by catalogue version and SHA-256,
+        verify its manifest, install it, and enable the plugin.
       requestBody:
         required: true
         content:
@@ -4640,7 +4640,7 @@ paths:
                   type: string
                 version:
                   type: string
-                  description: Optional release version (with or without leading v)
+                  description: Optional assertion of the currently approved version
       responses:
         '200':
           description: Installed plugin status
@@ -4673,7 +4673,7 @@ paths:
     post:
       tags:
         - Plugins
-      summary: Update an installed plugin from GitHub Releases
+      summary: Update an installed plugin to the approved catalogue version
       requestBody:
         required: true
         content:
