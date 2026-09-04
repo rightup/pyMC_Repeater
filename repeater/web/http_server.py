@@ -395,7 +395,7 @@ class StatsApp:
         # Application UI plugins: /plugins/{id}/...
         if args and args[0] == "plugins":
             if len(args) < 2:
-                raise cherrypy.NotFound()
+                return self.index()
             plugin_id = args[1]
             return self._serve_plugin_ui(plugin_id, tuple(args[2:]))
 
