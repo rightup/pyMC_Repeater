@@ -286,7 +286,7 @@ class StatsApp:
             raise cherrypy.NotFound()
         root = Path(root_dir).resolve()
         target = (root.joinpath(*relative_parts)).resolve()
-        if not str(target).startswith(str(root)) or not target.is_file():
+        if not target.is_relative_to(root) or not target.is_file():
             raise cherrypy.NotFound()
         guessed_type, _ = mimetypes.guess_type(str(target))
         cherrypy.response.headers["Content-Type"] = guessed_type or "application/octet-stream"
@@ -294,6 +294,7 @@ class StatsApp:
 
     def _serve_plugin_ui(self, plugin_id: str, relative_parts: tuple[str, ...]):
         """Serve static assets for an enabled application UI plugin."""
+        from repeater.plugins.manifest import ui_subtree
         from repeater.plugins.storage import PluginStorage, resolve_plugins_root, safe_join
 
         try:
@@ -317,19 +318,15 @@ class StatsApp:
                 raise cherrypy.NotFound()
 
             entry = manifest.ui.entry.replace("\\", "/")
-            entry_parts = tuple(p for p in entry.split("/") if p)
-            if not entry_parts:
-                raise cherrypy.NotFound()
+            ui_subtree(entry)
+            entry_parts = tuple(entry.split("/"))
 
-            # Document root is the directory containing the entry file so a
-            # relative Vite base (./assets/...) works at /plugins/{id}/.
-            # Example: entry ui/index.html → doc_root = release/ui
-            if len(entry_parts) > 1:
-                doc_root = safe_join(release_root, *entry_parts[:-1])
-                entry_name = entry_parts[-1]
-            else:
-                doc_root = release_root
-                entry_name = entry_parts[0]
+            # Check the resolved subtree too: an old release may contain a UI
+            # symlink pointing at a reserved directory or at the release root.
+            doc_root = safe_join(release_root, *entry_parts[:-1])
+            public_parts = doc_root.relative_to(release_root.resolve()).parts
+            entry_name = entry_parts[-1]
+            ui_subtree("/".join((*public_parts, entry_name)))
 
             if not relative_parts:
                 serve_parts = (entry_name,)

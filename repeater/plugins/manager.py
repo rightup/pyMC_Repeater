@@ -6,10 +6,18 @@ import json
 import logging
 import shutil
 import threading
+import os
+import stat
+import tempfile
+import time
+from contextlib import contextmanager
+from functools import wraps
+
+
 from pathlib import Path
 from typing import Any, Optional
 
-from .catalogue import DEFAULT_CATALOGUE_URL, CatalogueClient, CatalogueError
+from .catalogue import DEFAULT_CATALOGUE_URL, MAX_WHEEL_BYTES, CatalogueClient, CatalogueError
 from .github_releases import (
     GitHubReleaseClient,
     GitHubReleasesError,
@@ -21,6 +29,17 @@ from .runtime import PluginRuntime, PluginState
 from .storage import PluginStorage
 
 logger = logging.getLogger("PluginManager")
+
+
+def _serialized_plugin(fn):
+    """Keep a complete lifecycle transaction exclusive, without queuing callers."""
+
+    @wraps(fn)
+    def wrapped(self, plugin_id, *args, **kwargs):
+        with self._operation(plugin_id):
+            return fn(self, plugin_id, *args, **kwargs)
+
+    return wrapped
 
 
 class PluginManagerError(Exception):
@@ -46,8 +65,59 @@ class PluginManager:
         self.storage = storage
         self.runtime = runtime or PluginRuntime(storage)
         self._lock = threading.RLock()
+        self._operations: dict[str, tuple[int, int]] = {}
         self.catalogue = catalogue_client or CatalogueClient(catalogue_url or DEFAULT_CATALOGUE_URL)
         self.github = github_client or GitHubReleaseClient()
+
+    @contextmanager
+    def _operation(self, plugin_id: str):
+        owner = threading.get_ident()
+        with self._lock:
+            active = self._operations.get(plugin_id)
+            if active and active[0] != owner:
+                raise PluginManagerError(f"plugin operation already in progress: {plugin_id}", 409)
+            self._operations[plugin_id] = (owner, active[1] + 1 if active else 1)
+        try:
+            yield
+        finally:
+            with self._lock:
+                depth = self._operations[plugin_id][1]
+                if depth == 1:
+                    del self._operations[plugin_id]
+                else:
+                    self._operations[plugin_id] = (owner, depth - 1)
+
+    @contextmanager
+    def stage_upload(self, wheel_path: str):
+        """Own a bounded regular-file copy before IPC acknowledges processing.
+
+        Read through one opened descriptor, so unlinking an HTTP upload cannot
+        invalidate an in-progress copy. Never consume the caller's path later.
+        """
+        root = self.storage.root / ".ipc-staging"
+        root.mkdir(parents=True, exist_ok=True)
+        limit = MAX_WHEEL_BYTES
+        deadline = time.monotonic() + 30
+        with tempfile.TemporaryDirectory(prefix="install-", dir=root) as directory:
+            source = Path(wheel_path)
+            staged = Path(directory) / source.name
+            fd = os.open(source, os.O_RDONLY | os.O_NONBLOCK)
+            with os.fdopen(fd, "rb") as incoming:
+                metadata = os.fstat(incoming.fileno())
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise PluginManagerError("wheel must be a regular file", 400)
+                if metadata.st_size > limit:
+                    raise PluginManagerError("wheel exceeds 100 MiB limit", 413)
+                total = 0
+                with staged.open("wb") as outgoing:
+                    while chunk := incoming.read(1024 * 1024):
+                        total += len(chunk)
+                        if total > limit:
+                            raise PluginManagerError("wheel exceeds 100 MiB limit", 413)
+                        if time.monotonic() > deadline:
+                            raise PluginManagerError("wheel staging deadline exceeded", 504)
+                        outgoing.write(chunk)
+            yield staged
 
     def start(self) -> None:
         """Load state and start enabled service plugins."""
@@ -97,7 +167,7 @@ class PluginManager:
             manifest = load_manifest_from_wheel(wheel_path)
         except ManifestError as exc:
             raise PluginManagerError(str(exc), 400) from exc
-        with self._lock:
+        with self._operation(manifest.id):
             try:
                 info = self.runtime.install_wheel(wheel_path, manifest)
             except Exception as exc:
@@ -106,78 +176,78 @@ class PluginManager:
         # Return full status
         return self.status(info["id"])
 
+    @_serialized_plugin
     def enable(self, plugin_id: str) -> dict[str, Any]:
-        with self._lock:
-            state = self.storage.read_state(plugin_id)
-            if state is None:
-                raise PluginManagerError(f"plugin not found: {plugin_id}", 404)
-            state = dict(state)
-            state["enabled"] = True
-            self.storage.write_state(plugin_id, state)
-            manifest = self.storage.load_current_manifest(plugin_id)
-            if manifest and manifest.runtime is not None:
-                try:
-                    self.runtime.start(plugin_id)
-                except Exception as exc:
-                    raise PluginManagerError(f"enable start failed: {exc}", 500) from exc
-            else:
-                self.runtime._runtime_state[plugin_id] = PluginState.STOPPED
-        return self.status(plugin_id)
-
-    def disable(self, plugin_id: str) -> dict[str, Any]:
-        with self._lock:
-            state = self.storage.read_state(plugin_id)
-            if state is None:
-                raise PluginManagerError(f"plugin not found: {plugin_id}", 404)
-            try:
-                self.runtime.stop(plugin_id, mark_disabled=True)
-            except Exception as exc:
-                logger.warning("disable stop error for %s: %s", plugin_id, exc)
-            state = dict(state)
-            state["enabled"] = False
-            self.storage.write_state(plugin_id, state)
-            self.runtime._runtime_state[plugin_id] = PluginState.DISABLED
-        return self.status(plugin_id)
-
-    def start_plugin(self, plugin_id: str) -> dict[str, Any]:
-        with self._lock:
-            state = self.storage.read_state(plugin_id)
-            if state is None:
-                raise PluginManagerError(f"plugin not found: {plugin_id}", 404)
-            if not state.get("enabled", False):
-                raise PluginManagerError(
-                    f"plugin is disabled; enable it before starting: {plugin_id}", 409
-                )
+        state = self.storage.read_state(plugin_id)
+        if state is None:
+            raise PluginManagerError(f"plugin not found: {plugin_id}", 404)
+        state = dict(state)
+        state["enabled"] = True
+        self.storage.write_state(plugin_id, state)
+        manifest = self.storage.load_current_manifest(plugin_id)
+        if manifest and manifest.runtime is not None:
             try:
                 self.runtime.start(plugin_id)
             except Exception as exc:
-                raise PluginManagerError(f"start failed: {exc}", 500) from exc
+                raise PluginManagerError(f"enable start failed: {exc}", 500) from exc
+        else:
+            self.runtime._runtime_state[plugin_id] = PluginState.STOPPED
         return self.status(plugin_id)
 
+    @_serialized_plugin
+    def disable(self, plugin_id: str) -> dict[str, Any]:
+        state = self.storage.read_state(plugin_id)
+        if state is None:
+            raise PluginManagerError(f"plugin not found: {plugin_id}", 404)
+        try:
+            self.runtime.stop(plugin_id, mark_disabled=True)
+        except Exception as exc:
+            logger.warning("disable stop error for %s: %s", plugin_id, exc)
+        state = dict(state)
+        state["enabled"] = False
+        self.storage.write_state(plugin_id, state)
+        self.runtime._runtime_state[plugin_id] = PluginState.DISABLED
+        return self.status(plugin_id)
+
+    @_serialized_plugin
+    def start_plugin(self, plugin_id: str) -> dict[str, Any]:
+        state = self.storage.read_state(plugin_id)
+        if state is None:
+            raise PluginManagerError(f"plugin not found: {plugin_id}", 404)
+        if not state.get("enabled", False):
+            raise PluginManagerError(
+                f"plugin is disabled; enable it before starting: {plugin_id}", 409
+            )
+        try:
+            self.runtime.start(plugin_id)
+        except Exception as exc:
+            raise PluginManagerError(f"start failed: {exc}", 500) from exc
+        return self.status(plugin_id)
+
+    @_serialized_plugin
     def stop_plugin(self, plugin_id: str) -> dict[str, Any]:
-        with self._lock:
-            state = self.storage.read_state(plugin_id)
-            if state is None:
-                raise PluginManagerError(f"plugin not found: {plugin_id}", 404)
-            try:
-                self.runtime.stop(plugin_id)
-            except Exception as exc:
-                raise PluginManagerError(f"stop failed: {exc}", 500) from exc
+        state = self.storage.read_state(plugin_id)
+        if state is None:
+            raise PluginManagerError(f"plugin not found: {plugin_id}", 404)
+        try:
+            self.runtime.stop(plugin_id)
+        except Exception as exc:
+            raise PluginManagerError(f"stop failed: {exc}", 500) from exc
         return self.status(plugin_id)
 
+    @_serialized_plugin
     def restart_plugin(self, plugin_id: str) -> dict[str, Any]:
-        with self._lock:
-            state = self.storage.read_state(plugin_id)
-            if state is None:
-                raise PluginManagerError(f"plugin not found: {plugin_id}", 404)
-            if not state.get("enabled", False):
-                raise PluginManagerError(
-                    f"plugin is disabled; enable it before restarting: {plugin_id}", 409
-                )
-            try:
-                self.runtime.restart(plugin_id)
-            except Exception as exc:
-                raise PluginManagerError(f"restart failed: {exc}", 500) from exc
+        state = self.storage.read_state(plugin_id)
+        if state is None:
+            raise PluginManagerError(f"plugin not found: {plugin_id}", 404)
+        if not state.get("enabled", False):
+            raise PluginManagerError(
+                f"plugin is disabled; enable it before restarting: {plugin_id}", 409
+            )
+        try:
+            self.runtime.restart(plugin_id)
+        except Exception as exc:
+            raise PluginManagerError(f"restart failed: {exc}", 500) from exc
         return self.status(plugin_id)
 
     def logs(self, plugin_id: str, tail: int = 200) -> dict[str, Any]:
@@ -224,6 +294,7 @@ class PluginManager:
             "config": config,
         }
 
+    @_serialized_plugin
     def set_config(
         self,
         plugin_id: str,
@@ -245,23 +316,22 @@ class PluginManager:
         if len(encoded.encode("utf-8")) > 256 * 1024:
             raise PluginManagerError("config exceeds 256 KiB limit", 413)
 
-        with self._lock:
-            try:
-                self.storage.write_config(plugin_id, config)
-            except ValueError as exc:
-                raise PluginManagerError(str(exc), 400) from exc
+        try:
+            self.storage.write_config(plugin_id, config)
+        except ValueError as exc:
+            raise PluginManagerError(str(exc), 400) from exc
 
-            restarted = False
-            if restart and state.get("enabled", False):
-                manifest = self.storage.load_current_manifest(plugin_id)
-                if manifest and manifest.runtime is not None:
-                    try:
-                        self.runtime.restart(plugin_id)
-                        restarted = True
-                    except Exception as exc:
-                        raise PluginManagerError(
-                            f"config saved but restart failed: {exc}", 500
-                        ) from exc
+        restarted = False
+        if restart and state.get("enabled", False):
+            manifest = self.storage.load_current_manifest(plugin_id)
+            if manifest and manifest.runtime is not None:
+                try:
+                    self.runtime.restart(plugin_id)
+                    restarted = True
+                except Exception as exc:
+                    raise PluginManagerError(
+                        f"config saved but restart failed: {exc}", 500
+                    ) from exc
 
         result = self.get_config(plugin_id)
         result["restarted"] = restarted
@@ -286,19 +356,19 @@ class PluginManager:
             "runtime": runtime,
         }
 
+    @_serialized_plugin
     def uninstall(self, plugin_id: str, *, delete_data: bool = False) -> dict[str, Any]:
-        with self._lock:
-            state = self.storage.read_state(plugin_id)
-            if state is None:
-                raise PluginManagerError(f"plugin not found: {plugin_id}", 404)
-            try:
-                self.runtime.stop(plugin_id, mark_disabled=True)
-            except Exception as exc:
-                logger.warning("uninstall stop error for %s: %s", plugin_id, exc)
-            self.storage.remove_release_code(plugin_id, keep_data=not delete_data)
-            self.runtime._runtime_state.pop(plugin_id, None)
-            self.runtime._crash_times.pop(plugin_id, None)
-            self.runtime._exit_codes.pop(plugin_id, None)
+        state = self.storage.read_state(plugin_id)
+        if state is None:
+            raise PluginManagerError(f"plugin not found: {plugin_id}", 404)
+        try:
+            self.runtime.stop(plugin_id, mark_disabled=True)
+        except Exception as exc:
+            logger.warning("uninstall stop error for %s: %s", plugin_id, exc)
+        self.storage.remove_release_code(plugin_id, keep_data=not delete_data)
+        self.runtime._runtime_state.pop(plugin_id, None)
+        self.runtime._crash_times.pop(plugin_id, None)
+        self.runtime._exit_codes.pop(plugin_id, None)
         return {
             "id": plugin_id,
             "uninstalled": True,
@@ -359,6 +429,7 @@ class PluginManager:
             plugins_out.append(row)
         return {"schema": catalogue.schema, "plugins": plugins_out}
 
+    @_serialized_plugin
     def install_from_catalogue(
         self,
         plugin_id: str,
@@ -414,19 +485,18 @@ class PluginManager:
                     400,
                 )
 
-            with self._lock:
-                try:
-                    info = self.runtime.install_wheel(wheel_path, manifest)
-                except Exception as exc:
-                    raise PluginManagerError(f"install failed: {exc}", 500) from exc
-                # Record catalogue provenance (repository locked at install time)
-                st = self.storage.read_state(info["id"]) or {}
-                st = dict(st)
-                st["version"] = info["version"]
-                st["source"] = "catalogue"
-                st["repository"] = entry.repository
-                # Keep enabled flag from install_wheel; enable next
-                self.storage.write_state(info["id"], st)
+            try:
+                info = self.runtime.install_wheel(wheel_path, manifest)
+            except Exception as exc:
+                raise PluginManagerError(f"install failed: {exc}", 500) from exc
+            # Record catalogue provenance (repository locked at install time)
+            st = self.storage.read_state(info["id"]) or {}
+            st = dict(st)
+            st["version"] = info["version"]
+            st["source"] = "catalogue"
+            st["repository"] = entry.repository
+            # Keep enabled flag from install_wheel; enable next
+            self.storage.write_state(info["id"], st)
 
             # Catalogue installs are enabled by default
             return self.enable(info["id"])
@@ -497,6 +567,7 @@ class PluginManager:
             "releaseTag": latest.tag if latest else None,
         }
 
+    @_serialized_plugin
     def update_plugin(
         self,
         plugin_id: str,
@@ -601,23 +672,22 @@ class PluginManager:
                     400,
                 )
 
-            with self._lock:
-                # Stop running process before swapping release
-                try:
-                    self.runtime.stop(plugin_id)
-                except Exception as exc:
-                    logger.debug("update stop %s: %s", plugin_id, exc)
-                try:
-                    info = self.runtime.install_wheel(wheel_path, manifest)
-                except Exception as exc:
-                    raise PluginManagerError(f"update install failed: {exc}", 500) from exc
-                st = self.storage.read_state(info["id"]) or {}
-                st = dict(st)
-                st["version"] = info["version"]
-                st["source"] = st.get("source") or "catalogue"
-                st["repository"] = repository  # never silently retarget
-                st["enabled"] = was_enabled
-                self.storage.write_state(info["id"], st)
+            # Stop running process before swapping release
+            try:
+                self.runtime.stop(plugin_id)
+            except Exception as exc:
+                logger.debug("update stop %s: %s", plugin_id, exc)
+            try:
+                info = self.runtime.install_wheel(wheel_path, manifest)
+            except Exception as exc:
+                raise PluginManagerError(f"update install failed: {exc}", 500) from exc
+            st = self.storage.read_state(info["id"]) or {}
+            st = dict(st)
+            st["version"] = info["version"]
+            st["source"] = st.get("source") or "catalogue"
+            st["repository"] = repository  # never silently retarget
+            st["enabled"] = was_enabled
+            self.storage.write_state(info["id"], st)
 
             if was_enabled:
                 return self.enable(plugin_id)

@@ -12,7 +12,12 @@ from typing import Any, Optional
 import cherrypy
 
 from repeater.config import resolve_storage_dir
-from repeater.plugins.ipc import PluginIPCClient, PluginIPCError, PluginManagerUnavailable
+from repeater.plugins.ipc import (
+    PluginIPCClient,
+    PluginIPCError,
+    PluginIPCOutcomeUnknown,
+    PluginManagerUnavailable,
+)
 from repeater.plugins.storage import resolve_plugin_socket_path, resolve_plugins_root
 
 logger = logging.getLogger("HTTPServer")
@@ -52,6 +57,8 @@ class PluginAPIEndpoints:
     def _handle_ipc(self, fn):
         try:
             return self._ok(fn())
+        except PluginIPCOutcomeUnknown as exc:
+            return {**self._err(str(exc), 504), "outcome": "unknown"}
         except PluginManagerUnavailable as exc:
             return self._err(str(exc), 503)
         except PluginIPCError as exc:
@@ -209,6 +216,13 @@ class PluginAPIEndpoints:
 
             try:
                 return {"plugin": client.install(str(wheel_path.resolve()))}
+            except PluginIPCOutcomeUnknown as exc:
+                # A legacy manager can still consume this path after disconnect.
+                # Only the new processing acknowledgement proves it owns a copy.
+                if not exc.upload_safe:
+                    cleanup = False
+                    logger.warning("Retaining unacknowledged plugin upload after lost response")
+                raise
             finally:
                 if cleanup and wheel_path is not None:
                     # Remove staging dir (preferred) or lone temp file

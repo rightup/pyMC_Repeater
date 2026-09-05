@@ -6,6 +6,7 @@ import secrets
 import time
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from datetime import datetime, timezone
+from threading import RLock
 from typing import Callable, Optional
 
 import cherrypy
@@ -209,6 +210,11 @@ POLICY_GROUP_KINDS = {
 
 
 class APIEndpoints:
+    # Serialize both provisioning routes across mounts in this process, from
+    # authorization through persistence. Do not reuse ConfigManager's locks:
+    # imports must retain its normal persistence/live-update callbacks.
+    _provisioning_lock = RLock()
+
     # How long /api/query_neighbor_scopes holds a request open. The scope helper's
     # response window is normally its 5 s floor; a slow radio config (SF12) or a
     # duty-cycle deferral can push a single query past this, in which case the
@@ -232,6 +238,7 @@ class APIEndpoints:
         self.event_loop = event_loop
         self.daemon_instance = daemon_instance
         self._config_path = config_path or "/etc/openhop_repeater/config.yaml"
+
         self.cad_calibration = CADCalibrationEngine(daemon_instance, event_loop)
 
         # Initialize ConfigManager for centralized config management
@@ -673,7 +680,10 @@ class APIEndpoints:
         has_default_name = node_name in ["mesh-repeater-01", ""]
 
         admin_password = config.get("repeater", {}).get("security", {}).get("admin_password", "")
-        has_default_password = admin_password in ["admin123", ""]
+        has_default_password = admin_password is None or (
+            isinstance(admin_password, str)
+            and (not admin_password.strip() or admin_password == "admin123")  # nosec B105
+        )
 
         radio_type_raw = config.get("radio_type")
         radio_type = "" if radio_type_raw is None else str(radio_type_raw).lower().strip()
@@ -684,7 +694,12 @@ class APIEndpoints:
             "default_password": has_default_password,
             "radio_not_configured": radio_not_configured,
         }
-        return has_default_name or has_default_password or radio_not_configured, reasons
+        # Name and radio settings are diagnostics, not authorization signals:
+        # radio-less installations and default names are valid after provisioning.
+        # Legacy configs have no marker, so a custom password also closes setup.
+        # An explicit false marker must never override existing credentials.
+        setup_completed = config.get("setup_completed") is True
+        return has_default_password and not setup_completed, reasons
 
     def _default_policy_document(self) -> dict:
         return {
@@ -1498,6 +1513,10 @@ class APIEndpoints:
     @cherrypy.tools.json_in()
     def setup_wizard(self):
         """Complete initial setup wizard configuration"""
+        with self._provisioning_lock:
+            return self._setup_wizard_locked()
+
+    def _setup_wizard_locked(self):
         try:
             self._require_post()
             data = cherrypy.request.json
@@ -1738,8 +1757,10 @@ class APIEndpoints:
                     )
             # Explicit setup writes canonical names only.
             config_yaml = normalize_modem_config(config_yaml)
+            config_yaml["setup_completed"] = True
             with open(self._config_path, "w") as f:
                 yaml.dump(config_yaml, f, default_flow_style=False, sort_keys=False)
+            self.config["setup_completed"] = True
 
             logger.info(
                 f"Setup wizard completed: node_name={node_name}, hardware={hardware_key}, freq={freq_mhz}MHz"
@@ -8121,6 +8142,10 @@ class APIEndpoints:
         Returns: {"success": true, "message": "...", "restart_required": true,
                   "sections_updated": [...]}
         """
+        with self._provisioning_lock:
+            return self._config_import_locked()
+
+    def _config_import_locked(self):
         self._set_cors_headers()
         if cherrypy.request.method == "OPTIONS":
             return ""
@@ -8320,6 +8345,13 @@ class APIEndpoints:
 
             if not updated_sections:
                 return self._error("No valid configuration sections found in import")
+
+            # Keep authenticated restores closed even when restoring defaults.
+            # Partial first-run restores must still allow the existing wizard;
+            # finish provisioning once credentials have actually been supplied.
+            # setup_completed is deliberately not an importable section.
+            if request_user or not self._setup_status_from_config(self.config)[0]:
+                self.config["setup_completed"] = True
 
             # Persist and live-reload
             self.config_manager.update_and_save(

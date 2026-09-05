@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import io
 import json
+import os
 import subprocess
 import sys
 import zipfile
@@ -17,11 +19,21 @@ from repeater.plugins.runtime import PluginRuntime, PluginState
 from repeater.plugins.storage import PluginStorage
 
 
+@pytest.fixture(autouse=True)
+def isolate_fake_process_groups(monkeypatch):
+    # Fake PIDs must never signal real host processes.
+    def absent_group(*args):
+        raise ProcessLookupError
+
+    monkeypatch.setattr(os, "killpg", absent_group)
+
+
 class FakeProc:
     def __init__(self, pid: int = 4242):
         self.pid = pid
         self._code = None
         self.signals = []
+        self.stdout = io.BytesIO(b"hello from plugin\n")
 
     def poll(self):
         return self._code

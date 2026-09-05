@@ -4581,6 +4581,8 @@ paths:
         - BearerAuth: []
         - ApiKeyAuth: []
       responses:
+        '504':
+          $ref: '#/components/responses/PluginOutcomeUnknown'
         '200':
           description: Plugin list
           content:
@@ -4614,6 +4616,8 @@ paths:
             type: boolean
           description: Force refresh of the catalogue cache
       responses:
+        '504':
+          $ref: '#/components/responses/PluginOutcomeUnknown'
         '200':
           description: Catalogue entries
         '502':
@@ -4642,6 +4646,8 @@ paths:
                   type: string
                   description: Optional assertion of the currently approved version
       responses:
+        '504':
+          $ref: '#/components/responses/PluginOutcomeUnknown'
         '200':
           description: Installed plugin status
         '400':
@@ -4665,6 +4671,8 @@ paths:
           schema:
             type: boolean
       responses:
+        '504':
+          $ref: '#/components/responses/PluginOutcomeUnknown'
         '200':
           description: Update check result
         '404':
@@ -4687,6 +4695,8 @@ paths:
                 version:
                   type: string
       responses:
+        '504':
+          $ref: '#/components/responses/PluginOutcomeUnknown'
         '200':
           description: Updated plugin status
         '400':
@@ -4706,6 +4716,8 @@ paths:
           schema:
             type: string
       responses:
+        '504':
+          $ref: '#/components/responses/PluginOutcomeUnknown'
         '200':
           description: Config object
         '404':
@@ -4738,6 +4750,8 @@ paths:
                   type: boolean
                   default: false
       responses:
+        '504':
+          $ref: '#/components/responses/PluginOutcomeUnknown'
         '200':
           description: Saved
         '400':
@@ -4760,6 +4774,8 @@ paths:
           schema:
             type: string
       responses:
+        '504':
+          $ref: '#/components/responses/PluginOutcomeUnknown'
         '200':
           description: Runtime object
         '404':
@@ -4796,6 +4812,8 @@ paths:
                   type: string
                   description: Absolute path to a .whl on the Repeater host
       responses:
+        '504':
+          $ref: '#/components/responses/PluginOutcomeUnknown'
         '200':
           description: Installed
         '400':
@@ -4822,6 +4840,8 @@ paths:
                   type: string
                   example: openhop.nomad
       responses:
+        '504':
+          $ref: '#/components/responses/PluginOutcomeUnknown'
         '200':
           description: Enabled
         '404':
@@ -4847,6 +4867,8 @@ paths:
                 id:
                   type: string
       responses:
+        '504':
+          $ref: '#/components/responses/PluginOutcomeUnknown'
         '200':
           description: Disabled
         '404':
@@ -4872,6 +4894,8 @@ paths:
                 id:
                   type: string
       responses:
+        '504':
+          $ref: '#/components/responses/PluginOutcomeUnknown'
         '200':
           description: Started
         '409':
@@ -4897,6 +4921,8 @@ paths:
                 id:
                   type: string
       responses:
+        '504':
+          $ref: '#/components/responses/PluginOutcomeUnknown'
         '200':
           description: Stopped
         '503':
@@ -4920,6 +4946,8 @@ paths:
                 id:
                   type: string
       responses:
+        '504':
+          $ref: '#/components/responses/PluginOutcomeUnknown'
         '200':
           description: Restarted
         '503':
@@ -4945,6 +4973,8 @@ paths:
             type: integer
             default: 200
       responses:
+        '504':
+          $ref: '#/components/responses/PluginOutcomeUnknown'
         '200':
           description: Log lines
           content:
@@ -4985,6 +5015,8 @@ paths:
                   type: boolean
                   default: false
       responses:
+        '504':
+          $ref: '#/components/responses/PluginOutcomeUnknown'
         '200':
           description: Uninstalled
         '503':
@@ -5004,6 +5036,8 @@ paths:
           schema:
             type: string
       responses:
+        '504':
+          $ref: '#/components/responses/PluginOutcomeUnknown'
         '200':
           description: Status
           content:
@@ -5038,6 +5072,8 @@ paths:
             type: boolean
             default: false
       responses:
+        '504':
+          $ref: '#/components/responses/PluginOutcomeUnknown'
         '200':
           description: Uninstalled
         '503':
@@ -5045,6 +5081,27 @@ paths:
 
 
 components:
+  responses:
+    PluginOutcomeUnknown:
+      description: |
+        The manager response was lost or its completion deadline expired.
+        This is not cancellation: the operation may still complete. Check plugin
+        status before retrying. A busy manager instead returns 503; conflicting
+        lifecycle operations on the same plugin return 409.
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [success, error, outcome]
+            properties:
+              success:
+                type: boolean
+                enum: [false]
+              error:
+                type: string
+              outcome:
+                type: string
+                enum: [unknown]
   schemas:
 
     PluginStatus:

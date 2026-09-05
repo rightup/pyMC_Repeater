@@ -7,6 +7,7 @@ import logging
 import os
 import socket
 import threading
+import time
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -15,6 +16,10 @@ from .manager import PluginManager, PluginManagerError
 logger = logging.getLogger("PluginIPC")
 
 DEFAULT_TIMEOUT = 30.0
+OPERATION_TIMEOUT = 900.0  # completion budget, not a subprocess cancellation deadline
+MAX_CONNECTIONS = 16
+SLOW_OPS = frozenset({"install", "catalogue_install", "update", "catalogue", "check_update"})
+INSTALL_OPS = frozenset({"install", "catalogue_install", "update"})
 MAX_LINE_BYTES = 8 * 1024 * 1024  # install paths are short; keep headroom
 
 
@@ -24,27 +29,54 @@ class PluginIPCError(Exception):
         self.code = code
 
 
+class PluginIPCOutcomeUnknown(PluginIPCError):
+    """Transport stopped waiting; the manager may still complete the operation."""
+
+    def __init__(self, *, upload_safe: bool = False):
+        super().__init__(
+            "Plugin manager response was lost or timed out; outcome is unknown. "
+            "The operation may still complete. Check plugin status before retrying.",
+            504,
+        )
+        self.outcome = "unknown"
+        self.upload_safe = upload_safe
+
+
 class PluginManagerUnavailable(PluginIPCError):
     def __init__(self, message: str = "plugin manager unavailable"):
         super().__init__(message, code=503)
 
 
-def _read_line(conn: socket.socket, max_bytes: int = MAX_LINE_BYTES) -> bytes:
-    buf = bytearray()
+def _read_line(
+    conn: socket.socket,
+    max_bytes: int = MAX_LINE_BYTES,
+    *,
+    buffer: Optional[bytearray] = None,
+    deadline: Optional[float] = None,
+) -> bytes:
+    buf = buffer if buffer is not None else bytearray()
+    if deadline is None:
+        deadline = time.monotonic() + (conn.gettimeout() or DEFAULT_TIMEOUT)
     while True:
-        chunk = conn.recv(4096)
-        if not chunk:
-            break
-        buf.extend(chunk)
-        if b"\n" in chunk:
-            break
+        end = buf.find(b"\n")
+        if end >= 0:
+            if end > max_bytes:
+                raise PluginIPCError("IPC message too large", 413)
+            line = bytes(buf[:end])
+            del buf[: end + 1]
+            return line
         if len(buf) > max_bytes:
             raise PluginIPCError("IPC message too large", 413)
-    if not buf:
-        return b""
-    # Take first line only
-    line, _, _rest = bytes(buf).partition(b"\n")
-    return line
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("IPC response deadline exceeded")
+        conn.settimeout(remaining)
+        chunk = conn.recv(min(4096, max_bytes + 1 - len(buf)))
+        if not chunk:
+            if buf:
+                raise PluginIPCError("incomplete IPC message", 502)
+            return b""
+        buf.extend(chunk)
 
 
 def _send_msg(conn: socket.socket, payload: dict[str, Any]) -> None:
@@ -61,6 +93,10 @@ class PluginIPCServer:
         self._sock: Optional[socket.socket] = None
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
+        self._slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
+        self._slow_slot = threading.BoundedSemaphore(1)
+        self._workers: set[threading.Thread] = set()
+        self._workers_lock = threading.Lock()
         self._handlers: dict[str, Callable[[dict[str, Any]], Any]] = {
             "list": self._op_list,
             "status": self._op_status,
@@ -119,6 +155,11 @@ class PluginIPCServer:
         if thread and thread.is_alive():
             thread.join(timeout=3)
         self._thread = None
+        deadline = time.monotonic() + 3
+        with self._workers_lock:
+            workers = list(self._workers)
+        for worker in workers:
+            worker.join(timeout=max(0, deadline - time.monotonic()))
         if self.socket_path.exists():
             try:
                 self.socket_path.unlink()
@@ -139,15 +180,33 @@ class PluginIPCServer:
                 if self._stop.is_set():
                     break
                 continue
-            try:
-                self._handle_connection(conn)
-            except Exception as exc:
-                logger.debug("IPC connection error: %s", exc)
-            finally:
+            if not self._slots.acquire(blocking=False):
+                # No unbounded executor queue; a saturated transport rejects immediately.
                 try:
-                    conn.close()
+                    conn.settimeout(0.1)
+                    _send_msg(
+                        conn, {"ok": False, "error": "plugin IPC busy; retry later", "code": 503}
+                    )
                 except OSError:
                     pass
+                finally:
+                    conn.close()
+                continue
+            worker = threading.Thread(target=self._connection_worker, args=(conn,), daemon=True)
+            with self._workers_lock:
+                self._workers.add(worker)
+            worker.start()
+
+    def _connection_worker(self, conn: socket.socket) -> None:
+        try:
+            self._handle_connection(conn)
+        except Exception as exc:
+            logger.debug("IPC connection error: %s", exc)
+        finally:
+            conn.close()
+            with self._workers_lock:
+                self._workers.discard(threading.current_thread())
+            self._slots.release()
 
     def _handle_connection(self, conn: socket.socket) -> None:
         conn.settimeout(DEFAULT_TIMEOUT)
@@ -163,8 +222,26 @@ class PluginIPCServer:
             op = request.get("op")
             if not isinstance(op, str) or op not in self._handlers:
                 raise PluginIPCError(f"unknown op: {op!r}", 400)
-            result = self._handlers[op](request)
-            _send_msg(conn, {"id": req_id, "ok": True, "result": result})
+            slow = op in SLOW_OPS
+            if slow and not self._slow_slot.acquire(blocking=False):
+                raise PluginIPCError("plugin download/install busy; retry later", 503)
+            try:
+                if op == "install":
+                    wheel_path = request.get("wheel_path")
+                    if not isinstance(wheel_path, str) or not wheel_path.strip():
+                        raise PluginIPCError("wheel_path is required", 400)
+                    with self.manager.stage_upload(wheel_path.strip()) as staged:
+                        if request.get("completion_protocol") == 1:
+                            _send_msg(conn, {"id": req_id, "ok": True, "processing": True})
+                        result = self.manager.install(staged)
+                else:
+                    if op in INSTALL_OPS and request.get("completion_protocol") == 1:
+                        _send_msg(conn, {"id": req_id, "ok": True, "processing": True})
+                    result = self._handlers[op](request)
+                _send_msg(conn, {"id": req_id, "ok": True, "result": result})
+            finally:
+                if slow:
+                    self._slow_slot.release()
         except PluginManagerError as exc:
             _send_msg(
                 conn,
@@ -175,6 +252,9 @@ class PluginIPCServer:
                 conn,
                 {"id": req_id, "ok": False, "error": str(exc), "code": int(exc.code)},
             )
+        except OSError:
+            # A disconnected waiter is not an operation failure or cancellation.
+            raise
         except Exception as exc:
             logger.exception("IPC handler failure")
             _send_msg(
@@ -287,6 +367,7 @@ class PluginIPCClient:
     def __init__(self, socket_path: Path | str, timeout: float = DEFAULT_TIMEOUT):
         self.socket_path = Path(socket_path)
         self.timeout = timeout
+        self.operation_timeout = OPERATION_TIMEOUT
         self._next_id = 1
         self._lock = threading.Lock()
 
@@ -302,29 +383,48 @@ class PluginIPCClient:
             self._next_id += 1
 
         request = {"id": req_id, "op": op, **params}
+        if op in INSTALL_OPS:
+            request["completion_protocol"] = 1
         try:
             sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             sock.settimeout(self.timeout)
             sock.connect(str(self.socket_path))
         except OSError as exc:
+            sock.close()
             raise PluginManagerUnavailable(f"plugin manager unavailable: {exc}") from exc
 
+        upload_safe = False
         try:
             _send_msg(sock, request)
-            raw = _read_line(sock)
-            if not raw:
-                raise PluginManagerUnavailable("empty response from plugin manager")
-            try:
-                response = json.loads(raw.decode("utf-8"))
-            except json.JSONDecodeError as exc:
-                raise PluginIPCError(f"invalid IPC response: {exc}", 502) from exc
-            if not isinstance(response, dict):
-                raise PluginIPCError("invalid IPC response type", 502)
-            if not response.get("ok"):
-                code = int(response.get("code") or 500)
-                err = str(response.get("error") or "plugin manager error")
-                raise PluginIPCError(err, code)
-            return response.get("result")
+            buffer = bytearray()
+            deadline = time.monotonic() + self.timeout
+            completion_deadline = time.monotonic() + self.operation_timeout
+            while True:
+                try:
+                    raw = _read_line(sock, buffer=buffer, deadline=deadline)
+                except PluginIPCError as exc:
+                    raise PluginIPCOutcomeUnknown(upload_safe=upload_safe) from exc
+                if not raw:
+                    raise PluginIPCOutcomeUnknown(upload_safe=upload_safe)
+                try:
+                    response = json.loads(raw.decode("utf-8"))
+                except (ValueError, UnicodeError) as exc:
+                    raise PluginIPCOutcomeUnknown(upload_safe=upload_safe) from exc
+                if not isinstance(response, dict):
+                    raise PluginIPCOutcomeUnknown(upload_safe=upload_safe)
+                if not response.get("ok"):
+                    code = int(response.get("code") or 500)
+                    err = str(response.get("error") or "plugin manager error")
+                    raise PluginIPCError(err, code)
+                if response.get("id") != req_id:
+                    raise PluginIPCOutcomeUnknown(upload_safe=upload_safe)
+                if response.get("processing") is True:
+                    upload_safe = op == "install"
+                    deadline = completion_deadline
+                    continue
+                return response.get("result")
+        except OSError as exc:
+            raise PluginIPCOutcomeUnknown(upload_safe=upload_safe) from exc
         finally:
             try:
                 sock.close()

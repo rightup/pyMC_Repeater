@@ -4,6 +4,26 @@ The plugin system installs and supervises **external** applications around the
 Repeater. Plugins are not imported into the Repeater process. They talk to
 existing interfaces (REST, WebSocket/SSE, Companion frame server, static web).
 
+## Trust and access
+
+Plugins are trusted applications, **not sandboxed code**. A separate process and
+virtualenv keep Python dependencies separate; they do not create a filesystem,
+network, or credential boundary. Install only plugins and dependencies you trust.
+Native plugins currently run under the `repeater` service account; container
+plugins run under the configured container account. Never run a plugin manager as
+root merely to work around installation permissions.
+
+The current Repeater API tokens are administrator-equivalent. A token that can
+read status can also administer plugins, install uploaded wheels, and read plugin
+settings. Do not hand these tokens to untrusted or telemetry-only consumers.
+Scoped integration credentials would require a separate authorization feature.
+
+Schema-2 catalogue checksums approve the plugin wheel itself. Python dependencies
+resolved by pip are not covered by that checksum and can change on installation
+or environment rebuild. The curated catalogue is not a claim that the complete
+transitive dependency set is hash-locked. Deployments requiring reproducibility
+should use a controlled, pinned dependency source.
+
 ## Layout
 
 Default root (under Repeater storage):
@@ -70,6 +90,12 @@ UI-only application plugin:
 
 A plugin may declare both `runtime` and `ui`.
 
+The UI entry must be inside a dedicated asset subtree such as `ui/index.html`.
+A release-root entry (`index.html`), dot/parent path segments, and reserved
+runtime/storage subtrees (`venv`, `data`, `logs`, `releases`, `current`) are
+rejected. Existing plugins using these invalid layouts must be repackaged;
+serving the whole release directory is intentionally no longer supported.
+
 ## Plugin manager service
 
 Native installs:
@@ -91,6 +117,53 @@ with `tini` as PID 1 to reap orphaned children. It forwards shutdown signals to
 both services and their plugin processes, and restarts the manager if it exits
 unexpectedly while Repeater remains running. Set `OPENHOP_PLUGIN_MANAGER=0` to
 run Repeater without the manager.
+
+### Native upgrade prerequisite
+
+Existing native installations must run the updated `manage.sh upgrade` once as
+an administrator to replace the privileged OTA helper. Installing only a new
+Python wheel cannot safely replace an existing root-owned helper. Subsequent
+OTA upgrades through the refreshed helper install the manager unit from the
+installed package; no source checkout is required on the host.
+
+The helper runs from a trusted directory with a clean environment and isolated
+Python module lookup. It rejects writable/non-root-owned execution trees instead
+of silently granting existing code root ownership. If this check fails, an
+administrator must restore the application environment from a trusted package.
+Do not bypass the check or make the venv service-writable.
+
+## Operation safety and limits
+
+The manager serves bounded concurrent IPC requests, so a slow installation does
+not monopolize the socket. Mutations of the same plugin are serialized;
+conflicting requests return a busy response rather than interleaving state.
+Local wheel inputs are copied to manager-owned staging before installation.
+
+Installation has a longer IPC budget than ordinary status requests. If transport
+is lost after dispatch, HTTP 504 with `outcome: unknown` means the operation may
+still finish: **it does not mean cancellation or rollback**. Inspect plugin
+status before retrying. An uploaded source is retained when completion is
+ambiguous so an accepted install cannot lose its input.
+
+Venv creation and pip execution are time-limited, installer output is bounded,
+and plugin stdout/stderr are drained into bounded logs while the plugin runs.
+Stop/disable terminate the supervised process group, including ordinary child
+workers. This is process supervision, not containment of malicious applications
+that deliberately detach into new sessions or write other files.
+
+Failed Python-version rebuilds restore the previous venv and remain retryable;
+the new marker is accepted only after the new environment and entrypoint exist.
+A rebuild-intent record is reconciled before version checks after a manager
+restart, so interruption during replacement cannot silently accept a partial
+venv. This provides process-interruption recovery, not guaranteed filesystem
+durability across power loss; interruption during cleanup can leave an unused
+backup.
+
+Archive extraction limits expanded member size and total size and rejects
+symlink-backed destinations. Catalogue JSON and wheel response bodies have size
+limits and elapsed-time budgets; configured catalogue URLs must use HTTPS.
+DNS resolution and urllib connection/header setup are not guaranteed to obey a
+strict whole-request wall-clock deadline.
 
 ## Install a local wheel
 

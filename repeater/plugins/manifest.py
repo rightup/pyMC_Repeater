@@ -18,6 +18,49 @@ SUPPORTED_SCHEMA = 1
 SUPPORTED_RUNTIME_TYPES = frozenset({"python"})
 SUPPORTED_UI_TYPES = frozenset({"application"})
 MANIFEST_FILENAME = "openhop-plugin.json"
+ZIP_METADATA_MAX_BYTES = 1024 * 1024
+ZIP_MEMBER_MAX_BYTES = 16 * 1024 * 1024
+ZIP_TOTAL_MAX_BYTES = 256 * 1024 * 1024
+ZIP_MAX_MEMBERS = 4096
+
+
+def validate_archive_limits(zf) -> None:
+    """Bound expanded wheel size before reading or handing it to pip."""
+    members = zf.infolist()
+    if len(members) > ZIP_MAX_MEMBERS:
+        raise ManifestError("wheel exceeds archive member count limit")
+    if sum(member.file_size for member in members) > ZIP_TOTAL_MAX_BYTES:
+        raise ManifestError("wheel exceeds expanded archive size limit")
+    if any(member.file_size > ZIP_MEMBER_MAX_BYTES for member in members):
+        raise ManifestError("wheel member exceeds expanded size limit")
+
+
+def read_archive_member(zf, member, *, metadata: bool = False) -> bytes:
+    """Check advertised and actual expanded lengths; never use an unbounded read."""
+    limit = ZIP_METADATA_MAX_BYTES if metadata else ZIP_MEMBER_MAX_BYTES
+    info = zf.getinfo(member) if isinstance(member, str) else member
+    if info.file_size > limit:
+        raise ManifestError("wheel member exceeds expanded size limit")
+    with zf.open(info) as source:
+        data = source.read(limit + 1)
+    if len(data) > limit:
+        raise ManifestError("wheel member exceeds expanded size limit")
+    return data
+
+
+def ui_subtree(entry: str) -> str:
+    """Return a dedicated public directory, never the release or runtime root."""
+    _reject_path_traversal(entry, "ui.entry")
+    parts = entry.split("/")
+    if (
+        len(parts) < 2
+        or any(p in {"", ".", ".."} for p in parts)
+        or parts[0].startswith(".")
+        or ":" in entry
+        or parts[0].lower() in {"venv", "data", "logs", "releases", "current"}
+    ):
+        raise ManifestError("ui.entry must be inside a dedicated, non-reserved UI subtree")
+    return parts[0]
 
 
 class ManifestError(ValueError):
@@ -139,8 +182,7 @@ def _validate_ui(raw: Any) -> UISpec:
         raise ManifestError("ui.entry is required")
     entry = entry.strip().replace("\\", "/")
     _reject_path_traversal(entry, "ui.entry")
-    if not entry:
-        raise ManifestError("ui.entry is required")
+    ui_subtree(entry)
     return UISpec(type=str(utype), entry=entry)
 
 
@@ -234,6 +276,7 @@ def load_manifest_from_wheel(wheel_path: Path | str) -> PluginManifest:
 
     try:
         with zipfile.ZipFile(wheel_path) as zf:
+            validate_archive_limits(zf)
             candidates = [
                 name
                 for name in zf.namelist()
@@ -244,7 +287,7 @@ def load_manifest_from_wheel(wheel_path: Path | str) -> PluginManifest:
             # Prefer share/openhop/plugins/... layout, else first match
             preferred = [c for c in candidates if "share/openhop/plugins/" in c]
             chosen = preferred[0] if preferred else candidates[0]
-            raw = zf.read(chosen)
+            raw = read_archive_member(zf, chosen, metadata=True)
     except zipfile.BadZipFile as exc:
         raise ManifestError(f"invalid wheel archive: {exc}") from exc
 
