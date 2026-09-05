@@ -6,6 +6,7 @@ import secrets
 import time
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from datetime import datetime, timezone
+from threading import RLock
 from typing import Callable, Optional
 
 import cherrypy
@@ -209,6 +210,11 @@ POLICY_GROUP_KINDS = {
 
 
 class APIEndpoints:
+    # Serialize both provisioning routes across mounts in this process, from
+    # authorization through persistence. Do not reuse ConfigManager's locks:
+    # imports must retain its normal persistence/live-update callbacks.
+    _provisioning_lock = RLock()
+
     # How long /api/query_neighbor_scopes holds a request open. The scope helper's
     # response window is normally its 5 s floor; a slow radio config (SF12) or a
     # duty-cycle deferral can push a single query past this, in which case the
@@ -232,6 +238,7 @@ class APIEndpoints:
         self.event_loop = event_loop
         self.daemon_instance = daemon_instance
         self._config_path = config_path or "/etc/openhop_repeater/config.yaml"
+
         self.cad_calibration = CADCalibrationEngine(daemon_instance, event_loop)
 
         # Initialize ConfigManager for centralized config management
@@ -1506,6 +1513,10 @@ class APIEndpoints:
     @cherrypy.tools.json_in()
     def setup_wizard(self):
         """Complete initial setup wizard configuration"""
+        with self._provisioning_lock:
+            return self._setup_wizard_locked()
+
+    def _setup_wizard_locked(self):
         try:
             self._require_post()
             data = cherrypy.request.json
@@ -8131,6 +8142,10 @@ class APIEndpoints:
         Returns: {"success": true, "message": "...", "restart_required": true,
                   "sections_updated": [...]}
         """
+        with self._provisioning_lock:
+            return self._config_import_locked()
+
+    def _config_import_locked(self):
         self._set_cors_headers()
         if cherrypy.request.method == "OPTIONS":
             return ""

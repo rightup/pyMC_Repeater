@@ -141,6 +141,111 @@ def test_fresh_restore_custom_password_closes_followup_restore(api_env):
     assert cherrypy.response.status == 403
 
 
+@pytest.mark.parametrize("second_endpoint", ["setup_wizard", "config_import"])
+def test_concurrent_anonymous_provisioning_has_only_one_winner(
+    tmp_path, monkeypatch, second_endpoint
+):
+    config = make_config(password="admin123")
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump(config))
+    api = APIEndpoints(config=config, config_path=str(path))
+    monkeypatch.setattr(api.config_manager, "live_update_daemon", Mock(return_value=True))
+    request = threading.local()
+    response = threading.local()
+    monkeypatch.setattr(cherrypy, "request", request)
+    monkeypatch.setattr(cherrypy, "response", response)
+    real_start = threading.Thread.start
+
+    def safe_start(thread):
+        if getattr(thread._target, "__name__", "") != "delayed_restart":
+            real_start(thread)
+
+    monkeypatch.setattr(threading.Thread, "start", safe_start)
+    first_checked = threading.Event()
+    second_contending = threading.Event()
+    release_first = threading.Event()
+    first_finished = threading.Event()
+    original_status = api._setup_status_from_config
+
+    def gated_status(current):
+        result = original_status(current)
+        if threading.current_thread().name == "first":
+            first_checked.set()
+            assert release_first.wait(5)
+        elif not first_finished.is_set():
+            # Without serialization, capture the stale authorization decision.
+            second_contending.set()
+            assert first_finished.wait(5)
+        return result
+
+    monkeypatch.setattr(api, "_setup_status_from_config", gated_status)
+    # Observe attempted acquisition, not elapsed time, to prove overlap without
+    # deadlocking the correctly serialized implementation at a barrier.
+    if hasattr(api, "_provisioning_lock"):
+        lock = api._provisioning_lock
+
+        class ObservedLock:
+            def __enter__(self):
+                if threading.current_thread().name == "second":
+                    second_contending.set()
+                return lock.__enter__()
+
+            def __exit__(self, *args):
+                return lock.__exit__(*args)
+
+        monkeypatch.setattr(api, "_provisioning_lock", ObservedLock())
+
+    outcomes = {}
+    errors = []
+
+    def invoke(name, endpoint):
+        request.method = "POST"
+        request.user = None
+        request.headers = {}
+        request.params = {}
+        request.json = (
+            {"config": make_config(password="loser-password")}
+            if endpoint == "config_import"
+            else {
+                "node_name": name,
+                "hardware_key": "kiss",
+                "admin_password": f"{name}-password",
+                "radio_preset": {"frequency": 869.618, "bandwidth": 62.5},
+            }
+        )
+        response.status = 200
+        response.headers = {}
+        try:
+            outcomes[name] = (getattr(api, endpoint)(), response.status)
+        except BaseException as exc:  # noqa: BLE001 - propagate worker failures to pytest
+            errors.append(exc)
+        finally:
+            if name == "first":
+                first_finished.set()
+
+    first = threading.Thread(target=invoke, args=("first", "setup_wizard"), name="first")
+    second = threading.Thread(target=invoke, args=("second", second_endpoint), name="second")
+    first.start()
+    try:
+        assert first_checked.wait(5)
+        second.start()
+        assert second_contending.wait(5)
+    finally:
+        release_first.set()
+        first.join(5)
+        if second.ident is not None:
+            second.join(5)
+    assert not first.is_alive() and not second.is_alive()
+    assert not errors
+    assert outcomes["first"][0]["success"] is True
+    assert outcomes["second"][1] == 403
+    assert outcomes["second"][0]["success"] is False
+    persisted = yaml.safe_load(path.read_text())
+    assert persisted["repeater"]["security"]["admin_password"] == "first-password"
+    assert persisted["setup_completed"] is True
+    api.config_manager.live_update_daemon.assert_not_called()
+
+
 class QuietHandler(WSGIRequestHandler):
     def log_message(self, format, *args):
         pass
