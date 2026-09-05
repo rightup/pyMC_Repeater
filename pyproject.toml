@@ -75,6 +75,7 @@ repeater = [
     "web/*.yaml",
     "web/*.html",
     "presets/*.yaml",
+    "plugins/*.service",
 ]
 
 [tool.ruff]

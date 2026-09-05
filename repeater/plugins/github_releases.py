@@ -14,6 +14,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from .catalogue import (
+    JSON_DOWNLOAD_TIMEOUT_SECONDS,
+    MAX_JSON_BYTES,
+    MAX_WHEEL_BYTES,
+    WHEEL_DOWNLOAD_TIMEOUT_SECONDS,
+    _bounded_chunks,
+)
+
 logger = logging.getLogger("PluginGitHubReleases")
 
 GITHUB_API_BASE = "https://api.github.com"
@@ -224,9 +232,23 @@ class GitHubReleaseClient:
             },
             method="GET",
         )
+        deadline = time.monotonic() + WHEEL_DOWNLOAD_TIMEOUT_SECONDS
+        temporary = None
         try:
-            with self._opener(request, timeout=120.0) as resp:
-                data = resp.read()
+            with tempfile.NamedTemporaryFile(
+                prefix=".wheel-", dir=dest_dir, delete=False
+            ) as output:
+                temporary = Path(output.name)
+                total = 0
+                with self._opener(request, timeout=WHEEL_DOWNLOAD_TIMEOUT_SECONDS) as resp:
+                    for chunk in _bounded_chunks(
+                        resp, max_bytes=MAX_WHEEL_BYTES, deadline=deadline
+                    ):
+                        output.write(chunk)
+                        total += len(chunk)
+                if not total:
+                    raise GitHubReleasesError("downloaded wheel is empty", code=502)
+            temporary.replace(dest)
         except GitHubReleasesError:
             raise
         except urllib.error.HTTPError as exc:
@@ -235,10 +257,9 @@ class GitHubReleaseClient:
             raise GitHubReleasesError(f"failed to download wheel: {exc.reason}", code=502) from exc
         except Exception as exc:
             raise GitHubReleasesError(f"failed to download wheel: {exc}", code=502) from exc
-
-        if not data:
-            raise GitHubReleasesError("downloaded wheel is empty", code=502)
-        dest.write_bytes(data)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
         return dest
 
     def download_latest_wheel(
@@ -268,9 +289,12 @@ class GitHubReleaseClient:
             },
             method="GET",
         )
+        deadline = time.monotonic() + JSON_DOWNLOAD_TIMEOUT_SECONDS
         try:
-            with self._opener(request, timeout=30.0) as resp:
-                body = resp.read()
+            with self._opener(request, timeout=JSON_DOWNLOAD_TIMEOUT_SECONDS) as resp:
+                body = bytearray()
+                for chunk in _bounded_chunks(resp, max_bytes=MAX_JSON_BYTES, deadline=deadline):
+                    body.extend(chunk)
         except GitHubReleasesError:
             raise
         except urllib.error.HTTPError as exc:

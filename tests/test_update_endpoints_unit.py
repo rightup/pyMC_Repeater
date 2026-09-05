@@ -440,7 +440,7 @@ def test_do_install_wrapper_success_then_restart_failure(isolated_state, monkeyp
     assert "restart failed" in (st.error_message or "")
 
 
-def test_do_install_restarts_plugin_manager_service_when_present(isolated_state, monkeypatch):
+def test_do_install_leaves_plugin_manager_provisioning_to_wrapper(isolated_state, monkeypatch):
     st = isolated_state
     st.channel = "main"
     st.latest_version = "4.0.0"
@@ -482,8 +482,7 @@ def test_do_install_restarts_plugin_manager_service_when_present(isolated_state,
 
     ue._do_install()
 
-    assert any(cmd[:3] == ["/bin/systemctl", "enable", "openhop-plugin-manager"] for cmd in calls)
-    assert any(cmd[:3] == ["/bin/systemctl", "restart", "openhop-plugin-manager"] for cmd in calls)
+    assert calls == []
     assert st.state == "complete"
 
 
@@ -604,6 +603,8 @@ def test_do_install_root_does_not_force_a_predicted_version(isolated_state, monk
         assert "SETUPTOOLS_SCM_PRETEND_VERSION" not in call["env"]
     install = [c for c in calls if any("git+https://github.com" in str(x) for x in c["cmd"])]
     assert install, "expected a pip install from git"
+    assert install[-1]["cmd"][:4] == ["/opt/openhop_repeater/venv/bin/python", "-I", "-m", "pip"]
+    assert install[-1]["env"] == ue._native_upgrade_environment()
     assert any("@dev" in str(x) for x in install[-1]["cmd"])
 
 

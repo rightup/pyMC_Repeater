@@ -78,6 +78,54 @@ def test_list_and_status_via_client_mock(tmp_path, cherrypy_request):
         assert runtime["runtime"]["schema"] == 1
 
 
+@pytest.mark.parametrize("upload_safe", [False, True])
+def test_upload_timeout_reports_unknown_and_preserves_unacknowledged_file(
+    tmp_path, cherrypy_request, upload_safe
+):
+    from io import BytesIO
+    from pathlib import Path
+    from types import SimpleNamespace
+    from repeater.plugins.ipc import PluginIPCOutcomeUnknown
+
+    api = PluginAPIEndpoints({"storage": {"storage_dir": str(tmp_path)}})
+    uploaded = []
+
+    def install(path):
+        uploaded.append(Path(path))
+        raise PluginIPCOutcomeUnknown(upload_safe=upload_safe)
+
+    client = SimpleNamespace(install=install)
+    cherrypy.request.method = "POST"
+    wheel = SimpleNamespace(filename="demo-1-py3-none-any.whl", file=BytesIO(b"wheel"))
+    with patch.object(api, "_client_or_raise", return_value=client):
+        result = api.install(wheel=wheel)
+    assert cherrypy.response.status == 504
+    assert result["outcome"] == "unknown"
+    assert "may still complete" in result["error"]
+    assert uploaded[0].exists() is (not upload_safe)
+
+
+def test_upload_completed_install_preserves_sync_contract(tmp_path, cherrypy_request):
+    from io import BytesIO
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    api = PluginAPIEndpoints({"storage": {"storage_dir": str(tmp_path)}})
+    uploaded = []
+
+    def install(path):
+        uploaded.append(Path(path))
+        assert uploaded[0].read_bytes() == b"wheel"
+        return {"id": "demo", "version": "1"}
+
+    cherrypy.request.method = "POST"
+    wheel = SimpleNamespace(filename="demo-1-py3-none-any.whl", file=BytesIO(b"wheel"))
+    with patch.object(api, "_client_or_raise", return_value=SimpleNamespace(install=install)):
+        result = api.install(wheel=wheel)
+    assert result == {"success": True, "plugin": {"id": "demo", "version": "1"}}
+    assert not uploaded[0].exists()
+
+
 def test_ui_serving_index_assets_spa_and_disabled(tmp_path):
     plugins_root = tmp_path / "plugins"
     storage = PluginStorage(plugins_root)

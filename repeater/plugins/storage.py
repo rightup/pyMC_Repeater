@@ -6,7 +6,9 @@ import json
 import logging
 import os
 import shutil
+import stat
 import tempfile
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -18,6 +20,7 @@ logger = logging.getLogger("PluginStorage")
 STATE_FILENAME = "state.json"
 DEFAULT_PLUGINS_SUBDIR = "plugins"
 DEFAULT_SOCKET_NAME = "plugin-manager.sock"
+LOG_TAIL_MAX_BYTES = 256 * 1024
 
 
 @dataclass(frozen=True)
@@ -80,6 +83,49 @@ def safe_join(root: Path, *parts: str) -> Path:
     except ValueError as exc:
         raise ValueError(f"path escapes root: {candidate}") from exc
     return candidate
+
+
+def write_release_asset(root: Path, relative: str, data: bytes) -> None:
+    """Atomically write an asset without following directory or leaf symlinks.
+
+    Walk from the filesystem root with pinned directory descriptors, so a
+    concurrent symlink substitution cannot redirect extraction. Replacing the
+    leaf also avoids overwriting another file through an existing hard link.
+    """
+    parts = relative.split("/")
+    if any(p in {"", ".", ".."} or "\\" in p for p in parts):
+        raise ValueError("unsafe asset path")
+    absolute = root.absolute()
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    fd = os.open(absolute.anchor, flags)
+    temporary = None
+    try:
+        for component in (*absolute.parts[1:], *parts[:-1]):
+            try:
+                os.mkdir(component, dir_fd=fd)
+            except FileExistsError:
+                pass
+            child = os.open(component, flags, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        try:
+            mode = os.stat(parts[-1], dir_fd=fd, follow_symlinks=False).st_mode
+            if not stat.S_ISREG(mode):
+                raise ValueError("asset destination must be a regular file, not a symlink")
+        except FileNotFoundError:
+            pass
+        temporary = f".asset-{uuid.uuid4().hex}"
+        out_fd = os.open(
+            temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644, dir_fd=fd
+        )
+        with os.fdopen(out_fd, "wb") as out:
+            out.write(data)
+        os.replace(temporary, parts[-1], src_dir_fd=fd, dst_dir_fd=fd)
+        temporary = None
+    finally:
+        if temporary is not None:
+            os.unlink(temporary, dir_fd=fd)
+        os.close(fd)
 
 
 class PluginStorage:
@@ -276,8 +322,10 @@ class PluginStorage:
             return []
         lines = max(1, min(int(lines), 5000))
         try:
-            # Simple tail: read whole file if small; otherwise scan from end
-            data = log_path.read_text(encoding="utf-8", errors="replace")
+            with log_path.open("rb") as source:
+                source.seek(0, os.SEEK_END)
+                source.seek(max(0, source.tell() - LOG_TAIL_MAX_BYTES))
+                data = source.read(LOG_TAIL_MAX_BYTES).decode("utf-8", errors="replace")
         except OSError:
             return []
         all_lines = data.splitlines()

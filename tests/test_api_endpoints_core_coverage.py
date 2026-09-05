@@ -762,6 +762,8 @@ def test_config_import_rejects_missing_config_object(cherrypy_ctx):
 def test_config_import_updates_sections_and_preserves_redacted(cherrypy_ctx):
     request, _ = cherrypy_ctx
     request.method = "POST"
+    # A custom administrator password closes anonymous first-run import.
+    request.user = {"username": "admin", "auth_type": "jwt"}
 
     api = _make_api(
         {

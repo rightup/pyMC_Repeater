@@ -673,7 +673,10 @@ class APIEndpoints:
         has_default_name = node_name in ["mesh-repeater-01", ""]
 
         admin_password = config.get("repeater", {}).get("security", {}).get("admin_password", "")
-        has_default_password = admin_password in ["admin123", ""]
+        has_default_password = admin_password is None or (
+            isinstance(admin_password, str)
+            and (not admin_password.strip() or admin_password == "admin123")  # nosec B105
+        )
 
         radio_type_raw = config.get("radio_type")
         radio_type = "" if radio_type_raw is None else str(radio_type_raw).lower().strip()
@@ -684,7 +687,12 @@ class APIEndpoints:
             "default_password": has_default_password,
             "radio_not_configured": radio_not_configured,
         }
-        return has_default_name or has_default_password or radio_not_configured, reasons
+        # Name and radio settings are diagnostics, not authorization signals:
+        # radio-less installations and default names are valid after provisioning.
+        # Legacy configs have no marker, so a custom password also closes setup.
+        # An explicit false marker must never override existing credentials.
+        setup_completed = config.get("setup_completed") is True
+        return has_default_password and not setup_completed, reasons
 
     def _default_policy_document(self) -> dict:
         return {
@@ -1738,8 +1746,10 @@ class APIEndpoints:
                     )
             # Explicit setup writes canonical names only.
             config_yaml = normalize_modem_config(config_yaml)
+            config_yaml["setup_completed"] = True
             with open(self._config_path, "w") as f:
                 yaml.dump(config_yaml, f, default_flow_style=False, sort_keys=False)
+            self.config["setup_completed"] = True
 
             logger.info(
                 f"Setup wizard completed: node_name={node_name}, hardware={hardware_key}, freq={freq_mhz}MHz"
@@ -8320,6 +8330,13 @@ class APIEndpoints:
 
             if not updated_sections:
                 return self._error("No valid configuration sections found in import")
+
+            # Keep authenticated restores closed even when restoring defaults.
+            # Partial first-run restores must still allow the existing wizard;
+            # finish provisioning once credentials have actually been supplied.
+            # setup_completed is deliberately not an importable section.
+            if request_user or not self._setup_status_from_config(self.config)[0]:
+                self.config["setup_completed"] = True
 
             # Persist and live-reload
             self.config_manager.update_and_save(

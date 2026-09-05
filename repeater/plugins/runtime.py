@@ -10,18 +10,23 @@ import subprocess  # nosec B404 - argument arrays only, never shell=True
 import sys
 import threading
 import time
+import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Callable, Optional
 
-from .manifest import PluginManifest
-from .storage import PluginPaths, PluginStorage
+from .manifest import PluginManifest, read_archive_member, ui_subtree, validate_archive_limits
+from .storage import PluginPaths, PluginStorage, write_release_asset
 
 logger = logging.getLogger("PluginRuntime")
 
 STOP_TIMEOUT_SECONDS = 5.0
+VENV_TIMEOUT_SECONDS = 120.0
+PIP_TIMEOUT_SECONDS = 300.0
+PROCESS_KILL_TIMEOUT_SECONDS = 2.0
+INSTALL_OUTPUT_MAX_BYTES = 64 * 1024
 CRASH_WINDOW_SECONDS = 60.0
 CRASH_MAX_EXITS = 5
 LOG_MAX_BYTES = 5 * 1024 * 1024  # rotate simply by truncating when oversized
@@ -42,6 +47,8 @@ class ProcessHandle:
     process: subprocess.Popen
     log_fp: object
     started_at: float = field(default_factory=time.monotonic)
+    process_group: Optional[int] = None
+    log_thread: Optional[threading.Thread] = None
 
 
 class PluginRuntime:
@@ -64,7 +71,7 @@ class PluginRuntime:
         self.crash_window = crash_window
         self.crash_max_exits = crash_max_exits
         self._popen = popen_factory or subprocess.Popen
-        self._run = run_factory or subprocess.run
+        self._run = run_factory or self._run_install_command
         self._lock = threading.RLock()
         self._handles: dict[str, ProcessHandle] = {}
         self._runtime_state: dict[str, PluginState] = {}
@@ -184,9 +191,53 @@ class PluginRuntime:
             persisted_version[0],
             persisted_version[1],
         )
-        shutil.rmtree(venv_path)
-        self._create_venv(venv_path)
-        self._pip_install(venv_path, wheels[0])
+        # Build at the final absolute path: moving a freshly built venv would
+        # invalidate pip-generated shebangs. Keep the old environment for rollback.
+        backup = venv_path.with_name(f".venv-backup-{uuid.uuid4().hex}")
+        venv_path.rename(backup)
+        try:
+            self._create_venv(venv_path)
+            self._pip_install(venv_path, wheels[0])
+            self.resolve_entrypoint(paths, version, manifest.runtime.entrypoint)
+        except BaseException:
+            if venv_path.exists():
+                shutil.rmtree(venv_path)
+            backup.rename(venv_path)
+            raise
+        else:
+            shutil.rmtree(backup)
+
+    def _run_install_command(self, cmd, *, timeout, **kwargs):
+        """Drain output into bounded memory and kill the entire installer group."""
+        # Callers construct Python/venv/pip argv; installing trusted wheels is intentional.
+        proc = subprocess.Popen(  # nosec B603
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            start_new_session=(os.name == "posix"),
+        )
+        handle = ProcessHandle(
+            "installer", proc, None, process_group=proc.pid if os.name == "posix" else None
+        )
+        output = bytearray()
+
+        def drain():
+            with proc.stdout as source:
+                while chunk := source.read1(64 * 1024):
+                    output.extend(chunk)
+                    del output[:-INSTALL_OUTPUT_MAX_BYTES]
+
+        reader = threading.Thread(target=drain, name="plugin-install-output", daemon=True)
+        reader.start()
+        try:
+            proc.wait(timeout=timeout)
+        finally:
+            self._signal_handle(handle, signal.SIGKILL)
+            proc.wait(timeout=PROCESS_KILL_TIMEOUT_SECONDS)
+            reader.join(timeout=PROCESS_KILL_TIMEOUT_SECONDS)
+        return subprocess.CompletedProcess(
+            cmd, proc.returncode, output.decode("utf-8", errors="replace"), ""
+        )
 
     def _create_venv(self, venv_path: Path) -> None:
         if venv_path.exists():
@@ -197,6 +248,7 @@ class PluginRuntime:
         venv_path.parent.mkdir(parents=True, exist_ok=True)
         result = self._run(
             [self.python_executable, "-m", "venv", str(venv_path)],
+            timeout=VENV_TIMEOUT_SECONDS,
             check=False,
             capture_output=True,
             text=True,
@@ -214,6 +266,7 @@ class PluginRuntime:
         try:
             result = self._run(
                 [str(py), "-m", "pip", "install", "--upgrade", str(install_path)],
+                timeout=PIP_TIMEOUT_SECONDS,
                 check=False,
                 capture_output=True,
                 text=True,
@@ -251,9 +304,12 @@ class PluginRuntime:
         version = None
         try:
             with zipfile.ZipFile(wheel_path) as zf:
+                validate_archive_limits(zf)
                 for member in zf.namelist():
                     if member.endswith(".dist-info/METADATA") and member.count("/") == 1:
-                        text = zf.read(member).decode("utf-8", errors="replace")
+                        text = read_archive_member(zf, member, metadata=True).decode(
+                            "utf-8", errors="replace"
+                        )
                         for line in text.splitlines():
                             if line.startswith("Name:"):
                                 name = line.split(":", 1)[1].strip()
@@ -319,31 +375,18 @@ class PluginRuntime:
         import zipfile
 
         entry = manifest.ui.entry.replace("\\", "/")
-        # Copy any archive members under the entry's top-level directory (e.g. ui/)
-        top = entry.split("/", 1)[0]
-        prefixes = (f"{top}/",)
+        top = ui_subtree(entry)
         try:
             with zipfile.ZipFile(wheel_path) as zf:
-                for name in zf.namelist():
-                    # Also copy bare openhop-plugin.json already handled
-                    rel = None
-                    for prefix in prefixes:
-                        # Match ".../ui/..." or "ui/..."
-                        idx = name.find(prefix)
-                        if idx >= 0:
-                            rel = name[idx:]
-                            break
-                    if rel is None:
+                validate_archive_limits(zf)
+                for member in zf.infolist():
+                    parts = member.filename.split("/")
+                    if member.is_dir() or top not in parts[:-1]:
                         continue
-                    if rel.endswith("/"):
-                        continue
-                    # Reject traversal in archive member names
-                    if ".." in Path(rel).parts:
-                        continue
-                    dest = release_dir / rel
-                    dest.parent.mkdir(parents=True, exist_ok=True)
-                    with zf.open(name) as src, open(dest, "wb") as out:
-                        out.write(src.read())
+                    if any(part in {"", ".", ".."} or "\\" in part for part in parts):
+                        raise ValueError("unsafe UI archive path")
+                    rel = "/".join(parts[parts.index(top) :])
+                    write_release_asset(release_dir, rel, read_archive_member(zf, member))
         except zipfile.BadZipFile as exc:
             raise RuntimeError(f"invalid wheel while extracting UI: {exc}") from exc
 
@@ -362,6 +405,7 @@ class PluginRuntime:
 
         try:
             with zipfile.ZipFile(wheel_path) as zf:
+                validate_archive_limits(zf)
                 candidates = [
                     name
                     for name in zf.namelist()
@@ -373,9 +417,11 @@ class PluginRuntime:
                 chosen = preferred[0] if preferred else candidates[0]
                 if ".." in Path(chosen).parts:
                     return
-                dest = release_dir / "config.default.json"
-                with zf.open(chosen) as src, open(dest, "wb") as out:
-                    out.write(src.read())
+                write_release_asset(
+                    release_dir,
+                    "config.default.json",
+                    read_archive_member(zf, chosen, metadata=True),
+                )
         except zipfile.BadZipFile:
             return
 
@@ -500,7 +546,7 @@ class PluginRuntime:
             self._runtime_state[plugin_id] = PluginState.STARTING
             paths.logs_dir.mkdir(parents=True, exist_ok=True)
             self._rotate_log_if_needed(paths.log_file)
-            log_fp = open(paths.log_file, "a", encoding="utf-8", buffering=1)
+            log_fp = open(paths.log_file, "ab", buffering=0)
 
             env = os.environ.copy()
             # Never expose a stale manager-only credential left behind by an
@@ -512,11 +558,12 @@ class PluginRuntime:
             try:
                 proc = self._popen(
                     [str(exe)],
-                    stdout=log_fp,
+                    stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     env=env,
                     cwd=str(paths.data_dir),
                     shell=False,
+                    start_new_session=(os.name == "posix"),
                 )
             except Exception:
                 log_fp.close()
@@ -524,12 +571,40 @@ class PluginRuntime:
                 raise
 
             self._handles[plugin_id] = ProcessHandle(
-                plugin_id=plugin_id, process=proc, log_fp=log_fp
+                plugin_id=plugin_id,
+                process=proc,
+                log_fp=log_fp,
+                process_group=proc.pid if os.name == "posix" else None,
             )
+            handle = self._handles[plugin_id]
+            handle.log_thread = threading.Thread(
+                target=self._drain_plugin_log,
+                args=(handle,),
+                name=f"plugin-log-{plugin_id}",
+                daemon=True,
+            )
+            handle.log_thread.start()
             self._runtime_state[plugin_id] = PluginState.RUNNING
             self._exit_codes[plugin_id] = None
             logger.info("Started plugin %s pid=%s", plugin_id, proc.pid)
             return PluginState.RUNNING
+
+    @staticmethod
+    def _drain_plugin_log(handle: ProcessHandle) -> None:
+        """Continuously cap captured stdout/stderr, including newline-free output."""
+        source = getattr(handle.process, "stdout", None)
+        if source is None:
+            return
+        try:
+            with source:
+                while chunk := source.read1(64 * 1024):
+                    chunk = chunk[-LOG_MAX_BYTES:]
+                    if handle.log_fp.tell() + len(chunk) > LOG_MAX_BYTES:
+                        handle.log_fp.seek(0)
+                        handle.log_fp.truncate()
+                    handle.log_fp.write(chunk)
+        except (OSError, ValueError):
+            logger.debug("Plugin log stream closed for %s", handle.plugin_id)
 
     def stop(self, plugin_id: str, *, mark_disabled: bool = False) -> PluginState:
         with self._lock:
@@ -543,37 +618,8 @@ class PluginRuntime:
                 )
                 return self._runtime_state[plugin_id]
 
-            proc = handle.process
-            if proc.poll() is not None:
-                self._cleanup_handle(plugin_id)
-                self._runtime_state[plugin_id] = (
-                    PluginState.DISABLED if mark_disabled else PluginState.STOPPED
-                )
-                return self._runtime_state[plugin_id]
-
-            try:
-                proc.send_signal(signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-            except Exception as exc:
-                logger.debug("SIGTERM failed for %s: %s", plugin_id, exc)
-
-        # Wait outside lock
-        deadline = time.monotonic() + self.stop_timeout
-        while time.monotonic() < deadline:
-            if proc.poll() is not None:
-                break
-            time.sleep(0.05)
-
-        if proc.poll() is None:
-            try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
-            try:
-                proc.wait(timeout=2)
-            except Exception as exc:
-                logger.debug("Wait after killing %s failed: %s", plugin_id, exc)
+        # Keep the group identity captured at spawn even if the leader exited.
+        self._terminate_handle(handle)
 
         with self._lock:
             self._cleanup_handle(plugin_id)
@@ -583,6 +629,43 @@ class PluginRuntime:
             logger.info("Stopped plugin %s", plugin_id)
             return self._runtime_state[plugin_id]
 
+    @staticmethod
+    def _signal_handle(handle: ProcessHandle, sig: int) -> None:
+        group = handle.process_group
+        if group is not None:
+            # Never signal the manager's own group or a non-positive group ID.
+            if group <= 1 or group == os.getpgrp():
+                raise RuntimeError("refusing to signal unsafe plugin process group")
+            try:
+                os.killpg(group, sig)
+            except ProcessLookupError:
+                pass
+        elif handle.process.poll() is None:
+            if sig == signal.SIGKILL:
+                handle.process.kill()
+            else:
+                handle.process.send_signal(sig)
+
+    def _terminate_handle(self, handle: ProcessHandle) -> None:
+        self._signal_handle(handle, signal.SIGTERM)
+        deadline = time.monotonic() + self.stop_timeout
+        while time.monotonic() < deadline:
+            handle.process.poll()  # reap the leader, but do not equate it to the group
+            if handle.process_group is None:
+                if handle.process.poll() is not None:
+                    break
+            else:
+                try:
+                    os.killpg(handle.process_group, 0)
+                except ProcessLookupError:
+                    break
+            time.sleep(0.05)
+        self._signal_handle(handle, signal.SIGKILL)
+        try:
+            handle.process.wait(timeout=PROCESS_KILL_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            logger.warning("Plugin %s did not reap after SIGKILL", handle.plugin_id)
+
     def restart(self, plugin_id: str) -> PluginState:
         self.stop(plugin_id)
         return self.start(plugin_id)
@@ -591,11 +674,15 @@ class PluginRuntime:
         handle = self._handles.pop(plugin_id, None)
         if handle is None:
             return
+        # Crash supervision also owns descendants left behind by an exited leader.
+        self._signal_handle(handle, signal.SIGKILL)
         try:
             if handle.process.poll() is not None:
                 self._exit_codes[plugin_id] = handle.process.returncode
         except Exception as exc:
             logger.debug("Could not record exit status for %s: %s", plugin_id, exc)
+        if handle.log_thread is not None:
+            handle.log_thread.join(timeout=PROCESS_KILL_TIMEOUT_SECONDS)
         try:
             handle.log_fp.close()
         except Exception as exc:

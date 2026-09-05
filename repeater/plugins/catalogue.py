@@ -7,8 +7,10 @@ import json
 import logging
 import os
 import re
+import socket
 import ssl
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -26,6 +28,66 @@ USER_AGENT = "openhop-repeater-plugin-manager/1.0"
 GITHUB_RELEASE_ORIGIN = "https://github.com"
 GITHUB_RELEASE_ASSET_HOST = "release-assets.githubusercontent.com"
 MAX_WHEEL_BYTES = 100 * 1024 * 1024
+MAX_JSON_BYTES = 4 * 1024 * 1024
+JSON_DOWNLOAD_TIMEOUT_SECONDS = 30.0
+WHEEL_DOWNLOAD_TIMEOUT_SECONDS = 120.0
+
+
+def _bounded_chunks(response, *, max_bytes: int, deadline: float):
+    """Stream a bounded body, sharing the budget started before opening the URL.
+
+    HTTPResponse.read(n) can wait for n bytes despite a trickling peer. read1
+    returns after one buffered/socket read; resetting the socket timeout bounds
+    an idle final read by the *remaining* budget. The shutdown watchdog also
+    interrupts read1's internal chunk-header/trailer readline loops.
+
+    urllib's DNS, connect, TLS and response-header/redirect processing happen
+    before the response is exposed here: their timeout is not a strict total
+    deadline. Injected non-socket openers must themselves provide bounded reads.
+    """
+
+    def remaining():
+        budget = deadline - time.monotonic()
+        if budget <= 0:
+            raise TimeoutError("download deadline exceeded")
+        return budget
+
+    raw = getattr(getattr(response, "fp", None), "raw", None)
+    sock = getattr(raw, "_sock", None)
+    watchdog = None
+    if isinstance(sock, socket.socket):
+
+        def interrupt():
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass  # Response may already have closed its socket at EOF.
+
+        watchdog = threading.Timer(remaining(), interrupt)
+        watchdog.daemon = True
+        watchdog.start()
+    read = getattr(response, "read1", None) or response.read
+    total = 0
+    try:
+        while True:
+            budget = remaining()
+            if isinstance(sock, socket.socket) and sock.fileno() >= 0:
+                sock.settimeout(budget)
+            chunk = read(min(64 * 1024, max_bytes - total + 1))
+            remaining()
+            if not chunk:
+                if getattr(response, "length", None):
+                    raise ValueError("download ended before Content-Length was received")
+                return
+            total += len(chunk)
+            if total > max_bytes:
+                raise ValueError(f"download exceeds {max_bytes} bytes")
+            yield chunk
+    finally:
+        if watchdog is not None:
+            watchdog.cancel()
+            watchdog.join()
+
 
 _REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
@@ -269,7 +331,12 @@ def parse_catalogue(data: Any) -> Catalogue:
 
 
 class CatalogueClient:
-    """Fetch, cache, and download from the curated plugin catalogue."""
+    """Fetch, cache, and download from the curated plugin catalogue.
+
+    Configured catalogue URLs must use HTTPS; HTTP and other schemes are
+    rejected with code 400, not silently upgraded. Custom HTTPS origins,
+    ports, paths and query strings remain supported.
+    """
 
     def __init__(
         self,
@@ -280,6 +347,10 @@ class CatalogueClient:
         user_agent: str = USER_AGENT,
     ):
         self.url = str(url or DEFAULT_CATALOGUE_URL).strip() or DEFAULT_CATALOGUE_URL
+        # Reject insecure configuration; never silently rewrite HTTP to HTTPS.
+        parsed_url = urlsplit(self.url)
+        if parsed_url.scheme != "https" or not parsed_url.hostname:
+            raise CatalogueError("Plugin catalogue URL must use HTTPS", code=400)
         self.cache_ttl = cache_ttl
         self._opener = opener or self._default_open
         self.user_agent = user_agent
@@ -314,9 +385,14 @@ class CatalogueClient:
             },
             method="GET",
         )
+        deadline = time.monotonic() + JSON_DOWNLOAD_TIMEOUT_SECONDS
         try:
-            with self._opener(request, timeout=30.0) as resp:
-                body = resp.read()
+            with self._opener(request, timeout=JSON_DOWNLOAD_TIMEOUT_SECONDS) as resp:
+                body = bytearray()
+                for chunk in _bounded_chunks(resp, max_bytes=MAX_JSON_BYTES, deadline=deadline):
+                    body.extend(chunk)
+        except (ValueError, TimeoutError) as exc:
+            raise CatalogueError(f"Plugin catalogue download failed: {exc}", code=502) from exc
         except urllib.error.HTTPError as exc:
             raise CatalogueError(
                 f"Plugin catalogue is currently unavailable (HTTP {exc.code})",
@@ -378,23 +454,23 @@ class CatalogueClient:
         try:
             with os.fdopen(fd, "wb") as output:
                 try:
-                    with self._opener(request, timeout=120.0) as response:
+                    deadline = time.monotonic() + WHEEL_DOWNLOAD_TIMEOUT_SECONDS
+                    with self._opener(request, timeout=WHEEL_DOWNLOAD_TIMEOUT_SECONDS) as response:
                         final_url = getattr(response, "geturl", lambda: plugin.wheel_url)()
                         _validate_download_response_url(
                             plugin.wheel_url,
                             final_url or plugin.wheel_url,
                         )
-                        while True:
-                            chunk = response.read(1024 * 1024)
-                            if not chunk:
-                                break
+                        for chunk in _bounded_chunks(
+                            response, max_bytes=MAX_WHEEL_BYTES, deadline=deadline
+                        ):
                             total += len(chunk)
-                            if total > MAX_WHEEL_BYTES:
-                                raise CatalogueError(
-                                    "approved plugin wheel exceeds 100 MiB", code=502
-                                )
                             digest.update(chunk)
                             output.write(chunk)
+                except (ValueError, TimeoutError) as exc:
+                    raise CatalogueError(
+                        f"approved plugin wheel download failed: {exc}", code=502
+                    ) from exc
                 except CatalogueError:
                     raise
                 except urllib.error.HTTPError as exc:

@@ -21,7 +21,7 @@ from repeater.plugins.storage import PluginStorage
 
 
 class FakeProc:
-    def __init__(self, pid=1):
+    def __init__(self, pid=4242):
         self.pid = pid
         self._code = None
 
@@ -74,7 +74,12 @@ def _manager(tmp_path: Path) -> tuple[PluginManager, Path]:
     return PluginManager(storage, runtime), sock_path
 
 
-def test_ipc_list_status_start_stop(tmp_path: Path):
+def test_ipc_list_status_start_stop(tmp_path: Path, monkeypatch):
+    def absent_fake_group(*_args):
+        raise ProcessLookupError
+
+    # Lifecycle behavior uses fake Popen objects here; never signal host PIDs.
+    monkeypatch.setattr("os.killpg", absent_fake_group)
     manager, sock_path = _manager(tmp_path)
     wheel = _wheel(tmp_path / "demo-0.1.0-py3-none-any.whl")
     manager.install(wheel)
