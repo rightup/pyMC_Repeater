@@ -458,6 +458,112 @@ def test_text_helper_cli_prefix_and_admin_permission_checks():
     assert helper._check_admin_permission_for_identity(0x23, 0x41) is False
 
 
+class _TxtPacket:
+    """A packet as the core TextMessageHandler leaves it: text + its type."""
+
+    def __init__(self, text: str, txt_type=None):
+        self.decrypted = {"text": text}
+        if txt_type is not None:
+            self.decrypted["txt_type"] = txt_type
+        self.payload = bytearray([0x41, 0x21])
+        self.mark_do_not_retransmit = MagicMock()
+
+
+def _repeater_cli_helper():
+    """A TextHelper wired as a repeater identity whose admin CLI is a stub."""
+    helper = TextHelper(identity_manager=MagicMock(), acl_dict={})
+    helper.repeater_hash = 0x41
+    helper.cli = MagicMock()
+    helper.cli.handle_command = MagicMock(return_value="ok")
+    helper.handlers = {0x41: {"name": "rep", "type": "repeater", "identity": MagicMock()}}
+    helper._resolve_sender_client = MagicMock(
+        return_value=_FakeClient(
+            pubkey=bytes([0x21]) + b"x" * 31,
+            shared_secret=b"k" * 32,
+            permissions=PERM_ACL_ADMIN,
+        )
+    )
+    helper._check_admin_permission_for_identity = MagicMock(return_value=True)
+    helper._send_cli_reply = AsyncMock()
+    return helper
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "txt_type,runs",
+    [
+        (0, True),  # PLAIN     -- legacy CLI, firmware still accepts it
+        (1, True),  # CLI_DATA  -- what every released client sends
+        (3, True),  # CLI_COMMAND -- the type firmware split out (2c0ace25)
+        (2, False),  # SIGNED_PLAIN -- a room post, never a command
+        (None, True),  # no type reported (older core): behave as before
+    ],
+)
+async def test_text_helper_runs_cli_only_for_server_text_types(txt_type, runs):
+    """[fails pre-fix for SIGNED_PLAIN] The text type gates the CLI, not the text.
+
+    simple_repeater::onPeerDataRecv opens its TXT_MSG branch by rejecting any
+    flags outside {PLAIN, CLI_DATA, CLI_COMMAND}. openHop dispatched purely on
+    whether the text looked like a command, so a SIGNED_PLAIN -- a room post,
+    whose 4-byte author prefix the core handler has already stripped, leaving
+    bare text -- ran as an admin CLI command whenever it happened to start with
+    a command prefix.
+
+    ``txt_type is None`` is a core too old to report it; that must keep working
+    rather than silently dropping every message.
+    """
+    helper = _repeater_cli_helper()
+    packet = _TxtPacket("get status", txt_type)
+
+    await helper._on_message_received(
+        identity_name="rep",
+        identity_type="repeater",
+        packet=packet,
+        dest_hash=0x41,
+        src_hash=0x21,
+    )
+
+    assert helper.cli.handle_command.called is runs
+    assert helper._send_cli_reply.await_count == (1 if runs else 0)
+
+
+@pytest.mark.asyncio
+async def test_text_helper_signed_plain_is_not_stored_as_a_room_post():
+    """A SIGNED_PLAIN never reaches the room server either.
+
+    simple_room_server::onPeerDataRecv carries the same filter as the repeater;
+    only PLAIN becomes a post there. openHop stored whatever arrived.
+    """
+    helper = TextHelper(identity_manager=MagicMock(), acl_dict={})
+    room = MagicMock()
+    room.add_post = AsyncMock(return_value=True)
+    room.cli = None
+    helper.room_servers = {0x41: room}
+    helper.handlers = {0x41: {"name": "room", "type": "room_server", "identity": MagicMock()}}
+    helper._resolve_sender_client = MagicMock(
+        return_value=_FakeClient(pubkey=bytes([0x21]) + b"x" * 31, shared_secret=b"k" * 32)
+    )
+
+    await helper._on_message_received(
+        identity_name="room",
+        identity_type="room_server",
+        packet=_TxtPacket("hello room", 2),
+        dest_hash=0x41,
+        src_hash=0x21,
+    )
+    room.add_post.assert_not_awaited()
+
+    # ...while a plain post still lands.
+    await helper._on_message_received(
+        identity_name="room",
+        identity_type="room_server",
+        packet=_TxtPacket("hello room", 0),
+        dest_hash=0x41,
+        src_hash=0x21,
+    )
+    room.add_post.assert_awaited_once()
+
+
 @pytest.mark.asyncio
 async def test_text_helper_process_text_packet_routes_or_forwards():
     helper = TextHelper(identity_manager=MagicMock(), acl_dict={})

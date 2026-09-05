@@ -20,9 +20,25 @@ from .room_server import RoomServer
 logger = logging.getLogger("TextHelper")
 
 
-# Text message type flags
+# Text message type flags (firmware TxtDataHelpers.h)
 TXT_TYPE_PLAIN = 0x00
 TXT_TYPE_CLI_DATA = 0x01
+TXT_TYPE_SIGNED_PLAIN = 0x02
+TXT_TYPE_CLI_COMMAND = 0x03
+
+# The text types a server acts on. Both simple_repeater::onPeerDataRecv and
+# simple_room_server::onPeerDataRecv open their TXT_MSG branch with
+#
+#     if (!(flags == TXT_TYPE_PLAIN || flags == TXT_TYPE_CLI_DATA
+#           || flags == TXT_TYPE_CLI_COMMAND)) {
+#       MESH_DEBUG_PRINTLN("unsupported text type received: flags=%02x", flags);
+#     } else if (...)
+#
+# so anything else -- SIGNED_PLAIN included -- is logged and dropped: no
+# command run, no post stored, no reply. CLI_COMMAND joined the set when
+# firmware split "a CLI command" out of CLI_DATA (MeshCore 2c0ace25); CLI_DATA
+# stays in it because that is what every released client still sends.
+SERVER_TXT_TYPES = frozenset((TXT_TYPE_PLAIN, TXT_TYPE_CLI_DATA, TXT_TYPE_CLI_COMMAND))
 
 
 class TextHelper:
@@ -286,6 +302,22 @@ class TextHelper:
         # Extract decrypted message if available
         if hasattr(packet, "decrypted") and packet.decrypted:
             message_text = packet.decrypted.get("text", "<unknown>")
+
+            # Firmware gates the whole TXT_MSG branch on the text type before it
+            # looks at the text at all. Without this, a SIGNED_PLAIN — a room
+            # post, whose 4-byte author prefix the core handler has already
+            # split off, leaving bare text — reaches the repeater's CLI and runs
+            # as a command whenever it happens to start with a command prefix.
+            # A core older than the one that publishes ``txt_type`` reports
+            # None; behave as before rather than dropping every message.
+            txt_type = packet.decrypted.get("txt_type")
+            if txt_type is not None and txt_type not in SERVER_TXT_TYPES:
+                logger.debug(
+                    f"[{identity_type}:{identity_name}] unsupported text type "
+                    f"{txt_type} from 0x{src_hash:02X}; dropping"
+                )
+                return
+
             sender_client = self._resolve_sender_client(dest_hash, src_hash, packet)
 
             # Clean message text - remove null bytes and trailing whitespace
