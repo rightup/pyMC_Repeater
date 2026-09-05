@@ -565,6 +565,49 @@ async def test_text_helper_signed_plain_is_not_stored_as_a_room_post():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "permissions,posts",
+    [
+        (PERM_ACL_ADMIN, True),
+        (PERM_ACL_READ_WRITE, True),
+        (0, False),  # PERM_ACL_GUEST -- read the room, do not write to it
+    ],
+)
+async def test_text_helper_room_post_denies_guests(permissions, posts):
+    """[fails pre-fix] A guest may read the room but not post to it.
+
+    simple_room_server::onPeerDataRecv takes the
+    `(client->permissions & PERM_ACL_ROLE_MASK) == PERM_ACL_GUEST` branch for a
+    PLAIN message and stores nothing. openHop called add_post for anyone who
+    authenticated, so the guest password was enough to write to the room --
+    add_post enforces a length cap and a rate limit, but no role.
+    """
+    helper = TextHelper(identity_manager=MagicMock(), acl_dict={})
+    room = MagicMock()
+    room.add_post = AsyncMock(return_value=True)
+    room.cli = None
+    helper.room_servers = {0x41: room}
+    helper.handlers = {0x41: {"name": "room", "type": "room_server", "identity": MagicMock()}}
+    helper._resolve_sender_client = MagicMock(
+        return_value=_FakeClient(
+            pubkey=bytes([0x21]) + b"x" * 31,
+            shared_secret=b"k" * 32,
+            permissions=permissions,
+        )
+    )
+
+    await helper._on_message_received(
+        identity_name="room",
+        identity_type="room_server",
+        packet=_TxtPacket("hello room", 0),
+        dest_hash=0x41,
+        src_hash=0x21,
+    )
+
+    assert room.add_post.await_count == (1 if posts else 0)
+
+
+@pytest.mark.asyncio
 async def test_text_helper_process_text_packet_routes_or_forwards():
     helper = TextHelper(identity_manager=MagicMock(), acl_dict={})
 

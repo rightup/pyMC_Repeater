@@ -13,7 +13,7 @@ import time
 from openhop_core.node.handlers.text import TextMessageHandler
 from openhop_core.protocol import CryptoUtils, Identity
 
-from .acl import is_admin_permissions
+from .acl import PERM_ACL_GUEST, PERM_ACL_ROLE_MASK, is_admin_permissions
 from .mesh_cli import MeshCLI
 from .room_server import RoomServer
 
@@ -39,6 +39,18 @@ TXT_TYPE_CLI_COMMAND = 0x03
 # firmware split "a CLI command" out of CLI_DATA (MeshCore 2c0ace25); CLI_DATA
 # stays in it because that is what every released client still sends.
 SERVER_TXT_TYPES = frozenset((TXT_TYPE_PLAIN, TXT_TYPE_CLI_DATA, TXT_TYPE_CLI_COMMAND))
+
+
+def _is_guest_client(client) -> bool:
+    """True when ``client`` holds the GUEST role (firmware ``PERM_ACL_GUEST``).
+
+    Falls back to the role bits for a client object with no ``is_guest``
+    helper, so an older ACL shape still fails closed.
+    """
+    is_guest = getattr(client, "is_guest", None)
+    if callable(is_guest):
+        return bool(is_guest())
+    return (getattr(client, "permissions", 0) & PERM_ACL_ROLE_MASK) == PERM_ACL_GUEST
 
 
 class TextHelper:
@@ -311,6 +323,12 @@ class TextHelper:
             # A core older than the one that publishes ``txt_type`` reports
             # None; behave as before rather than dropping every message.
             txt_type = packet.decrypted.get("txt_type")
+            if txt_type is None:
+                logger.warning(
+                    "TXT_MSG carried no txt_type: openhop_core is older than the "
+                    "build that publishes it, so the text-type gate is open and a "
+                    "signed post can reach the CLI. Upgrade openhop_core."
+                )
             if txt_type is not None and txt_type not in SERVER_TXT_TYPES:
                 logger.debug(
                     f"[{identity_type}:{identity_name}] unsupported text type "
@@ -378,6 +396,19 @@ class TextHelper:
                     return
 
                 # NOT a CLI command - store as regular room post
+                #
+                # A guest may read the room but not write to it:
+                # simple_room_server::onPeerDataRecv takes the
+                # `(client->permissions & PERM_ACL_ROLE_MASK) == PERM_ACL_GUEST`
+                # branch for a PLAIN message and stores nothing (and sends no
+                # ACK). Without this, anyone who can log in with the guest
+                # password can post to the room.
+                if sender_client is not None and _is_guest_client(sender_client):
+                    logger.warning(
+                        f"Room '{identity_name}': post denied from 0x{src_hash:02X} (guest)"
+                    )
+                    return
+
                 try:
                     # Get sender's full pubkey
                     sender_pubkey = bytes([src_hash]) + b"\x00" * 31  # Default
