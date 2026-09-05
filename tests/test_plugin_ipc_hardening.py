@@ -1,6 +1,7 @@
 """Synthetic socket/lifecycle regressions; no subprocesses or network services."""
 
 import threading
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
@@ -108,9 +109,10 @@ def test_slow_capacity_rejects_without_blocking_control(service, tmp_path):
 
 def test_truncated_completion_is_unknown(tmp_path):
     import socket
+
     from repeater.plugins.ipc import _read_line
 
-    path = tmp_path / "legacy"
+    path = Path("/tmp") / f"legacy-{uuid.uuid4().hex}.sock"
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     listener.bind(str(path))
     listener.listen(1)

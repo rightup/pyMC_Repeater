@@ -172,6 +172,7 @@ class CataloguePlugin:
     repository: str
     category: str = ""
     logo: str = ""
+    homepage: str = ""
     version: Optional[str] = None
     wheel_url: Optional[str] = None
     sha256: Optional[str] = None
@@ -191,6 +192,8 @@ class CataloguePlugin:
             out["category"] = self.category
         if self.logo:
             out["logo"] = self.logo
+        if self.homepage:
+            out["homepage"] = self.homepage
         if self.version:
             out["version"] = self.version
         if self.wheel_url:
@@ -285,6 +288,18 @@ def parse_catalogue(data: Any) -> Catalogue:
                 code=400,
             )
 
+        homepage = item.get("homepage", "") or ""
+        if homepage is None:
+            homepage = ""
+        if not isinstance(homepage, str):
+            raise CatalogueError(f"plugins[{idx}].homepage must be a string", code=400)
+        homepage = homepage.strip()
+        if homepage and not homepage.startswith("https://"):
+            raise CatalogueError(
+                f"plugins[{idx}].homepage must be an https:// URL",
+                code=400,
+            )
+
         version = None
         wheel_url = None
         sha256 = None
@@ -322,6 +337,7 @@ def parse_catalogue(data: Any) -> Catalogue:
                 repository=repository,
                 category=category.strip(),
                 logo=logo,
+                homepage=homepage,
                 version=version,
                 wheel_url=wheel_url,
                 sha256=sha256,

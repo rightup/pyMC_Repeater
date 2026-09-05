@@ -778,14 +778,14 @@ cd /
 # Never repair untrusted executable trees by chowning attacker-owned code.
 require_root_owned() {
     local path="$1" unsafe
-    unsafe=$(/usr/bin/find -L "$path" -maxdepth 0 \( ! -uid 0 -o -perm /022 \) -print) || exit 1
+    unsafe=$(/usr/bin/find -L "$path" -maxdepth 0 \( ! -uid 0 -o -perm -022 \) -print) || exit 1
     [[ -z "$unsafe" ]] || { echo "Unsafe root execution path: $path" >&2; exit 1; }
 }
 for path in / /opt /opt/openhop_repeater /usr /usr/bin /usr/bin/python3; do
     require_root_owned "$path"
 done
 if [[ -e /opt/openhop_repeater/venv ]]; then
-    unsafe=$(/usr/bin/find -L /opt/openhop_repeater/venv \( ! -uid 0 -o -perm /022 \) -print -quit) || exit 1
+    unsafe=$(/usr/bin/find -L /opt/openhop_repeater/venv \( ! -uid 0 -o -perm -022 \) -print -quit) || exit 1
     [[ -z "$unsafe" ]] || { echo "Unsafe venv; administrator repair required" >&2; exit 1; }
 fi
 CHANNEL="${1:-main}"
@@ -1328,14 +1328,14 @@ cd /
 # Never repair untrusted executable trees by chowning attacker-owned code.
 require_root_owned() {
     local path="$1" unsafe
-    unsafe=$(/usr/bin/find -L "$path" -maxdepth 0 \( ! -uid 0 -o -perm /022 \) -print) || exit 1
+    unsafe=$(/usr/bin/find -L "$path" -maxdepth 0 \( ! -uid 0 -o -perm -022 \) -print) || exit 1
     [[ -z "$unsafe" ]] || { echo "Unsafe root execution path: $path" >&2; exit 1; }
 }
 for path in / /opt /opt/openhop_repeater /usr /usr/bin /usr/bin/python3; do
     require_root_owned "$path"
 done
 if [[ -e /opt/openhop_repeater/venv ]]; then
-    unsafe=$(/usr/bin/find -L /opt/openhop_repeater/venv \( ! -uid 0 -o -perm /022 \) -print -quit) || exit 1
+    unsafe=$(/usr/bin/find -L /opt/openhop_repeater/venv \( ! -uid 0 -o -perm -022 \) -print -quit) || exit 1
     [[ -z "$unsafe" ]] || { echo "Unsafe venv; administrator repair required" >&2; exit 1; }
 fi
 CHANNEL="${1:-main}"

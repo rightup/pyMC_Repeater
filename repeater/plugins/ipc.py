@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import socket
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -21,6 +23,19 @@ MAX_CONNECTIONS = 16
 SLOW_OPS = frozenset({"install", "catalogue_install", "update", "catalogue", "check_update"})
 INSTALL_OPS = frozenset({"install", "catalogue_install", "update"})
 MAX_LINE_BYTES = 8 * 1024 * 1024  # install paths are short; keep headroom
+MAX_AF_UNIX_PATH_BYTES = 92
+
+
+def _safe_socket_path(path: Path | str) -> Path:
+    candidate = Path(path)
+    if len(str(candidate)) <= MAX_AF_UNIX_PATH_BYTES:
+        return candidate
+    digest = hashlib.sha256(str(candidate).encode("utf-8")).hexdigest()[:16]
+    fallback = Path(tempfile.gettempdir()) / f"openhop-plugin-{digest}.sock"
+    logger.warning(
+        "Unix socket path %s is too long for AF_UNIX; using %s instead", candidate, fallback
+    )
+    return fallback
 
 
 class PluginIPCError(Exception):
@@ -88,7 +103,7 @@ class PluginIPCServer:
     """Serve plugin manager operations over a Unix domain socket."""
 
     def __init__(self, socket_path: Path | str, manager: PluginManager):
-        self.socket_path = Path(socket_path)
+        self.socket_path = _safe_socket_path(socket_path)
         self.manager = manager
         self._sock: Optional[socket.socket] = None
         self._thread: Optional[threading.Thread] = None
@@ -365,7 +380,7 @@ class PluginIPCClient:
     """Client used by the Repeater HTTP layer."""
 
     def __init__(self, socket_path: Path | str, timeout: float = DEFAULT_TIMEOUT):
-        self.socket_path = Path(socket_path)
+        self.socket_path = _safe_socket_path(socket_path)
         self.timeout = timeout
         self.operation_timeout = OPERATION_TIMEOUT
         self._next_id = 1

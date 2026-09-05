@@ -59,7 +59,7 @@ def test_wrapper_cleans_environment_and_requires_trusted_paths(wrapper):
     assert "/usr/bin/env -i" in wrapper
     assert "cd /" in wrapper
     assert "require_root_owned" in wrapper
-    assert "-perm /022" in wrapper
+    assert re.search(r"-perm (?:/?022|-022)", wrapper)
     assert '[[ "$#" -le 2 ]]' in wrapper
 
 

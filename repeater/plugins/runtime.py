@@ -663,7 +663,7 @@ class PluginRuntime:
                 raise RuntimeError("refusing to signal unsafe plugin process group")
             try:
                 os.killpg(group, sig)
-            except ProcessLookupError:
+            except (PermissionError, ProcessLookupError):
                 pass
         elif handle.process.poll() is None:
             if sig == signal.SIGKILL:
@@ -682,7 +682,7 @@ class PluginRuntime:
             else:
                 try:
                     os.killpg(handle.process_group, 0)
-                except ProcessLookupError:
+                except (PermissionError, ProcessLookupError):
                     break
             time.sleep(0.05)
         self._signal_handle(handle, signal.SIGKILL)

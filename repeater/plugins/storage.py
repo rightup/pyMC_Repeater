@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -377,12 +378,20 @@ def resolve_plugin_socket_path(
     plugins_cfg = config.get("plugins") if isinstance(config.get("plugins"), dict) else {}
     configured = plugins_cfg.get("socket") or plugins_cfg.get("socket_path")
     if configured:
-        return Path(str(configured)).expanduser().resolve()
+        candidate = Path(str(configured)).expanduser().resolve()
+        if len(str(candidate)) <= 92:
+            return candidate
+        digest = hashlib.sha256(candidate.as_posix().encode("utf-8")).hexdigest()[:16]
+        return Path(tempfile.gettempdir()) / f"openhop-plugin-{digest}.sock"
     if storage_dir is None:
         from repeater.config import resolve_storage_dir
 
         storage_dir = resolve_storage_dir(config)
-    return Path(storage_dir).expanduser().resolve() / DEFAULT_SOCKET_NAME
+    candidate = Path(storage_dir).expanduser().resolve() / DEFAULT_SOCKET_NAME
+    if len(str(candidate)) <= 92:
+        return candidate
+    digest = hashlib.sha256(candidate.as_posix().encode("utf-8")).hexdigest()[:16]
+    return Path(tempfile.gettempdir()) / f"openhop-plugin-{digest}.sock"
 
 
 def resolve_catalogue_url(config: Optional[dict] = None) -> str:
