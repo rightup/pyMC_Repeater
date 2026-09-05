@@ -153,6 +153,11 @@ that deliberately detach into new sessions or write other files.
 
 Failed Python-version rebuilds restore the previous venv and remain retryable;
 the new marker is accepted only after the new environment and entrypoint exist.
+A rebuild-intent record is reconciled before version checks after a manager
+restart, so interruption during replacement cannot silently accept a partial
+venv. This provides process-interruption recovery, not guaranteed filesystem
+durability across power loss; interruption during cleanup can leave an unused
+backup.
 
 Archive extraction limits expanded member size and total size and rejects
 symlink-backed destinations. Catalogue JSON and wheel response bodies have size

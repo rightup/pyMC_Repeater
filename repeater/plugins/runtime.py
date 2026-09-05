@@ -153,6 +153,24 @@ class PluginRuntime:
         version = str(state.get("version") or manifest.version)
         paths = self.storage.paths_for(plugin_id)
         venv_path = paths.venv_dir(version)
+        # Reconcile before either missing-config or matching-version early return:
+        # a newly created pyvenv.cfg does not mean pip/entrypoint validation finished.
+        rebuild_marker = venv_path.with_name(".venv-rebuild-in-progress")
+        if rebuild_marker.exists():
+            backup_name = rebuild_marker.read_text(encoding="ascii")
+            suffix = backup_name.removeprefix(".venv-backup-")
+            if backup_name != f".venv-backup-{uuid.UUID(hex=suffix).hex}":
+                raise ValueError("invalid venv rebuild backup marker")
+            interrupted_backup = venv_path.with_name(backup_name)
+            if interrupted_backup.exists():
+                if venv_path.exists():
+                    shutil.rmtree(venv_path)
+                interrupted_backup.rename(venv_path)
+            # No backup means interruption before rename or after rollback.
+            if not venv_path.exists():
+                raise RuntimeError("interrupted venv rebuild has no recoverable environment")
+            rebuild_marker.unlink()
+
         config_path = venv_path / "pyvenv.cfg"
         if not config_path.is_file():
             # Legacy/test venvs have no reliable version marker. Let normal
@@ -194,6 +212,9 @@ class PluginRuntime:
         # Build at the final absolute path: moving a freshly built venv would
         # invalidate pip-generated shebangs. Keep the old environment for rollback.
         backup = venv_path.with_name(f".venv-backup-{uuid.uuid4().hex}")
+        # Publish intent atomically before moving the old environment. This is
+        # process-interruption recovery, not a filesystem power-loss guarantee.
+        write_release_asset(venv_path.parent, rebuild_marker.name, backup.name.encode("ascii"))
         venv_path.rename(backup)
         try:
             self._create_venv(venv_path)
@@ -203,8 +224,12 @@ class PluginRuntime:
             if venv_path.exists():
                 shutil.rmtree(venv_path)
             backup.rename(venv_path)
+            rebuild_marker.unlink()
             raise
         else:
+            # Commit only after validation; an interrupted cleanup may leave an
+            # unused backup, but must never restore a partly deleted backup.
+            rebuild_marker.unlink()
             shutil.rmtree(backup)
 
     def _run_install_command(self, cmd, *, timeout, **kwargs):

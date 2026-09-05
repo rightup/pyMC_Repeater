@@ -2,6 +2,7 @@
 
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -167,6 +168,54 @@ def test_failed_rebuild_restores_old_environment_and_retries(tmp_path):
     entry = runtime.resolve_entrypoint(paths, "1.0.0", "demo-cli")
     assert subprocess.check_output([str(entry)], text=True, timeout=5).strip() == "working"
     assert len([cmd for cmd in calls if "pip" in cmd]) == 2
+
+
+@pytest.mark.parametrize("stage", ["old_renamed", "new_config"])
+def test_fresh_runtime_recovers_interrupted_rebuild_snapshot(tmp_path, stage):
+    snapshot = tmp_path / "snapshot"
+    calls = []
+    capturing = True
+
+    def run(cmd, **kwargs):
+        calls.append(cmd)
+        if "venv" in cmd:
+            target = Path(cmd[-1])
+            if capturing and stage == "old_renamed":
+                shutil.copytree(tmp_path / "plugins", snapshot, symlinks=True)
+                raise RuntimeError("snapshot captured")
+            (target / "bin").mkdir(parents=True)
+            (target / "bin/python").symlink_to(sys.executable)
+            (target / "pyvenv.cfg").write_text(
+                f"version = {sys.version_info.major}.{sys.version_info.minor}.0\n"
+            )
+            if capturing:
+                shutil.copytree(tmp_path / "plugins", snapshot, symlinks=True)
+                raise RuntimeError("snapshot captured")
+        else:
+            entry = Path(cmd[0]).parent / "demo-cli"
+            entry.write_text(f"#!{cmd[0]}\nprint('recovered')\n")
+            entry.chmod(0o755)
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    runtime, paths = prepared_runtime(tmp_path, run_factory=run)
+    venv = paths.venv_dir("1.0.0")
+    (venv / "bin").mkdir(parents=True)
+    (venv / "bin/python").write_text("old")
+    (venv / "pyvenv.cfg").write_text("version = 2.7.0\n")
+    (paths.release_dir("1.0.0") / "demo-1.0.0-py3-none-any.whl").touch()
+    with pytest.raises(RuntimeError, match="snapshot captured"):
+        runtime.ensure_venv_compatible("openhop.demo")
+
+    capturing = False
+    calls.clear()
+    fresh = PluginRuntime(PluginStorage(snapshot), run_factory=run)
+    fresh.ensure_venv_compatible("openhop.demo")
+    assert len([cmd for cmd in calls if "pip" in cmd]) == 1
+    entry = fresh.resolve_entrypoint(fresh.storage.paths_for("openhop.demo"), "1.0.0", "demo-cli")
+    assert subprocess.check_output([str(entry)], text=True, timeout=5).strip() == "recovered"
+    calls.clear()
+    fresh.ensure_venv_compatible("openhop.demo")
+    assert calls == []
 
 
 def test_install_subprocesses_have_deadlines(tmp_path):
