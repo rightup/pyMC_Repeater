@@ -1,0 +1,28 @@
+/*
+ * Integration-layer correction for the generated Plugins catalogue cards.
+ * The upstream UI source is not present in this repository, so keep this
+ * override isolated instead of modifying content-hashed bundle output.
+ */
+
+/* The card grid stretches peers to the tallest card. Let copy absorb that
+ * extra room while keeping catalogue artwork within a bounded media region. */
+div:has(> div > img[alt$=" artwork"]) {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+}
+
+div:has(> img[alt$=" artwork"]) {
+  height: clamp(6.5rem, 12vw, 8rem) !important;
+  flex: 0 0 auto;
+}
+
+img[alt$=" artwork"] {
+  object-fit: contain !important;
+  padding: 0.75rem;
+}
+
+div:has(> img[alt$=" artwork"]) + div {
+  min-width: 0;
+  flex: 1 1 auto;
+}

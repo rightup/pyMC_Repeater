@@ -117,6 +117,7 @@ def test_ui_serving_index_assets_spa_and_disabled(tmp_path):
 
     index = app._serve_plugin_ui(plugin_id, ())
     assert b"ok" in index
+    assert cherrypy.response.headers["Cache-Control"] == "no-store, no-cache, must-revalidate"
 
     # Paths are relative to the entry directory (ui/), matching Vite base './'
     asset = app._serve_plugin_ui(plugin_id, ("assets", "app.js"))
@@ -125,6 +126,7 @@ def test_ui_serving_index_assets_spa_and_disabled(tmp_path):
     # SPA fallback
     spa = app._serve_plugin_ui(plugin_id, ("dashboard", "settings"))
     assert b"ok" in spa
+    assert cherrypy.response.headers["Cache-Control"] == "no-store, no-cache, must-revalidate"
 
     # Path traversal rejected
     with pytest.raises(cherrypy.HTTPError):

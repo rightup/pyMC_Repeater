@@ -117,7 +117,10 @@ def test_stats_app_index_and_default_routing(monkeypatch, tmp_path):
     app = hs.StatsApp(config={"web": {"web_path": str(tmp_path)}})
 
     monkeypatch.setattr(cherrypy, "request", SimpleNamespace(method="GET"), raising=False)
+    monkeypatch.setattr(cherrypy, "response", SimpleNamespace(headers={}), raising=False)
     assert app.index() == "<html>ok</html>"
+    assert cherrypy.response.headers["Cache-Control"] == "no-store, no-cache, must-revalidate"
+    assert cherrypy.response.headers["Pragma"] == "no-cache"
 
     monkeypatch.setattr(cherrypy, "request", SimpleNamespace(method="OPTIONS"), raising=False)
     assert app.default("anything") == ""

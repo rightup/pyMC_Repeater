@@ -281,6 +281,14 @@ class StatsApp:
         current = self._resolve_html_dir()
         return previous != current
 
+    @staticmethod
+    def _set_html_response_headers() -> None:
+        """Prevent a browser from reusing another frontend's root document."""
+        cherrypy.response.headers["Content-Type"] = "text/html; charset=utf-8"
+        cherrypy.response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+        cherrypy.response.headers["Pragma"] = "no-cache"
+        cherrypy.response.headers["Expires"] = "0"
+
     def _serve_static_file(self, root_dir: str, relative_parts: tuple[str, ...]):
         if not relative_parts:
             raise cherrypy.NotFound()
@@ -346,12 +354,14 @@ class StatsApp:
                 cherrypy.response.headers["Content-Type"] = (
                     guessed_type or "application/octet-stream"
                 )
+                if target.suffix.lower() == ".html":
+                    self._set_html_response_headers()
                 return target.read_bytes()
 
             # SPA fallback to entry HTML for client-side routes
             entry_target = safe_join(doc_root, entry_name)
             if entry_target.is_file():
-                cherrypy.response.headers["Content-Type"] = "text/html; charset=utf-8"
+                self._set_html_response_headers()
                 return entry_target.read_bytes()
             raise cherrypy.NotFound()
         except cherrypy.HTTPError:
@@ -373,6 +383,7 @@ class StatsApp:
         index_path = os.path.join(self.html_dir, "index.html")
         try:
             with open(index_path, "r", encoding="utf-8") as f:
+                self._set_html_response_headers()
                 return f.read()
         except FileNotFoundError:
             raise cherrypy.HTTPError(404, "Application not found. Please build the frontend first.")
