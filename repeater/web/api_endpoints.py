@@ -6,6 +6,7 @@ import secrets
 import time
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from datetime import datetime, timezone
+from threading import RLock
 from typing import Callable, Optional
 
 import cherrypy
@@ -40,6 +41,7 @@ from .auth.middleware import require_auth
 from .auth_endpoints import AuthAPIEndpoints
 from .cad_calibration_engine import CADCalibrationEngine
 from .companion_endpoints import CompanionAPIEndpoints
+from .plugin_endpoints import PluginAPIEndpoints
 from .update_endpoints import UpdateAPIEndpoints
 
 logger = logging.getLogger("HTTPServer")
@@ -168,6 +170,16 @@ POLICY_GROUP_KINDS = {
 # GET    /api/update/channels        - List available release channels (branches)
 # POST   /api/update/set_channel     - Switch release channel {"channel": "dev"}
 
+# Plugins (managed via local plugin-manager IPC)
+# GET    /api/plugins/               - List installed plugins
+# GET    /api/plugins/{id}           - Plugin status
+# POST   /api/plugins/install        - Install local wheel (multipart or wheel_path)
+# POST   /api/plugins/enable         - Enable plugin {"id"}
+# POST   /api/plugins/disable        - Disable plugin {"id"}
+# POST   /api/plugins/start|stop|restart - Lifecycle {"id"}
+# GET    /api/plugins/logs?id=       - Tail plugin logs
+# DELETE /api/plugins/{id}           - Uninstall (keeps data by default)
+
 # Setup Wizard
 # GET    /api/needs_setup - Check if repeater needs initial setup
 # GET    /api/site_info - Get site identification name (public, no auth required)
@@ -198,6 +210,11 @@ POLICY_GROUP_KINDS = {
 
 
 class APIEndpoints:
+    # Serialize both provisioning routes across mounts in this process, from
+    # authorization through persistence. Do not reuse ConfigManager's locks:
+    # imports must retain its normal persistence/live-update callbacks.
+    _provisioning_lock = RLock()
+
     # How long /api/query_neighbor_scopes holds a request open. The scope helper's
     # response window is normally its 5 s floor; a slow radio config (SF12) or a
     # duty-cycle deferral can push a single query past this, in which case the
@@ -221,6 +238,7 @@ class APIEndpoints:
         self.event_loop = event_loop
         self.daemon_instance = daemon_instance
         self._config_path = config_path or "/etc/openhop_repeater/config.yaml"
+
         self.cad_calibration = CADCalibrationEngine(daemon_instance, event_loop)
 
         # Initialize ConfigManager for centralized config management
@@ -240,6 +258,9 @@ class APIEndpoints:
 
         # Create nested update object for /api/update/* routes
         self.update = UpdateAPIEndpoints()
+
+        # Create nested plugins object for /api/plugins/* routes
+        self.plugins = PluginAPIEndpoints(self.config, self._config_path)
 
     def _is_cors_enabled(self):
         return self.config.get("web", {}).get("cors_enabled", False)
@@ -659,7 +680,10 @@ class APIEndpoints:
         has_default_name = node_name in ["mesh-repeater-01", ""]
 
         admin_password = config.get("repeater", {}).get("security", {}).get("admin_password", "")
-        has_default_password = admin_password in ["admin123", ""]
+        has_default_password = admin_password is None or (
+            isinstance(admin_password, str)
+            and (not admin_password.strip() or admin_password == "admin123")  # nosec B105
+        )
 
         radio_type_raw = config.get("radio_type")
         radio_type = "" if radio_type_raw is None else str(radio_type_raw).lower().strip()
@@ -670,7 +694,12 @@ class APIEndpoints:
             "default_password": has_default_password,
             "radio_not_configured": radio_not_configured,
         }
-        return has_default_name or has_default_password or radio_not_configured, reasons
+        # Name and radio settings are diagnostics, not authorization signals:
+        # radio-less installations and default names are valid after provisioning.
+        # Legacy configs have no marker, so a custom password also closes setup.
+        # An explicit false marker must never override existing credentials.
+        setup_completed = config.get("setup_completed") is True
+        return has_default_password and not setup_completed, reasons
 
     def _default_policy_document(self) -> dict:
         return {
@@ -1484,6 +1513,10 @@ class APIEndpoints:
     @cherrypy.tools.json_in()
     def setup_wizard(self):
         """Complete initial setup wizard configuration"""
+        with self._provisioning_lock:
+            return self._setup_wizard_locked()
+
+    def _setup_wizard_locked(self):
         try:
             self._require_post()
             data = cherrypy.request.json
@@ -1724,8 +1757,10 @@ class APIEndpoints:
                     )
             # Explicit setup writes canonical names only.
             config_yaml = normalize_modem_config(config_yaml)
+            config_yaml["setup_completed"] = True
             with open(self._config_path, "w") as f:
                 yaml.dump(config_yaml, f, default_flow_style=False, sort_keys=False)
+            self.config["setup_completed"] = True
 
             logger.info(
                 f"Setup wizard completed: node_name={node_name}, hardware={hardware_key}, freq={freq_mhz}MHz"
@@ -2301,10 +2336,109 @@ class APIEndpoints:
             logger.error(f"Error updating advert rate limit config: {e}")
             return self._error(str(e))
 
+    @staticmethod
+    def _read_ui_version(html_dir: str) -> Optional[str]:
+        """Best-effort version for a static UI tree (VERSION / version.json / package.json)."""
+        if not html_dir or not os.path.isdir(html_dir):
+            return None
+        version_file = os.path.join(html_dir, "VERSION")
+        if os.path.isfile(version_file):
+            try:
+                value = open(version_file, "r", encoding="utf-8").read().strip()
+                return value or None
+            except OSError:
+                pass
+        for name in ("version.json", "package.json"):
+            candidate = os.path.join(html_dir, name)
+            if not os.path.isfile(candidate):
+                continue
+            try:
+                import json as _json
+
+                data = _json.loads(open(candidate, "r", encoding="utf-8").read())
+            except (OSError, ValueError):
+                continue
+            if isinstance(data, dict):
+                ver = data.get("version")
+                if isinstance(ver, str) and ver.strip():
+                    return ver.strip()
+            elif isinstance(data, str) and data.strip():
+                return data.strip()
+        return None
+
+    def _plugin_ui_frontends(self) -> list:
+        """Installed application-UI plugins usable as primary web frontends."""
+        out = []
+        try:
+            from repeater.config import resolve_storage_dir
+            from repeater.plugins.storage import PluginStorage, resolve_plugins_root, safe_join
+        except Exception as exc:
+            logger.debug("plugin UI frontends unavailable: %s", exc)
+            return out
+
+        try:
+            storage_dir = resolve_storage_dir(self.config, config_path=self._config_path)
+            plugins_root = resolve_plugins_root(self.config, storage_dir=storage_dir)
+            storage = PluginStorage(plugins_root)
+        except Exception as exc:
+            logger.debug("plugin storage resolve failed: %s", exc)
+            return out
+
+        for plugin_id in storage.list_plugin_ids():
+            try:
+                state = storage.read_state(plugin_id) or {}
+                manifest = storage.load_current_manifest(plugin_id)
+                if manifest is None or manifest.ui is None:
+                    continue
+                paths = storage.paths_for(plugin_id)
+                if paths.current_link.exists() or paths.current_link.is_symlink():
+                    release_root = paths.current_link.resolve()
+                else:
+                    version = state.get("version") or (manifest.version if manifest else None)
+                    if not version:
+                        continue
+                    release_root = paths.release_dir(str(version))
+                if not release_root.is_dir():
+                    continue
+                entry = str(manifest.ui.entry or "").replace("\\", "/")
+                entry_parts = tuple(p for p in entry.split("/") if p)
+                if not entry_parts:
+                    continue
+                if len(entry_parts) > 1:
+                    doc_root = safe_join(release_root, *entry_parts[:-1])
+                    entry_name = entry_parts[-1]
+                else:
+                    doc_root = release_root
+                    entry_name = entry_parts[0]
+                if not doc_root.is_dir():
+                    continue
+                index_path = doc_root / entry_name
+                available = bool(state.get("enabled", False)) and index_path.is_file()
+                version = str(state.get("version") or manifest.version or "") or None
+                out.append(
+                    {
+                        "id": f"plugin:{plugin_id}",
+                        "plugin_id": plugin_id,
+                        "kind": "plugin",
+                        "name": manifest.name or plugin_id,
+                        "description": (manifest.description or "Application UI plugin").strip()
+                        or "Application UI plugin",
+                        "path": str(doc_root),
+                        "version": version,
+                        "enabled": bool(state.get("enabled", False)),
+                        "available": available,
+                        "source": state.get("source") or "local",
+                    }
+                )
+            except Exception as exc:
+                logger.debug("skip plugin frontend %s: %s", plugin_id, exc)
+                continue
+        return out
+
     @cherrypy.expose
     @cherrypy.tools.json_out()
     def check_pymc_console(self):
-        """Check if PyMC Console directory exists."""
+        """Check if openHop Console directory exists (and report version when known)."""
         self._set_cors_headers()
 
         if cherrypy.request.method == "OPTIONS":
@@ -2313,10 +2447,120 @@ class APIEndpoints:
         try:
             pymc_console_path = "/opt/pymc_console/web/html"
             exists = os.path.isdir(pymc_console_path)
+            version = self._read_ui_version(pymc_console_path) if exists else None
 
-            return self._success({"exists": exists, "path": pymc_console_path})
+            return self._success(
+                {
+                    "exists": exists,
+                    "path": pymc_console_path,
+                    "version": version,
+                }
+            )
         except Exception as e:
             logger.error(f"Error checking PyMC Console directory: {e}")
+            return self._error(str(e))
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    def web_frontends(self):
+        """List selectable primary web frontends (built-in, Console, UI plugins)."""
+        self._set_cors_headers()
+
+        if cherrypy.request.method == "OPTIONS":
+            return ""
+        if cherrypy.request.method not in ("GET", "HEAD"):
+            raise cherrypy.HTTPError(405, "Method Not Allowed")
+
+        try:
+            web_cfg = (self.config or {}).get("web") or {}
+            current_path = web_cfg.get("web_path")
+            if isinstance(current_path, str):
+                current_path = current_path.strip() or None
+            else:
+                current_path = None
+
+            try:
+                from repeater import __version__ as repeater_version
+            except Exception:
+                repeater_version = None
+
+            default_html = os.path.join(os.path.dirname(__file__), "html")
+            frontends = [
+                {
+                    "id": "builtin",
+                    "kind": "builtin",
+                    "name": "Default Frontend",
+                    "description": "Built-in Repeater web interface",
+                    "path": None,
+                    "version": repeater_version,
+                    "available": True,
+                    "enabled": True,
+                }
+            ]
+
+            console_path = "/opt/pymc_console/web/html"
+            console_exists = os.path.isdir(console_path)
+            frontends.append(
+                {
+                    "id": "console",
+                    "kind": "console",
+                    "name": "openHop Console",
+                    "description": "Alternative web interface for Repeater",
+                    "path": console_path,
+                    "version": self._read_ui_version(console_path) if console_exists else None,
+                    "available": console_exists,
+                    "enabled": console_exists,
+                }
+            )
+
+            frontends.extend(self._plugin_ui_frontends())
+
+            selected_id = "builtin"
+            if current_path:
+                # Prefer exact path match; fall back to path prefix for console.
+                matched = None
+                for item in frontends:
+                    path = item.get("path")
+                    if not path:
+                        continue
+                    if os.path.abspath(str(path)) == os.path.abspath(str(current_path)):
+                        matched = item["id"]
+                        break
+                if matched is None and (
+                    current_path == console_path
+                    or str(current_path).startswith("/opt/pymc_console/")
+                ):
+                    matched = "console"
+                if matched is None:
+                    # Unknown custom path — surface as selected custom entry
+                    frontends.append(
+                        {
+                            "id": "custom",
+                            "kind": "custom",
+                            "name": "Custom path",
+                            "description": "Configured web_path not matching a known frontend",
+                            "path": current_path,
+                            "version": self._read_ui_version(current_path),
+                            "available": os.path.isdir(current_path),
+                            "enabled": True,
+                        }
+                    )
+                    matched = "custom"
+                selected_id = matched
+
+            for item in frontends:
+                item["selected"] = item["id"] == selected_id
+
+            return self._success(
+                {
+                    "frontends": frontends,
+                    "selected_id": selected_id,
+                    "web_path": current_path,
+                    "default_html_dir": default_html,
+                }
+            )
+        except Exception as e:
+            logger.error(f"Error listing web frontends: {e}")
             return self._error(str(e))
 
     @cherrypy.expose
@@ -7898,6 +8142,10 @@ class APIEndpoints:
         Returns: {"success": true, "message": "...", "restart_required": true,
                   "sections_updated": [...]}
         """
+        with self._provisioning_lock:
+            return self._config_import_locked()
+
+    def _config_import_locked(self):
         self._set_cors_headers()
         if cherrypy.request.method == "OPTIONS":
             return ""
@@ -8097,6 +8345,13 @@ class APIEndpoints:
 
             if not updated_sections:
                 return self._error("No valid configuration sections found in import")
+
+            # Keep authenticated restores closed even when restoring defaults.
+            # Partial first-run restores must still allow the existing wizard;
+            # finish provisioning once credentials have actually been supplied.
+            # setup_completed is deliberately not an importable section.
+            if request_user or not self._setup_status_from_config(self.config)[0]:
+                self.config["setup_completed"] = True
 
             # Persist and live-reload
             self.config_manager.update_and_save(

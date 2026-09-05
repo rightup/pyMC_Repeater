@@ -635,6 +635,19 @@ storage:
     # - 1 hour resolution for 1 year
 
 
+# Plugin manager (optional external process lifecycle)
+# plugins:
+#   # Master switch for the openhop-plugin-manager service (default: enabled when omitted)
+#   enabled: true
+#   # Install root (default: {storage.storage_dir}/plugins)
+#   # root: "/var/lib/openhop_repeater/plugins"
+#   # Unix domain socket used by Repeater HTTP → plugin manager IPC
+#   # socket: "/var/lib/openhop_repeater/plugin-manager.sock"
+  # Optional override for the curated catalogue hosted on openHop's R2 endpoint
+  # catalogue_url: "https://repeater-plugins.openhop.dev/catalogue.json"
+
+
+
 mqtt_brokers:
   iata_code: "Test"  # e.g., "SFO", "LHR", "Test"
   status_interval: 300 # How often a status message is sent (in seconds)

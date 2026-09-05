@@ -127,6 +127,7 @@ def test_stats_app_index_and_default_routing(monkeypatch, tmp_path):
         app.default("api")
 
     assert app.default("ws", "packets") == ""
+    assert app.default("plugins") == "<html>ok</html>"
     assert app.default("route") == "<html>ok</html>"
 
 

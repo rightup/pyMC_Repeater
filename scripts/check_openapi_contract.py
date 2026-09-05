@@ -245,6 +245,8 @@ def _collect_routes() -> dict[str, RouteInfo]:
         (WEB_DIR / "companion_endpoints.py", "CompanionAPIEndpoints", ["/companion"]),
         # Nested /api/update/* endpoints are described as /update/* when documented.
         (WEB_DIR / "update_endpoints.py", "UpdateAPIEndpoints", ["/update"]),
+        # Nested /api/plugins/* endpoints are described as /plugins/*.
+        (WEB_DIR / "plugin_endpoints.py", "PluginAPIEndpoints", ["/plugins"]),
         # Auth top-level endpoints are mounted at /auth/*
         (WEB_DIR / "auth_endpoints.py", "AuthEndpoints", ["/auth"]),
         # Token sub-resource is exposed both under /auth and /api/auth in current routing.

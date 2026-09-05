@@ -679,6 +679,7 @@ install_repeater() {
     echo "29"; echo "# Installing files..."
     cp "$SCRIPT_DIR/manage.sh" "$INSTALL_DIR/" 2>/dev/null || true
     cp "$SCRIPT_DIR/openhop-repeater.service" "$INSTALL_DIR/" 2>/dev/null || true
+    cp "$SCRIPT_DIR/openhop-plugin-manager.service" "$INSTALL_DIR/" 2>/dev/null || true
     cp "$SCRIPT_DIR/radio-settings.json" "$DATA_DIR/" 2>/dev/null || true
     cp "$SCRIPT_DIR/radio-presets.json" "$DATA_DIR/" 2>/dev/null || true
 
@@ -690,6 +691,9 @@ install_repeater() {
 
     echo "55"; echo "# Installing systemd service..."
     cp "$SCRIPT_DIR/openhop-repeater.service" /etc/systemd/system/
+    if [ -f "$SCRIPT_DIR/openhop-plugin-manager.service" ]; then
+        cp "$SCRIPT_DIR/openhop-plugin-manager.service" /etc/systemd/system/openhop-plugin-manager.service
+    fi
     systemctl daemon-reload
 
     echo "58"; echo "# Installing udev rules for CH341..."
@@ -763,18 +767,38 @@ EOF
 
     echo ">>> Installing OTA upgrade wrapper..."
     cat > /usr/local/bin/pymc-do-upgrade <<'UPGRADEEOF'
-#!/bin/bash
-# pymc-do-upgrade: invoked by the repeater service user via sudo for OTA upgrades.
-# Usage: sudo /usr/local/bin/pymc-do-upgrade [channel] [pretend-version]
+#!/bin/bash -p
+# Ignore caller shell startup hooks, then run with a clean environment.
+exec /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root LANG=C.UTF-8 PIP_CONFIG_FILE=/dev/null /bin/bash --noprofile --norc -s -- "$@" <<'CLEANENV'
 set -Eeuo pipefail
+umask 022
+cd /
+[[ "$EUID" -eq 0 ]] || { echo "Root is required" >&2; exit 1; }
+[[ "$#" -le 2 ]] || { echo "Too many arguments" >&2; exit 1; }
+# Never repair untrusted executable trees by chowning attacker-owned code.
+require_root_owned() {
+    local path="$1" unsafe
+    unsafe=$(/usr/bin/find -L "$path" -maxdepth 0 \( ! -uid 0 -o -perm -022 \) -print) || exit 1
+    [[ -z "$unsafe" ]] || { echo "Unsafe root execution path: $path" >&2; exit 1; }
+}
+for path in / /opt /opt/openhop_repeater /usr /usr/bin /usr/bin/python3; do
+    require_root_owned "$path"
+done
+if [[ -e /opt/openhop_repeater/venv ]]; then
+    unsafe=$(/usr/bin/find -L /opt/openhop_repeater/venv \( ! -uid 0 -o -perm -022 \) -print -quit) || exit 1
+    [[ -z "$unsafe" ]] || { echo "Unsafe venv; administrator repair required" >&2; exit 1; }
+fi
 CHANNEL="${1:-main}"
 PRETEND_VERSION="${2:-}"
 VENV_DIR="/opt/openhop_repeater/venv"
-VENV_PIP="$VENV_DIR/bin/pip"
 VENV_PYTHON="$VENV_DIR/bin/python"
 # Validate: only allow safe git ref characters
 if ! [[ "$CHANNEL" =~ ^[a-zA-Z0-9._/-]{1,80}$ ]]; then
     echo "Invalid channel name: $CHANNEL" >&2
+    exit 1
+fi
+if [[ -n "$PRETEND_VERSION" ]] && ! [[ "$PRETEND_VERSION" =~ ^[a-zA-Z0-9][a-zA-Z0-9.!+_-]{0,127}$ ]]; then
+    echo "Invalid version" >&2
     exit 1
 fi
 # If caller supplied a version string, tell setuptools_scm to use it (sudo
@@ -786,8 +810,8 @@ fi
 # ---- Migration: ensure venv exists (handles upgrades from system-pip era) ----
 if [ ! -x "$VENV_PYTHON" ]; then
     echo "[pymc-do-upgrade] Creating venv at $VENV_DIR ..."
-    python3 -m venv --system-site-packages "$VENV_DIR"
-    "$VENV_PYTHON" -m pip install --upgrade pip setuptools wheel
+    /usr/bin/python3 -I -m venv --system-site-packages "$VENV_DIR"
+    "$VENV_PYTHON" -I -m pip install --upgrade pip setuptools wheel
 fi
 # ---- Migration: clean up legacy service unit issues ----
 SVC_UNIT=/etc/systemd/system/openhop-repeater.service
@@ -818,10 +842,10 @@ fi
 [ -d /opt/pymc_repeater/repeater ] && rm -rf /opt/pymc_repeater/repeater
 [ -d /opt/pymc_repeater/pymc-repeater ] && rm -rf /opt/pymc_repeater/pymc-repeater
 # ---- Remove old system-level packages to avoid confusion ----
-python3 -m pip uninstall -y openhop_repeater 2>/dev/null || true
-python3 -m pip uninstall -y openhop_core 2>/dev/null || true
-python3 -m pip uninstall -y pymc_repeater 2>/dev/null || true
-python3 -m pip uninstall -y pymc_core 2>/dev/null || true
+/usr/bin/python3 -I -m pip uninstall -y openhop_repeater 2>/dev/null || true
+/usr/bin/python3 -I -m pip uninstall -y openhop_core 2>/dev/null || true
+/usr/bin/python3 -I -m pip uninstall -y pymc_repeater 2>/dev/null || true
+/usr/bin/python3 -I -m pip uninstall -y pymc_core 2>/dev/null || true
 # ---- Try R2 wheels first for faster OTA upgrades ----
 R2_BASE_URL="https://wheel.pymc.dev/pymc_build_deps"
 MACHINE_ARCH=$(uname -m)
@@ -832,16 +856,28 @@ case "$MACHINE_ARCH" in
     *) ARCH_TAG=""; PLATFORM_TAG="" ;;
 esac
 if [ -n "$ARCH_TAG" ]; then
-    PY_TAG=$("$VENV_PYTHON" -c 'import sys; v=f"cp{sys.version_info.major}{sys.version_info.minor}"; print(f"{v}-{v}")' 2>/dev/null || echo "cp311-cp311")
+    PY_TAG=$("$VENV_PYTHON" -I -c 'import sys; v=f"cp{sys.version_info.major}{sys.version_info.minor}"; print(f"{v}-{v}")' 2>/dev/null || echo "cp311-cp311")
     WHEEL_BASE="${R2_BASE_URL}/${ARCH_TAG}/${PLATFORM_TAG}/${PY_TAG}"
     echo "[pymc-do-upgrade] Trying dependencies from R2 wheels..."
-    "$VENV_PYTHON" -m pip install --find-links "${WHEEL_BASE}/index.html" --no-cache-dir "pycryptodome>=3.23.0" "PyNaCl>=1.5.0" cffi "pyyaml>=6.0.0" 2>/dev/null || true
+    "$VENV_PYTHON" -I -m pip install --find-links "${WHEEL_BASE}/index.html" --no-cache-dir "pycryptodome>=3.23.0" "PyNaCl>=1.5.0" cffi "pyyaml>=6.0.0" 2>/dev/null || true
 fi
 # ---- Install openhop_repeater from git ----
-if "$VENV_PYTHON" -m pip install \
+if "$VENV_PYTHON" -I -m pip install \
     --upgrade \
     --no-cache-dir \
     "openhop_repeater[hardware] @ git+https://github.com/openhop-dev/openhop_repeater.git@${CHANNEL}"; then
+    # Use the just-installed distribution, never a caller checkout or cwd.
+    PLUGIN_UNIT=$("$VENV_PYTHON" -I -c 'from importlib.metadata import distribution; print(distribution("openhop_repeater").locate_file("repeater/plugins/openhop-plugin-manager.service"))')
+    if [[ -f "$PLUGIN_UNIT" ]]; then
+        require_root_owned "$PLUGIN_UNIT"
+        install -o root -g root -m 0644 "$PLUGIN_UNIT" /etc/systemd/system/openhop-plugin-manager.service
+        systemctl daemon-reload
+        systemctl enable openhop-plugin-manager
+        # ExecCondition skips startup successfully when plugins.enabled is false.
+        systemctl restart openhop-plugin-manager || echo "[pymc-do-upgrade] WARNING: inspect openhop-plugin-manager service status" >&2
+    else
+        echo "[pymc-do-upgrade] WARNING: selected package does not ship a plugin-manager unit; older channels may not support plugins. Re-run manage.sh upgrade from a plugin-capable release if unexpected." >&2
+    fi
     # Keep web/OTA updates aligned with manage.sh install/upgrade defaults.
     RADIO_BASE_URL="https://raw.githubusercontent.com/openhop-dev/openhop_repeater/${CHANNEL}"
     RADIO_STORAGE_DIR="/var/lib/openhop_repeater"
@@ -851,11 +887,16 @@ if "$VENV_PYTHON" -m pip install \
 else
     exit 1
 fi
+CLEANENV
 UPGRADEEOF
+    chown root:root /usr/local/bin/pymc-do-upgrade
     chmod 0755 /usr/local/bin/pymc-do-upgrade
 
     echo "75"; echo "# Starting service..."
     systemctl enable "$SERVICE_NAME"
+    if [ -f /etc/systemd/system/openhop-plugin-manager.service ]; then
+        systemctl enable openhop-plugin-manager 2>/dev/null || true
+    fi
 
     echo "90"; echo "# Installation files complete..."
     ) | "$DIALOG" --backtitle "openHop Repeater Management" --title "Installing" --gauge "Setting up openHop Repeater..." 8 70 0
@@ -949,6 +990,10 @@ UPGRADEEOF
     if ! systemctl start "$SERVICE_NAME"; then
         error "Failed to start ${SERVICE_NAME}"
         return 1
+    fi
+    if [ -f /etc/systemd/system/openhop-plugin-manager.service ]; then
+        systemctl enable openhop-plugin-manager >/dev/null 2>&1 || true
+        systemctl start openhop-plugin-manager >/dev/null 2>&1 || true
     fi
 
     # Show final results
@@ -1183,6 +1228,15 @@ upgrade_repeater() {
     if ! cp "$SCRIPT_DIR/openhop-repeater.service" /etc/systemd/system/; then
         echo "    ⚠ Warning: Failed to update service file – old service file may remain"
     fi
+    if [ -f "$SCRIPT_DIR/openhop-plugin-manager.service" ]; then
+        if cp "$SCRIPT_DIR/openhop-plugin-manager.service" /etc/systemd/system/openhop-plugin-manager.service; then
+            echo "    ✓ openhop-plugin-manager.service installed"
+        else
+            echo "    ⚠ Warning: Failed to install openhop-plugin-manager.service"
+        fi
+    else
+        echo "    ⚠ openhop-plugin-manager.service not found in $SCRIPT_DIR (skipped)"
+    fi
     cp "$SCRIPT_DIR/radio-settings.json" "$DATA_DIR/" 2>/dev/null || true
     cp "$SCRIPT_DIR/radio-presets.json" "$DATA_DIR/" 2>/dev/null || true
     echo "    ✓ Files updated"
@@ -1263,18 +1317,38 @@ EOF
     chmod 0440 /etc/sudoers.d/openhop-repeater
 
     cat > /usr/local/bin/pymc-do-upgrade <<'UPGRADEEOF'
-#!/bin/bash
-# pymc-do-upgrade: invoked by the repeater service user via sudo for OTA upgrades.
-# Usage: sudo /usr/local/bin/pymc-do-upgrade [channel] [pretend-version]
+#!/bin/bash -p
+# Ignore caller shell startup hooks, then run with a clean environment.
+exec /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root LANG=C.UTF-8 PIP_CONFIG_FILE=/dev/null /bin/bash --noprofile --norc -s -- "$@" <<'CLEANENV'
 set -Eeuo pipefail
+umask 022
+cd /
+[[ "$EUID" -eq 0 ]] || { echo "Root is required" >&2; exit 1; }
+[[ "$#" -le 2 ]] || { echo "Too many arguments" >&2; exit 1; }
+# Never repair untrusted executable trees by chowning attacker-owned code.
+require_root_owned() {
+    local path="$1" unsafe
+    unsafe=$(/usr/bin/find -L "$path" -maxdepth 0 \( ! -uid 0 -o -perm -022 \) -print) || exit 1
+    [[ -z "$unsafe" ]] || { echo "Unsafe root execution path: $path" >&2; exit 1; }
+}
+for path in / /opt /opt/openhop_repeater /usr /usr/bin /usr/bin/python3; do
+    require_root_owned "$path"
+done
+if [[ -e /opt/openhop_repeater/venv ]]; then
+    unsafe=$(/usr/bin/find -L /opt/openhop_repeater/venv \( ! -uid 0 -o -perm -022 \) -print -quit) || exit 1
+    [[ -z "$unsafe" ]] || { echo "Unsafe venv; administrator repair required" >&2; exit 1; }
+fi
 CHANNEL="${1:-main}"
 PRETEND_VERSION="${2:-}"
 VENV_DIR="/opt/openhop_repeater/venv"
-VENV_PIP="$VENV_DIR/bin/pip"
 VENV_PYTHON="$VENV_DIR/bin/python"
 # Validate: only allow safe git ref characters
 if ! [[ "$CHANNEL" =~ ^[a-zA-Z0-9._/-]{1,80}$ ]]; then
     echo "Invalid channel name: $CHANNEL" >&2
+    exit 1
+fi
+if [[ -n "$PRETEND_VERSION" ]] && ! [[ "$PRETEND_VERSION" =~ ^[a-zA-Z0-9][a-zA-Z0-9.!+_-]{0,127}$ ]]; then
+    echo "Invalid version" >&2
     exit 1
 fi
 # If caller supplied a version string, tell setuptools_scm to use it (sudo
@@ -1286,8 +1360,8 @@ fi
 # ---- Migration: ensure venv exists (handles upgrades from system-pip era) ----
 if [ ! -x "$VENV_PYTHON" ]; then
     echo "[pymc-do-upgrade] Creating venv at $VENV_DIR ..."
-    python3 -m venv --system-site-packages "$VENV_DIR"
-    "$VENV_PYTHON" -m pip install --upgrade pip setuptools wheel
+    /usr/bin/python3 -I -m venv --system-site-packages "$VENV_DIR"
+    "$VENV_PYTHON" -I -m pip install --upgrade pip setuptools wheel
 fi
 # ---- Migration: clean up legacy service unit issues ----
 SVC_UNIT=/etc/systemd/system/openhop-repeater.service
@@ -1318,40 +1392,54 @@ fi
 [ -d /opt/pymc_repeater/repeater ] && rm -rf /opt/pymc_repeater/repeater
 [ -d /opt/pymc_repeater/pymc-repeater ] && rm -rf /opt/pymc_repeater/pymc-repeater
 # ---- Remove old system-level packages to avoid confusion ----
-python3 -m pip uninstall -y openhop_repeater 2>/dev/null || true
-python3 -m pip uninstall -y openhop_core 2>/dev/null || true
-python3 -m pip uninstall -y pymc_repeater 2>/dev/null || true
-python3 -m pip uninstall -y pymc_core 2>/dev/null || true
-        # ---- Try R2 wheels first for faster OTA upgrades ----
-        R2_BASE_URL="https://wheel.pymc.dev/pymc_build_deps"
-        MACHINE_ARCH=$(uname -m)
-        case "$MACHINE_ARCH" in
-            aarch64) ARCH_TAG="arm64"; PLATFORM_TAG="aarch64" ;;
-            armv7l|armv7) ARCH_TAG="armv7"; PLATFORM_TAG="armv7l" ;;
-            x86_64) ARCH_TAG="x86_64"; PLATFORM_TAG="x86_64" ;;
-            *) ARCH_TAG=""; PLATFORM_TAG="" ;;
-        esac
-        if [ -n "$ARCH_TAG" ]; then
-            PY_TAG=$("$VENV_PYTHON" -c 'import sys; v=f"cp{sys.version_info.major}{sys.version_info.minor}"; print(f"{v}-{v}")' 2>/dev/null || echo "cp311-cp311")
-            WHEEL_BASE="${R2_BASE_URL}/${ARCH_TAG}/${PLATFORM_TAG}/${PY_TAG}"
-            echo "[pymc-do-upgrade] Trying dependencies from R2 wheels..."
-            "$VENV_PYTHON" -m pip install --find-links "${WHEEL_BASE}/index.html" --no-cache-dir "pycryptodome>=3.23.0" "PyNaCl>=1.5.0" cffi "pyyaml>=6.0.0" 2>/dev/null || true
-        fi
-        # ---- Install openhop_repeater from git ----
-        if "$VENV_PYTHON" -m pip install \
-            --upgrade \
-            --no-cache-dir \
-            "openhop_repeater[hardware] @ git+https://github.com/openhop-dev/openhop_repeater.git@${CHANNEL}"; then
-            # Keep web/OTA updates aligned with manage.sh install/upgrade defaults.
-            RADIO_BASE_URL="https://raw.githubusercontent.com/openhop-dev/openhop_repeater/${CHANNEL}"
-            RADIO_STORAGE_DIR="/var/lib/openhop_repeater"
-            mkdir -p "$RADIO_STORAGE_DIR"
-            wget -qO "$RADIO_STORAGE_DIR/radio-settings.json" "${RADIO_BASE_URL}/radio-settings.json" 2>/dev/null || true
-            wget -qO "$RADIO_STORAGE_DIR/radio-presets.json" "${RADIO_BASE_URL}/radio-presets.json" 2>/dev/null || true
-        else
-            exit 1
-        fi
+/usr/bin/python3 -I -m pip uninstall -y openhop_repeater 2>/dev/null || true
+/usr/bin/python3 -I -m pip uninstall -y openhop_core 2>/dev/null || true
+/usr/bin/python3 -I -m pip uninstall -y pymc_repeater 2>/dev/null || true
+/usr/bin/python3 -I -m pip uninstall -y pymc_core 2>/dev/null || true
+# ---- Try R2 wheels first for faster OTA upgrades ----
+R2_BASE_URL="https://wheel.pymc.dev/pymc_build_deps"
+MACHINE_ARCH=$(uname -m)
+case "$MACHINE_ARCH" in
+    aarch64) ARCH_TAG="arm64"; PLATFORM_TAG="aarch64" ;;
+    armv7l|armv7) ARCH_TAG="armv7"; PLATFORM_TAG="armv7l" ;;
+    x86_64) ARCH_TAG="x86_64"; PLATFORM_TAG="x86_64" ;;
+    *) ARCH_TAG=""; PLATFORM_TAG="" ;;
+esac
+if [ -n "$ARCH_TAG" ]; then
+    PY_TAG=$("$VENV_PYTHON" -I -c 'import sys; v=f"cp{sys.version_info.major}{sys.version_info.minor}"; print(f"{v}-{v}")' 2>/dev/null || echo "cp311-cp311")
+    WHEEL_BASE="${R2_BASE_URL}/${ARCH_TAG}/${PLATFORM_TAG}/${PY_TAG}"
+    echo "[pymc-do-upgrade] Trying dependencies from R2 wheels..."
+    "$VENV_PYTHON" -I -m pip install --find-links "${WHEEL_BASE}/index.html" --no-cache-dir "pycryptodome>=3.23.0" "PyNaCl>=1.5.0" cffi "pyyaml>=6.0.0" 2>/dev/null || true
+fi
+# ---- Install openhop_repeater from git ----
+if "$VENV_PYTHON" -I -m pip install \
+    --upgrade \
+    --no-cache-dir \
+    "openhop_repeater[hardware] @ git+https://github.com/openhop-dev/openhop_repeater.git@${CHANNEL}"; then
+    # Use the just-installed distribution, never a caller checkout or cwd.
+    PLUGIN_UNIT=$("$VENV_PYTHON" -I -c 'from importlib.metadata import distribution; print(distribution("openhop_repeater").locate_file("repeater/plugins/openhop-plugin-manager.service"))')
+    if [[ -f "$PLUGIN_UNIT" ]]; then
+        require_root_owned "$PLUGIN_UNIT"
+        install -o root -g root -m 0644 "$PLUGIN_UNIT" /etc/systemd/system/openhop-plugin-manager.service
+        systemctl daemon-reload
+        systemctl enable openhop-plugin-manager
+        # ExecCondition skips startup successfully when plugins.enabled is false.
+        systemctl restart openhop-plugin-manager || echo "[pymc-do-upgrade] WARNING: inspect openhop-plugin-manager service status" >&2
+    else
+        echo "[pymc-do-upgrade] WARNING: selected package does not ship a plugin-manager unit; older channels may not support plugins. Re-run manage.sh upgrade from a plugin-capable release if unexpected." >&2
+    fi
+    # Keep web/OTA updates aligned with manage.sh install/upgrade defaults.
+    RADIO_BASE_URL="https://raw.githubusercontent.com/openhop-dev/openhop_repeater/${CHANNEL}"
+    RADIO_STORAGE_DIR="/var/lib/openhop_repeater"
+    mkdir -p "$RADIO_STORAGE_DIR"
+    wget -qO "$RADIO_STORAGE_DIR/radio-settings.json" "${RADIO_BASE_URL}/radio-settings.json" 2>/dev/null || true
+    wget -qO "$RADIO_STORAGE_DIR/radio-presets.json" "${RADIO_BASE_URL}/radio-presets.json" 2>/dev/null || true
+else
+    exit 1
+fi
+CLEANENV
 UPGRADEEOF
+    chown root:root /usr/local/bin/pymc-do-upgrade
     chmod 0755 /usr/local/bin/pymc-do-upgrade
     echo "    ✓ Permissions updated"
 
@@ -1426,6 +1514,24 @@ UPGRADEEOF
         echo "    ✓ Service restarted and active"
     else
         echo "    ✓ Service was not running/enabled before upgrade; no restart required"
+    fi
+
+    # Plugin manager is optional but should be installed/enabled on upgrade when present.
+    # Failures here must not fail the Repeater upgrade.
+    if [ -f /etc/systemd/system/openhop-plugin-manager.service ]; then
+        if systemctl enable openhop-plugin-manager >/dev/null 2>&1; then
+            echo "    ✓ openhop-plugin-manager enabled"
+        else
+            echo "    ⚠ Could not enable openhop-plugin-manager"
+        fi
+        if systemctl restart openhop-plugin-manager >/dev/null 2>&1; then
+            echo "    ✓ openhop-plugin-manager restarted"
+        elif systemctl start openhop-plugin-manager >/dev/null 2>&1; then
+            echo "    ✓ openhop-plugin-manager started"
+        else
+            echo "    ⚠ openhop-plugin-manager installed but failed to start (Repeater still OK)"
+            systemctl status openhop-plugin-manager --no-pager -l 2>/dev/null | head -20 || true
+        fi
     fi
 
     local new_version
@@ -1508,6 +1614,8 @@ uninstall_repeater() {
         echo ""
         
         echo ">>> Stopping and disabling service..."
+        systemctl stop openhop-plugin-manager 2>/dev/null || true
+        systemctl disable openhop-plugin-manager 2>/dev/null || true
         systemctl stop "$SERVICE_NAME" 2>/dev/null || true
         systemctl disable "$SERVICE_NAME" 2>/dev/null || true
 
@@ -1520,6 +1628,7 @@ uninstall_repeater() {
 
         echo "40"; echo "# Removing service files..."
         rm -f /etc/systemd/system/openhop-repeater.service
+        rm -f /etc/systemd/system/openhop-plugin-manager.service
         systemctl daemon-reload
 
         echo "50"; echo "# Removing polkit and sudoers rules..."

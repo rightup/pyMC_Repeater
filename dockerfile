@@ -10,14 +10,10 @@ ARG GPIO_GID=986
 ARG SPI_GID=989
 ARG TARGETARCH
 ARG YQ_VERSION=v4.40.5
-ARG OPENHOP_CONSOLE_REPO=Treehouse-00/pymc_console-dist
-ARG OPENHOP_CONSOLE_VERSION=latest
-ARG OPENHOP_CONSOLE_CACHE_BUST=default
 
 ENV INSTALL_DIR=/opt/openhop_repeater \
     CONFIG_DIR=/etc/openhop_repeater \
     DATA_DIR=/var/lib/openhop_repeater \
-    OPENHOP_CONSOLE_WEB_DIR=/opt/pymc_console/web/html \
     HOME_DIR=/home/${USER} \
     PATH=/home/${USER}/.local/bin:${PATH} \
     PYTHONUNBUFFERED=1 \
@@ -38,6 +34,7 @@ RUN DEBIAN_FRONTEND=noninteractive apt-get update && apt-get install -y \
     libusb-1.0-0 \
     swig \
     git \
+    tini \
     build-essential \
     python3-dev \
     && rm -rf /var/lib/apt/lists/*
@@ -53,22 +50,6 @@ RUN arch="${TARGETARCH:-}" \
     && wget -qO /usr/local/bin/yq "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/${YQ_BINARY}" \
     && chmod +x /usr/local/bin/yq
 
-# Bundle the optional openHop Console frontend so the web UI can select it without
-# requiring a host bind mount. Use OPENHOP_CONSOLE_VERSION=latest to pull the
-# newest release at image build time, or pin a tag such as v0.9.329.
-RUN set -eux; \
-    echo "Bundling openHop Console cache key: ${OPENHOP_CONSOLE_CACHE_BUST}"; \
-    mkdir -p "${OPENHOP_CONSOLE_WEB_DIR}"; \
-    if [ "${OPENHOP_CONSOLE_VERSION}" = "latest" ]; then \
-        console_url="https://github.com/${OPENHOP_CONSOLE_REPO}/releases/latest/download/pymc-ui-latest.tar.gz"; \
-    else \
-        console_url="https://github.com/${OPENHOP_CONSOLE_REPO}/releases/download/${OPENHOP_CONSOLE_VERSION}/pymc-ui-${OPENHOP_CONSOLE_VERSION}.tar.gz"; \
-    fi; \
-    wget -qO /tmp/pymc-console.tar.gz "${console_url}"; \
-    tar -xzf /tmp/pymc-console.tar.gz -C "${OPENHOP_CONSOLE_WEB_DIR}"; \
-    rm /tmp/pymc-console.tar.gz; \
-    test -f "${OPENHOP_CONSOLE_WEB_DIR}/index.html"
-
 # Create the group and user in order to run without root privileges
 RUN groupadd --gid "$PGID" "$GROUP" \
     && (getent group dialout >/dev/null || groupadd --gid "$DIALOUT_GID" dialout) \
@@ -79,7 +60,7 @@ RUN groupadd --gid "$PGID" "$GROUP" \
 
 # Create runtime directories
 RUN mkdir -p ${INSTALL_DIR} ${CONFIG_DIR} ${DATA_DIR} \
-    && chown -R "$USER":"$GROUP" ${INSTALL_DIR} ${CONFIG_DIR} ${DATA_DIR} ${HOME_DIR} /opt/pymc_console
+    && chown -R "$USER":"$GROUP" ${INSTALL_DIR} ${CONFIG_DIR} ${DATA_DIR} ${HOME_DIR}
 
 WORKDIR ${INSTALL_DIR}
 
@@ -105,4 +86,4 @@ USER ${USER}
 
 EXPOSE 8000
 
-ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+ENTRYPOINT ["/usr/bin/tini", "-g", "--", "/usr/local/bin/docker-entrypoint.sh"]

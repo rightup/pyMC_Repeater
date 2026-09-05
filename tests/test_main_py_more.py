@@ -76,6 +76,12 @@ async def test_run_starts_http_and_handles_dispatcher_cancelled_gracefully():
         patch("asyncio.get_running_loop", return_value=fake_loop_for_signals),
         patch("repeater.main.HTTPStatsServer", return_value=fake_http_instance),
         patch("os.path.exists", return_value=False),
+        # run()'s finally reaches _shutdown(), which arms the real exit
+        # watchdog: a threading.Timer that calls os._exit(0) after
+        # SHUTDOWN_EXIT_GRACE_S (5 s). It would fire long after this test
+        # returns and take the whole pytest process down. Same guard the
+        # shutdown tests in test_main_py_coverage.py already use.
+        patch.object(daemon, "_arm_exit_watchdog"),
     ):
         await daemon.run()
 

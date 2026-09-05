@@ -286,11 +286,76 @@ class StatsApp:
             raise cherrypy.NotFound()
         root = Path(root_dir).resolve()
         target = (root.joinpath(*relative_parts)).resolve()
-        if not str(target).startswith(str(root)) or not target.is_file():
+        if not target.is_relative_to(root) or not target.is_file():
             raise cherrypy.NotFound()
         guessed_type, _ = mimetypes.guess_type(str(target))
         cherrypy.response.headers["Content-Type"] = guessed_type or "application/octet-stream"
         return target.read_bytes()
+
+    def _serve_plugin_ui(self, plugin_id: str, relative_parts: tuple[str, ...]):
+        """Serve static assets for an enabled application UI plugin."""
+        from repeater.plugins.manifest import ui_subtree
+        from repeater.plugins.storage import PluginStorage, resolve_plugins_root, safe_join
+
+        try:
+            plugins_root = resolve_plugins_root(self.config)
+            storage = PluginStorage(plugins_root)
+            state = storage.read_state(plugin_id)
+            if state is None or not state.get("enabled", False):
+                raise cherrypy.NotFound()
+            manifest = storage.load_current_manifest(plugin_id)
+            if manifest is None or manifest.ui is None:
+                raise cherrypy.NotFound()
+            paths = storage.paths_for(plugin_id)
+            if paths.current_link.exists() or paths.current_link.is_symlink():
+                release_root = paths.current_link.resolve()
+            else:
+                version = state.get("version")
+                if not version:
+                    raise cherrypy.NotFound()
+                release_root = paths.release_dir(str(version))
+            if not release_root.is_dir():
+                raise cherrypy.NotFound()
+
+            entry = manifest.ui.entry.replace("\\", "/")
+            ui_subtree(entry)
+            entry_parts = tuple(entry.split("/"))
+
+            # Check the resolved subtree too: an old release may contain a UI
+            # symlink pointing at a reserved directory or at the release root.
+            doc_root = safe_join(release_root, *entry_parts[:-1])
+            public_parts = doc_root.relative_to(release_root.resolve()).parts
+            entry_name = entry_parts[-1]
+            ui_subtree("/".join((*public_parts, entry_name)))
+
+            if not relative_parts:
+                serve_parts = (entry_name,)
+            else:
+                serve_parts = relative_parts
+
+            try:
+                target = safe_join(doc_root, *serve_parts)
+            except ValueError:
+                raise cherrypy.HTTPError(400, "invalid path")
+
+            if target.is_file():
+                guessed_type, _ = mimetypes.guess_type(str(target))
+                cherrypy.response.headers["Content-Type"] = (
+                    guessed_type or "application/octet-stream"
+                )
+                return target.read_bytes()
+
+            # SPA fallback to entry HTML for client-side routes
+            entry_target = safe_join(doc_root, entry_name)
+            if entry_target.is_file():
+                cherrypy.response.headers["Content-Type"] = "text/html; charset=utf-8"
+                return entry_target.read_bytes()
+            raise cherrypy.NotFound()
+        except cherrypy.HTTPError:
+            raise
+        except Exception as exc:
+            logger.debug("Plugin UI serve error for %s: %s", plugin_id, exc)
+            raise cherrypy.NotFound()
 
     @cherrypy.expose
     def favicon_ico(self):
@@ -323,6 +388,13 @@ class StatsApp:
         # Let API routes pass through
         if args and args[0] == "api":
             raise cherrypy.NotFound()
+
+        # Application UI plugins: /plugins/{id}/...
+        if args and args[0] == "plugins":
+            if len(args) < 2:
+                return self.index()
+            plugin_id = args[1]
+            return self._serve_plugin_ui(plugin_id, tuple(args[2:]))
 
         # Handle WebSocket routes
         if (

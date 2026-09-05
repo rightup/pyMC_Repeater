@@ -7,7 +7,7 @@ def _make_api(config):
     return api
 
 
-def test_needs_setup_triggers_when_radio_type_missing():
+def test_needs_setup_stays_closed_when_radio_type_missing():
     api = _make_api(
         {
             "repeater": {
@@ -19,7 +19,7 @@ def test_needs_setup_triggers_when_radio_type_missing():
 
     result = api.needs_setup()
 
-    assert result["needs_setup"] is True
+    assert result["needs_setup"] is False
     assert result["reasons"]["radio_not_configured"] is True
     assert result["reasons"]["default_name"] is False
     assert result["reasons"]["default_password"] is False
