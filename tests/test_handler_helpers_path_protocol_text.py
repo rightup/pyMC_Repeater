@@ -16,7 +16,7 @@ from repeater.handler_helpers.acl import (
 )
 from repeater.handler_helpers.path import PathHelper
 from repeater.handler_helpers.protocol_request import ProtocolRequestHelper
-from repeater.handler_helpers.text import TextHelper
+from repeater.handler_helpers.text import TextHelper, _may_ack
 
 # ---------------------------------------------------------------------------
 # Real-crypto collision scaffolding (BUG-053 "try all local candidates").
@@ -720,6 +720,108 @@ async def test_text_helper_room_post_denies_guests(permissions, posts):
     )
 
     assert room.add_post.await_count == (1 if posts else 0)
+
+
+@pytest.mark.parametrize(
+    "identity_type,permissions,txt_type,timestamp,allowed,why",
+    [
+        ("repeater", PERM_ACL_ADMIN, 0, 101, True, "PLAIN from an admin is the legacy CLI"),
+        ("repeater", PERM_ACL_READ_WRITE, 0, 101, False, "the branch is gated on isAdmin()"),
+        ("repeater", PERM_ACL_ADMIN, 1, 101, False, "no ACK for a CLI type"),
+        ("repeater", PERM_ACL_ADMIN, 3, 101, False, "no ACK for a CLI type"),
+        ("repeater", PERM_ACL_ADMIN, 2, 101, False, "SIGNED_PLAIN is not an accepted type"),
+        ("repeater", PERM_ACL_ADMIN, 0, 99, False, "older stamp: the branch is skipped"),
+        ("repeater", PERM_ACL_ADMIN, 0, 100, True, "equal stamp is a retry, still ACKed"),
+        ("room_server", PERM_ACL_READ_WRITE, 0, 101, True, "a writer's post is ACKed"),
+        ("room_server", 0, 0, 101, False, "a guest gets neither post nor ACK"),
+        ("room_server", PERM_ACL_ADMIN, 1, 101, False, "no ACK for a CLI type"),
+    ],
+)
+def test_may_ack_matches_firmware(identity_type, permissions, txt_type, timestamp, allowed, why):
+    """A server ACKs only what it would accept, and decides before answering.
+
+    simple_repeater builds an ACK only under `if (flags == TXT_TYPE_PLAIN)`,
+    inside a branch already gated on `client->isAdmin()`. simple_room_server
+    sets send_ack only on the non-guest PLAIN path. Neither answers a CLI type,
+    an unsupported type, or a replayed timestamp -- but both still answer a
+    retry, because firmware suppresses the work, not the reply.
+    """
+    client = _FakeClient(
+        pubkey=bytes([0x21]) + b"x" * 31, shared_secret=b"k" * 32, permissions=permissions
+    )
+    client.last_timestamp = 100
+
+    assert _may_ack(identity_type, client, txt_type, timestamp) is allowed, why
+
+
+def test_may_ack_stays_quiet_for_an_unknown_client():
+    """Firmware only reaches onPeerDataRecv for a client its ACL matched."""
+    assert _may_ack("repeater", None, 0, 100) is False
+
+
+def test_may_ack_keeps_acking_when_the_core_reports_no_type():
+    """An older core publishes no txt_type; do not go silent on that account."""
+    client = _FakeClient(pubkey=bytes([0x21]) + b"x" * 31, shared_secret=b"k" * 32, permissions=0)
+    assert _may_ack("room_server", client, None, 100) is True
+
+
+def test_register_identity_survives_a_core_without_the_ack_hook():
+    """[fails pre-fix] An older core must not take the node off the air.
+
+    `pyproject.toml` tracks `openhop_core@dev` with no version floor, so running
+    against a core that predates should_ack_fn is an ordinary state. Passing the
+    argument regardless raises TypeError out of register_identity, which leaves
+    the node with no text handler at all -- a far worse outcome than an ACK it
+    should have withheld.
+    """
+    acl = _FakeACL([_FakeClient(pubkey=bytes([0x35]) + b"x" * 31, shared_secret=b"k" * 32)])
+    helper = TextHelper(
+        identity_manager=MagicMock(), packet_injector=AsyncMock(), acl_dict={0x35: acl}
+    )
+    identity = _FakeId(bytes([0x35]) + b"x" * 31)
+
+    with (
+        patch("repeater.handler_helpers.text.CORE_ACCEPTS_ACK_POLICY", False),
+        patch("repeater.handler_helpers.text.TextMessageHandler") as tmh,
+        patch("repeater.handler_helpers.text.MeshCLI", return_value=MagicMock()),
+    ):
+        helper.register_identity("rep", identity, identity_type="repeater", radio_config={})
+
+    assert "should_ack_fn" not in tmh.call_args.kwargs
+    assert 0x35 in helper.handlers
+
+
+def test_register_identity_hands_the_core_handler_an_ack_policy():
+    """The policy has to reach the handler, or none of the above applies.
+
+    Core decides the ACK before the repeater's gates run, so this seam is the
+    only place a server's rule can be applied in time.
+    """
+    acl = _FakeACL(
+        [
+            _FakeClient(
+                pubkey=bytes([0x33]) + b"x" * 31,
+                shared_secret=b"k" * 32,
+                permissions=PERM_ACL_ADMIN,
+            )
+        ]
+    )
+    helper = TextHelper(
+        identity_manager=MagicMock(), packet_injector=AsyncMock(), acl_dict={0x33: acl}
+    )
+    identity = _FakeId(bytes([0x33]) + b"x" * 31)
+
+    with (
+        patch("repeater.handler_helpers.text.TextMessageHandler") as tmh,
+        patch("repeater.handler_helpers.text.MeshCLI", return_value=MagicMock()),
+    ):
+        helper.register_identity("rep", identity, identity_type="repeater", radio_config={})
+
+    policy = tmh.call_args.kwargs["should_ack_fn"]
+    admin_key = bytes([0x33]) + b"x" * 31
+    assert policy(admin_key, 0, 100) is True  # PLAIN from the admin
+    assert policy(admin_key, 1, 100) is False  # CLI_DATA earns no ACK
+    assert policy(bytes([0x44]) + b"x" * 31, 0, 100) is False  # not a client here
 
 
 @pytest.mark.asyncio

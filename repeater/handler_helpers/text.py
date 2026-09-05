@@ -7,6 +7,7 @@ Also handles CLI commands for admin users on the repeater identity.
 """
 
 import asyncio
+import inspect
 import logging
 import time
 
@@ -18,6 +19,24 @@ from .mesh_cli import MeshCLI
 from .room_server import RoomServer
 
 logger = logging.getLogger("TextHelper")
+
+
+def _core_accepts_ack_policy() -> bool:
+    """Does the installed openhop_core's text handler take ``should_ack_fn``?
+
+    Passing an argument an older core does not know raises TypeError from
+    ``register_identity`` -- which would leave the node with no text handler at
+    all, i.e. off the air. `pyproject.toml` tracks `openhop_core@dev` with no
+    version floor, so an older core is an ordinary state to be in, not an
+    error.
+    """
+    try:
+        return "should_ack_fn" in inspect.signature(TextMessageHandler.__init__).parameters
+    except (TypeError, ValueError):  # pragma: no cover - exotic/absent signature
+        return False
+
+
+CORE_ACCEPTS_ACK_POLICY = _core_accepts_ack_policy()
 
 
 # Text message type flags (firmware TxtDataHelpers.h)
@@ -69,6 +88,41 @@ def _accept_once(client, sender_timestamp) -> tuple[bool, bool]:
     client.last_timestamp = sender_timestamp
     client.last_activity = int(time.time())
     return True, is_retry
+
+
+def _may_ack(identity_type, client, txt_type, sender_timestamp) -> bool:
+    """Firmware's delivery-ACK rule for a server identity. Read-only.
+
+    A server answers far less than a chat node does, and decides *before* it
+    answers, so nothing it refuses is ever acknowledged:
+
+    - ``simple_repeater``: only ``TXT_TYPE_PLAIN``, and only from an admin --
+      the whole TXT_MSG branch is gated on ``client->isAdmin()``, and inside it
+      the ACK is built only under ``if (flags == TXT_TYPE_PLAIN)``.
+    - ``simple_room_server``: only PLAIN, and only when the role is not
+      ``PERM_ACL_GUEST`` (``send_ack`` stays false on the guest branch).
+    - Neither ACKs a CLI type, an unsupported type, or a replayed timestamp:
+      those never reach the ACK at all.
+
+    A retry (equal timestamp) *is* acknowledged by both -- firmware suppresses
+    the work, not the answer -- so only a strictly older stamp fails here.
+
+    ``txt_type is None`` means a core too old to publish it; there is nothing to
+    judge, so keep the previous behaviour rather than silently going quiet.
+    """
+    if txt_type is None:
+        return True
+    if txt_type != TXT_TYPE_PLAIN:
+        return False
+    if client is None:
+        return False
+    if sender_timestamp is not None:
+        last = int(getattr(client, "last_timestamp", 0) or 0)
+        if sender_timestamp < last:
+            return False
+    if identity_type == "room_server":
+        return not _is_guest_client(client)
+    return is_admin_permissions(getattr(client, "permissions", 0))
 
 
 def _is_guest_client(client) -> bool:
@@ -157,13 +211,24 @@ class TextHelper:
         acl_contacts = self._create_acl_contacts_wrapper(identity_acl)
 
         # Create TextMessageHandler for this identity
-        handler = TextMessageHandler(
-            local_identity=identity,
-            contacts=acl_contacts,
-            log_fn=self.log_fn,
-            send_packet_fn=self._send_packet,
-            radio_config=radio_config,
-        )
+        handler_kwargs = {
+            "local_identity": identity,
+            "contacts": acl_contacts,
+            "log_fn": self.log_fn,
+            "send_packet_fn": self._send_packet,
+            "radio_config": radio_config,
+        }
+        if CORE_ACCEPTS_ACK_POLICY:
+            # The handler's own rule is BaseChatMesh's, which over-answers for a
+            # server: without this, a signed post, a non-admin command or a
+            # guest's post is ACKed there and only then refused here.
+            handler_kwargs["should_ack_fn"] = self._make_ack_policy(hash_byte, identity_type)
+        else:
+            logger.warning(
+                "openhop_core's text handler takes no should_ack_fn: it will "
+                "acknowledge messages this server then refuses. Upgrade openhop_core."
+            )
+        handler = TextMessageHandler(**handler_kwargs)
 
         # Register by dest hash
         hash_byte = identity.get_public_key()[0]
@@ -256,6 +321,41 @@ class TextHelper:
                 logger.error(f"Failed to create room server '{name}': {e}", exc_info=True)
 
         logger.info(f"Registered {identity_type} '{name}' text handler: hash=0x{hash_byte:02X}")
+
+    def _client_by_pubkey(self, identity_hash: int, pubkey: bytes):
+        """The ACL client for an already-authenticated public key.
+
+        Core hands the ACK policy the key it actually decrypted with, so this
+        is an exact lookup rather than the hash-collision search
+        ``_resolve_sender_client`` has to do from the wire.
+        """
+        identity_acl = self.acl_dict.get(identity_hash)
+        if not identity_acl:
+            return None
+        get_client = getattr(identity_acl, "get_client", None)
+        if callable(get_client):
+            client = get_client(pubkey)
+            if client is not None:
+                return client
+        for client_info in identity_acl.get_all_clients():
+            if client_info.id.get_public_key() == pubkey:
+                return client_info
+        return None
+
+    def _make_ack_policy(self, identity_hash: int, identity_type: str):
+        """Bind :func:`_may_ack` to one registered identity for the core handler."""
+
+        def _policy(sender_pubkey: bytes, txt_type: int, sender_timestamp: int) -> bool:
+            client = self._client_by_pubkey(identity_hash, sender_pubkey)
+            allowed = _may_ack(identity_type, client, txt_type, sender_timestamp)
+            if not allowed:
+                logger.debug(
+                    f"[{identity_type}] withholding ACK for txt_type={txt_type} "
+                    f"from {sender_pubkey[:4].hex()}"
+                )
+            return allowed
+
+        return _policy
 
     def _create_acl_contacts_wrapper(self, acl):
 
