@@ -286,7 +286,7 @@ class StatsApp:
             raise cherrypy.NotFound()
         root = Path(root_dir).resolve()
         target = (root.joinpath(*relative_parts)).resolve()
-        if not str(target).startswith(str(root)) or not target.is_file():
+        if not target.is_relative_to(root) or not target.is_file():
             raise cherrypy.NotFound()
         guessed_type, _ = mimetypes.guess_type(str(target))
         cherrypy.response.headers["Content-Type"] = guessed_type or "application/octet-stream"
