@@ -459,14 +459,51 @@ def test_text_helper_cli_prefix_and_admin_permission_checks():
 
 
 class _TxtPacket:
-    """A packet as the core TextMessageHandler leaves it: text + its type."""
+    """A packet as the core TextMessageHandler leaves it.
 
-    def __init__(self, text: str, txt_type=None):
+    ``txt_type``/``sender_timestamp`` default to absent so a test can model a
+    core too old to publish them.
+    """
+
+    def __init__(self, text: str, txt_type=None, sender_timestamp=None):
         self.decrypted = {"text": text}
         if txt_type is not None:
             self.decrypted["txt_type"] = txt_type
+        if sender_timestamp is not None:
+            self.decrypted["sender_timestamp"] = sender_timestamp
         self.payload = bytearray([0x41, 0x21])
         self.mark_do_not_retransmit = MagicMock()
+
+
+def _room_helper(permissions=PERM_ACL_ADMIN):
+    """A TextHelper wired as a room-server identity with a stub CLI and store."""
+    helper = TextHelper(identity_manager=MagicMock(), acl_dict={})
+    room = MagicMock()
+    room.add_post = AsyncMock(return_value=True)
+    room.cli = MagicMock()
+    room.cli.handle_command = MagicMock(return_value="ok")
+    helper.room_servers = {0x41: room}
+    helper.handlers = {0x41: {"name": "room", "type": "room_server", "identity": MagicMock()}}
+    helper._resolve_sender_client = MagicMock(
+        return_value=_FakeClient(
+            pubkey=bytes([0x21]) + b"x" * 31,
+            shared_secret=b"k" * 32,
+            permissions=permissions,
+        )
+    )
+    helper._check_admin_permission_for_identity = MagicMock(return_value=True)
+    helper._send_cli_reply = AsyncMock()
+    return helper, room
+
+
+async def _deliver(helper, packet, identity_type="repeater", name="rep"):
+    await helper._on_message_received(
+        identity_name=name,
+        identity_type=identity_type,
+        packet=packet,
+        dest_hash=0x41,
+        src_hash=0x21,
+    )
 
 
 def _repeater_cli_helper():
@@ -500,7 +537,7 @@ def _repeater_cli_helper():
     ],
 )
 async def test_text_helper_runs_cli_only_for_server_text_types(txt_type, runs):
-    """[fails pre-fix for SIGNED_PLAIN] The text type gates the CLI, not the text.
+    """[fails pre-fix for SIGNED_PLAIN] Only the accepted types reach the CLI.
 
     simple_repeater::onPeerDataRecv opens its TXT_MSG branch by rejecting any
     flags outside {PLAIN, CLI_DATA, CLI_COMMAND}. openHop dispatched purely on
@@ -508,6 +545,9 @@ async def test_text_helper_runs_cli_only_for_server_text_types(txt_type, runs):
     whose 4-byte author prefix the core handler has already stripped, leaving
     bare text -- ran as an admin CLI command whenever it happened to start with
     a command prefix.
+
+    All three accepted types run here because a repeater has no chat function;
+    that a *plain* one runs with no text test is covered separately.
 
     ``txt_type is None`` is a core too old to report it; that must keep working
     rather than silently dropping every message.
@@ -534,34 +574,109 @@ async def test_text_helper_signed_plain_is_not_stored_as_a_room_post():
     simple_room_server::onPeerDataRecv carries the same filter as the repeater;
     only PLAIN becomes a post there. openHop stored whatever arrived.
     """
-    helper = TextHelper(identity_manager=MagicMock(), acl_dict={})
-    room = MagicMock()
-    room.add_post = AsyncMock(return_value=True)
-    room.cli = None
-    helper.room_servers = {0x41: room}
-    helper.handlers = {0x41: {"name": "room", "type": "room_server", "identity": MagicMock()}}
-    helper._resolve_sender_client = MagicMock(
-        return_value=_FakeClient(pubkey=bytes([0x21]) + b"x" * 31, shared_secret=b"k" * 32)
-    )
+    helper, room = _room_helper(permissions=PERM_ACL_READ_WRITE)
 
-    await helper._on_message_received(
-        identity_name="room",
-        identity_type="room_server",
-        packet=_TxtPacket("hello room", 2),
-        dest_hash=0x41,
-        src_hash=0x21,
-    )
+    await _deliver(helper, _TxtPacket("hello room", 2, sender_timestamp=100), "room_server", "room")
     room.add_post.assert_not_awaited()
 
-    # ...while a plain post still lands.
-    await helper._on_message_received(
-        identity_name="room",
-        identity_type="room_server",
-        packet=_TxtPacket("hello room", 0),
-        dest_hash=0x41,
-        src_hash=0x21,
-    )
+    # ...while a plain post from the same writer still lands.
+    await _deliver(helper, _TxtPacket("hello room", 0, sender_timestamp=101), "room_server", "room")
     room.add_post.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "txt_type,is_command",
+    [
+        (0, False),  # PLAIN       -> a post
+        (1, True),  # CLI_DATA    -> the admin CLI
+        (3, True),  # CLI_COMMAND -> the admin CLI
+    ],
+)
+async def test_room_dispatches_on_type_not_text(txt_type, is_command):
+    """[fails pre-fix] The room splits command from post by type, as firmware does.
+
+    simple_room_server::onPeerDataRecv routes CLI_DATA/CLI_COMMAND through
+    handleCommand and turns PLAIN into a post. openHop asked
+    `_is_cli_command(message_text)` instead, so it got both wrong: a PLAIN
+    "get status" ran as a command rather than being posted, and a CLI command
+    whose text was not in the prefix list was published to the room.
+
+    Both cases use the *same* text, so only the type can decide.
+    """
+    helper, room = _room_helper()
+
+    await _deliver(
+        helper,
+        _TxtPacket("get status", txt_type, sender_timestamp=100),
+        identity_type="room_server",
+        name="room",
+    )
+
+    assert room.cli.handle_command.called is is_command
+    assert room.add_post.await_count == (0 if is_command else 1)
+
+
+@pytest.mark.asyncio
+async def test_repeater_runs_any_accepted_type_without_a_text_test():
+    """[fails pre-fix] A repeater has no chat, so every accepted type is a command.
+
+    simple_repeater::onPeerDataRecv hands PLAIN, CLI_DATA and CLI_COMMAND alike
+    to handleCommand with no text test. openHop dropped anything whose text did
+    not start with a known prefix, so an admin's mistyped command vanished
+    silently instead of being answered.
+    """
+    helper = _repeater_cli_helper()
+
+    await _deliver(helper, _TxtPacket("frobnicate", 1, sender_timestamp=100))
+
+    helper.cli.handle_command.assert_called_once()
+    assert helper.cli.handle_command.call_args.kwargs["command"] == "frobnicate"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "second_timestamp,label",
+    [(99, "older"), (100, "equal")],
+)
+async def test_repeater_command_is_not_run_twice(second_timestamp, label):
+    """[fails pre-fix] A resent command is not executed again.
+
+    simple_repeater guards on `sender_timestamp >= client->last_timestamp` and
+    treats equality as a retry it answers with an empty reply; an older stamp is
+    dropped whole. openHop checked neither, so replaying an admin command with
+    the same timestamp and different attempt bits re-ran it -- packet dedup does
+    not catch that, because the bytes differ.
+    """
+    helper = _repeater_cli_helper()
+
+    await _deliver(helper, _TxtPacket("reboot", 1, sender_timestamp=100))
+    assert helper.cli.handle_command.call_count == 1
+
+    await _deliver(helper, _TxtPacket("reboot", 1, sender_timestamp=second_timestamp))
+    assert helper.cli.handle_command.call_count == 1, f"{label} timestamp re-ran the command"
+
+
+@pytest.mark.asyncio
+async def test_repeater_command_runs_again_for_a_newer_timestamp():
+    """The guard blocks replays, not legitimate repeat commands."""
+    helper = _repeater_cli_helper()
+
+    await _deliver(helper, _TxtPacket("reboot", 1, sender_timestamp=100))
+    await _deliver(helper, _TxtPacket("reboot", 1, sender_timestamp=101))
+
+    assert helper.cli.handle_command.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_room_post_is_not_stored_twice_for_a_retry():
+    """[fails pre-fix] firmware calls addPost only when `!is_retry`."""
+    helper, room = _room_helper(permissions=PERM_ACL_READ_WRITE)
+
+    await _deliver(helper, _TxtPacket("hello", 0, sender_timestamp=100), "room_server", "room")
+    await _deliver(helper, _TxtPacket("hello", 0, sender_timestamp=100), "room_server", "room")
+
+    assert room.add_post.await_count == 1
 
 
 @pytest.mark.asyncio

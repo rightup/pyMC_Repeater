@@ -41,6 +41,36 @@ TXT_TYPE_CLI_COMMAND = 0x03
 SERVER_TXT_TYPES = frozenset((TXT_TYPE_PLAIN, TXT_TYPE_CLI_DATA, TXT_TYPE_CLI_COMMAND))
 
 
+def _accept_once(client, sender_timestamp) -> tuple[bool, bool]:
+    """Firmware's TXT_MSG replay guard. Returns ``(accepted, is_retry)``.
+
+    ``simple_repeater`` and ``simple_room_server`` both open the branch with
+    ``sender_timestamp >= client->last_timestamp``: an older timestamp is a
+    replay and is dropped whole, an equal one is a *retry* — accepted, activity
+    refreshed, but the command not re-run and the post not re-added — and a
+    newer one is fresh work. The watermark advances either way.
+
+    Note the deliberate difference from ``ACL._is_replay``, which rejects the
+    equal case: that matches the REQ branch (``timestamp > last_timestamp``),
+    not this one.
+
+    An unresolved client or a core too old to publish the timestamp yields
+    ``(True, False)`` — no watermark to check against, so behave as before.
+    """
+    if client is None or sender_timestamp is None:
+        return True, False
+    last = int(getattr(client, "last_timestamp", 0) or 0)
+    if sender_timestamp < last:
+        logger.warning(
+            f"Possible replay: text timestamp={sender_timestamp} < last={last}; dropping"
+        )
+        return False, False
+    is_retry = sender_timestamp == last
+    client.last_timestamp = sender_timestamp
+    client.last_activity = int(time.time())
+    return True, is_retry
+
+
 def _is_guest_client(client) -> bool:
     """True when ``client`` holds the GUEST role (firmware ``PERM_ACL_GUEST``).
 
@@ -323,11 +353,12 @@ class TextHelper:
             # A core older than the one that publishes ``txt_type`` reports
             # None; behave as before rather than dropping every message.
             txt_type = packet.decrypted.get("txt_type")
-            if txt_type is None:
+            sender_timestamp = packet.decrypted.get("sender_timestamp")
+            if txt_type is None or sender_timestamp is None:
                 logger.warning(
-                    "TXT_MSG carried no txt_type: openhop_core is older than the "
-                    "build that publishes it, so the text-type gate is open and a "
-                    "signed post can reach the CLI. Upgrade openhop_core."
+                    "TXT_MSG carried no txt_type/sender_timestamp: openhop_core is "
+                    "older than the build that publishes them, so the text-type "
+                    "gate and the replay guard are open. Upgrade openhop_core."
                 )
             if txt_type is not None and txt_type not in SERVER_TXT_TYPES:
                 logger.debug(
@@ -338,6 +369,15 @@ class TextHelper:
 
             sender_client = self._resolve_sender_client(dest_hash, src_hash, packet)
 
+            # Firmware checks the type, then the replay watermark, and only then
+            # looks at the message. A retry is accepted but re-runs nothing.
+            accepted, is_retry = _accept_once(sender_client, sender_timestamp)
+            if not accepted:
+                logger.warning(
+                    f"[{identity_type}:{identity_name}] replay from 0x{src_hash:02X}; dropping"
+                )
+                return
+
             # Clean message text - remove null bytes and trailing whitespace
             message_text = message_text.rstrip("\x00").rstrip()
 
@@ -347,8 +387,19 @@ class TextHelper:
             if identity_type == "room_server" and dest_hash in self.room_servers:
                 room_server = self.room_servers[dest_hash]
 
-                # Check if this is a CLI command FIRST (before storing as post)
-                if self._is_cli_command(message_text):
+                # simple_room_server::onPeerDataRecv splits by *type*, not by
+                # text: CLI_DATA/CLI_COMMAND go to the admin CLI, PLAIN becomes
+                # a post. Deciding from the text instead got both wrong -- a
+                # PLAIN "set ..." ran as a command instead of being posted, and
+                # a command whose text was not in the prefix list was published
+                # to the room.
+                if txt_type is None:
+                    # Older core: no type to dispatch on, keep the text test.
+                    room_is_command = self._is_cli_command(message_text)
+                else:
+                    room_is_command = txt_type in (TXT_TYPE_CLI_DATA, TXT_TYPE_CLI_COMMAND)
+
+                if room_is_command:
                     # Handle CLI command - do NOT store as post
                     if room_server and room_server.cli:
                         try:
@@ -367,6 +418,16 @@ class TextHelper:
                             sender_pubkey = bytes([src_hash]) + b"\x00" * 31  # Default
                             if sender_client is not None:
                                 sender_pubkey = sender_client.id.get_public_key()
+
+                            # A retry re-sends the same command; firmware
+                            # answers it with an empty reply rather than running
+                            # it a second time.
+                            if is_retry:
+                                logger.info(
+                                    f"Room '{identity_name}': retry of command from "
+                                    f"0x{src_hash:02X}; not re-running"
+                                )
+                                return
 
                             # Handle CLI command
                             reply = room_server.cli.handle_command(
@@ -409,6 +470,15 @@ class TextHelper:
                     )
                     return
 
+                # Firmware calls addPost only when `!is_retry`, so a resent post
+                # does not appear in the room twice.
+                if is_retry:
+                    logger.info(
+                        f"Room '{identity_name}': retry of post from 0x{src_hash:02X}; "
+                        "not storing again"
+                    )
+                    return
+
                 try:
                     # Get sender's full pubkey
                     sender_pubkey = bytes([src_hash]) + b"\x00" * 31  # Default
@@ -434,8 +504,16 @@ class TextHelper:
 
                 return
 
-            # Check if this is a CLI command to the repeater (AFTER decryption)
-            if dest_hash == self.repeater_hash and self.cli and self._is_cli_command(message_text):
+            # A repeater has no chat function, so simple_repeater::onPeerDataRecv
+            # runs *every* accepted type from an admin through handleCommand with
+            # no text test at all. Matching that means a plain DM to the repeater
+            # is a command too -- which it always was; openHop simply dropped the
+            # ones whose text did not match a prefix.
+            if txt_type is None and not self._is_cli_command(message_text):
+                # Older core: no type to dispatch on, keep the text test.
+                return
+
+            if dest_hash == self.repeater_hash and self.cli:
                 try:
                     repeater_hash = self.repeater_hash
                     if repeater_hash is None:
@@ -457,6 +535,12 @@ class TextHelper:
                     sender_pubkey = bytes([src_hash]) + b"\x00" * 31  # Default
                     if sender_client is not None:
                         sender_pubkey = sender_client.id.get_public_key()
+
+                    # A retry re-sends the same command; firmware answers it
+                    # with an empty reply rather than running it again.
+                    if is_retry:
+                        logger.info(f"Retry of command from 0x{src_hash:02X}; not re-running")
+                        return
 
                     # Handle CLI command
                     reply = self.cli.handle_command(
