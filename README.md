@@ -255,6 +255,11 @@ The web interface can upgrade an installation or switch branches.
 > Docker installs cannot be upgraded or branch-switched from the web interface.
 > Update the container image instead.
 
+Existing native installations must run the updated `sudo bash ./manage.sh upgrade`
+once as an administrator to replace the privileged OTA helper after the security
+update. Updating only the Python package or using the old web updater does not
+refresh that helper. See [native upgrade prerequisites](docs/plugins.md#native-upgrade-prerequisite).
+
 ![Upgrade](docs/webui-upgrade.png)
 
 ### CLI
@@ -451,22 +456,80 @@ that source as a directory, which breaks startup.
 1. Copy `.env.example` to `.env`.
 2. Review `.env` and update `OPENHOP_REPEATER_IMAGE`, `DIALOUT_GID`,
    `GPIO_GID`, or `SPI_GID` if needed.
-3. Configure `docker-compose.yml` for your hardware and device paths.
-4. Uncomment the USB device mapping only if your host has that device path.
+3. Configure `docker-compose.yml` for your hardware. Remove every device mapping
+   that is absent or unnecessary: the shipped file enables SPI, GPIO, and USB
+   bus examples. Network-radio installations do not need those mappings.
+4. Add a serial-modem mapping only after preparing its host device path.
 5. Pull and start the container.
 
 ```bash
 docker compose up -d
 ```
 
-The Docker image bundles the optional openHop Console frontend at
-`/opt/pymc_console/web/html`. Local builds with `docker-compose.build.yml`
-download the newest openHop Console release by default. Set `OPENHOP_CONSOLE_VERSION`
-in `.env` to pin a release tag such as `v0.9.329`.
+The Docker image includes the default RepeaterUI but no longer downloads or bundles
+openHop Console. Install optional Console functionality through the plugin catalogue.
 
-After the container starts, open Web Settings and choose `openHop Console` as the
-web frontend if you want the repeater to serve that UI. The existing
-`/api/check_pymc_console` endpoint should report that the Console path exists.
+Before upgrading an older image with `/opt/pymc_console/web/html` selected as its
+frontend, switch back to the default RepeaterUI. The old bundled directory is absent
+from new images. Existing plugin data remains in the persistent data volume.
+
+### Image updates and persistent plugins
+
+For a published image, select the intended image tag in `.env`, then run:
+
+```bash
+docker compose pull
+docker compose up -d
+```
+
+For a local source build, after updating the intended branch:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+```
+
+Pulling Git changes or restarting a container alone does not rebuild its image.
+The Dockerfile packages the frontend assets present in the build context; it does
+not fetch or build the default RepeaterUI. Frontend changes belong in
+[RepeaterUI](https://github.com/openhop-dev/openHop_RepeaterUI), using the matching
+UI branch (`feat-plugin-ui` for `feat-plugin-manager`). Stage the complete verified
+UI build for packaging; do not hand-edit generated JavaScript. Optional Console
+installation is managed through the plugin catalogue, independently of image builds.
+
+Back up both config and data volumes before upgrading. Do **not** use
+`docker compose down -v` if you want to retain configuration and plugins.
+The default data volume contains plugin releases, retained wheels, venvs,
+settings, logs, and manager state. A custom `plugins.root` outside that volume
+needs its own persistent writable mount.
+
+Plugin venvs can rebuild after a Python minor-version change. Keep retained wheels;
+plugins with external dependencies may need network access and compatible packages
+to rebuild. Older installations without retained wheels need plugin reinstallation.
+Changing CPU architecture or absolute storage paths is not covered by minor-version
+rebuild detection.
+
+The image runs Repeater and its plugin manager as an unprivileged user under a
+supervisor and `tini`. To run without the manager, set `plugins.enabled: false` in
+configuration, or explicitly add this to the Compose service:
+
+```yaml
+environment:
+  OPENHOP_PLUGIN_MANAGER: "0"
+```
+
+Putting that variable only in `.env` does not pass it through the shipped Compose
+file. Repeater remains available without the manager; plugin operations are then
+unavailable. Plugins are trusted applications, not sandboxed code.
+
+On startup, existing user configuration overrides defaults from the current image's
+bundled example; an older example in the config volume is preserved but is not the
+upgrade merge source. Keep config writable by the image user. The temporary merged
+config fallback is not persistent; use an absolute `storage.storage_dir` inside the
+mounted data directory.
+
+The volume variables accept the default named volumes or absolute bind paths. If
+you choose another named volume, also declare it under top-level `volumes:`; use
+`external: true` when intentionally attaching an existing volume.
 
 ### Example `docker-compose.yml`
 

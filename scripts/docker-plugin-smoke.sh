@@ -14,7 +14,7 @@ cleanup() {
 trap cleanup EXIT HUP INT TERM
 
 start_container() {
-    docker run -d \
+    docker run -d --network none \
         --name "${CONTAINER}" \
         -v "${CONFIG_VOLUME}:/etc/openhop_repeater" \
         -v "${DATA_VOLUME}:/var/lib/openhop_repeater" \
@@ -92,10 +92,14 @@ def stop(signum, frame):
 def main():
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
+    child = os.fork()
     with lifecycle.open("a", encoding="utf-8") as handle:
-        handle.write(f"START {os.getpid()}\\n")
+        kind = "START" if child else "CHILD"
+        handle.write(f"{kind} {os.getpid()}\\n")
     while running:
         time.sleep(0.1)
+    if child:
+        os.waitpid(child, 0)
 '''
 metadata = "Metadata-Version: 2.1\nName: openhop-smoke-plugin\nVersion: 0.1.0\n"
 wheel = "Wheel-Version: 1.0\nGenerator: openhop-container-smoke\nRoot-Is-Purelib: true\nTag: py3-none-any\n"
@@ -228,6 +232,47 @@ assert status["enabled"] is True
 assert status["state"] == "RUNNING"
 '
 
+echo "Checking plugin stop/start, descendants, permissions and venv rebuild"
+docker exec -i "${CONTAINER}" python3 - <<'PY'
+import os
+import re
+import stat
+import sys
+import time
+from pathlib import Path
+from repeater.plugins.ipc import PluginIPCClient
+client = PluginIPCClient("/var/lib/openhop_repeater/plugin-manager.sock")
+root = Path("/var/lib/openhop_repeater/plugins/openhop.smoke")
+log = root / "data/lifecycle.log"
+for _ in range(50):
+    lines = log.read_text().splitlines()
+    children = [int(line.split()[1]) for line in lines if line.startswith("CHILD ")]
+    if children:
+        break
+    time.sleep(0.1)
+assert children
+pid = client.status("openhop.smoke")["pid"]
+child = children[-1]
+assert Path(f"/proc/{child}").exists()
+client.call("stop", plugin_id="openhop.smoke")
+for _ in range(50):
+    if not any(Path(f"/proc/{p}").exists() for p in (pid, child)):
+        break
+    time.sleep(0.1)
+assert not any(Path(f"/proc/{p}").exists() for p in (pid, child))
+assert f"TERM {pid}" in log.read_text().splitlines()
+assert f"TERM {child}" in log.read_text().splitlines()
+assert os.getuid() == 15888
+assert root.stat().st_uid == 15888
+assert stat.S_IMODE(Path(client.socket_path).stat().st_mode) == 0o660
+venv_config = root / "releases/0.1.0/venv/pyvenv.cfg"
+venv_config.write_text(re.sub(r"(?m)^version = .*", "version = 3.11.0", venv_config.read_text()))
+client.call("start", plugin_id="openhop.smoke")
+assert client.status("openhop.smoke")["state"] == "RUNNING"
+assert f"version = {sys.version_info.major}.{sys.version_info.minor}." in venv_config.read_text()
+print("stop/start descendants, non-root/socket permissions, real offline venv rebuild passed")
+PY
+
 echo "Checking graceful plugin shutdown"
 EXPECTED_PLUGIN_PID="$(docker exec "${CONTAINER}" python3 -c '
 from repeater.plugins.ipc import PluginIPCClient
@@ -235,7 +280,7 @@ client = PluginIPCClient("/var/lib/openhop_repeater/plugin-manager.sock")
 print(client.status("openhop.smoke")["pid"])
 ')"
 docker stop -t 10 "${CONTAINER}" >/dev/null
-docker run --rm --entrypoint python3 -e EXPECTED_PLUGIN_PID="${EXPECTED_PLUGIN_PID}" \
+docker run --rm --network none --entrypoint python3 -e EXPECTED_PLUGIN_PID="${EXPECTED_PLUGIN_PID}" \
     -v "${DATA_VOLUME}:/var/lib/openhop_repeater" \
     "${IMAGE}" -c '
 import os
