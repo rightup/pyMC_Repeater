@@ -1,9 +1,11 @@
 import asyncio
 import copy
 import logging
+import math
 import secrets
 import time
 from collections import OrderedDict, deque
+from collections.abc import Mapping
 from enum import Enum
 from typing import Optional, Tuple
 
@@ -1514,6 +1516,102 @@ class RepeaterHandler(BaseHandler):
             packet.drop_reason = f"Unknown route type: {route_type}"
             return None
 
+    # A local transmit whose radio link has dropped waits this long for it to come
+    # back before giving up, polling at LOCAL_TX_LINK_POLL_S. Kept well inside the
+    # companion client's own command timeout (meshcore_py: 15s), which is already
+    # partly spent on the TX delay by the time we get here.
+    DEFAULT_LOCAL_TX_LINK_WAIT_S = 5.0
+    # Hard ceiling regardless of configuration: the companion client is already
+    # waiting on this send, and an unbounded (or infinite) value would hold its
+    # command open forever rather than reporting a failure it can act on.
+    MAX_LOCAL_TX_LINK_WAIT_S = 30.0
+    LOCAL_TX_LINK_POLL_S = 0.1
+
+    def _local_tx_link_wait_s(self) -> float:
+        """Configured ceiling for waiting out a radio-link outage on a local TX."""
+        delays = self.config.get("delays") or {}
+        try:
+            wait = float(
+                delays.get("local_tx_link_wait_seconds", self.DEFAULT_LOCAL_TX_LINK_WAIT_S)
+            )
+        except (TypeError, ValueError):
+            return self.DEFAULT_LOCAL_TX_LINK_WAIT_S
+        if not math.isfinite(wait):
+            logger.warning(
+                "local_tx_link_wait_seconds=%r is not a finite number; using %.1fs",
+                wait,
+                self.DEFAULT_LOCAL_TX_LINK_WAIT_S,
+            )
+            return self.DEFAULT_LOCAL_TX_LINK_WAIT_S
+        return min(max(0.0, wait), self.MAX_LOCAL_TX_LINK_WAIT_S)
+
+    def _resolve_tx_radio(self, radio_id: Optional[str] = None):
+        """The radio a send will actually use, or None when that cannot be told.
+
+        Attribute access on a FabricRadio passes through to its *default* endpoint
+        (rf_fabric/fabric.py), so reading link state off it while the send targets
+        another radio_id answers about the wrong radio -- suppressing a healthy one,
+        or waving through a dead one. Resolve the named endpoint instead, and return
+        None rather than guess: no answer leaves the send to proceed as before.
+        """
+        radio = getattr(self.dispatcher, "radio", None)
+        if radio is None:
+            return None
+        fabric = getattr(radio, "fabric", None)
+        if fabric is None and hasattr(radio, "get_radio"):
+            fabric = radio  # an RFFabric handed to the dispatcher directly
+        radios = getattr(fabric, "radios", None) if fabric is not None else None
+        # isinstance, not truthiness: RFFabric.radios is an OrderedDict, so this
+        # recognises a real multi-endpoint fabric without mistaking a stand-in
+        # attribute on a single-radio wrapper for one.
+        if not isinstance(radios, Mapping) or len(radios) <= 1:
+            return radio  # one radio, and it is the one that transmits
+        if not radio_id:
+            # The fabric picks its endpoint at send time, so there is nothing here
+            # to inspect. Say so rather than answer about whichever radio happens
+            # to be the default -- a wrong "down" would suppress a healthy send.
+            return None
+        getter = getattr(fabric, "get_radio", None)
+        if getter is None:
+            return None
+        try:
+            return getter(str(radio_id))
+        except Exception:
+            return None
+
+    def _radio_link_down(self, radio_id: Optional[str] = None) -> bool:
+        """True when the radio this send will use reports its link unusable.
+
+        Only radios that track a link state answer this -- a KISS modem over serial
+        does, a directly-driven SX1262 has none to lose -- so it reads False for the
+        rest and leaves their timing untouched.
+        """
+        radio = self._resolve_tx_radio(radio_id)
+        if radio is None:
+            return False
+        # Identity checks, not truthiness: a radio that does not track link state
+        # answers with something that is neither True nor False (or nothing at all),
+        # and that has to read as "no opinion" rather than "down".
+        if getattr(radio, "is_connected", None) is False:
+            return True
+        return getattr(radio, "is_degraded", None) is True
+
+    async def _await_radio_link(self, timeout: float, radio_id: Optional[str] = None) -> bool:
+        """Wait up to *timeout* seconds for the radio link, True if it is usable."""
+        if not self._radio_link_down(radio_id):
+            return True
+        if timeout <= 0:
+            return False
+        logger.info("Local TX: radio link down, waiting up to %.1fs for it", timeout)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            await asyncio.sleep(self.LOCAL_TX_LINK_POLL_S)
+            if not self._radio_link_down(radio_id):
+                logger.info("Local TX: radio link back, transmitting now")
+                return True
+        logger.warning("Local TX: radio link still down after %.1fs, giving up", timeout)
+        return False
+
     async def schedule_retransmit(
         self,
         fwd_pkt: Packet,
@@ -1540,10 +1638,21 @@ class RepeaterHandler(BaseHandler):
             #   attempt 0 — initial try (no pre-sleep)
             #   attempt 1 — retry after 1s backoff outside the lock
             for attempt in range(2 if local_transmission else 1):
-                if attempt > 0:
-                    # Back-off OUTSIDE the lock — other tasks can transmit here.
+                if attempt > 0 and not self._radio_link_down(preferred_tx_radio_id):
+                    # A transient failure with the link still up: back off OUTSIDE
+                    # the lock — other tasks can transmit here.
                     logger.info("Retrying local TX in 1s (lock released during backoff)...")
                     await asyncio.sleep(1.0)
+
+                # A dropped link is not a transient failure to back off from. A KISS
+                # modem that falls off USB re-enumerates and re-handshakes in ~2s, so
+                # the flat backoff above would land inside the outage and spend the
+                # retry on a link that is still down — which is exactly what turned
+                # one modem hiccup into a failed message. Wait for the link instead.
+                if local_transmission and not await self._await_radio_link(
+                    self._local_tx_link_wait_s(), preferred_tx_radio_id
+                ):
+                    return False
 
                 async with self._tx_lock:
                     # ── Authoritative duty-cycle gate ──────────────────────────
