@@ -399,6 +399,15 @@ class RoomServer:
             # (from before this limit was enforced on write) exceeds
             # MAX_POST_TEXT_LEN bytes -- truncate at a UTF-8 codepoint boundary.
             message_text = post["message_text"]
+            # The body is a C string on the wire: pushPostToClient sizes it with
+            # `strlen(post.text)` for both the payload and the expected ACK. A
+            # post stored with an interior NUL (the web API accepts one) would
+            # otherwise be transmitted and hashed whole, while the receiver
+            # stops at that NUL -- so its ACK would never match ours and the
+            # push would retry until it hit the failure backoff.
+            nul = message_text.find("\x00")
+            if nul >= 0:
+                message_text = message_text[:nul]
             if len(message_text.encode("utf-8")) > MAX_POST_TEXT_LEN:
                 message_text = _truncate_utf8(message_text, MAX_POST_TEXT_LEN)
             message_bytes = message_text.encode("utf-8")

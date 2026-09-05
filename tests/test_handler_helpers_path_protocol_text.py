@@ -1,3 +1,4 @@
+import asyncio
 import struct
 import time
 from types import SimpleNamespace
@@ -5,7 +6,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from openhop_core.node.handlers.result import HandlerResult
+from openhop_core.node.handlers.text import TXT_ACK_DELAY_MS
 from openhop_core.protocol import Identity, LocalIdentity
+from openhop_core.protocol.constants import PAYLOAD_TYPE_ACK
 from openhop_core.protocol.packet_builder import PacketBuilder
 
 from repeater.handler_helpers.acl import (
@@ -16,7 +19,7 @@ from repeater.handler_helpers.acl import (
 )
 from repeater.handler_helpers.path import PathHelper
 from repeater.handler_helpers.protocol_request import ProtocolRequestHelper
-from repeater.handler_helpers.text import TextHelper, _may_ack
+from repeater.handler_helpers.text import CORE_ACCEPTS_ACK_POLICY, TextHelper, _may_ack
 
 # ---------------------------------------------------------------------------
 # Real-crypto collision scaffolding (BUG-053 "try all local candidates").
@@ -602,7 +605,9 @@ async def test_room_dispatches_on_type_not_text(txt_type, is_command):
     "get status" ran as a command rather than being posted, and a CLI command
     whose text was not in the prefix list was published to the room.
 
-    Both cases use the *same* text, so only the type can decide.
+    Both cases use the *same* text, so only the type can decide. The text is
+    one `_is_cli_command` recognises, which is what makes the PLAIN row the
+    discriminator; the unrecognised direction is covered separately below.
     """
     helper, room = _room_helper()
 
@@ -615,6 +620,29 @@ async def test_room_dispatches_on_type_not_text(txt_type, is_command):
 
     assert room.cli.handle_command.called is is_command
     assert room.add_post.await_count == (0 if is_command else 1)
+
+
+@pytest.mark.asyncio
+async def test_room_runs_a_command_whose_text_is_not_a_known_prefix():
+    """[fails pre-fix] The other direction: an unrecognised CLI command still runs.
+
+    Deciding from the text published a command to the room whenever it was not
+    in `_is_cli_command`'s prefix list -- the room's members got to read what
+    the admin meant to run. Firmware routes every CLI_DATA/CLI_COMMAND from an
+    admin through handleCommand regardless of what it says
+    (simple_room_server::onPeerDataRecv).
+    """
+    helper, room = _room_helper()
+
+    await _deliver(
+        helper,
+        _TxtPacket("frobnicate", 1, sender_timestamp=100),
+        identity_type="room_server",
+        name="room",
+    )
+
+    room.cli.handle_command.assert_called_once()
+    room.add_post.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -659,7 +687,12 @@ async def test_repeater_command_is_not_run_twice(second_timestamp, label):
 
 @pytest.mark.asyncio
 async def test_repeater_command_runs_again_for_a_newer_timestamp():
-    """The guard blocks replays, not legitimate repeat commands."""
+    """A guard against over-blocking: a newer timestamp is fresh work.
+
+    Prerequisite rather than regression proof -- it passes with the guard
+    removed too. It is here so a future tightening of _accept_once cannot
+    quietly reject the legitimate case.
+    """
     helper = _repeater_cli_helper()
 
     await _deliver(helper, _TxtPacket("reboot", 1, sender_timestamp=100))
@@ -760,9 +793,72 @@ def test_may_ack_stays_quiet_for_an_unknown_client():
 
 
 def test_may_ack_keeps_acking_when_the_core_reports_no_type():
-    """An older core publishes no txt_type; do not go silent on that account."""
+    """An older core publishes no txt_type; do not go silent on that account.
+
+    Reached only through the compatibility fallback: a core old enough to omit
+    the type is also too old to install the policy, so this pins _may_ack's own
+    contract rather than a path the pair can take together.
+    """
     client = _FakeClient(pubkey=bytes([0x21]) + b"x" * 31, shared_secret=b"k" * 32, permissions=0)
     assert _may_ack("room_server", client, None, 100) is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "permissions,expect_ack",
+    [
+        (PERM_ACL_READ_WRITE, True),  # a writer's post is stored and answered
+        (0, False),  # PERM_ACL_GUEST -- neither stored nor answered
+    ],
+)
+async def test_guest_plain_post_earns_no_ack_on_the_wire(permissions, expect_ack):
+    """[fails pre-fix] End to end: a guest's post produces nothing on the air.
+
+    This drives the whole MC-R4 seam with real crypto -- a genuinely encrypted
+    PLAIN DM, a real registered room identity, core's real TextMessageHandler,
+    the real ACL -- and watches the injector. Core schedules the ACK before
+    this helper's gates run, so without the policy the guest would see delivery
+    confirmed for a post that was then refused.
+
+    simple_room_server::onPeerDataRecv gives a guest neither storage nor ACK.
+    """
+    if not CORE_ACCEPTS_ACK_POLICY:
+        pytest.skip("installed openhop_core has no should_ack_fn hook")
+
+    server, sender = _distinct_identities(2)
+    acl = ACL()
+    client = ClientInfo(Identity(sender.get_public_key()), permissions=permissions)
+    client.shared_secret = Identity(sender.get_public_key()).calc_shared_secret(
+        server.get_private_key()
+    )
+    acl.clients[sender.get_public_key()] = client
+
+    injector = AsyncMock(return_value=True)
+    helper = TextHelper(
+        identity_manager=MagicMock(),
+        packet_injector=injector,
+        acl_dict={server.get_public_key()[0]: acl},
+    )
+    room = MagicMock()
+    room.add_post = AsyncMock(return_value=True)
+    room.cli = None
+    helper.register_identity("room", server, identity_type="room_server", radio_config={})
+    helper.room_servers[server.get_public_key()[0]] = room
+
+    packet, _crc = PacketBuilder.create_text_message(
+        _SendDest(server.get_public_key()), sender, "hello room", 0, "direct", None, 0
+    )
+    assert await helper.process_text_packet(packet) is True
+
+    # The ACK is scheduled on a delay; give it room to fire if it was going to.
+    await asyncio.sleep(TXT_ACK_DELAY_MS / 1000.0 + 0.2)
+
+    acked = any(
+        getattr(call.args[0], "get_payload_type", lambda: None)() == PAYLOAD_TYPE_ACK
+        for call in injector.await_args_list
+    )
+    assert acked is expect_ack
+    assert room.add_post.await_count == (1 if expect_ack else 0)
 
 
 def test_register_identity_survives_a_core_without_the_ack_hook():
@@ -811,7 +907,11 @@ def test_register_identity_hands_the_core_handler_an_ack_policy():
     )
     identity = _FakeId(bytes([0x33]) + b"x" * 31)
 
+    # Pin the capability flag: this test is about what the policy decides, not
+    # about which core happens to be importable, and indexing the kwarg would
+    # KeyError under an older one.
     with (
+        patch("repeater.handler_helpers.text.CORE_ACCEPTS_ACK_POLICY", True),
         patch("repeater.handler_helpers.text.TextMessageHandler") as tmh,
         patch("repeater.handler_helpers.text.MeshCLI", return_value=MagicMock()),
     ):
