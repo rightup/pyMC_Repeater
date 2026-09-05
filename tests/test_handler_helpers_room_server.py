@@ -368,6 +368,49 @@ async def test_room_server_push_post_to_client_clamps_oversized_legacy_stored_te
 
 
 @pytest.mark.asyncio
+async def test_room_server_push_ends_the_text_at_an_embedded_nul():
+    """[fails pre-fix] A stored post with an interior NUL is cut where firmware cuts it.
+
+    pushPostToClient sizes the body with `strlen(post.text)`, for the payload
+    and the expected ACK alike. The web API will store "a\0b", so pushing it
+    whole sends text the receiver cannot see -- it stops at the NUL -- and,
+    worse, hashes the pending ACK over a span the receiver never reproduces.
+    The push would then never be acknowledged and would retry into the
+    failure backoff.
+    """
+    db = _FakeDB()
+    db.get_client_sync.return_value = {"push_failures": 0}
+    injector = AsyncMock(return_value=True)
+    rs = _make_room_server(db=db, injector=injector)
+    rs.global_limiter = SimpleNamespace(acquire=AsyncMock(), release=MagicMock())
+    rs._handle_ack_received = AsyncMock()
+
+    client = _FakeClient(pubkey=b"E" * 32, out_path=b"\xaa\xbb", out_path_len=2)
+    post = {
+        "author_pubkey": (b"F" * 32).hex(),
+        "message_text": "a\x00b",
+        "post_timestamp": 1234.5,
+    }
+
+    packet = SimpleNamespace(path=bytearray(), path_len=0)
+    with (
+        patch(
+            "repeater.handler_helpers.room_server.CryptoUtils.sha256",
+            return_value=b"\x01\x02\x03\x04abcd",
+        ),
+        patch(
+            "repeater.handler_helpers.room_server.PacketBuilder.create_datagram",
+            return_value=packet,
+        ) as create_datagram,
+    ):
+        ok = await rs.push_post_to_client(client, post)
+
+    assert ok is True
+    # Prefix is timestamp(4) + flags(1) + author_prefix(4) = 9 bytes.
+    assert create_datagram.call_args.kwargs["plaintext"][9:] == b"a"
+
+
+@pytest.mark.asyncio
 async def test_room_server_push_expected_ack_matches_firmware_signed_ack():
     """The pending ACK CRC must match what a signed-plain receiver sends back.
 

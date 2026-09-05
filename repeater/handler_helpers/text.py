@@ -107,6 +107,12 @@ def _may_ack(identity_type, client, txt_type, sender_timestamp) -> bool:
     A retry (equal timestamp) *is* acknowledged by both -- firmware suppresses
     the work, not the answer -- so only a strictly older stamp fails here.
 
+    This predicts *eligibility*, not the outcome. A post that clears the role
+    and replay checks and is then refused by ``add_post`` -- openHop's own
+    per-client rate limit, or a database error, neither of which firmware has --
+    is still acknowledged. Closing that would mean feeding the store result back
+    to an ACK the core handler has already scheduled.
+
     ``txt_type is None`` means a core too old to publish it; there is nothing to
     judge, so keep the previous behaviour rather than silently going quiet.
     """
