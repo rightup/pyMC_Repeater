@@ -245,7 +245,7 @@ class ConfigManager:
         try:
             normalize_modem_config_in_place(self.config)
             os.makedirs(os.path.dirname(self.config_path), exist_ok=True)
-            with open(self.config_path, "w") as f:
+            with open(self.config_path, "w", encoding="utf-8") as f:
                 # Use safe_dump with explicit width to prevent line wrapping
                 # Setting width to a very large number prevents truncation of long strings like identity keys
                 yaml.safe_dump(

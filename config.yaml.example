@@ -190,12 +190,12 @@ gps:
 
   # ---------------------------------------------------------------------------
   # Location behaviour
-  # Three independent controls — read the comments carefully, they do
+  # Three independent controls - read the comments carefully, they do
   # different things:
   #
-  #   api_fallback_to_config_location  — what the API *displays* before a fix
-  #   advertise_gps_location           — what the mesh *advertises* in adverts
-  #   persist_gps_fix_to_config        — whether the fix is *written* to config
+  #   api_fallback_to_config_location  - what the API *displays* before a fix
+  #   advertise_gps_location           - what the mesh *advertises* in adverts
+  #   persist_gps_fix_to_config        - whether the fix is *written* to config
   # ---------------------------------------------------------------------------
 
   # API display: while GPS has no valid fix, show repeater.latitude/longitude

@@ -1758,8 +1758,15 @@ class APIEndpoints:
             # Explicit setup writes canonical names only.
             config_yaml = normalize_modem_config(config_yaml)
             config_yaml["setup_completed"] = True
-            with open(self._config_path, "w") as f:
-                yaml.dump(config_yaml, f, default_flow_style=False, sort_keys=False)
+            with open(self._config_path, "w", encoding="utf-8") as f:
+                yaml.safe_dump(
+                    config_yaml,
+                    f,
+                    default_flow_style=False,
+                    sort_keys=False,
+                    allow_unicode=True,
+                    width=1000000,
+                )
             self.config["setup_completed"] = True
 
             logger.info(
