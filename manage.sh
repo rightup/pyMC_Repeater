@@ -60,6 +60,55 @@ is_expected_repo_checkout() {
     return 1
 }
 
+# Refresh the checkout supplying both the package and its management logic.
+# Never pull the caller's cwd or silently merge/stash administrator changes.
+refresh_upgrade_checkout() {
+    local silent="${1:-true}"
+    local before after branch changes
+
+    if [ ! -e "$SCRIPT_DIR/.git" ]; then
+        echo "No Git checkout beside manage.sh; keeping standalone upgrade source."
+        return 0
+    fi
+    if ! command -v git >/dev/null 2>&1; then
+        error "Git is required to update the manage.sh checkout"
+        return 1
+    fi
+    branch="$(git -C "$SCRIPT_DIR" symbolic-ref --quiet --short HEAD)" || {
+        error "Checkout has detached HEAD; switch to the branch you want to upgrade first"
+        return 1
+    }
+    changes="$(git -C "$SCRIPT_DIR" status --porcelain --untracked-files=no)" || return 1
+    if [ -n "$changes" ]; then
+        error "Checkout has local changes; commit or stash them before upgrading"
+        return 1
+    fi
+    if ! git -C "$SCRIPT_DIR" rev-parse --verify '@{upstream}' >/dev/null 2>&1; then
+        error "Branch $branch has no upstream; configure its tracking branch before upgrading"
+        return 1
+    fi
+    before="$(git -C "$SCRIPT_DIR" hash-object "$SCRIPT_PATH")" || return 1
+    echo ">>> Pulling checkout branch $branch in $SCRIPT_DIR ..."
+    if ! git -C "$SCRIPT_DIR" pull --ff-only; then
+        error "Git pull failed; upgrade aborted before changing the installation"
+        return 1
+    fi
+    after="$(git -C "$SCRIPT_DIR" hash-object "$SCRIPT_PATH")" || return 1
+    echo "Checkout revision: $(git -C "$SCRIPT_DIR" rev-parse HEAD)"
+    if [ "$before" != "$after" ]; then
+        echo "manage.sh changed; restarting with the updated upgrade logic..."
+        # The new process acquires the lock normally. No installation changes
+        # have happened yet; aborting on a competing upgrade is safe.
+        exec 9>&-
+        if [[ "$silent" == "true" ]]; then
+            exec bash "$SCRIPT_PATH" upgrade --silent
+        else
+            exec bash "$SCRIPT_PATH" upgrade --interactive
+        fi
+    fi
+    return 0
+}
+
 determine_package_source() {
     local script_dir=$1
     local requested_ref=$2
@@ -1164,6 +1213,8 @@ upgrade_repeater() {
         error "Invalid upgrade ref: $requested_ref"
         return 1
     fi
+
+    refresh_upgrade_checkout "$silent" || return 1
 
     package_source="$(determine_package_source "$SCRIPT_DIR" "$requested_ref")"
     package_requirement="$(build_package_requirement "$package_source")"

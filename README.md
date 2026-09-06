@@ -271,11 +271,25 @@ sudo bash ./manage.sh upgrade
 
 The upgrade script will:
 
-- Pull the latest code from the main branch
+- Run `git pull --ff-only` in the checkout containing `manage.sh`, following the
+  current branch's configured upstream (it does not switch branches)
+- Re-execute the updated script if the pull changed `manage.sh`, so new upgrade
+  logic takes effect in the same invocation
 - Update application files
 - Upgrade Python dependencies if needed
 - Restart the service automatically
 - Preserve the existing configuration
+
+The pull happens before installation/configuration changes. Local tracked changes,
+a detached HEAD, a missing upstream, or a failed pull abort the upgrade without
+stashing, resetting, or merging your work. Resolve those Git conditions first.
+Untracked files are left alone; Git still refuses a pull that would overwrite them.
+
+A standalone copy of `manage.sh` outside a checkout cannot pull itself; its existing
+Git-package fallback uses `dev` (or `OPENHOP_UPGRADE_REF`). Run from a current clone
+to keep the management script and support files aligned with the installed package.
+Older scripts without this self-update step need one manual `git pull --ff-only`
+before running `sudo bash ./manage.sh upgrade` to pick up this behavior.
 
 ## Proxmox LXC Installation
 
