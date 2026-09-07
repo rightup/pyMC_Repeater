@@ -99,25 +99,45 @@ def get_container_restart_message() -> str:
 def ensure_plugin_manager_service() -> Tuple[bool, str]:
     """Ensure the packaged plugin-manager systemd unit is installed and running.
 
-    This is intentionally idempotent and root-only. It is safe to run during
-    startup and after upgrades so a single upgrade can heal older installs that
-    pre-date the plugin-manager system service.
+    This is intentionally idempotent. It runs as root when already privileged,
+    or via sudo when the app is started under a service account, so a single
+    upgrade can heal older installs that pre-date the plugin-manager system
+    service without requiring a second update.
     """
     if is_container() or is_buildroot():
         return True, "Plugin-manager bootstrap skipped in container/buildroot environment"
 
-    if os.geteuid() != 0:
-        logger.info(
-            "Plugin-manager bootstrap skipped: root privileges required for systemd provisioning"
-        )
-        return (
-            True,
-            "Plugin-manager bootstrap skipped: root privileges required for systemd provisioning",
-        )
-
     venv_python = "/opt/openhop_repeater/venv/bin/python"
     if not os.path.isfile(venv_python):
         return False, "Plugin-manager bootstrap skipped: venv not present"
+
+    sudo_cmd: list[str] = []
+    if os.geteuid() != 0:
+        sudo_bin = shutil.which("sudo")
+        if not sudo_bin:
+            logger.info(
+                "Plugin-manager bootstrap skipped: root privileges required for systemd provisioning"
+            )
+            return (
+                True,
+                "Plugin-manager bootstrap skipped: root privileges required for systemd provisioning",
+            )
+        sudo_cmd = [sudo_bin, "--non-interactive"]
+
+    install_cmd = [
+        "/usr/bin/install",
+        "-o",
+        "root",
+        "-g",
+        "root",
+        "-m",
+        "0644",
+    ]
+    daemon_reload = ["/bin/systemctl", "daemon-reload"]
+    enable_cmd = ["/bin/systemctl", "enable", "openhop-plugin-manager"]
+    is_active_cmd = ["/bin/systemctl", "is-active", "--quiet", "openhop-plugin-manager"]
+    start_cmd = ["/bin/systemctl", "start", "openhop-plugin-manager"]
+    restart_cmd = ["/bin/systemctl", "restart", "openhop-plugin-manager"]
 
     package_unit = None
     code = """
@@ -170,22 +190,30 @@ sys.exit(1)
                     changed = True
 
         if changed:
-            shutil.copy2(package_unit, unit_path)
             subprocess.run(
-                [_SYSTEMCTL_BIN, "daemon-reload"], check=False, capture_output=True, text=True
+                sudo_cmd + install_cmd + [package_unit, unit_path],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                sudo_cmd + daemon_reload,
+                check=False,
+                capture_output=True,
+                text=True,
             )
             logger.info("Plugin-manager unit installed or refreshed")
         else:
             logger.info("Plugin-manager unit already matches packaged version")
 
         subprocess.run(
-            [_SYSTEMCTL_BIN, "enable", "openhop-plugin-manager"],
+            sudo_cmd + enable_cmd,
             check=False,
             capture_output=True,
             text=True,
         )
         active = subprocess.run(
-            [_SYSTEMCTL_BIN, "is-active", "--quiet", "openhop-plugin-manager"],
+            sudo_cmd + is_active_cmd,
             check=False,
             capture_output=True,
             text=True,
@@ -193,7 +221,7 @@ sys.exit(1)
         if active.returncode != 0:
             logger.info("Starting plugin-manager service")
             subprocess.run(
-                [_SYSTEMCTL_BIN, "start", "openhop-plugin-manager"],
+                sudo_cmd + start_cmd,
                 check=False,
                 capture_output=True,
                 text=True,
@@ -201,7 +229,7 @@ sys.exit(1)
         elif changed:
             logger.info("Restarting plugin-manager service after unit refresh")
             subprocess.run(
-                [_SYSTEMCTL_BIN, "restart", "openhop-plugin-manager"],
+                sudo_cmd + restart_cmd,
                 check=False,
                 capture_output=True,
                 text=True,
