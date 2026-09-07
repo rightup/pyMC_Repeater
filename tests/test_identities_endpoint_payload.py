@@ -15,7 +15,6 @@ from unittest.mock import MagicMock
 
 import cherrypy
 import pytest
-
 from openhop_core.protocol import LocalIdentity
 
 from repeater.identity_manager import IdentityManager
