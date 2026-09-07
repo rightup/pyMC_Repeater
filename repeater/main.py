@@ -48,7 +48,7 @@ from repeater.identity_manager import IdentityConfigurationError, IdentityManage
 from repeater.logging_utils import normalize_log_level
 from repeater.neighbors_publisher import NeighborsPublisher
 from repeater.packet_router import PacketRouter
-from repeater.region_map_builder import build_region_map
+from repeater.region_map_builder import build_region_map, resolve_default_scope_key
 from repeater.sensors import SensorManager
 from repeater.utils_packet import create_scoped_advert_packet
 from repeater.web.http_server import HTTPStatsServer, _log_buffer
@@ -256,6 +256,7 @@ class RepeaterDaemon:
         self._region_map = build_region_map(self.config, sqlite_handler)
         if self.dispatcher is not None:
             self.dispatcher.region_map = self._region_map
+        self.refresh_default_flood_scope()
         if sqlite_handler is not None and hasattr(
             sqlite_handler, "set_transport_keys_changed_callback"
         ):
@@ -263,6 +264,50 @@ class RepeaterDaemon:
         logger.info(
             "Region map initialized with %d served region(s)",
             len(self._region_map.regions),
+        )
+
+    def refresh_default_flood_scope(self) -> None:
+        """Re-resolve ``mesh.default_region`` onto the dispatcher's default scope.
+
+        Firmware's ``simple_repeater`` holds a ``default_scope`` TransportKey and
+        answers the ``REPLY_SCOPE_DEFAULT`` row with
+        ``sendFloodScoped(default_scope, ...)``. Core expresses that key as
+        ``Dispatcher.default_flood_transport_key``, which its send-time resolver
+        reads for any flood packet no earlier layer decided -- so this is the half
+        that makes a reply whose request scope was unknowable go out scoped rather
+        than plain. See ``region_map_builder.resolve_default_scope_key`` for which
+        replies those are, and why plain ones die at hop 0.
+
+        Re-run from three places, because three separate things change the answer:
+        boot (``_init_region_map``), a transport_keys edit that adds, removes or
+        re-keys the default region (``refresh_region_map``), and a runtime
+        ``mesh.default_region`` change (``ConfigManager.live_update_daemon``).
+
+        Companion bridges are covered by this one assignment rather than needing
+        their own: a deferred reply from a bridge's login server reaches the shared
+        dispatcher unmarked, so it resolves here. That mirrors firmware
+        ``simple_room_server``, which keeps its own ``default_scope`` for exactly
+        these rows. A bridge's *outgoing requests* are a different matter -- those
+        take the bridge's own companion scope, which its app owns over the frame
+        protocol, as ``_prefs.default_scope_key`` does on a firmware companion.
+        """
+        if self.dispatcher is None:
+            return
+        region_map = self._region_map
+        if region_map is None:
+            self.dispatcher.default_flood_transport_key = None
+            return
+        try:
+            key = resolve_default_scope_key(self.config, region_map)
+        except Exception:
+            # Never let a bad default-region value break TX: an unresolved default
+            # is a plain flood, which is firmware's null-default row.
+            logger.debug("Failed to resolve mesh.default_region", exc_info=True)
+            key = None
+        self.dispatcher.default_flood_transport_key = key
+        logger.info(
+            "Default flood scope %s",
+            "resolved from mesh.default_region" if key else "unset (replies flood un-scoped)",
         )
 
     def refresh_region_map(self) -> None:
@@ -285,6 +330,10 @@ class RepeaterDaemon:
                 bridge.region_map = new_map
             except Exception:
                 logger.debug("Failed to update region map on a companion bridge", exc_info=True)
+        # After the rebind, so the default resolves against the map that is now
+        # live: this hook is exactly where the default region gains, loses or
+        # re-keys its entry.
+        self.refresh_default_flood_scope()
         logger.info("Region map refreshed with %d served region(s)", len(new_map.regions))
 
     async def initialize(self):
