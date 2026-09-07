@@ -5963,6 +5963,12 @@ class APIEndpoints:
                     (r for r in registered_identities if r["name"] == f"room_server:{name}"), None
                 )
 
+                pk_display = None
+                if matching:
+                    pk_display = matching.get("public_key")
+                else:
+                    pk_display = derive_companion_public_key_hex(room_config.get("identity_key"))
+
                 configured.append(
                     {
                         "name": name,
@@ -5974,6 +5980,7 @@ class APIEndpoints:
                         "settings": settings,
                         "hash": matching["hash"] if matching else None,
                         "address": matching["address"] if matching else None,
+                        "public_key": pk_display,
                         "registered": matching is not None,
                     }
                 )
