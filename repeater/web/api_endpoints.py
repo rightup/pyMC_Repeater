@@ -6,6 +6,7 @@ import secrets
 import time
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from datetime import datetime, timezone
+from pathlib import Path
 from threading import RLock
 from typing import Callable, Optional
 
@@ -2378,7 +2379,8 @@ class APIEndpoints:
         out = []
         try:
             from repeater.config import resolve_storage_dir
-            from repeater.plugins.storage import PluginStorage, resolve_plugins_root, safe_join
+            from repeater.plugins.manifest import ui_subtree
+            from repeater.plugins.storage import PluginStorage, resolve_plugins_root
         except Exception as exc:
             logger.debug("plugin UI frontends unavailable: %s", exc)
             return out
@@ -2399,7 +2401,9 @@ class APIEndpoints:
                     continue
                 paths = storage.paths_for(plugin_id)
                 if paths.current_link.exists() or paths.current_link.is_symlink():
-                    release_root = paths.current_link.resolve()
+                    # Keep a stable filesystem path under "current" so saved
+                    # web.web_path does not pin to a specific release version.
+                    release_root = paths.current_link
                 else:
                     version = state.get("version") or (manifest.version if manifest else None)
                     if not version:
@@ -2408,11 +2412,12 @@ class APIEndpoints:
                 if not release_root.is_dir():
                     continue
                 entry = str(manifest.ui.entry or "").replace("\\", "/")
+                ui_subtree(entry)
                 entry_parts = tuple(p for p in entry.split("/") if p)
                 if not entry_parts:
                     continue
                 if len(entry_parts) > 1:
-                    doc_root = safe_join(release_root, *entry_parts[:-1])
+                    doc_root = release_root.joinpath(*entry_parts[:-1])
                     entry_name = entry_parts[-1]
                 else:
                     doc_root = release_root
@@ -2441,6 +2446,56 @@ class APIEndpoints:
                 logger.debug("skip plugin frontend %s: %s", plugin_id, exc)
                 continue
         return out
+
+    def _plugin_id_from_web_path(self, web_path: str) -> Optional[str]:
+        value = str(web_path or "").strip()
+        if not value:
+            return None
+        if value.startswith("plugin:"):
+            plugin_id = value.split(":", 1)[1].strip()
+            return plugin_id or None
+        if value.startswith("/plugins/"):
+            suffix = value[len("/plugins/") :].strip("/")
+            plugin_id = suffix.split("/", 1)[0] if suffix else ""
+            return plugin_id or None
+
+        try:
+            from repeater.config import resolve_storage_dir
+            from repeater.plugins.storage import resolve_plugins_root
+
+            storage_dir = resolve_storage_dir(self.config, config_path=self._config_path)
+            plugins_root = resolve_plugins_root(self.config, storage_dir=storage_dir).resolve()
+            rel = Path(value).expanduser().resolve(strict=False).relative_to(plugins_root)
+            parts = rel.parts
+            if len(parts) >= 2 and parts[1] in {"current", "releases"}:
+                return parts[0] or None
+        except Exception:
+            return None
+        return None
+
+    def _normalize_web_path_for_persistence(self, web_path):
+        if web_path is None:
+            return None
+        value = str(web_path).strip()
+        if not value:
+            return None
+
+        plugin_id = self._plugin_id_from_web_path(value)
+        if plugin_id:
+            return f"plugin:{plugin_id}"
+
+        abs_value = os.path.abspath(value)
+        for item in self._plugin_ui_frontends():
+            if item.get("kind") != "plugin":
+                continue
+            item_path = item.get("path")
+            if not item_path:
+                continue
+            if os.path.abspath(str(item_path)) == abs_value:
+                item_plugin_id = str(item.get("plugin_id") or "").strip()
+                if item_plugin_id:
+                    return f"plugin:{item_plugin_id}"
+        return value
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
@@ -2526,7 +2581,14 @@ class APIEndpoints:
             if current_path:
                 # Prefer exact path match; fall back to path prefix for console.
                 matched = None
+                plugin_id = self._plugin_id_from_web_path(current_path)
+                if plugin_id:
+                    candidate_id = f"plugin:{plugin_id}"
+                    if any(item.get("id") == candidate_id for item in frontends):
+                        matched = candidate_id
                 for item in frontends:
+                    if matched is not None:
+                        break
                     path = item.get("path")
                     if not path:
                         continue
@@ -2586,6 +2648,13 @@ class APIEndpoints:
 
             if not updates:
                 return self._error("No configuration updates provided")
+
+            if isinstance(updates.get("web"), dict) and "web_path" in updates["web"]:
+                updates = dict(updates)
+                updates["web"] = dict(updates["web"])
+                updates["web"]["web_path"] = self._normalize_web_path_for_persistence(
+                    updates["web"].get("web_path")
+                )
 
             # Use ConfigManager to update and save configuration
             # Persist web changes first, then apply to running HTTP server.

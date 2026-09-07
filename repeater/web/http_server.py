@@ -251,12 +251,14 @@ class StatsApp:
         self.pub_key = pub_key
         self.dashboard_template = None
         self.config = config or {}
+        self._config_path = config_path
         self.default_html_dir = os.path.join(os.path.dirname(__file__), "html")
 
         # Path to the compiled Vue.js application
         # Use web_path from config if provided, otherwise use default
         web_path = self.config.get("web", {}).get("web_path")
-        self.html_dir = (
+        plugin_dir = self._resolve_plugin_frontend_dir(web_path)
+        self.html_dir = plugin_dir or (
             web_path if web_path is not None and os.path.isdir(web_path) else self.default_html_dir
         )
 
@@ -268,10 +270,80 @@ class StatsApp:
         # Create doc endpoint for API documentation
         self.doc = DocEndpoint(self.api)
 
+    def _resolve_plugin_frontend_dir(self, web_path: object) -> Optional[str]:
+        value = str(web_path or "").strip()
+        if not value:
+            return None
+
+        try:
+            from repeater.plugins.manifest import ui_subtree
+            from repeater.plugins.storage import PluginStorage, resolve_plugins_root
+
+            storage_dir = resolve_storage_dir(self.config, config_path=self._config_path)
+            plugins_root = resolve_plugins_root(self.config, storage_dir=storage_dir).resolve()
+            plugin_id: Optional[str] = None
+
+            if value.startswith("plugin:"):
+                plugin_id = value.split(":", 1)[1].strip() or None
+            elif value.startswith("/plugins/"):
+                suffix = value[len("/plugins/") :].strip("/")
+                plugin_id = (suffix.split("/", 1)[0] if suffix else "").strip() or None
+            else:
+                try:
+                    rel = Path(value).expanduser().resolve(strict=False).relative_to(plugins_root)
+                    parts = rel.parts
+                    if len(parts) >= 2 and parts[1] in {"current", "releases"}:
+                        plugin_id = parts[0] or None
+                except Exception:
+                    plugin_id = None
+
+            if not plugin_id:
+                return None
+
+            storage = PluginStorage(plugins_root)
+            state = storage.read_state(plugin_id) or {}
+            manifest = storage.load_current_manifest(plugin_id)
+            if manifest is None or manifest.ui is None:
+                return None
+
+            paths = storage.paths_for(plugin_id)
+            if paths.current_link.exists() or paths.current_link.is_symlink():
+                release_root = paths.current_link
+            else:
+                version = state.get("version") or manifest.version
+                if not version:
+                    return None
+                release_root = paths.release_dir(str(version))
+
+            entry = str(manifest.ui.entry or "").replace("\\", "/")
+            ui_subtree(entry)
+            entry_parts = tuple(p for p in entry.split("/") if p)
+            if not entry_parts:
+                return None
+
+            if len(entry_parts) > 1:
+                doc_root = release_root.joinpath(*entry_parts[:-1])
+                entry_name = entry_parts[-1]
+            else:
+                doc_root = release_root
+                entry_name = entry_parts[0]
+
+            if not doc_root.is_dir() or not (doc_root / entry_name).is_file():
+                return None
+            return str(doc_root)
+        except Exception as exc:
+            logger.debug("Plugin frontend resolve error for %r: %s", web_path, exc)
+            return None
+
     def _resolve_html_dir(self) -> str:
         web_path = self.config.get("web", {}).get("web_path")
+        plugin_dir = self._resolve_plugin_frontend_dir(web_path)
         candidate = (
-            web_path if web_path is not None and os.path.isdir(web_path) else self.default_html_dir
+            plugin_dir
+            if plugin_dir is not None
+            else web_path
+            if web_path is not None and os.path.isdir(web_path)
+            else self.default_html_dir
         )
         self.html_dir = candidate
         return candidate
