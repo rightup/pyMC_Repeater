@@ -4,16 +4,14 @@ from __future__ import annotations
 
 import json
 import logging
-import shutil
-import threading
 import os
+import shutil
 import stat
 import tempfile
+import threading
 import time
 from contextlib import contextmanager
 from functools import wraps
-
-
 from pathlib import Path
 from typing import Any, Optional
 
@@ -94,8 +92,9 @@ def _reported(operation: str):
                 raise
             finally:
                 self.runtime.on_output = previous
-            progress.finish()
-            return result
+            if progress.finished is None:
+                progress.finish()
+                return result
 
         return wrapped
 
