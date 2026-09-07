@@ -31,6 +31,77 @@ from .storage import PluginStorage
 logger = logging.getLogger("PluginManager")
 
 
+PROGRESS_MAX_LINES = 500
+PROGRESS_MAX_LOGS = 32
+
+
+class OperationProgress:
+    """Bounded output log of a plugin's last install or update."""
+
+    def __init__(self, plugin_id: str, operation: str):
+        self.plugin_id = plugin_id
+        self.operation = operation
+        self.state = "running"
+        self.error: Optional[str] = None
+        self.started = time.time()
+        self.finished: Optional[float] = None
+        self._lines: list[str] = []
+        self._dropped = 0  # cursors count every line ever appended
+        self._lock = threading.Lock()
+
+    def append(self, line: str) -> None:
+        with self._lock:
+            self._lines.append(line)
+            excess = len(self._lines) - PROGRESS_MAX_LINES
+            if excess > 0:
+                del self._lines[:excess]
+                self._dropped += excess
+
+    def finish(self, error: Optional[str] = None) -> None:
+        with self._lock:
+            self.state = "error" if error else "complete"
+            self.error = error
+            self.finished = time.time()
+
+    def snapshot(self, since: int = 0) -> dict[str, Any]:
+        with self._lock:
+            start = max(0, min(int(since) - self._dropped, len(self._lines)))
+            return {
+                "id": self.plugin_id,
+                "operation": self.operation,
+                "state": self.state,
+                "error": self.error,
+                "lines": list(self._lines[start:]),
+                "next": self._dropped + len(self._lines),
+                "started": self.started,
+                "finished": self.finished,
+            }
+
+
+def _reported(operation: str):
+    """Record the operation's installer output and outcome for /plugins/progress."""
+
+    def decorate(fn):
+        @wraps(fn)
+        def wrapped(self, plugin_id, *args, **kwargs):
+            progress = self._start_progress(plugin_id, operation)
+            previous = self.runtime.on_output
+            self.runtime.on_output = progress.append
+            try:
+                result = fn(self, plugin_id, *args, **kwargs)
+            except Exception as exc:
+                progress.finish(str(exc))
+                raise
+            finally:
+                self.runtime.on_output = previous
+            progress.finish()
+            return result
+
+        return wrapped
+
+    return decorate
+
+
 def _serialized_plugin(fn):
     """Keep a complete lifecycle transaction exclusive, without queuing callers."""
 
@@ -66,6 +137,7 @@ class PluginManager:
         self.runtime = runtime or PluginRuntime(storage)
         self._lock = threading.RLock()
         self._operations: dict[str, tuple[int, int]] = {}
+        self._progress: dict[str, OperationProgress] = {}
         self.catalogue = catalogue_client or CatalogueClient(catalogue_url or DEFAULT_CATALOGUE_URL)
         self.github = github_client or GitHubReleaseClient()
 
@@ -86,6 +158,34 @@ class PluginManager:
                     del self._operations[plugin_id]
                 else:
                     self._operations[plugin_id] = (owner, depth - 1)
+
+    def _start_progress(self, plugin_id: str, operation: str) -> OperationProgress:
+        progress = OperationProgress(plugin_id, operation)
+        with self._lock:
+            self._progress[plugin_id] = progress
+            finished = sorted(
+                (p for p in self._progress.values() if p.state != "running"),
+                key=lambda p: p.finished or 0,
+            )
+            for old in finished[: max(0, len(self._progress) - PROGRESS_MAX_LOGS)]:
+                del self._progress[old.plugin_id]
+        return progress
+
+    def progress(self, plugin_id: str, since: int = 0) -> dict[str, Any]:
+        with self._lock:
+            progress = self._progress.get(plugin_id)
+        if progress is None:
+            return {
+                "id": plugin_id,
+                "operation": None,
+                "state": "idle",
+                "error": None,
+                "lines": [],
+                "next": 0,
+                "started": None,
+                "finished": None,
+            }
+        return progress.snapshot(since)
 
     @contextmanager
     def stage_upload(self, wheel_path: str):
@@ -430,6 +530,7 @@ class PluginManager:
         return {"schema": catalogue.schema, "plugins": plugins_out}
 
     @_serialized_plugin
+    @_reported("install")
     def install_from_catalogue(
         self,
         plugin_id: str,
@@ -568,6 +669,7 @@ class PluginManager:
         }
 
     @_serialized_plugin
+    @_reported("update")
     def update_plugin(
         self,
         plugin_id: str,

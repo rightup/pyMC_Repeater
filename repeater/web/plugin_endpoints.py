@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import shutil
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -21,6 +23,10 @@ from repeater.plugins.ipc import (
 from repeater.plugins.storage import resolve_plugin_socket_path, resolve_plugins_root
 
 logger = logging.getLogger("HTTPServer")
+
+PROGRESS_POLL_SECONDS = 0.75
+PROGRESS_MAX_SECONDS = 900.0  # the IPC completion budget
+PROGRESS_IDLE_SECONDS = 60.0
 
 
 class PluginAPIEndpoints:
@@ -305,6 +311,102 @@ class PluginAPIEndpoints:
         except (TypeError, ValueError):
             raise cherrypy.HTTPError(400, "tail must be an integer")
         return self._handle_ipc(lambda: self._client_or_raise().logs(plugin_id, tail=tail))
+
+    @cherrypy.expose
+    def progress(self, **kwargs):
+        """GET /api/plugins/progress?id=&since=&fresh= — SSE of an install or update."""
+        if cherrypy.request.method == "OPTIONS":
+            return ""
+        if cherrypy.request.method not in ("GET", "HEAD"):
+            raise cherrypy.HTTPError(405)
+        plugin_id = self._plugin_id_from(kwargs)
+        try:
+            since = int(kwargs.get("since", 0))
+        except (TypeError, ValueError):
+            raise cherrypy.HTTPError(400, "since must be an integer")
+        fresh = str(kwargs.get("fresh", "")).strip().lower() in {"1", "true", "yes", "on"}
+        cherrypy.response.headers["Content-Type"] = "text/event-stream"
+        if cherrypy.request.method == "HEAD":
+            return ""
+        cherrypy.response.headers["Cache-Control"] = "no-cache"
+        cherrypy.response.headers["X-Accel-Buffering"] = "no"
+        cherrypy.response.headers["Connection"] = "keep-alive"
+        return self._progress_events(plugin_id, since, fresh=fresh)
+
+    progress._cp_config = {"response.stream": True}
+
+    def _progress_events(
+        self,
+        plugin_id: str,
+        since: int,
+        *,
+        fresh: bool = False,
+        sleep=time.sleep,
+        clock=time.monotonic,
+    ):
+        def event(payload: dict) -> str:
+            return f"data: {json.dumps(payload)}\n\n"
+
+        def generate():
+            yield event({"type": "connected", "id": plugin_id})
+            cursor, last_state, quiet, stale = since, None, 0, None
+            opened = clock()
+            while True:
+                try:
+                    snap = self._client_or_raise().progress(plugin_id, since=cursor)
+                except GeneratorExit:
+                    return
+                except Exception as exc:
+                    yield event({"type": "done", "state": "error", "error": str(exc)})
+                    return
+
+                state, started = snap.get("state"), snap.get("started")
+                # fresh: a log already finished when the stream opened is not this operation's
+                if fresh and last_state is None and state in ("complete", "error"):
+                    stale = started
+                if stale is not None and started == stale:
+                    state, snap = "idle", {"next": cursor, "operation": None, "started": None}
+
+                changed = False
+                for line in snap.get("lines") or []:
+                    yield event({"type": "line", "line": line})
+                    changed = True
+                cursor = int(snap.get("next") or cursor)
+                if state != last_state:
+                    yield event(
+                        {
+                            "type": "status",
+                            "state": state,
+                            "operation": snap.get("operation"),
+                            "started": snap.get("started"),
+                        }
+                    )
+                    last_state, changed = state, True
+                if state in ("complete", "error"):
+                    yield event(
+                        {
+                            "type": "done",
+                            "state": state,
+                            "error": snap.get("error"),
+                            "started": snap.get("started"),
+                        }
+                    )
+                    return
+                now = clock()
+                if now >= opened + PROGRESS_MAX_SECONDS:
+                    yield event(
+                        {"type": "done", "state": "timeout", "error": "progress stream timed out"}
+                    )
+                    return
+                if state == "idle" and now >= opened + PROGRESS_IDLE_SECONDS:
+                    yield event({"type": "done", "state": "idle", "error": None})
+                    return
+                quiet = 0 if changed else quiet + 1
+                if quiet and quiet % 4 == 0:
+                    yield event({"type": "keepalive"})
+                sleep(PROGRESS_POLL_SECONDS)
+
+        return generate()
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
