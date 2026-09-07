@@ -3884,16 +3884,13 @@ class SQLiteHandler:
                         if t in self._ADVERT_TYPE_BY_API
                     }
                     stored = sorted(
-                        key
-                        for key, adv in self._ADVERT_TYPE_BY_STORED.items()
-                        if adv in wanted
+                        key for key, adv in self._ADVERT_TYPE_BY_STORED.items() if adv in wanted
                     )
                     if not stored:
                         return 0
                     placeholders = ",".join("?" * len(stored))
                     query += (
-                        " AND LOWER(REPLACE(TRIM(contact_type), ' ', '_')) "
-                        f"IN ({placeholders})"
+                        f" AND LOWER(REPLACE(TRIM(contact_type), ' ', '_')) IN ({placeholders})"
                     )
                     params.extend(stored)
                 if hours is not None:
