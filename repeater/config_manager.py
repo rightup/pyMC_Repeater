@@ -354,6 +354,15 @@ class ConfigManager:
                 self.daemon.dispatcher.set_default_path_hash_mode(path_hash_mode)
                 logger.info(f"Reloaded path hash mode: mesh.path_hash_mode={path_hash_mode}")
 
+                # mesh.default_region is firmware's default_scope, which decides
+                # the REPLY_SCOPE_DEFAULT row. Re-resolve it here rather than
+                # leaving it to the transport_keys hook: setting the default region
+                # over the web API writes the config *after* it creates the region,
+                # so that hook has already run against the previous value.
+                refresh_default_scope = getattr(self.daemon, "refresh_default_flood_scope", None)
+                if callable(refresh_default_scope):
+                    refresh_default_scope()
+
             if "radio_type" in sections:
                 logger.info("radio_type change detected; service restart required")
                 live_update_ok = False

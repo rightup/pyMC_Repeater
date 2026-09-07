@@ -122,3 +122,71 @@ def build_region_map(config, sqlite_handler) -> RegionMap:
         )
 
     return region_map
+
+
+def resolve_default_scope_key(config, region_map: RegionMap) -> Optional[bytes]:
+    """Return the transport key for ``mesh.default_region``, or ``None``.
+
+    This is firmware's ``default_scope``. ``simple_repeater`` resolves it once at
+    boot from ``region_map.getDefaultRegion()`` via
+    ``getTransportKeysFor(*r, &default_scope, 1)``, and ``sendFloodReply`` uses it
+    for the ``REPLY_SCOPE_DEFAULT`` row: a reply whose request scope is
+    *unknowable* rather than un-scoped -- a DIRECT request we hold no return path
+    for, or a transport code that matched no served region. Firmware's comment on
+    that branch is why it matters::
+
+        // un-scoped would be dropped at hop 0 by repeaters running flood.max.unscoped=0
+
+    ``None`` is firmware's ``default_scope.isNull()``, which ``chooseReplyScope``
+    turns into ``REPLY_SCOPE_NONE`` -- a plain flood. That is the correct answer
+    for an unset default and for the ``*`` wildcard, which is deliberately not a
+    region entry (see the module docstring).
+
+    Resolution goes through the built map rather than hashing the configured name
+    directly, for parity with ``getDefaultRegion()``, which can only ever return a
+    region the map holds:
+
+    - a ``$private`` default resolves to its stored key material, which its name
+      cannot reproduce;
+    - a default naming a region this repeater does not serve resolves to nothing,
+      rather than to a scope no local Region would match on the way back in;
+    - a deny-flood default still resolves, because ``REGION_DENY_FLOOD`` gates
+      *inbound* ``find_match``, not what this node may scope its own replies with.
+
+    The name is matched case-insensitively against each region's display name (the
+    stored ``#`` stripped), as ``web.api_endpoints.default_region`` matches it when
+    auto-creating the region. The key itself always comes from the matched entry,
+    so it derives from the name the table actually holds.
+    """
+    mesh_cfg = config.get("mesh", {}) if isinstance(config, dict) else {}
+    if not isinstance(mesh_cfg, dict):
+        return None
+
+    raw = mesh_cfg.get("default_region")
+    name = str(raw).strip() if raw not in (None, "") else ""
+    if name.startswith("#"):
+        name = name[1:].strip()
+    if not name or name == "*":
+        return None
+
+    needle = name.lower()
+    for region in region_map.regions:
+        display = (region.name or "").strip()
+        if display.startswith("#"):
+            display = display[1:]
+        if display.lower() == needle:
+            key = region_map.first_key_for(region)
+            if key is None:
+                logger.warning(
+                    "mesh.default_region '%s' resolves to no usable transport key; "
+                    "replies with an unknowable request scope will flood un-scoped",
+                    name,
+                )
+            return key
+
+    logger.warning(
+        "mesh.default_region '%s' is not a served region; replies with an "
+        "unknowable request scope will flood un-scoped",
+        name,
+    )
+    return None
