@@ -226,3 +226,23 @@ def test_restart_service_systemctl_and_sudo_paths(monkeypatch):
     ok, msg = su.restart_service()
     assert ok is False
     assert "Restart command failed" in msg
+
+
+def test_ensure_plugin_manager_service_runs_root_bootstrap(monkeypatch):
+    monkeypatch.setattr(su, "is_container", lambda: False)
+    monkeypatch.setattr(su, "is_buildroot", lambda: False)
+    monkeypatch.setattr(su.os, "geteuid", lambda: 1000)
+    monkeypatch.setattr(
+        su.shutil, "which", lambda name: "/usr/bin/sudo" if name == "sudo" else None
+    )
+    monkeypatch.setattr(
+        su.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args=args[0], returncode=0, stdout="ok", stderr=""
+        ),
+    )
+
+    ok, msg = su.ensure_plugin_manager_service()
+    assert ok is True
+    assert "root privileges" in msg.lower()
