@@ -308,6 +308,45 @@ def test_neighbor_link_history_uses_packets_table_and_filters_hash_and_size(tmp_
     assert rows[1]["is_duplicate"] is True
 
 
+def _store_link_observation(h, ts, score, rssi, snr, duplicate=False, hash_="AA"):
+    h.store_packet(
+        {
+            "timestamp": ts,
+            "type": 4,
+            "route": 1,
+            "length": 10,
+            "rssi": rssi,
+            "snr": snr,
+            "score": score,
+            "is_duplicate": duplicate,
+            "packet_hash": f"pkt-{ts}",
+            "upstream_hash": hash_,
+            "upstream_hash_size": 1,
+            "original_path": [hash_],
+        }
+    )
+
+
+def test_neighbor_link_history_buckets_summarise_the_rows(tmp_path):
+    h = _make_handler(tmp_path)
+    t0 = 1_700_000_400.0  # a 600 s boundary
+    _store_link_observation(h, t0 + 5, 0.2, -100, -2.0)
+    _store_link_observation(h, t0 + 300, 0.6, -80, 4.0, duplicate=True)
+    _store_link_observation(h, t0 + 599, 0.4, -90, 1.0)
+    _store_link_observation(h, t0 + 1300, 0.9, -70, 8.0)
+    _store_link_observation(h, t0 + 10, 0.0, -120, -9.0, hash_="BB")
+
+    def history(**kwargs):
+        return h.get_neighbor_link_history(peer_hash="AA", path_hash_size=1, hours=50000, **kwargs)
+
+    first, second = history(bucket_seconds=600)
+    assert (first["timestamp"], first["last_ts"], first["n"], first["dup"]) == (t0, t0 + 599, 3, 1)
+    assert (first["score"], first["rssi"], first["snr"]) == (0.4, -90.0, 1.0)
+    assert (second["timestamp"], second["n"], second["score"]) == (t0 + 1200, 1, 0.9)
+    assert [b["timestamp"] for b in history(bucket_seconds=600, limit=1)] == [t0 + 1200]
+    assert len(history()) == 4
+
+
 def test_recent_packet_queries_include_ids_and_preserve_duplicate_hash_rows(tmp_path):
     h = _make_handler(tmp_path)
 
