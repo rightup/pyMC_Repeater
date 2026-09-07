@@ -3896,10 +3896,12 @@ class APIEndpoints:
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
-    def recent_packets(self, limit=100):
+    def recent_packets(self, limit=100, include_raw=None):
         try:
             limit = int(limit)
-            packets = self._get_storage().get_recent_packets(limit=limit)
+            packets = self._get_storage().get_recent_packets(
+                limit=limit, include_raw=str(include_raw).lower() in ("true", "1", "yes")
+            )
             return self._success(packets, count=len(packets))
         except Exception as e:
             logger.error(f"Error getting recent packets: {e}")
@@ -3908,13 +3910,16 @@ class APIEndpoints:
     @cherrypy.expose
     @cherrypy.tools.gzip(compress_level=6)
     @cherrypy.tools.json_out()
-    def bulk_packets(self, limit=1000, offset=0, start_timestamp=None, end_timestamp=None):
+    def bulk_packets(
+        self, limit=1000, offset=0, start_timestamp=None, end_timestamp=None, include_raw=None
+    ):
         """
         Optimized bulk packet retrieval with gzip compression and DB-level pagination.
         """
         try:
-            # Enforce reasonable limits
-            limit = min(int(limit), 10000)
+            # Enforce reasonable limits; raw frames make a page several times heavier
+            include_raw = str(include_raw).lower() in ("true", "1", "yes")
+            limit = min(int(limit), 1000 if include_raw else 10000)
             offset = max(int(offset), 0)
 
             # Get packets from storage with TRUE DB-level pagination
@@ -3927,6 +3932,7 @@ class APIEndpoints:
                 end_timestamp=float(end_timestamp) if end_timestamp else None,
                 limit=limit,
                 offset=offset,
+                include_raw=include_raw,
             )
 
             response = {
@@ -3947,7 +3953,13 @@ class APIEndpoints:
     @cherrypy.expose
     @cherrypy.tools.json_out()
     def filtered_packets(
-        self, start_timestamp=None, end_timestamp=None, limit=1000, type=None, route=None
+        self,
+        start_timestamp=None,
+        end_timestamp=None,
+        limit=1000,
+        type=None,
+        route=None,
+        include_raw=None,
     ):
         # Handle OPTIONS request for CORS preflight
         if cherrypy.request.method == "OPTIONS":
@@ -3968,6 +3980,7 @@ class APIEndpoints:
                 start_timestamp=start_ts,
                 end_timestamp=end_ts,
                 limit=limit_int,
+                include_raw=str(include_raw).lower() in ("true", "1", "yes"),
             )
             return self._success(
                 packets,

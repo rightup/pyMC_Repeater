@@ -2078,26 +2078,29 @@ class SQLiteHandler:
             logger.error(f"Failed to get SQLite metrics data: {e}", exc_info=True)
             raise
 
-    def get_recent_packets(self, limit: int = 100) -> list:
+    _PACKET_LIST_SELECT_PLAIN = (
+        "SELECT id, "
+        "timestamp, type, route, length, rssi, snr, score, "
+        "transmitted, is_duplicate, drop_reason, src_hash, dst_hash, path_hash, "
+        "upstream_hash, upstream_hash_size, "
+        "transport_codes, payload, payload_length, "
+        "tx_delay_ms, rx_radio_id, tx_radio_id, "
+        "packet_hash, original_path, forwarded_path, "
+        "lbt_attempts, lbt_channel_busy "
+        "FROM packets"
+    )
+    _PACKET_LIST_SELECT_RAW = _PACKET_LIST_SELECT_PLAIN.replace(
+        " FROM packets", ", raw_packet FROM packets"
+    )
+
+    def get_recent_packets(self, limit: int = 100, include_raw: bool = False) -> list:
         try:
             with self._connect() as conn:
                 conn.row_factory = sqlite3.Row
 
                 packets = conn.execute(
-                    """
-                    SELECT
-                        id,
-                        timestamp, type, route, length, rssi, snr, score,
-                        transmitted, is_duplicate, drop_reason, src_hash, dst_hash, path_hash,
-                        upstream_hash, upstream_hash_size,
-                        transport_codes, payload, payload_length,
-                        tx_delay_ms, rx_radio_id, tx_radio_id,
-                        packet_hash, original_path, forwarded_path,
-                        lbt_attempts, lbt_channel_busy
-                    FROM packets
-                    ORDER BY timestamp DESC
-                    LIMIT ?
-                """,
+                    f"{self._PACKET_LIST_SELECT_RAW if include_raw else self._PACKET_LIST_SELECT_PLAIN}"
+                    " ORDER BY timestamp DESC LIMIT ?",
                     (limit,),
                 ).fetchall()
 
@@ -2115,6 +2118,7 @@ class SQLiteHandler:
         end_timestamp: Optional[float] = None,
         limit: int = 1000,
         offset: int = 0,
+        include_raw: bool = False,
     ) -> list:
         try:
             with self._connect() as conn:
@@ -2139,18 +2143,9 @@ class SQLiteHandler:
                     where_clauses.append("timestamp <= ?")
                     params.append(end_timestamp)
 
-                base_query = """
-                    SELECT
-                        id,
-                        timestamp, type, route, length, rssi, snr, score,
-                        transmitted, is_duplicate, drop_reason, src_hash, dst_hash, path_hash,
-                        upstream_hash, upstream_hash_size,
-                        transport_codes, payload, payload_length,
-                        tx_delay_ms, rx_radio_id, tx_radio_id,
-                        packet_hash, original_path, forwarded_path,
-                        lbt_attempts, lbt_channel_busy
-                    FROM packets
-                """
+                base_query = (
+                    self._PACKET_LIST_SELECT_RAW if include_raw else self._PACKET_LIST_SELECT_PLAIN
+                )
 
                 if where_clauses:
                     query = f"{base_query} WHERE {' AND '.join(where_clauses)}"

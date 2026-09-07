@@ -451,8 +451,8 @@ class StorageCollector:
     def get_packet_stats(self, hours: int = 24) -> dict:
         return self.sqlite_handler.get_packet_stats(hours)
 
-    def get_recent_packets(self, limit: int = 100) -> list:
-        return self.sqlite_handler.get_recent_packets(limit)
+    def get_recent_packets(self, limit: int = 100, include_raw: bool = False) -> list:
+        return self.sqlite_handler.get_recent_packets(limit, include_raw=include_raw)
 
     def get_filtered_packets(
         self,
@@ -462,9 +462,16 @@ class StorageCollector:
         end_timestamp: Optional[float] = None,
         limit: int = 1000,
         offset: int = 0,
+        include_raw: bool = False,
     ) -> list:
         return self.sqlite_handler.get_filtered_packets(
-            packet_type, route, start_timestamp, end_timestamp, limit, offset
+            packet_type,
+            route,
+            start_timestamp,
+            end_timestamp,
+            limit,
+            offset,
+            include_raw=include_raw,
         )
 
     def get_airtime_data(

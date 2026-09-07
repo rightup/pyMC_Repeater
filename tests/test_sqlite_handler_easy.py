@@ -349,6 +349,27 @@ def test_recent_packet_queries_include_ids_and_preserve_duplicate_hash_rows(tmp_
     assert by_id["packet_hash"] == "same-hash"
 
 
+def test_packet_list_queries_add_raw_frame_only_on_request(tmp_path):
+    h = _make_handler(tmp_path)
+    h.store_packet(
+        {
+            "timestamp": 100.0,
+            "type": 2,
+            "route": 1,
+            "length": 12,
+            "transmitted": False,
+            "is_duplicate": False,
+            "packet_hash": "with-frame",
+            "raw_packet": "0901aa55",
+        }
+    )
+    assert "raw_packet" not in h.get_recent_packets(limit=10)[0]
+    assert "raw_packet" not in h.get_filtered_packets(limit=10)[0]
+    assert h.get_recent_packets(limit=10, include_raw=True)[0]["raw_packet"] == "0901aa55"
+    windowed = h.get_filtered_packets(start_timestamp=50.0, limit=10, include_raw=True)
+    assert windowed[0]["raw_packet"] == "0901aa55"
+
+
 def test_verify_api_token_last_used_throttle(tmp_path, monkeypatch):
     h = _make_handler(tmp_path)
     h._api_token_last_used_interval_sec = 300

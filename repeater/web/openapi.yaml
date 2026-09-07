@@ -874,6 +874,12 @@ paths:
             minimum: 1
             maximum: 1000
           description: Maximum number of packets to return
+        - name: include_raw
+          in: query
+          schema:
+            type: boolean
+            default: false
+          description: Add each packet's raw frame (raw_packet, hex) to the rows
       responses:
         '200':
           description: Recent packets
@@ -995,6 +1001,12 @@ paths:
             type: integer
             default: 1000
           description: Maximum results
+        - name: include_raw
+          in: query
+          schema:
+            type: boolean
+            default: false
+          description: Add each packet's raw frame (raw_packet, hex) to the rows
       responses:
         '200':
           description: Filtered packets
@@ -3707,6 +3719,12 @@ paths:
           in: query
           schema:
             type: number
+        - name: include_raw
+          in: query
+          schema:
+            type: boolean
+            default: false
+          description: Add each packet's raw frame (raw_packet, hex) to the rows
       responses:
         '200':
           description: Bulk packet result
