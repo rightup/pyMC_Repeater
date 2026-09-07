@@ -131,6 +131,7 @@ class PluginIPCServer:
             "catalogue_install": self._op_catalogue_install,
             "check_update": self._op_check_update,
             "update": self._op_update,
+            "progress": self._op_progress,
             "ping": self._op_ping,
         }
 
@@ -367,6 +368,14 @@ class PluginIPCServer:
         force = bool(request.get("force_refresh") or request.get("refresh"))
         return self.manager.check_update(plugin_id, force_refresh=force)
 
+    def _op_progress(self, request: dict[str, Any]) -> dict[str, Any]:
+        plugin_id = self._require_id(request)
+        try:
+            since = int(request.get("since") or 0)
+        except (TypeError, ValueError):
+            raise PluginIPCError("since must be an integer", 400)
+        return self.manager.progress(plugin_id, since=since)
+
     def _op_update(self, request: dict[str, Any]) -> dict[str, Any]:
         plugin_id = self._require_id(request)
         version = request.get("version")
@@ -508,6 +517,9 @@ class PluginIPCClient:
         if version:
             payload["version"] = version
         return self.call("catalogue_install", **payload)
+
+    def progress(self, plugin_id: str, *, since: int = 0) -> dict[str, Any]:
+        return self.call("progress", plugin_id=plugin_id, since=int(since))
 
     def check_update(self, plugin_id: str, *, force_refresh: bool = False) -> dict[str, Any]:
         return self.call("check_update", plugin_id=plugin_id, force_refresh=bool(force_refresh))
