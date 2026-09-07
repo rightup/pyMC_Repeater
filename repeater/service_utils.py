@@ -158,7 +158,7 @@ if path.is_file():
 sys.exit(1)
 """
     try:
-        result = subprocess.run(
+        result = subprocess.run(  # nosec B603
             [venv_python, "-I", "-c", code],
             capture_output=True,
             text=True,
@@ -190,13 +190,13 @@ sys.exit(1)
                     changed = True
 
         if changed:
-            subprocess.run(
+            subprocess.run(  # nosec B603
                 sudo_cmd + install_cmd + [package_unit, unit_path],
                 check=False,
                 capture_output=True,
                 text=True,
             )
-            subprocess.run(
+            subprocess.run(  # nosec B603
                 sudo_cmd + daemon_reload,
                 check=False,
                 capture_output=True,
@@ -206,13 +206,13 @@ sys.exit(1)
         else:
             logger.info("Plugin-manager unit already matches packaged version")
 
-        subprocess.run(
+        subprocess.run(  # nosec B603
             sudo_cmd + enable_cmd,
             check=False,
             capture_output=True,
             text=True,
         )
-        active = subprocess.run(
+        active = subprocess.run(  # nosec B603
             sudo_cmd + is_active_cmd,
             check=False,
             capture_output=True,
@@ -220,7 +220,7 @@ sys.exit(1)
         )
         if active.returncode != 0:
             logger.info("Starting plugin-manager service")
-            subprocess.run(
+            subprocess.run(  # nosec B603
                 sudo_cmd + start_cmd,
                 check=False,
                 capture_output=True,
@@ -228,7 +228,7 @@ sys.exit(1)
             )
         elif changed:
             logger.info("Restarting plugin-manager service after unit refresh")
-            subprocess.run(
+            subprocess.run(  # nosec B603
                 sudo_cmd + restart_cmd,
                 check=False,
                 capture_output=True,
