@@ -96,6 +96,151 @@ def get_container_restart_message() -> str:
     )
 
 
+def ensure_plugin_manager_service() -> Tuple[bool, str]:
+    """Ensure the packaged plugin-manager systemd unit is installed and running.
+
+    This is intentionally idempotent. It runs as root when already privileged,
+    or via sudo when the app is started under a service account, so a single
+    upgrade can heal older installs that pre-date the plugin-manager system
+    service without requiring a second update.
+    """
+    if is_container() or is_buildroot():
+        return True, "Plugin-manager bootstrap skipped in container/buildroot environment"
+
+    venv_python = "/opt/openhop_repeater/venv/bin/python"
+    if not os.path.isfile(venv_python):
+        return False, "Plugin-manager bootstrap skipped: venv not present"
+
+    sudo_cmd: list[str] = []
+    if os.geteuid() != 0:
+        sudo_bin = shutil.which("sudo")
+        if not sudo_bin:
+            logger.info(
+                "Plugin-manager bootstrap skipped: root privileges required for systemd provisioning"
+            )
+            return (
+                True,
+                "Plugin-manager bootstrap skipped: root privileges required for systemd provisioning",
+            )
+        sudo_cmd = [sudo_bin, "--non-interactive"]
+
+    install_cmd = [
+        "/usr/bin/install",
+        "-o",
+        "root",
+        "-g",
+        "root",
+        "-m",
+        "0644",
+    ]
+    daemon_reload = ["/bin/systemctl", "daemon-reload"]
+    enable_cmd = ["/bin/systemctl", "enable", "openhop-plugin-manager"]
+    is_active_cmd = ["/bin/systemctl", "is-active", "--quiet", "openhop-plugin-manager"]
+    start_cmd = ["/bin/systemctl", "start", "openhop-plugin-manager"]
+    restart_cmd = ["/bin/systemctl", "restart", "openhop-plugin-manager"]
+
+    package_unit = None
+    code = """
+from importlib.metadata import distribution
+from pathlib import Path
+import sys
+try:
+    dist = distribution('openhop_repeater')
+except Exception:
+    sys.exit(1)
+try:
+    path = Path(dist.locate_file('repeater/plugins/openhop-plugin-manager.service'))
+except Exception:
+    sys.exit(1)
+if path.is_file():
+    print(path)
+    sys.exit(0)
+sys.exit(1)
+"""
+    try:
+        result = subprocess.run(  # nosec B603
+            [venv_python, "-I", "-c", code],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            package_unit = result.stdout.strip().splitlines()[-1]
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        logger.warning("Plugin-manager bootstrap lookup failed: %s", exc)
+        return False, f"Plugin-manager bootstrap lookup failed: {exc}"
+
+    if not package_unit:
+        return (
+            False,
+            "Plugin-manager bootstrap skipped: packaged service not found in installed package",
+        )
+
+    unit_path = "/etc/systemd/system/openhop-plugin-manager.service"
+    changed = False
+    try:
+        if not os.path.exists(unit_path):
+            logger.info("Plugin-manager unit missing; installing packaged service")
+            changed = True
+        else:
+            with open(package_unit, "rb") as src, open(unit_path, "rb") as dst:
+                if src.read() != dst.read():
+                    logger.info("Plugin-manager unit differs from packaged version; updating")
+                    changed = True
+
+        if changed:
+            subprocess.run(  # nosec B603
+                sudo_cmd + install_cmd + [package_unit, unit_path],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(  # nosec B603
+                sudo_cmd + daemon_reload,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            logger.info("Plugin-manager unit installed or refreshed")
+        else:
+            logger.info("Plugin-manager unit already matches packaged version")
+
+        subprocess.run(  # nosec B603
+            sudo_cmd + enable_cmd,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        active = subprocess.run(  # nosec B603
+            sudo_cmd + is_active_cmd,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if active.returncode != 0:
+            logger.info("Starting plugin-manager service")
+            subprocess.run(  # nosec B603
+                sudo_cmd + start_cmd,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        elif changed:
+            logger.info("Restarting plugin-manager service after unit refresh")
+            subprocess.run(  # nosec B603
+                sudo_cmd + restart_cmd,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+        return True, "Plugin-manager service is installed and active"
+    except Exception as exc:
+        logger.warning("Plugin-manager bootstrap failed: %s", exc)
+        return False, f"Plugin-manager bootstrap failed: {exc}"
+
+
 def restart_service() -> Tuple[bool, str]:
     """
     Restart the openhop-repeater service.

@@ -15,7 +15,6 @@ from unittest.mock import MagicMock
 
 import cherrypy
 import pytest
-
 from openhop_core.protocol import LocalIdentity
 
 from repeater.identity_manager import IdentityManager
@@ -125,3 +124,5 @@ def test_name_repeater_is_reserved_by_the_default_identity(cherrypy_ctx):
     room_entry = data["configured"][0]
     assert room_entry["registered"] is False
     assert room_entry["hash"] is None
+    expected_pubkey = LocalIdentity(seed=bytes.fromhex("aa" * 32)).get_public_key().hex()
+    assert room_entry["public_key"] == expected_pubkey

@@ -291,6 +291,17 @@ class RepeaterDaemon:
 
         logger.info(f"Initializing repeater: {self.config['repeater']['node_name']}")
 
+        try:
+            from repeater.service_utils import ensure_plugin_manager_service
+
+            ok, msg = ensure_plugin_manager_service()
+            if ok:
+                logger.info("Plugin-manager bootstrap: %s", msg)
+            else:
+                logger.warning("Plugin-manager bootstrap: %s", msg)
+        except Exception as exc:  # pragma: no cover - defensive safeguard
+            logger.warning("Plugin-manager bootstrap check raised an exception: %s", exc)
+
         # -----------------------------------------------
         # Get the actual Network IP Address
         try:
