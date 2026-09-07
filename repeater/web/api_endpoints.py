@@ -3911,16 +3911,36 @@ class APIEndpoints:
     @cherrypy.tools.gzip(compress_level=6)
     @cherrypy.tools.json_out()
     def bulk_packets(
-        self, limit=1000, offset=0, start_timestamp=None, end_timestamp=None, include_raw=None
+        self,
+        limit=1000,
+        offset=0,
+        start_timestamp=None,
+        end_timestamp=None,
+        include_raw=None,
+        upstream_hash=None,
+        upstream_hash_size=None,
+        cursor=None,
+        fields=None,
     ):
         """
         Optimized bulk packet retrieval with gzip compression and DB-level pagination.
+
+        ``cursor`` is the ``next_cursor`` of the previous page (keyset paging on
+        timestamp and id); ``fields`` is a comma-separated projection.
         """
         try:
             # Enforce reasonable limits; raw frames make a page several times heavier
             include_raw = str(include_raw).lower() in ("true", "1", "yes")
             limit = min(int(limit), 1000 if include_raw else 10000)
             offset = max(int(offset), 0)
+            cursor_key = None
+            if cursor:
+                ts_text, _, id_text = str(cursor).partition(":")
+                cursor_key = (float(ts_text), int(id_text))
+            field_list = None
+            if fields:
+                field_list = [f.strip() for f in str(fields).split(",") if f.strip()]
+                include_raw = include_raw or "raw_packet" in field_list
 
             # Get packets from storage with TRUE DB-level pagination
             # Uses SQL "LIMIT ? OFFSET ?" - no Python slicing needed!
@@ -3933,8 +3953,13 @@ class APIEndpoints:
                 limit=limit,
                 offset=offset,
                 include_raw=include_raw,
+                upstream_hash=upstream_hash or None,
+                upstream_hash_size=int(upstream_hash_size) if upstream_hash_size else None,
+                cursor=cursor_key,
+                fields=field_list,
             )
 
+            last = packets[-1] if len(packets) >= limit else None
             response = {
                 "success": True,
                 "data": packets,
@@ -3942,10 +3967,13 @@ class APIEndpoints:
                 "offset": offset,
                 "limit": limit,
                 "compressed": True,
+                "next_cursor": f"{last['timestamp']}:{last['id']}" if last else None,
             }
 
             return response
 
+        except ValueError as e:
+            return self._error(f"Invalid parameter format: {e}")
         except Exception as e:
             logger.error(f"Error getting bulk packets: {e}")
             return self._error(e)

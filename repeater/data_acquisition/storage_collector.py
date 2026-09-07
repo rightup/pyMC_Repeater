@@ -463,6 +463,7 @@ class StorageCollector:
         limit: int = 1000,
         offset: int = 0,
         include_raw: bool = False,
+        **query,
     ) -> list:
         return self.sqlite_handler.get_filtered_packets(
             packet_type,
@@ -472,6 +473,7 @@ class StorageCollector:
             limit,
             offset,
             include_raw=include_raw,
+            **query,
         )
 
     def get_airtime_data(

@@ -8,7 +8,7 @@ def test_packet_list_wrappers_forward_include_raw():
     collector.sqlite_handler = Mock()
     collector.get_recent_packets(limit=25, include_raw=True)
     collector.sqlite_handler.get_recent_packets.assert_called_once_with(25, include_raw=True)
-    collector.get_filtered_packets(limit=10, offset=5)
+    collector.get_filtered_packets(limit=10, offset=5, cursor=(1.0, 2))
     collector.sqlite_handler.get_filtered_packets.assert_called_once_with(
-        None, None, None, None, 10, 5, include_raw=False
+        None, None, None, None, 10, 5, include_raw=False, cursor=(1.0, 2)
     )

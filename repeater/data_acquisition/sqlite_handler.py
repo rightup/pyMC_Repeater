@@ -2119,13 +2119,30 @@ class SQLiteHandler:
         limit: int = 1000,
         offset: int = 0,
         include_raw: bool = False,
+        upstream_hash: Optional[str] = None,
+        upstream_hash_size: Optional[int] = None,
+        cursor: Optional[tuple[float, int]] = None,
+        fields: Optional[list[str]] = None,
     ) -> list:
+        """``cursor`` is the (timestamp, id) of the last row seen; ``fields`` projects the rows."""
         try:
             with self._connect() as conn:
                 conn.row_factory = sqlite3.Row
 
                 where_clauses = []
                 params = []
+
+                if upstream_hash is not None:
+                    where_clauses.append("upstream_hash = ?")
+                    params.append(str(upstream_hash).upper())
+
+                if upstream_hash_size is not None:
+                    where_clauses.append("upstream_hash_size = ?")
+                    params.append(int(upstream_hash_size))
+
+                if cursor is not None:
+                    where_clauses.append("(timestamp < ? OR (timestamp = ? AND id < ?))")
+                    params.extend([cursor[0], cursor[0], cursor[1]])
 
                 if packet_type is not None:
                     where_clauses.append("type = ?")
@@ -2152,13 +2169,15 @@ class SQLiteHandler:
                 else:
                     query = base_query
 
-                query += " ORDER BY timestamp DESC LIMIT ? OFFSET ?"
+                query += " ORDER BY timestamp DESC, id DESC LIMIT ? OFFSET ?"
                 params.append(limit)
-                params.append(offset)
+                params.append(0 if cursor is not None else offset)
 
-                packets = conn.execute(query, params).fetchall()
-
-                return [dict(row) for row in packets]
+                packets = [dict(row) for row in conn.execute(query, params).fetchall()]
+                if fields:
+                    keep = set(fields) | {"id", "timestamp"}
+                    packets = [{k: v for k, v in row.items() if k in keep} for row in packets]
+                return packets
 
         except Exception as e:
             logger.error(f"Failed to get filtered packets: {e}")

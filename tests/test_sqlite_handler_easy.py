@@ -370,6 +370,37 @@ def test_packet_list_queries_add_raw_frame_only_on_request(tmp_path):
     assert windowed[0]["raw_packet"] == "0901aa55"
 
 
+def test_filtered_packets_cursor_order_filter_and_fields(tmp_path):
+    h = _make_handler(tmp_path)
+    for i, (ts, up) in enumerate([(100.0, "AA"), (100.0, "AA"), (100.0, "BB"), (200.0, "AA")]):
+        h.store_packet(
+            {
+                "timestamp": ts,
+                "type": 2,
+                "route": 1,
+                "length": 10,
+                "rssi": -90 - i,
+                "packet_hash": f"p{i}",
+                "upstream_hash": up,
+                "upstream_hash_size": 1,
+                "original_path": [up],
+            }
+        )
+
+    page = h.get_filtered_packets(limit=2)
+    assert [r["packet_hash"] for r in page] == ["p3", "p2"]
+    cursor = (page[-1]["timestamp"], page[-1]["id"])
+    assert [r["packet_hash"] for r in h.get_filtered_packets(limit=2, cursor=cursor)] == [
+        "p1",
+        "p0",
+    ]
+    assert h.get_filtered_packets(limit=2, cursor=(100.0, page[-1]["id"] - 2)) == []
+
+    aa = h.get_filtered_packets(limit=10, upstream_hash="aa", upstream_hash_size=1, fields=["rssi"])
+    assert [r["rssi"] for r in aa] == [-93, -91, -90]
+    assert set(aa[0]) == {"id", "timestamp", "rssi"}
+
+
 def test_verify_api_token_last_used_throttle(tmp_path, monkeypatch):
     h = _make_handler(tmp_path)
     h._api_token_last_used_interval_sec = 300

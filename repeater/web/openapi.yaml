@@ -3725,9 +3725,28 @@ paths:
             type: boolean
             default: false
           description: Add each packet's raw frame (raw_packet, hex) to the rows
+        - name: upstream_hash
+          in: query
+          schema:
+            type: string
+          description: Only packets heard from this upstream hash
+        - name: upstream_hash_size
+          in: query
+          schema:
+            type: integer
+        - name: cursor
+          in: query
+          schema:
+            type: string
+          description: The previous page's `next_cursor`; keyset paging on (timestamp, id), ignores `offset`
+        - name: fields
+          in: query
+          schema:
+            type: string
+          description: Comma-separated columns to return (id and timestamp always included)
       responses:
         '200':
-          description: Bulk packet result
+          description: Bulk packet result; `next_cursor` is null on the last page
           content:
             application/json:
               schema:

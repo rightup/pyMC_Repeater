@@ -1057,6 +1057,10 @@ def test_recent_packets_and_bulk_packets(cherrypy_ctx):
         limit=10000,
         offset=0,
         include_raw=False,
+        upstream_hash=None,
+        upstream_hash_size=None,
+        cursor=None,
+        fields=None,
     )
 
 
@@ -1078,6 +1082,30 @@ def test_packet_lists_read_the_include_raw_flag(cherrypy_ctx):
         True,
         True,
     ]
+
+
+def test_bulk_packets_cursor_fields_and_filters(cherrypy_ctx):
+    del cherrypy_ctx
+    api = _make_api()
+    rows = [{"id": 9, "timestamp": 200.0}, {"id": 4, "timestamp": 100.0}]
+    storage = SimpleNamespace(get_filtered_packets=MagicMock(return_value=rows))
+    _attach_storage(api, storage)
+
+    result = api.bulk_packets(
+        limit="2",
+        cursor="300.5:12",
+        fields="rssi, raw_packet",
+        upstream_hash="ab",
+        upstream_hash_size="1",
+    )
+    assert result["next_cursor"] == "100.0:4"
+    kwargs = storage.get_filtered_packets.call_args.kwargs
+    assert kwargs["cursor"] == (300.5, 12)
+    assert (kwargs["fields"], kwargs["include_raw"]) == (["rssi", "raw_packet"], True)
+    assert (kwargs["upstream_hash"], kwargs["upstream_hash_size"]) == ("ab", 1)
+
+    assert api.bulk_packets(limit="5")["next_cursor"] is None
+    assert api.bulk_packets(cursor="junk")["success"] is False
 
 
 def test_filtered_packets_options_and_success(cherrypy_ctx):
