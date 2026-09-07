@@ -353,6 +353,54 @@ class StatsApp:
         current = self._resolve_html_dir()
         return previous != current
 
+    _IMMUTABLE_CACHE = "public, max-age=31536000, immutable"
+    _REVALIDATE_CACHE = "no-cache"
+    # Vite names hashed files ``name-XXXXXXXX.ext``; a hash carries an uppercase letter or a
+    # digit, which a plain two-word name such as ``red-btn-down.svg`` does not.
+    _HASHED_NAME = re.compile(r"-([A-Za-z0-9_-]{8})\.[A-Za-z0-9]+$")
+
+    @classmethod
+    def _is_hashed(cls, name: str) -> bool:
+        match = cls._HASHED_NAME.search(name)
+        return match is not None and re.search(r"[A-Z0-9]", match.group(1)) is not None
+
+    @classmethod
+    def _send_static(cls, target: Path, *, immutable: bool) -> bytes:
+        """Send a file, its precompressed sibling when accepted, with cache headers and 304."""
+        guessed_type, _ = mimetypes.guess_type(str(target))
+        chosen, encoding = target, None
+        accepted = {
+            e.value.lower()
+            for e in cherrypy.request.headers.elements("Accept-Encoding")
+            if e.qvalue > 0
+        }
+        for token, suffix in (("br", ".br"), ("gzip", ".gz")):
+            candidate = target.with_name(target.name + suffix)
+            if (
+                token in accepted
+                and candidate.is_file()
+                and not candidate.is_symlink()
+                and candidate.stat().st_mtime >= target.stat().st_mtime
+            ):
+                chosen, encoding = candidate, token
+                break
+
+        stat = chosen.stat()
+        etag = f'W/"{stat.st_size:x}-{int(stat.st_mtime):x}{"-" + encoding if encoding else ""}"'
+        headers = cherrypy.response.headers
+        headers["Content-Type"] = guessed_type or "application/octet-stream"
+        headers["Cache-Control"] = cls._IMMUTABLE_CACHE if immutable else cls._REVALIDATE_CACHE
+        headers["ETag"] = etag
+        headers["Vary"] = "Accept-Encoding"
+        if encoding:
+            headers["Content-Encoding"] = encoding
+
+        if_none_match = str(cherrypy.request.headers.get("If-None-Match", "") or "")
+        if etag in [tag.strip() for tag in if_none_match.split(",")]:
+            cherrypy.response.status = 304
+            return b""
+        return chosen.read_bytes()
+
     def _serve_static_file(self, root_dir: str, relative_parts: tuple[str, ...]):
         if not relative_parts:
             raise cherrypy.NotFound()
@@ -360,9 +408,7 @@ class StatsApp:
         target = (root.joinpath(*relative_parts)).resolve()
         if not target.is_relative_to(root) or not target.is_file():
             raise cherrypy.NotFound()
-        guessed_type, _ = mimetypes.guess_type(str(target))
-        cherrypy.response.headers["Content-Type"] = guessed_type or "application/octet-stream"
-        return target.read_bytes()
+        return self._send_static(target, immutable=self._is_hashed(target.name))
 
     def _serve_plugin_ui(self, plugin_id: str, relative_parts: tuple[str, ...]):
         """Serve static assets for an enabled application UI plugin."""
@@ -411,17 +457,12 @@ class StatsApp:
                 raise cherrypy.HTTPError(400, "invalid path")
 
             if target.is_file():
-                guessed_type, _ = mimetypes.guess_type(str(target))
-                cherrypy.response.headers["Content-Type"] = (
-                    guessed_type or "application/octet-stream"
-                )
-                return target.read_bytes()
+                return self._send_static(target, immutable=self._is_hashed(target.name))
 
             # SPA fallback to entry HTML for client-side routes
             entry_target = safe_join(doc_root, entry_name)
             if entry_target.is_file():
-                cherrypy.response.headers["Content-Type"] = "text/html; charset=utf-8"
-                return entry_target.read_bytes()
+                return self._send_static(entry_target, immutable=False)
             raise cherrypy.NotFound()
         except cherrypy.HTTPError:
             raise
@@ -441,6 +482,7 @@ class StatsApp:
         self._resolve_html_dir()
         index_path = os.path.join(self.html_dir, "index.html")
         try:
+            cherrypy.response.headers["Cache-Control"] = self._REVALIDATE_CACHE
             with open(index_path, "r", encoding="utf-8") as f:
                 return f.read()
         except FileNotFoundError:
