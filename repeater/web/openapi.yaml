@@ -1071,7 +1071,14 @@ paths:
             default: 1000
             minimum: 1
             maximum: 5000
-          description: Maximum rows to return.
+          description: Maximum rows (or buckets) to return.
+        - name: bucket_seconds
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 60
+          description: Bucket width in seconds; the answer carries `buckets` instead of `rows`.
       responses:
         '200':
           description: Neighbour link history
@@ -5315,10 +5322,28 @@ components:
           type: integer
         rows:
           type: array
+          description: Observations, oldest first; absent when `bucket_seconds` was requested.
           items:
             $ref: '#/components/schemas/NeighborLinkHistoryRow'
+        bucket_seconds: {type: integer, description: Bucket width in seconds; only when requested}
+        buckets:
+          type: array
+          description: One summary per non-empty bucket, oldest first; only when `bucket_seconds` was requested.
+          items:
+            $ref: '#/components/schemas/NeighborLinkHistoryBucket'
         count:
           type: integer
+
+    NeighborLinkHistoryBucket:
+      type: object
+      properties:
+        timestamp: {type: integer, description: Bucket start (Unix timestamp)}
+        last_ts: {type: number, description: The bucket's last observation}
+        n: {type: integer, description: Observations in the bucket}
+        dup: {type: integer, description: Observations flagged as duplicates}
+        score: {type: number, nullable: true, description: Mean score}
+        rssi: {type: number, nullable: true, description: Mean RSSI}
+        snr: {type: number, nullable: true, description: Mean SNR}
 
     NeighborLinkHistoryResponse:
       type: object

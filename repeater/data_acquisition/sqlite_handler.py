@@ -2331,7 +2331,9 @@ class SQLiteHandler:
         path_hash_size: int,
         hours: int = 24,
         limit: int = 1000,
+        bucket_seconds: Optional[int] = None,
     ) -> list:
+        """Observations of one peer, oldest first; ``bucket_seconds`` summarises them instead."""
         try:
             normalized_hash = str(peer_hash or "").strip().upper()
             if not normalized_hash:
@@ -2344,6 +2346,11 @@ class SQLiteHandler:
 
             with self._connect() as conn:
                 conn.row_factory = sqlite3.Row
+                if bucket_seconds is not None:
+                    return self._bucket_neighbor_link_history(
+                        conn, normalized_hash, path_hash_size, cutoff, int(bucket_seconds), limit
+                    )
+
                 rows = conn.execute(
                     """
                     SELECT
@@ -2397,6 +2404,53 @@ class SQLiteHandler:
         except Exception as e:
             logger.error(f"Failed to get neighbor link history: {e}")
             return []
+
+    @staticmethod
+    def _bucket_neighbor_link_history(
+        conn,
+        peer_hash: str,
+        path_hash_size: int,
+        cutoff: float,
+        bucket_seconds: int,
+        limit: int,
+    ) -> list:
+        bucket_seconds = max(1, bucket_seconds)
+        rows = conn.execute(
+            """
+            SELECT
+                CAST(timestamp / ? AS INTEGER) * ? AS bucket_ts,
+                COUNT(*) AS n,
+                SUM(is_duplicate) AS dup,
+                MAX(timestamp) AS last_ts,
+                AVG(score) AS score,
+                AVG(rssi) AS rssi,
+                AVG(snr) AS snr
+            FROM packets INDEXED BY idx_packets_upstream_time
+            WHERE upstream_hash = ?
+              AND upstream_hash_size = ?
+              AND timestamp >= ?
+            GROUP BY bucket_ts
+            ORDER BY bucket_ts DESC
+            LIMIT ?
+            """,
+            (bucket_seconds, bucket_seconds, peer_hash, path_hash_size, cutoff, limit),
+        ).fetchall()
+
+        def mean(value):
+            return None if value is None else round(value, 3)
+
+        return [
+            {
+                "timestamp": int(row["bucket_ts"]),
+                "last_ts": row["last_ts"],
+                "n": int(row["n"]),
+                "dup": int(row["dup"]),
+                "score": mean(row["score"]),
+                "rssi": mean(row["rssi"]),
+                "snr": mean(row["snr"]),
+            }
+            for row in reversed(rows)
+        ]
 
     def get_packet_type_stats(self, hours: int = 24) -> dict:
         try:

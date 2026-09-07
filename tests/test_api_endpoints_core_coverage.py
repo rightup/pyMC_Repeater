@@ -1025,7 +1025,23 @@ def test_neighbor_link_history_endpoint_filters_by_hash_and_size(cherrypy_ctx):
         path_hash_size=2,
         hours=12,
         limit=50,
+        bucket_seconds=None,
     )
+
+
+def test_neighbor_link_history_endpoint_buckets(cherrypy_ctx):
+    del cherrypy_ctx
+    api = _make_api()
+    buckets = [{"timestamp": 600}, {"timestamp": 1200}]
+    storage = SimpleNamespace(get_neighbor_link_history=MagicMock(return_value=buckets))
+    _attach_storage(api, storage)
+
+    data = api.neighbor_link_history(peer_hash="ab", path_hash_size="1", bucket_seconds="30")[
+        "data"
+    ]
+    assert "rows" not in data
+    assert (data["bucket_seconds"], data["buckets"], data["count"]) == (60, buckets, 2)
+    assert storage.get_neighbor_link_history.call_args.kwargs["bucket_seconds"] == 60
 
 
 def test_recent_packets_and_bulk_packets(cherrypy_ctx):

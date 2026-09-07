@@ -502,12 +502,14 @@ class StorageCollector:
         path_hash_size: int,
         hours: int = 24,
         limit: int = 1000,
+        bucket_seconds: Optional[int] = None,
     ) -> list:
         return self.sqlite_handler.get_neighbor_link_history(
             peer_hash=peer_hash,
             path_hash_size=path_hash_size,
             hours=hours,
             limit=limit,
+            bucket_seconds=bucket_seconds,
         )
 
     def get_rrd_data(
