@@ -1550,7 +1550,7 @@ UPGRADEEOF
         fi
         echo "✓ Configuration preserved"
         if [[ -n "$container_note" ]]; then
-            echo "$container_note"
+            printf '%b\n' "$container_note"
         fi
     else
         show_info "Upgrade Complete" "Upgrade completed successfully!\n\nVersion: $current_version → $new_version\n\n✓ Configuration preserved${container_note}"
