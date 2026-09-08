@@ -84,6 +84,24 @@ def test_non_root_denied_schedule_retries_legacy_and_succeeds(monkeypatch):
     assert run.call_count == 2
 
 
+def test_non_root_denied_schedule_legacy_interrupted_is_likely_success(monkeypatch):
+    monkeypatch.setattr(su.os, "geteuid", lambda: 1000)
+    monkeypatch.setattr(su.os.path, "exists", lambda p: p == su._SUDO_SYSTEMCTL_BIN)
+    run = Mock(
+        side_effect=[
+            subprocess.CompletedProcess([], 1, "", "sudo: a password is required"),
+            subprocess.CompletedProcess([], -15, "", ""),
+        ]
+    )
+    monkeypatch.setattr(su.subprocess, "run", run)
+
+    ok, message = su.restart_service()
+
+    assert ok is True
+    assert "likely initiated" in message
+    assert run.call_count == 2
+
+
 def test_installer_authorizes_only_fixed_restart_timer_command():
     script = (Path(__file__).resolve().parents[1] / "manage.sh").read_text()
     rules = [line for line in script.splitlines() if "NOPASSWD:" in line]
