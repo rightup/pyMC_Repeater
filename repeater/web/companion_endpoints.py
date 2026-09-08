@@ -12,7 +12,7 @@ import logging
 import queue
 import threading
 import time
-from typing import Optional
+from typing import Callable, Optional
 
 import cherrypy
 from openhop_core.companion.constants import DEFAULT_OFFLINE_QUEUE_SIZE
@@ -49,8 +49,9 @@ class CompanionAPIEndpoints:
         self._sse_clients: list[queue.Queue] = []
         self._sse_lock = threading.Lock()
 
-        # Flag: have we registered push callbacks yet?
-        self._callbacks_registered = False
+        # Built once, then re-asserted on every stream open (see
+        # _ensure_callbacks). Kept stable so re-registering is a no-op.
+        self._sse_callbacks: list[tuple[str, Callable]] = []
 
     # ------------------------------------------------------------------
     # Helpers
@@ -176,37 +177,47 @@ class CompanionAPIEndpoints:
     # ------------------------------------------------------------------
 
     def _ensure_callbacks(self):
-        """Register push callbacks on the bridge (once)."""
-        if self._callbacks_registered:
-            return
+        """Subscribe this stream's push callbacks on the bridge.
+
+        Re-asserted on every stream open rather than latched after the first.
+        Bridge registration is idempotent, so a repeat call costs nothing while
+        a subscription that went missing — anything calling
+        ``clear_push_callbacks`` — is repaired instead of leaving the stream
+        silently dead until the daemon restarts. The callback objects are built
+        once and cached so they keep comparing equal across calls, which is what
+        makes the re-registration a no-op.
+        """
         try:
             bridge = self._get_bridge()
         except cherrypy.HTTPError:
             return  # bridge not yet available
 
-        def _make_cb(event_name):
-            """Create a callback that serialises event data for SSE clients."""
+        if not self._sse_callbacks:
+            self._sse_callbacks = [
+                (name, self._make_sse_callback(name))
+                for name in (
+                    "message_received",
+                    "channel_message_received",
+                    "advert_received",
+                    "contact_path_updated",
+                    "send_confirmed",
+                    "login_result",
+                )
+            ]
 
-            def _cb(*args, **kwargs):
-                payload = self._serialise_event(event_name, args, kwargs)
-                self._broadcast_sse(payload)
-
-            return _cb
-
-        callback_names = [
-            "message_received",
-            "channel_message_received",
-            "advert_received",
-            "contact_path_updated",
-            "send_confirmed",
-            "login_result",
-        ]
-        for name in callback_names:
+        for name, callback in self._sse_callbacks:
             register_fn = getattr(bridge, f"on_{name}", None)
             if register_fn:
-                register_fn(_make_cb(name))
+                register_fn(callback)
 
-        self._callbacks_registered = True
+    def _make_sse_callback(self, event_name: str) -> Callable:
+        """Return a callback that serialises event data for SSE clients."""
+
+        def _cb(*args, **kwargs):
+            payload = self._serialise_event(event_name, args, kwargs)
+            self._broadcast_sse(payload)
+
+        return _cb
 
     @staticmethod
     def _serialise_event(event_name: str, args: tuple, kwargs: dict) -> dict:

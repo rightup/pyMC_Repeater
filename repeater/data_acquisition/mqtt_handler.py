@@ -239,6 +239,12 @@ class _BrokerConnection:
 
         self.enabled = broker.get("enabled", False)
         self.retain_status = broker.get("retain_status", False)
+        # Opt-in per broker, default off. The neighbors topic is not part of every
+        # MC2MQTT deployment's contract, and a broker that rejects an unexpected
+        # topic closes the connection (rc=16) - see the format auto-correction
+        # below for the same hazard. This is the openhop equivalent of the
+        # firmware's packets-only MeshRank exclusion.
+        self.neighbors_enabled = bool(broker.get("neighbors", False))
 
         self._tls_verified = False
 
@@ -327,7 +333,7 @@ class _BrokerConnection:
         """MQTT connection callback"""
         rc_value = int(getattr(rc, "value", rc)) if rc is not None else -1
         if rc_value == 0:
-            logger.info(f"Connected to {self.broker['name']}")
+            logger.debug(f"Connected to {self.broker['name']}")
             self._running = True
             self._reconnect_attempts = 0  # Reset counter on success
             # Successful connect can race with a previously scheduled timer; cancel it.
@@ -362,7 +368,7 @@ class _BrokerConnection:
         self._running = False
 
         if self._shutdown_requested:
-            logger.info(f"Clean disconnect from {self.broker['name']}")
+            logger.debug(f"Clean disconnect from {self.broker['name']}")
             if self._on_disconnect_callback:
                 self._on_disconnect_callback(self.broker["name"])
             return
@@ -381,7 +387,7 @@ class _BrokerConnection:
             if was_running:  # Only reconnect if we were intentionally connected
                 self._schedule_reconnect(reason=error_msg)
         else:
-            logger.info(f"Clean disconnect from {self.broker['name']}")
+            logger.debug(f"Clean disconnect from {self.broker['name']}")
 
         if self._on_disconnect_callback:
             self._on_disconnect_callback(self.broker["name"])
@@ -398,7 +404,7 @@ class _BrokerConnection:
         delay = min(5 * (2**self._reconnect_attempts), self._max_reconnect_delay)
         self._reconnect_attempts += 1
 
-        logger.info(
+        logger.debug(
             f"Scheduling reconnect to {self.broker['name']} in {delay}s (attempt {self._reconnect_attempts}, reason: {reason})"
         )
         self._reconnect_timer = threading.Timer(delay, lambda: self._attempt_reconnect(reason))
@@ -418,7 +424,7 @@ class _BrokerConnection:
             return
 
         try:
-            logger.info(f"Attempting reconnection to {self.broker['name']} (reason: {reason})...")
+            logger.debug(f"Attempting reconnection to {self.broker['name']} (reason: {reason})...")
 
             # Stop the loop if it's still running (websocket mode requires clean restart)
             try:
@@ -497,7 +503,7 @@ class _BrokerConnection:
         # Set JWT credentials before CONNECT handshake
         self._set_credentials()
 
-        logger.info(
+        logger.debug(
             f"Connecting to {self.broker['name']} "
             f"({protocol}://{self.broker['host']}:{self.broker['port']}) ..."
         )
@@ -598,7 +604,7 @@ class _BrokerConnection:
         if not self._running:
             return
 
-        logger.info(f"JWT token expiring soon for {self.broker['name']}, refreshing...")
+        logger.debug(f"JWT token expiring soon for {self.broker['name']}, refreshing...")
         self._running = False
         self._jwt_refresh_timer = None
 
@@ -617,6 +623,7 @@ class MeshCoreToMqttPusher:
         jwt_expiry_minutes: int = 10,
         stats_provider: Optional[Callable[[], dict]] = None,
     ):
+        self.config = config
         # Store local identity and get public key
         self.local_identity = local_identity
         public_key = local_identity.get_public_key().hex().upper()
@@ -965,15 +972,19 @@ class MeshCoreToMqttPusher:
         else:
             live_stats = {"uptime_secs": 0, "packets_sent": 0, "packets_received": 0}
 
+        mode = str(self.config.get("repeater", {}).get("mode", "forward")).strip().lower()
+        repeat_state = "on" if mode == "forward" else "off"
+
         status = {
             "status": state,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "origin": origin or self.node_name,
             "origin_id": self.public_key,
-            "model": "PyMC-Repeater",
+            "model": "openHop-Repeater",
             "firmware_version": self.app_version,
             "radio": radio_config or self.radio_config,
             "client_version": f"openhop_repeater/{self.app_version}",
+            "repeat": repeat_state,
             "stats": {**live_stats, "errors": 0, "queue_len": 0, **(extra_stats or {})},
         }
 
@@ -1008,6 +1019,61 @@ class MeshCoreToMqttPusher:
 
         if not results:
             logger.warning(f"No active broker connections for publishing to {subtopic}")
+
+        return results
+
+    def has_neighbors_brokers(self) -> bool:
+        """True when at least one enabled broker opted into the neighbors topic."""
+        return any(conn.enabled and conn.neighbors_enabled for conn in self.connections)
+
+    def has_connected_neighbors_brokers(self) -> bool:
+        """True when an opted-in broker is connected and could receive a publish."""
+        return any(
+            conn.enabled and conn.neighbors_enabled and conn.is_connected()
+            for conn in self.connections
+        )
+
+    def publish_neighbors(self, payload: dict):
+        """Publish the neighbours table to every broker that opted in.
+
+        QoS 1 and non-retained, matching the firmware's ``publishNeighbors()``:
+        the table is a periodic snapshot, so a stale retained copy would outlive
+        its usefulness, but it is infrequent enough to be worth delivering once.
+        """
+        message = json.dumps(payload)
+        neighbor_count = len(payload.get("neighbors", []))
+        logger.debug(
+            f"Publishing topic='neighbors', neighbors={neighbor_count}, "
+            f"bytes={len(message.encode('utf-8'))}"
+        )
+
+        results = []
+        with self._lock:
+            for conn in self.connections:
+                if not (conn.enabled and conn.neighbors_enabled):
+                    continue
+                if not conn.is_connected():
+                    logger.warning(
+                        f"Cannot publish neighbors to {conn.broker['name']} - not connected"
+                    )
+                    continue
+                result = conn.publish("neighbors", message, retain=False, qos=1)
+                # This is by far the largest payload the node emits and it is not
+                # size-capped, so an oversized or queue-full rejection is a real
+                # outcome. Check paho's rc rather than reporting a publish that
+                # never left the client as a success.
+                rc = getattr(result, "rc", None)
+                if result is None or (rc is not None and rc != mqtt.MQTT_ERR_SUCCESS):
+                    logger.warning(
+                        f"Neighbors publish rejected by {conn.broker['name']} "
+                        f"(rc={rc}, bytes={len(message.encode('utf-8'))})"
+                    )
+                    continue
+                results.append((conn.broker["name"], result))
+                _trace(f"Published to {conn.broker['name']} -- neighbors")
+
+        if not results:
+            logger.warning("Neighbors table was not published to any broker")
 
         return results
 

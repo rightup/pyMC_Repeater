@@ -1,37 +1,62 @@
+import math
+
+from repeater.airtime import AirtimeManager
 from repeater.config_manager import ConfigManager
 
 
 class _DummyRepeaterHandler:
-    def __init__(self):
+    def __init__(self, config=None):
         self.radio_config = {}
+        self.airtime_mgr = AirtimeManager(
+            config
+            or {
+                "radio": {
+                    "frequency": 868000000,
+                    "bandwidth": 125000,
+                    "spreading_factor": 7,
+                    "coding_rate": 5,
+                    "tx_power": 14,
+                    "preamble_length": 8,
+                }
+            }
+        )
 
 
 class _DummySX1262Radio:
-    def __init__(self):
+    def __init__(self, apply_ok=True):
         self.frequency = 868000000
         self.bandwidth = 125000
         self.spreading_factor = 7
         self.coding_rate = 5
         self.tx_power = 14
         self.calls = []
+        self.apply_ok = apply_ok
 
     def set_frequency(self, frequency):
         self.calls.append(("set_frequency", frequency))
+        if not self.apply_ok:
+            return False
         self.frequency = frequency
         return True
 
     def set_tx_power(self, power):
         self.calls.append(("set_tx_power", power))
+        if not self.apply_ok:
+            return False
         self.tx_power = power
         return True
 
     def set_spreading_factor(self, spreading_factor):
         self.calls.append(("set_spreading_factor", spreading_factor))
+        if not self.apply_ok:
+            return False
         self.spreading_factor = spreading_factor
         return True
 
     def set_bandwidth(self, bandwidth):
         self.calls.append(("set_bandwidth", bandwidth))
+        if not self.apply_ok:
+            return False
         self.bandwidth = bandwidth
         return True
 
@@ -64,7 +89,7 @@ class _DummyDaemon:
             "kiss": dict(config.get("kiss", {})),
         }
         self.radio = radio
-        self.repeater_handler = _DummyRepeaterHandler()
+        self.repeater_handler = _DummyRepeaterHandler(config)
         self.advert_helper = None
         self.dispatcher = None
 
@@ -128,3 +153,66 @@ def test_live_update_daemon_applies_kiss_radio_config():
     ]
     assert radio.radio_config == config["radio"]
     assert daemon.repeater_handler.radio_config == config["radio"]
+
+
+def test_live_update_daemon_refreshes_airtime_manager_modulation():
+    startup_radio = {
+        "frequency": 868000000,
+        "bandwidth": 125000,
+        "spreading_factor": 7,
+        "coding_rate": 5,
+        "tx_power": 14,
+        "preamble_length": 8,
+    }
+    updated_radio = {
+        "frequency": 915000000,
+        "bandwidth": 125000,
+        "spreading_factor": 12,
+        "coding_rate": 5,
+        "tx_power": 14,
+        "preamble_length": 8,
+    }
+    config = {"radio": dict(startup_radio)}
+    radio = _DummySX1262Radio()
+    daemon = _DummyDaemon(config, radio)
+    airtime_mgr = daemon.repeater_handler.airtime_mgr
+    before = airtime_mgr.calculate_airtime(50)
+    assert math.isclose(before, 97.536, rel_tol=1e-9)
+
+    config["radio"] = dict(updated_radio)
+    manager = ConfigManager("/tmp/config.yaml", config, daemon)
+    assert manager.live_update_daemon(["radio"])
+
+    assert airtime_mgr.spreading_factor == 12
+    assert airtime_mgr.bandwidth == 125000
+    assert airtime_mgr.preamble_length == 8
+    assert math.isclose(airtime_mgr.calculate_airtime(50), 2301.952, rel_tol=1e-9)
+
+
+def test_failed_live_radio_apply_leaves_airtime_manager_unchanged():
+    startup_radio = {
+        "frequency": 868000000,
+        "bandwidth": 125000,
+        "spreading_factor": 7,
+        "coding_rate": 5,
+        "tx_power": 14,
+        "preamble_length": 8,
+    }
+    config = {"radio": dict(startup_radio)}
+    radio = _DummySX1262Radio(apply_ok=False)
+    daemon = _DummyDaemon(config, radio)
+    airtime_mgr = daemon.repeater_handler.airtime_mgr
+
+    config["radio"] = {
+        "frequency": 915000000,
+        "bandwidth": 125000,
+        "spreading_factor": 12,
+        "coding_rate": 5,
+        "tx_power": 14,
+        "preamble_length": 8,
+    }
+    manager = ConfigManager("/tmp/config.yaml", config, daemon)
+    assert manager.live_update_daemon(["radio"]) is False
+
+    assert airtime_mgr.spreading_factor == 7
+    assert math.isclose(airtime_mgr.calculate_airtime(50), 97.536, rel_tol=1e-9)

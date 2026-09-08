@@ -6,6 +6,7 @@ from typing import Dict
 
 from openhop_core.protocol import CryptoUtils, PacketBuilder
 from openhop_core.protocol.constants import PAYLOAD_TYPE_TXT_MSG
+from openhop_core.protocol.packet_utils import PathUtils
 
 logger = logging.getLogger("RoomServer")
 
@@ -26,7 +27,10 @@ PUSH_TIMEOUT_BASE_MS = 4000
 PUSH_ACK_TIMEOUT_FACTOR_MS = 2000
 
 # Safety limits and protections
-MAX_MESSAGE_LENGTH = 160  # Match C++ MAX_POST_TEXT_LEN (151 bytes for text)
+# Match C++ MAX_POST_TEXT_LEN from examples/simple_room_server/MyMesh.h:
+# #define MAX_POST_TEXT_LEN (160-9) -- 160-byte encrypted text budget minus the
+# 9-byte prefix (4-byte timestamp + 1-byte flags/attempt + 4-byte author pubkey prefix).
+MAX_POST_TEXT_LEN = 151
 MAX_POSTS_PER_CLIENT_PER_MINUTE = 10  # Prevent spam
 MAX_CLIENTS_PER_ROOM = 50  # From ACL default
 MAX_PUSH_FAILURES = 3  # Evict after this many consecutive failures
@@ -46,27 +50,52 @@ _global_push_lock = asyncio.Lock()
 GLOBAL_MIN_GAP_BETWEEN_MESSAGES = 1.1  # 1.1s  minimum gap between transmissions
 
 
+def _truncate_utf8(text: str, max_bytes: int) -> str:
+    """Truncate ``text`` to at most ``max_bytes`` of its UTF-8 encoding.
+
+    Cuts at a codepoint boundary so a partial multi-byte sequence is never
+    emitted (matches firmware's byte-length text budget, but stays
+    UTF-8-safe rather than the firmware's raw ``strncpy``).
+    """
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return text
+    return encoded[:max_bytes].decode("utf-8", errors="ignore")
+
+
 class GlobalRateLimiter:
     def __init__(self, min_gap_seconds: float = 0.1):
         self.min_gap = min_gap_seconds  # Minimum gap between consecutive messages
         self.lock = asyncio.Lock()  # Only one transmission at a time
-        self.last_release_time = 0
+        self.last_release_time = 0.0
 
     async def acquire(self):
+        """Acquire the global transmit lock and enforce the inter-message gap.
 
-        async with self.lock:
-            # Enforce minimum gap between consecutive transmissions
-            now = time.time()
-            time_since_last = now - self.last_release_time
+        The lock is **held on return** and must be released with ``release()``
+        (call it in a ``finally``). The previous implementation released the
+        lock inside an ``async with`` before returning, so the caller's radio
+        transmission ran with no lock held and multiple room loops could push
+        concurrently. A monotonic clock is used so a wall-clock jump cannot
+        skip or extend the gap.
+        """
+        await self.lock.acquire()
+        try:
+            time_since_last = time.monotonic() - self.last_release_time
             if time_since_last < self.min_gap:
                 wait_time = self.min_gap - time_since_last
                 logger.debug(f"Global rate limiter: waiting {wait_time * 1000:.0f}ms")
                 await asyncio.sleep(wait_time)
-            # Lock is now held - caller can transmit
-            # Will be released when context exits
+        except BaseException:
+            # Never leak the lock if the gap wait is cancelled.
+            self.lock.release()
+            raise
 
     def release(self):
-        self.last_release_time = time.time()
+        """Record the transmission time and release the transmit lock."""
+        self.last_release_time = time.monotonic()
+        if self.lock.locked():
+            self.lock.release()
 
 
 class RoomServer:
@@ -116,8 +145,13 @@ class RoomServer:
                         room_settings = rs.get("settings", {})
                         break
 
-                # Use room-specific name and location
-                node_name = room_settings.get("room_name", room_name)
+                # Use room-specific name and location. Prefer node_name to
+                # match the daemon scheduler and the HTTP endpoint — reading
+                # only room_name here meant one CLI advert renamed the room
+                # on the mesh to the identity-name fallback.
+                node_name = room_settings.get(
+                    "node_name", room_settings.get("room_name", room_name)
+                )
                 latitude = room_settings.get("latitude", 0.0)
                 longitude = room_settings.get("longitude", 0.0)
 
@@ -135,7 +169,10 @@ class RoomServer:
                 )
 
                 # Send via packet injector
-                await packet_injector(packet, wait_for_ack=False)
+                sent = await packet_injector(packet, wait_for_ack=False)
+                if not sent:
+                    logger.error(f"Room '{room_name}': Failed to send advert")
+                    return False
 
                 logger.info(
                     f"Room '{room_name}': Sent flood advert '{node_name}' at ({latitude:.6f}, {longitude:.6f})"
@@ -230,13 +267,15 @@ class RoomServer:
     ) -> bool:
 
         try:
-            # SAFETY: Validate message length
-            if len(message_text) > MAX_MESSAGE_LENGTH:
+            # SAFETY: Validate message length (byte length, matching firmware's
+            # MAX_POST_TEXT_LEN text budget), cutting at a UTF-8 codepoint boundary.
+            encoded_len = len(message_text.encode("utf-8"))
+            if encoded_len > MAX_POST_TEXT_LEN:
                 logger.warning(
                     f"Room '{self.room_name}': Message from {client_pubkey[:4].hex()} "
-                    f"exceeds max length ({len(message_text)} > {MAX_MESSAGE_LENGTH}), truncating"
+                    f"exceeds max length ({encoded_len} > {MAX_POST_TEXT_LEN} bytes), truncating"
                 )
-                message_text = message_text[:MAX_MESSAGE_LENGTH]
+                message_text = _truncate_utf8(message_text, MAX_POST_TEXT_LEN)
 
             # SAFETY: Rate limit per client
             client_key = client_pubkey.hex()
@@ -287,17 +326,15 @@ class RoomServer:
                     f"{len(all_clients)} authenticated client(s)"
                 )
 
-                # Update client's sync_since to this message's timestamp
-                # This prevents the author from receiving their own message back
-                # Also update activity timestamp (they're clearly active if posting)
-                logger.debug(
-                    f"Room '{self.room_name}': Updating author's sync_since to {post_timestamp} "
-                    f"to prevent echo"
-                )
+                # Refresh the author's activity timestamp (they're clearly active
+                # if posting). The sync_since watermark is deliberately NOT
+                # advanced here: it moves only when a push is ACKed, and self-echo
+                # is already prevented by the author exclusion in the
+                # unsynced-message query. Advancing it on post would skip other
+                # authors' older, still-unsynced messages for this client.
                 self.db.upsert_client_sync(
                     room_hash=f"0x{self.room_hash:02X}",
                     client_pubkey=client_pubkey.hex(),
-                    sync_since=post_timestamp,  # Don't send this message back to author
                     last_activity=time.time(),
                 )
 
@@ -316,10 +353,6 @@ class RoomServer:
     async def push_post_to_client(self, client_info, post: Dict) -> bool:
 
         try:
-            # SAFETY: Global transmission lock - only ONE message on radio at a time
-            # This is critical because LoRa is serial (0.5-9s airtime per message)
-            await self.global_limiter.acquire()
-
             # SAFETY: Check client failure backoff
             sync_state = self.db.get_client_sync(
                 room_hash=f"0x{self.room_hash:02X}",
@@ -328,6 +361,12 @@ class RoomServer:
 
             if sync_state:
                 failures = sync_state.get("push_failures", 0)
+                if failures >= MAX_PUSH_FAILURES:
+                    logger.debug(
+                        f"Room '{self.room_name}': Client 0x{client_info.id.get_public_key()[0]:02X} "
+                        f"at max failures ({failures}), skipping push"
+                    )
+                    return False
                 if failures > 0:
                     # Apply exponential backoff
                     backoff_idx = min(failures, len(RETRY_BACKOFF_SCHEDULE) - 1)
@@ -343,24 +382,41 @@ class RoomServer:
                         )
                         return False  # Skip this client for now
 
-            # Build message payload
-            timestamp = int(time.time())
-            flags = TXT_TYPE_SIGNED_PLAIN << 2  # Include author prefix
+            # Build message payload.
+            # Timestamp is the post's own stored timestamp, not the delivery
+            # time (MyMesh.cpp:56 serializes the stored post's timestamp).
+            timestamp = int(post["post_timestamp"])
+            # Low 2 bits carry a random attempt nonce so retries of the same
+            # post get a different packet hash/ACK (MyMesh.cpp:59-60).
+            flags = (TXT_TYPE_SIGNED_PLAIN << 2) | (secrets.randbits(8) & 0x03)
 
             # Author prefix (first 4 bytes of pubkey)
             author_pubkey = bytes.fromhex(post["author_pubkey"])
             author_prefix = author_pubkey[:4]
 
             # Plaintext: timestamp(4) + flags(1) + author_prefix(4) + text
-            message_bytes = post["message_text"].encode("utf-8")
+            # SAFETY: Clamp at push time too, in case a legacy stored post
+            # (from before this limit was enforced on write) exceeds
+            # MAX_POST_TEXT_LEN bytes -- truncate at a UTF-8 codepoint boundary.
+            message_text = post["message_text"]
+            # The body is a C string on the wire: pushPostToClient sizes it with
+            # `strlen(post.text)` for both the payload and the expected ACK. A
+            # post stored with an interior NUL (the web API accepts one) would
+            # otherwise be transmitted and hashed whole, while the receiver
+            # stops at that NUL -- so its ACK would never match ours and the
+            # push would retry until it hit the failure backoff.
+            nul = message_text.find("\x00")
+            if nul >= 0:
+                message_text = message_text[:nul]
+            if len(message_text.encode("utf-8")) > MAX_POST_TEXT_LEN:
+                message_text = _truncate_utf8(message_text, MAX_POST_TEXT_LEN)
+            message_bytes = message_text.encode("utf-8")
             plaintext = (
                 timestamp.to_bytes(4, "little") + bytes([flags]) + author_prefix + message_bytes
             )
-
-            # Calculate expected ACK (same algorithm as openhop_core)
-            attempt = 0
-            pack_data = PacketBuilder._pack_timestamp_data(timestamp, attempt, message_bytes)
-            ack_hash = CryptoUtils.sha256(pack_data + client_info.id.get_public_key())[:4]
+            # Calculate expected ACK (MeshCore signed text):
+            # sha256(timestamp + flags + author_prefix + text + recipient_pubkey)[:4]
+            ack_hash = CryptoUtils.sha256(plaintext + client_info.id.get_public_key())[:4]
             expected_ack_crc = int.from_bytes(ack_hash, "little")
 
             # Determine routing based on stored out_path
@@ -376,34 +432,75 @@ class RoomServer:
                 route_type=route_type,
             )
 
-            # Add stored path for direct routing
+            # Add stored path for direct routing. out_path_len is the encoded
+            # wire byte (bits 0-5 = hash count, bits 6-7 = hash size - 1);
+            # out_path already holds exactly the path bytes.
             if route_type == "direct" and len(client_info.out_path) > 0:
-                packet.path = bytearray(client_info.out_path[: client_info.out_path_len])
-                packet.path_len = client_info.out_path_len
+                if PathUtils.is_valid_path_len(client_info.out_path_len):
+                    path_byte_len = PathUtils.get_path_byte_len(client_info.out_path_len)
+                    packet.path = bytearray(client_info.out_path[:path_byte_len])
+                    packet.path_len = client_info.out_path_len
+                else:
+                    # Legacy fallback: treat stored path as 1-byte-hop path and clamp to
+                    # valid encoded range (0-63 hops).
+                    legacy_hops = min(len(client_info.out_path), 63)
+                    packet.path = bytearray(client_info.out_path[:legacy_hops])
+                    packet.path_len = legacy_hops
 
-            # Calculate ACK timeout
+            # Calculate ACK timeout from the HOP count, not the encoded byte
+            # (0x80 = empty 3-byte-hash path would otherwise give a ~4min wait)
             if route_type == "flood":
                 ack_timeout = PUSH_ACK_TIMEOUT_FLOOD_MS / 1000.0
             else:
-                path_len = client_info.out_path_len if client_info.out_path_len >= 0 else 0
+                if PathUtils.is_valid_path_len(client_info.out_path_len):
+                    path_len = PathUtils.get_path_hash_count(client_info.out_path_len)
+                else:
+                    path_len = min(len(client_info.out_path), 63)
                 ack_timeout = (
                     PUSH_TIMEOUT_BASE_MS + PUSH_ACK_TIMEOUT_FACTOR_MS * (path_len + 1)
                 ) / 1000.0
 
-            # Update client sync state with pending ACK
-            self.db.upsert_client_sync(
-                room_hash=f"0x{self.room_hash:02X}",
-                client_pubkey=client_info.id.get_public_key().hex(),
-                pending_ack_crc=expected_ack_crc,
-                push_post_timestamp=post["post_timestamp"],
-                ack_timeout_time=time.time() + ack_timeout,
+            current_sync_since = (
+                sync_state.get("sync_since", 0)
+                if sync_state
+                else getattr(client_info, "sync_since", 0)
             )
-            # Send packet (dispatcher will track ACK automatically)
-            # This blocks for the entire transmission duration (0.5-9 seconds)
-            success = await self.packet_injector(packet, wait_for_ack=True)
 
-            # SAFETY: Release transmission lock AFTER send completes
-            self.global_limiter.release()
+            # SAFETY: Global transmission lock - only ONE message on the radio at
+            # a time, enforced across the entire send. LoRa is serial (0.5-9s
+            # airtime per message), and every room has its own sync loop sharing
+            # this limiter, so the lock must be held from before we start the ACK
+            # timeout clock through the blocking send. Released in `finally` so
+            # backoff/exception paths above (which returned before acquiring) do
+            # not, and the send path always does, free it exactly once.
+            await self.global_limiter.acquire()
+            try:
+                # Update client sync state with pending ACK. Done under the lock
+                # so the ACK-timeout clock starts when the send actually begins,
+                # not before the inter-message gap has elapsed.
+                self.db.upsert_client_sync(
+                    room_hash=f"0x{self.room_hash:02X}",
+                    client_pubkey=client_info.id.get_public_key().hex(),
+                    sync_since=current_sync_since,
+                    pending_ack_crc=expected_ack_crc,
+                    push_post_timestamp=post["post_timestamp"],
+                    ack_timeout_time=time.time() + ack_timeout,
+                    last_activity=time.time(),
+                )
+                # Send and wait for the client's delivery ACK. The injector must
+                # be told the crypto ACK CRC we computed above — its default
+                # (packet.get_crc()) is a packet-hash CRC no client ever sends.
+                # This blocks for the entire transmission duration (0.5-9 seconds)
+                success = await self.packet_injector(
+                    packet,
+                    wait_for_ack=True,
+                    expected_crc=expected_ack_crc,
+                    ack_timeout_s=ack_timeout,
+                )
+            finally:
+                # SAFETY: Release the transmission lock on every path (ACK,
+                # timeout, or exception during the send).
+                self.global_limiter.release()
 
             if success:
                 # ACK received! Update sync state
@@ -460,7 +557,7 @@ class RoomServer:
                     pending_ack_crc=0,
                 )
 
-                if failures >= 3:
+                if failures >= MAX_PUSH_FAILURES:
                     logger.warning(
                         f"Room '{self.room_name}': Client 0x{client_pubkey[0]:02X} "
                         f"has {failures} consecutive failures"
@@ -625,7 +722,7 @@ class RoomServer:
                             )
                             continue
 
-                        if push_failures >= 3:
+                        if push_failures >= MAX_PUSH_FAILURES:
                             logger.debug(
                                 f"Skipping client 0x{client.id.get_public_key()[0]:02X} (max failures)"
                             )

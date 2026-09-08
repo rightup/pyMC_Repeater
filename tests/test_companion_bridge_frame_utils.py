@@ -5,7 +5,8 @@ from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from openhop_core.companion.constants import RESP_CODE_NO_MORE_MESSAGES
+from openhop_core.companion.constants import PUSH_CODE_MSG_WAITING, RESP_CODE_NO_MORE_MESSAGES
+from openhop_core.companion.models import MessageEvent
 
 from repeater.companion.bridge import RepeaterCompanionBridge, _to_json_safe
 from repeater.companion.frame_server import CompanionFrameServer
@@ -127,7 +128,7 @@ async def test_frame_server_persistence_paths_and_stop():
         companion_upsert_contact=MagicMock(),
     )
     bridge = SimpleNamespace(
-        message_queue=SimpleNamespace(pop_last=MagicMock()),
+        message_queue=SimpleNamespace(remove=MagicMock(), pop_last=MagicMock()),
         sync_next_message=lambda: None,
         get_contacts=lambda: [],
         channels=SimpleNamespace(max_channels=2),
@@ -146,9 +147,10 @@ async def test_frame_server_persistence_paths_and_stop():
         srv._write_frame = MagicMock()
         srv._build_message_frame = MagicMock(return_value=b"frame")
 
-        await srv._persist_companion_message({"text": "x"})
+        entry = object()
+        await srv._persist_companion_message({"text": "x"}, entry)
         sqlite.companion_push_message.assert_called_once_with("h", {"text": "x"}, None)
-        bridge.message_queue.pop_last.assert_called_once()
+        bridge.message_queue.remove.assert_called_once_with(entry)
 
         msg = srv._sync_next_from_persistence()
         assert msg is not None
@@ -199,6 +201,60 @@ async def test_frame_server_no_more_messages_response_when_empty():
         await srv._cmd_sync_next_message(b"")
         # RESP_CODE_NO_MORE_MESSAGES is encoded as a single-byte frame.
         assert srv._write_frame.call_args[0][0] == bytes([RESP_CODE_NO_MORE_MESSAGES])
+
+
+@pytest.mark.asyncio
+async def test_restart_queue_rows_are_delivered_once_from_sqlite():
+    sqlite = SimpleNamespace(
+        companion_pop_message=MagicMock(
+            side_effect=[
+                {"sender_key": b"a", "timestamp": 1, "text": "first"},
+                {"sender_key": b"b", "timestamp": 2, "text": "second"},
+                None,
+            ]
+        )
+    )
+    bridge = SimpleNamespace(sync_next_message=lambda: None)
+
+    with patch(
+        "repeater.companion.frame_server._BaseFrameServer.__init__", lambda self, **kwargs: None
+    ):
+        srv = CompanionFrameServer(bridge=bridge, companion_hash="h", sqlite_handler=sqlite)
+        srv.bridge = bridge
+        srv.companion_hash = "h"
+        srv._write_frame = MagicMock()
+        srv._build_message_frame = lambda message: message.text.encode()
+
+        await srv._cmd_sync_next_message(b"")
+        await srv._cmd_sync_next_message(b"")
+        await srv._cmd_sync_next_message(b"")
+
+    assert [call.args[0] for call in srv._write_frame.call_args_list] == [
+        b"first",
+        b"second",
+        bytes([RESP_CODE_NO_MORE_MESSAGES]),
+    ]
+    assert sqlite.companion_pop_message.call_count == 3
+
+
+@pytest.mark.asyncio
+async def test_rejected_queue_callback_skips_sqlite_persistence_but_notifies_client():
+    server = object.__new__(CompanionFrameServer)
+    server._persist_companion_message = AsyncMock()
+    server._enqueue_frame = MagicMock()
+
+    await server._on_message_event(
+        MessageEvent(
+            sender_key=b"\x01" * 32,
+            text="rejected",
+            timestamp=1,
+            txt_type=0,
+            queued=False,
+        )
+    )
+
+    server._persist_companion_message.assert_not_awaited()
+    server._enqueue_frame.assert_called_once_with(bytes([PUSH_CODE_MSG_WAITING]))
 
 
 def test_companion_utils_validation_and_normalization():

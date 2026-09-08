@@ -14,9 +14,20 @@ from openhop_core.node.handlers.protocol_request import (
     REQ_TYPE_GET_NEIGHBOURS,
     REQ_TYPE_GET_OWNER_INFO,
     REQ_TYPE_GET_STATUS,
+    REQ_TYPE_GET_TELEMETRY_DATA,
     SERVER_RESPONSE_DELAY_MS,
     ProtocolRequestHandler,
 )
+from openhop_core.protocol.cayenne_lpp import (
+    TELEM_CHANNEL_SELF,
+    encode_barometric_pressure,
+    encode_current,
+    encode_power,
+    encode_relative_humidity,
+    encode_temperature,
+    encode_voltage,
+)
+from openhop_core.protocol.constants import TELEM_PERM_ENVIRONMENT
 
 logger = logging.getLogger("ProtocolRequestHelper")
 
@@ -33,6 +44,7 @@ class ProtocolRequestHelper:
         engine=None,
         neighbor_tracker=None,
         config=None,
+        sensor_manager=None,
     ):
 
         self.identity_manager = identity_manager
@@ -42,6 +54,7 @@ class ProtocolRequestHelper:
         self.engine = engine
         self.neighbor_tracker = neighbor_tracker
         self.config = config or {}
+        self.sensor_manager = sensor_manager
 
         # Dictionary of core handlers keyed by dest_hash
         self.handlers = {}
@@ -62,6 +75,7 @@ class ProtocolRequestHelper:
         # Build request handlers dict
         request_handlers = {
             REQ_TYPE_GET_STATUS: self._handle_get_status,
+            REQ_TYPE_GET_TELEMETRY_DATA: self._handle_get_telemetry,
             REQ_TYPE_GET_ACCESS_LIST: self._make_handle_get_access_list(identity_acl),
             REQ_TYPE_GET_NEIGHBOURS: self._handle_get_neighbours,
             REQ_TYPE_GET_OWNER_INFO: self._handle_get_owner_info,
@@ -124,13 +138,22 @@ class ProtocolRequestHelper:
             if not handler_info:
                 return False
 
-            # Let core handler build response
-            response_packet = await handler_info["handler"](packet)
+            # Let the core handler decrypt and build a response. It returns a
+            # HandlerResult: authenticated is False when the one-byte dest hash
+            # collided with ours but the REQ did not decrypt for a local client —
+            # do not consume it, so the engine can still forward/re-flood it.
+            result = await handler_info["handler"](packet)
+            if not result.authenticated:
+                logger.debug(
+                    f"REQ dest 0x{dest_hash:02X} did not decrypt for a local identity "
+                    f"(hash collision), allowing forward"
+                )
+                return False
 
             # Send response after delay
-            if response_packet and self.packet_injector:
+            if result.response and self.packet_injector:
                 await asyncio.sleep(SERVER_RESPONSE_DELAY_MS / 1000.0)
-                await self.packet_injector(response_packet, wait_for_ack=False)
+                await self.packet_injector(result.response, wait_for_ack=False)
 
             packet.mark_do_not_retransmit()
             return True
@@ -146,6 +169,10 @@ class ProtocolRequestHelper:
         # n_sent_flood, n_sent_direct, n_recv_flood, n_recv_direct,
         # uint16 err_events, int16 last_snr (×4), uint16 n_direct_dups, n_flood_dups,
         # uint32 total_rx_air_time_secs, n_recv_errors  → 56 bytes
+
+        # Battery Readings: uses first configured sensor that reports bus/pack voltage.
+        readings = self._get_sensor_readings()
+        batt = int(min(max(self._battery_voltage(readings) * 1000, 0), 0xFFFF))
 
         # Uptime: use engine start_time when available (fixes wrong "20521 days" from time.time())
         if self.engine and hasattr(self.engine, "start_time"):
@@ -203,7 +230,7 @@ class ProtocolRequestHelper:
         # Pack 56-byte RepeaterStats (layout matches firmware)
         stats = struct.pack(
             "<HHhhIIIIIIIIHhHHII",
-            0,  # batt_milli_volts (not available on Pi)
+            batt,  # battery in mV
             0,  # curr_tx_queue_len (TODO)
             noise_floor,
             last_rssi,
@@ -235,6 +262,141 @@ class ProtocolRequestHelper:
 
         return stats
 
+    def _handle_get_telemetry(self, client, timestamp: int, req_data: bytes):
+        """Return CayenneLPP telemetry: base voltage + configured sensors.
+
+        Matches C++ simple_repeater/simple_room_server handleRequest
+        REQ_TYPE_GET_TELEMETRY_DATA. req_data[0] is the inverse permission mask
+        (firmware payload[1]); guests are restricted to base telemetry. The base
+        voltage entry on TELEM_CHANNEL_SELF is always emitted. Environment
+        sensors are appended only when the mask grants environment access.
+
+        The firmware's MCU-temperature append is intentionally not mirrored: only
+        configured sensors are reported.
+        """
+        # Inverse mask -> permission mask (firmware: perm_mask = ~payload[1]).
+        inverse_mask = req_data[0] if len(req_data) >= 1 else 0
+        perm_mask = (~inverse_mask) & 0xFF
+
+        # Guests get base telemetry only (firmware: PERM_ACL_GUEST -> perm_mask 0).
+        if hasattr(client, "is_guest") and client.is_guest():
+            perm_mask = 0x00
+
+        readings = self._get_sensor_readings()
+
+        # Base voltage entry: configured UPS/battery voltage when available,
+        # else 0.0 V (voltage-only floor, mirroring the companion self-telemetry).
+        lpp = bytearray(encode_voltage(TELEM_CHANNEL_SELF, self._battery_voltage(readings)))
+
+        # One channel per sensor reading (matches firmware channel assignment).
+        if perm_mask & TELEM_PERM_ENVIRONMENT:
+            channel = TELEM_CHANNEL_SELF + 1
+            for reading in readings:
+                entry = self._encode_power_reading(
+                    channel, reading
+                ) + self._encode_environment_reading(channel, reading)
+                if entry:
+                    lpp.extend(entry)
+                    channel += 1
+
+        logger.debug(
+            "GET_TELEMETRY: perm_mask=0x%02X, %d LPP bytes",
+            perm_mask,
+            len(lpp),
+        )
+        return bytes(lpp)
+
+    def _get_sensor_readings(self):
+        """Return the latest cached sensor readings (empty list if unavailable)."""
+        if not self.sensor_manager:
+            return []
+        try:
+            summary = self.sensor_manager.get_summary()
+            return summary.get("readings", []) or []
+        except Exception as exc:
+            logger.debug("Could not read sensor summary: %s", exc)
+            return []
+
+    @staticmethod
+    def _battery_voltage(readings) -> float:
+        """First configured sensor's pack/bus voltage, else 0.0 V."""
+        for reading in readings:
+            if not reading.get("ok"):
+                continue
+            data = reading.get("data") or {}
+            voltage = data.get("bus_voltage_v")
+            if voltage is not None:
+                try:
+                    return float(voltage)
+                except (TypeError, ValueError):
+                    continue
+        return 0.0
+
+    @staticmethod
+    def _encode_power_reading(channel: int, reading) -> bytes:
+        """Encode a voltage/current/power reading as CayenneLPP, or b"" if none.
+
+        TODO: a multi-rail sensor (e.g. INA3221) would need one channel per
+        rail here, not one channel for the whole reading.
+        """
+        if not reading.get("ok"):
+            return b""
+        data = reading.get("data") or {}
+        out = bytearray()
+        voltage = data.get("bus_voltage_v")
+        if voltage is not None:
+            try:
+                out.extend(encode_voltage(channel, float(voltage)))
+            except (TypeError, ValueError):
+                pass
+        current = data.get("current_ma")
+        if current is not None:
+            try:
+                out.extend(encode_current(channel, float(current) / 1000.0))
+            except (TypeError, ValueError):
+                pass
+        power = data.get("power_mw")
+        if power is not None:
+            try:
+                power_mw = float(power)
+                watts = int(power_mw / 1000.0)
+                if power_mw >= 0.0 and watts <= 0xFFFF:
+                    out.extend(encode_power(channel, watts))
+            except (TypeError, ValueError, OverflowError):
+                pass
+        return bytes(out)
+
+    @staticmethod
+    def _encode_environment_reading(channel: int, reading) -> bytes:
+        """Encode a temperature/humidity/pressure reading as CayenneLPP, or b"" if none.
+
+        Follows the firmware SHT/BME query order: temperature, relative
+        humidity, then barometric pressure, all on the same channel.
+        """
+        if not reading.get("ok"):
+            return b""
+        data = reading.get("data") or {}
+        out = bytearray()
+        temperature = data.get("temperature_c")
+        if temperature is not None:
+            try:
+                out.extend(encode_temperature(channel, float(temperature)))
+            except (TypeError, ValueError):
+                pass
+        humidity = data.get("humidity_pct")
+        if humidity is not None:
+            try:
+                out.extend(encode_relative_humidity(channel, float(humidity)))
+            except (TypeError, ValueError):
+                pass
+        pressure = data.get("pressure_hpa")
+        if pressure is not None:
+            try:
+                out.extend(encode_barometric_pressure(channel, float(pressure)))
+            except (TypeError, ValueError):
+                pass
+        return bytes(out)
+
     def _make_handle_get_access_list(self, identity_acl):
         """Create a closure for GET_ACCESS_LIST bound to a specific identity ACL."""
 
@@ -260,7 +422,10 @@ class ProtocolRequestHelper:
         result = bytearray()
         for ci in identity_acl.get_all_clients():
             if ci.permissions == 0:
-                continue  # skip deleted entries
+                # Skip deleted entries. Firmware does the same check verbatim,
+                # so plain guests (role 0, no extra bits) are deliberately
+                # absent from the access list on both implementations.
+                continue
             pubkey = ci.id.get_public_key()
             result.extend(pubkey[:6])  # 6-byte pub_key prefix
             result.append(ci.permissions & 0xFF)

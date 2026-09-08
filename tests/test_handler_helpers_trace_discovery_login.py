@@ -5,10 +5,47 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from openhop_core.protocol.constants import PAYLOAD_TYPE_ANON_REQ, ROUTE_TYPE_DIRECT
+from openhop_core.node.handlers.result import HandlerResult
+from openhop_core.protocol import LocalIdentity
+from openhop_core.protocol.constants import (
+    PAYLOAD_TYPE_ANON_REQ,
+    ROUTE_TYPE_DIRECT,
+    ROUTE_TYPE_TRANSPORT_DIRECT,
+)
+from openhop_core.protocol.packet_builder import PacketBuilder
+
 from repeater.handler_helpers.discovery import DiscoveryHelper
 from repeater.handler_helpers.login import LoginHelper
 from repeater.handler_helpers.trace import TraceHelper
+
+
+def _distinct_identities(n=3):
+    """Return `n` identities whose public keys start with distinct bytes."""
+    ids, seen = [], set()
+    while len(ids) < n:
+        idn = LocalIdentity()
+        first = idn.get_public_key()[0]
+        if first in seen:
+            continue
+        seen.add(first)
+        ids.append(idn)
+    return ids
+
+
+class _SendDest:
+    """Minimal contact object accepted by PacketBuilder as a send destination."""
+
+    def __init__(self, pubkey: bytes):
+        self.public_key = pubkey.hex()
+        self.out_path = []
+        self.out_path_len = -1
+
+
+def _force_dest_hash(packet, hash_byte: int):
+    """Rewrite the on-air one-byte dest hash to simulate a prefix collision."""
+    packet.payload = bytearray(packet.payload)
+    packet.payload[0] = hash_byte
+    return packet
 
 
 class DummyPacket:
@@ -24,6 +61,9 @@ class DummyPacket:
 
     def get_route_type(self):
         return self.header
+
+    def is_route_direct(self):
+        return self.header in (ROUTE_TYPE_DIRECT, ROUTE_TYPE_TRANSPORT_DIRECT)
 
     def get_payload_type(self):
         return 0x09
@@ -88,7 +128,7 @@ async def test_trace_helper_process_sets_pending_ping_and_forwards():
     tag = 77
     evt = helper.register_ping(tag, 0x42)
 
-    packet = DummyPacket(path=b"\x01", payload=b"\xaa\xbb\xcc")
+    packet = DummyPacket(route=ROUTE_TYPE_TRANSPORT_DIRECT, path=b"\x01", payload=b"\xaa\xbb\xcc")
     helper._forward_trace_packet = AsyncMock()
     helper._extract_path_info = MagicMock(return_value=([], []))
     helper._should_forward_trace = MagicMock(return_value=True)
@@ -159,6 +199,70 @@ async def test_trace_helper_forward_trace_packet_updates_recent_record_and_injec
     assert repeater_handler.recent_packets[0]["drop_reason"] == "trace_forwarded"
     assert pkt.path_len == 1
     packet_injector.assert_awaited_once()
+
+
+def _trace_relay_helper(mode, forward=True):
+    """TraceHelper wired so _should_forward_trace says yes; mode comes from config."""
+    repeater_handler = MagicMock()
+    repeater_handler.is_duplicate.return_value = False
+    repeater_handler.calculate_packet_score.return_value = 0.9
+    repeater_handler.config = {"repeater": {"mode": mode}}
+    helper = TraceHelper(
+        local_hash=0x42,
+        local_identity=FakeIdentity(0x42),
+        repeater_handler=repeater_handler,
+    )
+    helper._forward_trace_packet = AsyncMock()
+    helper._extract_path_info = MagicMock(return_value=([], []))
+    helper._should_forward_trace = MagicMock(return_value=forward)
+    helper.trace_handler._parse_trace_payload = MagicMock(
+        return_value={
+            "valid": True,
+            "trace_path_bytes": b"\x42\x43",
+            "flags": 0,
+            "trace_hops": [b"\x42", b"\x43"],
+            "trace_path": [0x42, 0x43],
+            "tag": 1234,
+        }
+    )
+    helper.trace_handler._format_trace_response = MagicMock(return_value="trace ok")
+    return helper
+
+
+@pytest.mark.asyncio
+async def test_trace_relay_suppressed_in_monitor_and_no_tx_mode():
+    # Firmware gates TRACE relay on allowPacketForward, so a repeater with
+    # repeat off must not relay an intermediate-hop trace.
+    for mode in ("monitor", "no_tx"):
+        helper = _trace_relay_helper(mode)
+        packet = DummyPacket(path=b"\x01", payload=b"\xaa\xbb\xcc")
+        await helper.process_trace_packet(packet)
+        helper._forward_trace_packet.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_trace_relay_allowed_in_forward_and_unknown_mode():
+    for mode in ("forward", "weird-mode"):
+        helper = _trace_relay_helper(mode)
+        packet = DummyPacket(path=b"\x01", payload=b"\xaa\xbb\xcc")
+        await helper.process_trace_packet(packet)
+        helper._forward_trace_packet.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_trace_ping_response_still_matches_in_monitor_mode():
+    # Ping origination/response handling is not relay: a pending ping must
+    # resolve even when the repeater is not forwarding.
+    helper = _trace_relay_helper("monitor", forward=False)
+    tag = 555
+    helper.trace_handler._parse_trace_payload.return_value["tag"] = tag
+    evt = helper.register_ping(tag, 0x42)
+
+    packet = DummyPacket(path=b"\x01", payload=b"\xaa\xbb\xcc")
+    await helper.process_trace_packet(packet)
+
+    assert evt.is_set()
+    helper._forward_trace_packet.assert_not_awaited()
 
 
 def test_trace_helper_cleanup_stale_pings():
@@ -252,6 +356,120 @@ async def test_discovery_response_jitter_disabled_does_not_sleep():
 
     sleep_mock.assert_not_called()
     injector.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_discovery_session_collects_and_completes():
+    injector = AsyncMock(return_value=True)
+    helper = DiscoveryHelper(
+        local_identity=FakeIdentity(0x42),
+        packet_injector=injector,
+        response_jitter_ms=0,
+    )
+
+    session = helper.create_session(timeout=0.01, filter_mask=0x04)
+    session_id = session["session_id"]
+
+    execute_task = asyncio.create_task(helper.execute_session(session_id))
+    await asyncio.sleep(0)
+
+    tag = helper.get_session_snapshot(session_id)["tag"]
+    callback = helper.control_handler._response_callbacks[tag]
+    callback(
+        {
+            "tag": tag,
+            "node_type": 2,
+            "inbound_snr": 1.0,
+            "response_snr": 2.0,
+            "rssi": -70,
+            "pub_key": "aa" * 32,
+            "timestamp": 123.0,
+            "valid": True,
+        }
+    )
+
+    await execute_task
+
+    snapshot = helper.get_session_snapshot(session_id)
+    assert snapshot["status"] == "completed"
+    assert snapshot["count"] == 1
+
+    event_state = helper.get_events_since(session_id)
+    event_names = [event["event"] for event in event_state["events"]]
+    assert "started" in event_names
+    assert "discovery_result" in event_names
+    assert "completed" in event_names
+
+
+@pytest.mark.asyncio
+async def test_discovery_session_deduplicates_by_pubkey():
+    helper = DiscoveryHelper(
+        local_identity=FakeIdentity(0x42),
+        packet_injector=AsyncMock(return_value=True),
+        response_jitter_ms=0,
+    )
+    session = helper.create_session(timeout=1, filter_mask=0x04)
+    session_id = session["session_id"]
+
+    helper._record_response(
+        session_id,
+        {
+            "tag": session["tag"],
+            "node_type": 2,
+            "inbound_snr": 1.0,
+            "response_snr": 2.0,
+            "rssi": -70,
+            "pub_key": "bb" * 32,
+            "timestamp": 1.0,
+        },
+    )
+    helper._record_response(
+        session_id,
+        {
+            "tag": session["tag"],
+            "node_type": 2,
+            "inbound_snr": 1.5,
+            "response_snr": 2.5,
+            "rssi": -60,
+            "pub_key": "bb" * 32,
+            "timestamp": 2.0,
+        },
+    )
+
+    snapshot = helper.get_session_snapshot(session_id)
+    assert snapshot["count"] == 0  # session not running yet, responses ignored
+
+    helper._get_session(session_id)["status"] = "running"
+    helper._record_response(
+        session_id,
+        {
+            "tag": session["tag"],
+            "node_type": 2,
+            "inbound_snr": 1.0,
+            "response_snr": 2.0,
+            "rssi": -70,
+            "pub_key": "cc" * 32,
+            "timestamp": 1.0,
+        },
+    )
+    helper._record_response(
+        session_id,
+        {
+            "tag": session["tag"],
+            "node_type": 2,
+            "inbound_snr": 1.5,
+            "response_snr": 2.5,
+            "rssi": -60,
+            "pub_key": "cc" * 32,
+            "timestamp": 2.0,
+        },
+    )
+
+    snapshot = helper.get_session_snapshot(session_id)
+    assert snapshot["count"] == 1
+    latest_events = helper.get_events_since(session_id)["events"]
+    result_events = [event for event in latest_events if event["event"] == "discovery_result"]
+    assert result_events[-1]["data"]["is_update"] is True
 
 
 def test_discovery_send_response_without_injector_is_safe():
@@ -375,7 +593,8 @@ def test_owner_and_features_callbacks_from_config():
 @pytest.mark.asyncio
 async def test_login_process_packet_routes_to_registered_handler_and_marks_no_retransmit():
     helper = LoginHelper(identity_manager=MagicMock(), packet_injector=AsyncMock())
-    login_handler = AsyncMock()
+    # Handler decrypts successfully: consume and stop forwarding.
+    login_handler = AsyncMock(return_value=HandlerResult.consumed())
     helper.handlers[0x62] = login_handler
 
     packet = SimpleNamespace(
@@ -389,6 +608,28 @@ async def test_login_process_packet_routes_to_registered_handler_and_marks_no_re
     assert handled is True
     login_handler.assert_awaited_once_with(packet)
     packet.mark_do_not_retransmit.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_login_process_packet_hash_collision_forwards():
+    """dest hash matches a local identity but decryption fails (collision): the
+    ANON_REQ is not ours, so it must NOT be consumed and must forward (#353)."""
+    helper = LoginHelper(identity_manager=MagicMock(), packet_injector=AsyncMock())
+    # Handler could not decrypt for this identity.
+    login_handler = AsyncMock(return_value=HandlerResult.not_for_us())
+    helper.handlers[0x62] = login_handler
+
+    packet = SimpleNamespace(
+        payload=bytearray([0x62, 0xAA]),
+        get_payload_type=lambda: 0x01,
+        mark_do_not_retransmit=MagicMock(),
+    )
+
+    handled = await helper.process_login_packet(packet)
+
+    assert handled is False
+    login_handler.assert_awaited_once_with(packet)
+    packet.mark_do_not_retransmit.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -431,3 +672,34 @@ def test_login_acl_access_and_client_listing():
 
     all_clients = helper.list_authenticated_clients()
     assert {c["id"] for c in all_clients} == {"a1", "b1", "b2"}
+
+
+@pytest.mark.asyncio
+async def test_login_helper_real_crypto_consume_vs_collision_forward():
+    """A real ANON_REQ login to a local room-server identity is consumed (a wrong
+    password still decrypts, so it is ours to reject); an ANON_REQ encrypted for a
+    remote node that collides on the one-byte dest hash is left for forwarding."""
+    local, sender, remote = _distinct_identities()
+    local_hash = local.get_public_key()[0]
+
+    helper = LoginHelper(identity_manager=MagicMock(), packet_injector=AsyncMock())
+    helper.register_identity(
+        "room-a",
+        local,
+        identity_type="room_server",
+        config={"settings": {"admin_password": "secret"}},
+    )
+    assert local_hash in helper.handlers  # registration succeeded
+
+    # Genuine login (wrong password still decrypts -> ours to reject, not forward).
+    genuine = PacketBuilder.create_login_packet(_SendDest(local.get_public_key()), sender, "nope")
+    assert await helper.process_login_packet(genuine) is True
+    assert genuine.is_marked_do_not_retransmit()
+
+    # Login encrypted for a remote node whose dest hash collides with ours.
+    collision = PacketBuilder.create_login_packet(
+        _SendDest(remote.get_public_key()), sender, "nope"
+    )
+    _force_dest_hash(collision, local_hash)
+    assert await helper.process_login_packet(collision) is False
+    assert not collision.is_marked_do_not_retransmit()

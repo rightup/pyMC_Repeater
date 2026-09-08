@@ -31,6 +31,7 @@ def test_list_presets_returns_bundled_names():
     assert "letsmesh" in names
     assert "meshmapper" in names
     assert "meshat-se" in names
+    assert "chimesh" in names
 
 
 def test_get_preset_waev_uses_alias_for_server_side_failover():

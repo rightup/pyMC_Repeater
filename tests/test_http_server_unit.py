@@ -1,4 +1,5 @@
 import io
+import json
 import logging
 import sys
 from pathlib import Path
@@ -127,7 +128,22 @@ def test_stats_app_index_and_default_routing(monkeypatch, tmp_path):
         app.default("api")
 
     assert app.default("ws", "packets") == ""
+    assert app.default("plugins") == "<html>ok</html>"
     assert app.default("route") == "<html>ok</html>"
+
+
+def test_stats_app_exposes_compiled_ui_favicon(monkeypatch, tmp_path):
+    favicon = b"compiled-ui-favicon"
+    (tmp_path / "favicon.ico").write_bytes(favicon)
+
+    fake_api = SimpleNamespace(config_manager=object(), docs=lambda: "d")
+    monkeypatch.setattr(hs, "APIEndpoints", lambda *args, **kwargs: fake_api)
+    monkeypatch.setattr(cherrypy, "response", SimpleNamespace(headers={}), raising=False)
+
+    app = hs.StatsApp(config={"web": {"web_path": str(tmp_path)}})
+
+    assert app.favicon_ico() == favicon
+    assert cherrypy.response.headers["Content-Type"] == "image/x-icon"
 
 
 def test_stats_app_index_error_paths(monkeypatch, tmp_path):
@@ -147,6 +163,40 @@ def test_stats_app_index_error_paths(monkeypatch, tmp_path):
     (tmp_path / "index.html").write_text("ignored", encoding="utf-8")
     with pytest.raises(cherrypy.HTTPError):
         app.index()
+
+
+def test_stats_app_resolves_legacy_plugin_web_path(tmp_path, monkeypatch):
+    plugins_root = tmp_path / "plugins"
+    plugin_id = "waev.outpost"
+    release = plugins_root / plugin_id / "releases" / "0.9.400"
+    ui = release / "ui"
+    ui.mkdir(parents=True)
+    (ui / "index.html").write_text("<html>plugin</html>", encoding="utf-8")
+    manifest = {
+        "schema": 1,
+        "id": plugin_id,
+        "name": "Outpost",
+        "version": "0.9.400",
+        "description": "Outpost UI",
+        "ui": {"type": "application", "entry": "ui/index.html"},
+    }
+    (release / "openhop-plugin.json").write_text(json.dumps(manifest), encoding="utf-8")
+    (plugins_root / plugin_id / "state.json").write_text(
+        json.dumps({"id": plugin_id, "version": "0.9.400", "enabled": True, "source": "catalogue"}),
+        encoding="utf-8",
+    )
+    (plugins_root / plugin_id / "current").symlink_to(Path("releases/0.9.400"))
+
+    fake_api = SimpleNamespace(config_manager=object(), docs=lambda: "d")
+    monkeypatch.setattr(hs, "APIEndpoints", lambda *args, **kwargs: fake_api)
+
+    legacy_cfg_path = plugins_root / plugin_id / "releases" / "0.9.386" / "ui"
+    app = hs.StatsApp(
+        config={"plugins": {"root": str(plugins_root)}, "web": {"web_path": str(legacy_cfg_path)}}
+    )
+
+    resolved = app._resolve_html_dir()
+    assert resolved.endswith(f"{plugin_id}/current/ui")
 
 
 def test_http_server_utility_methods(monkeypatch, tmp_path):
@@ -185,3 +235,12 @@ def test_http_server_utility_methods(monkeypatch, tmp_path):
     )
     server.stop()
     assert exited["v"] is True
+
+
+def test_cors_response_headers_allow_bearer_preflight_without_credentials():
+    headers = dict(hs._cors_response_headers())
+
+    assert headers["Access-Control-Allow-Origin"] == "*"
+    assert "OPTIONS" in headers["Access-Control-Allow-Methods"]
+    assert "Authorization" in headers["Access-Control-Allow-Headers"]
+    assert "Access-Control-Allow-Credentials" not in headers

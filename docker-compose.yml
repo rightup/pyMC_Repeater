@@ -11,6 +11,12 @@ services:
       - /dev/gpiochip0
       # USB DEVICES (Your path may differ)
       - /dev/bus/usb/002:/dev/bus/usb/002
+      # USB SERIAL MODEM (KISS / openHop USB). Do NOT use a /dev/serial/by-id/
+      # path here: ESP32-S3 boards report their MAC as the USB serial number, so
+      # the name contains colons and Docker reads those as the host:container
+      # separator. Install 99-openhop-modem.rules on the host and map the
+      # symlink it creates instead. See README, "USB serial modems".
+      # - /dev/openhop-modem:/dev/openhop-modem
     # SPI DEVICES PERMISSIONS
     cap_add:
       - SYS_RAWIO
@@ -23,6 +29,10 @@ services:
     volumes:
       - ${OPENHOP_CONFIG_VOLUME:-${PYMC_CONFIG_VOLUME:-openhop-repeater-config}}:/etc/openhop_repeater
       - ${OPENHOP_DATA_VOLUME:-${PYMC_DATA_VOLUME:-openhop-repeater-data}}:/var/lib/openhop_repeater
+      # Optional host-device discovery for the setup UI. This read-only mount
+      # only exposes names under /host/dev; the selected serial device must
+      # still be granted under `devices:` above before the container can open it.
+      # - /dev:/host/dev:ro
 
 volumes:
   openhop-repeater-config:

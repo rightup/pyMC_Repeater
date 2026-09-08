@@ -58,6 +58,8 @@ tags:
     description: Access Control Lists
   - name: Room Server
     description: Room server messaging
+  - name: Plugins
+    description: External plugin install and lifecycle management
 
 paths:
   # ============================================================================
@@ -454,6 +456,18 @@ paths:
       tags: [System]
       summary: Send repeater advertisement
       description: Manually trigger sending a repeater advertisement packet
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                mode:
+                  type: string
+                  enum: [flood, direct]
+                  default: flood
+                  description: Advert send mode label for UI/workflow selection.
       responses:
         '200':
           description: Advertisement sent
@@ -797,7 +811,10 @@ paths:
     post:
       tags: [System]
       summary: Update radio configuration
-      description: Update LoRa radio parameters
+      description: |
+        Update LoRa radio parameters. In multi-radio mode, pass radio_id to
+        target a radios[] entry; air settings are written to that entry and
+        mirrored to top-level radio when it is the default radio.
       security:
         - BearerAuth: []
         - ApiKeyAuth: []
@@ -807,6 +824,31 @@ paths:
           application/json:
             schema:
               type: object
+              properties:
+                radio_id:
+                  type: string
+                  description: Optional multi-radio id from config.radios[].id
+                frequency:
+                  type: number
+                bandwidth:
+                  type: number
+                spreading_factor:
+                  type: integer
+                coding_rate:
+                  type: integer
+                tx_power:
+                  type: number
+                preamble_length:
+                  type: integer
+                flood_advert_interval_hours:
+                  type: integer
+                  description: Repeater flood advert interval in hours (0 = off, 3-168)
+                advert_interval_minutes:
+                  type: integer
+                  description: Legacy local advert interval in minutes (0 = off, 1-10080)
+                direct_advert_interval_hours:
+                  type: integer
+                  description: Additional repeater advert interval in hours (0 = off, 1-168)
       responses:
         '200':
           description: Radio config updated
@@ -858,6 +900,21 @@ paths:
           schema:
             type: string
           description: Packet hash to lookup
+      responses:
+        '200':
+          description: Packet details
+
+  /packet_by_id:
+    get:
+      tags: [Packets]
+      summary: Get packet by ID
+      parameters:
+        - name: packet_id
+          in: query
+          required: true
+          schema:
+            type: integer
+          description: Packet database ID to lookup
       responses:
         '200':
           description: Packet details
@@ -945,6 +1002,90 @@ paths:
             application/json:
               schema:
                 type: object
+
+  /neighbor_links:
+    get:
+      tags: [Packets]
+      summary: Get observed neighbour link snapshots
+      description: Returns observation-only neighbour link metrics by upstream peer hash.
+      parameters:
+        - name: active_within_seconds
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 90
+            minimum: 1
+          description: Mark links as active when last-seen age is within this threshold.
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 500
+            minimum: 1
+            maximum: 5000
+          description: Maximum number of link snapshots to return.
+      responses:
+        '200':
+          description: Neighbour link snapshots
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NeighborLinksResponse'
+
+  /neighbor_link_history:
+    get:
+      tags: [Packets]
+      summary: Get neighbour link packet history
+      description: Returns historical packet observations for a single upstream peer hash.
+      parameters:
+        - name: peer_hash
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Upstream peer hash to query.
+        - name: path_hash_size
+          in: query
+          required: true
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 3
+          description: Path hash size in bytes for the peer hash.
+        - name: hours
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 24
+            minimum: 1
+            maximum: 168
+          description: Time window in hours.
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 1000
+            minimum: 1
+            maximum: 5000
+          description: Maximum rows (or buckets) to return.
+        - name: bucket_seconds
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 60
+          description: Bucket width in seconds; the answer carries `buckets` instead of `rows`.
+      responses:
+        '200':
+          description: Neighbour link history
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NeighborLinkHistoryResponse'
 
   # ============================================================================
   # Charts & RRD Endpoints
@@ -1117,6 +1258,66 @@ paths:
                               items:
                                 type: number
 
+  /lbt_diagnostics:
+    get:
+      tags: [Charts]
+      summary: Get LBT diagnostics aligned with RF metrics
+      description: |
+        Returns aggregated Listen Before Talk (LBT) diagnostics for transmission-path
+        packets, aligned to RF health buckets for correlation analysis.
+
+        Notes:
+        - LBT total attempts are derived as `lbt_attempts + 1` from stored packet metadata.
+        - Buckets are bounded and aggregated server-side for efficient dashboard refresh.
+      parameters:
+        - name: hours
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 168
+            default: 24
+          description: Fallback range in hours when explicit timestamps are not provided.
+        - name: start_timestamp
+          in: query
+          schema:
+            type: number
+            format: float
+          description: Inclusive start timestamp (Unix epoch seconds).
+        - name: end_timestamp
+          in: query
+          schema:
+            type: number
+            format: float
+          description: Inclusive end timestamp (Unix epoch seconds).
+        - name: bucket_seconds
+          in: query
+          schema:
+            type: integer
+            minimum: 60
+            maximum: 3600
+          description: Bucket width in seconds. If omitted, server auto-selects based on range.
+        - name: severe_attempt_threshold
+          in: query
+          schema:
+            type: integer
+            minimum: 2
+            maximum: 16
+            default: 4
+          description: Attempt threshold used to classify severe contention events.
+      responses:
+        '200':
+          description: LBT diagnostics response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  data:
+                    $ref: '#/components/schemas/LbtDiagnosticsResponse'
+
   /noise_floor_history:
     get:
       tags: [Noise Floor]
@@ -1258,6 +1459,91 @@ paths:
               schema:
                 $ref: '#/components/schemas/SuccessResponse'
 
+  /cad_manual_check:
+    post:
+      tags: [CAD Calibration]
+      summary: Run manual CAD check
+      description: Execute one or more immediate CAD checks and return aggregated detection metrics.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                samples:
+                  type: integer
+                  minimum: 1
+                  maximum: 32
+                  default: 1
+                  description: Number of CAD checks to perform.
+                det_peak:
+                  type: integer
+                  minimum: 0
+                  maximum: 255
+                  description: Temporary CAD peak threshold.
+                det_min:
+                  type: integer
+                  minimum: 0
+                  maximum: 255
+                  description: Temporary CAD minimum threshold.
+                cad_symbol_num:
+                  type: integer
+                  enum: [1, 2, 4, 8, 16]
+                  default: 2
+                  description: CAD symbol count used by the radio.
+                cad_timeout_ms:
+                  type: integer
+                  minimum: 50
+                  maximum: 5000
+                  default: 500
+                  description: Timeout per CAD check in milliseconds.
+                apply_live:
+                  type: boolean
+                  default: false
+                  description: Apply det_peak and det_min to live radio thresholds before checks.
+      responses:
+        '200':
+          description: Manual CAD check result.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  data:
+                    type: object
+                    properties:
+                      det_peak:
+                        type: integer
+                      det_min:
+                        type: integer
+                      cad_symbol_num:
+                        type: integer
+                      cad_timeout_ms:
+                        type: integer
+                      apply_live:
+                        type: boolean
+                      samples:
+                        type: integer
+                      attempts:
+                        type: integer
+                      detections:
+                        type: integer
+                      non_detections:
+                        type: integer
+                      timeouts:
+                        type: integer
+                      errors:
+                        type: integer
+                      cad_done_count:
+                        type: integer
+                      detection_rate:
+                        type: number
+                      detected:
+                        type: boolean
+
   /save_cad_settings:
     post:
       tags: [CAD Calibration]
@@ -1286,6 +1572,11 @@ paths:
                   maximum: 255
                   description: CAD minimum value
                   example: 64
+                cad_symbol_num:
+                  type: integer
+                  enum: [1, 2, 4, 8, 16]
+                  default: 2
+                  description: CAD symbol count to persist for runtime CAD detections.
       responses:
         '200':
           description: Settings saved
@@ -1526,6 +1817,61 @@ paths:
               schema:
                 $ref: '#/components/schemas/SuccessResponse'
 
+  /default_region:
+    get:
+      tags: [Network Policy]
+      summary: Get default region
+      description: Get current mesh default region used for locally-originated flood adverts.
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      responses:
+        '200':
+          description: Current default region
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  data:
+                    type: object
+                    properties:
+                      default_region:
+                        type: string
+                        nullable: true
+                  message:
+                    type: string
+                  error:
+                    type: string
+    post:
+      tags: [Network Policy]
+      summary: Update default region
+      description: Set or clear mesh default region. Pass null to clear.
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [default_region]
+              properties:
+                default_region:
+                  type: string
+                  nullable: true
+                  description: Region name to set, or null to clear.
+      responses:
+        '200':
+          description: Default region updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+
   /ping_neighbor:
     post:
       tags: [Network Policy]
@@ -1580,6 +1926,163 @@ paths:
                         type: integer
                       path_hash_mode:
                         type: integer
+                  message:
+                    type: string
+                  error:
+                    type: string
+
+  /discover_neighbors_start:
+    post:
+      tags: [Network Policy]
+      summary: Start neighbor discovery session
+      description: Start a short-lived discovery broadcast session and return a session ID for SSE streaming.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                timeout:
+                  type: number
+                  minimum: 1
+                  maximum: 60
+                  default: 5
+                filter_mask:
+                  type: integer
+                  minimum: 0
+                  maximum: 255
+                  default: 4
+                since:
+                  type: integer
+                  minimum: 0
+                  default: 0
+                prefix_only:
+                  type: boolean
+                  default: false
+      responses:
+        '200':
+          description: Discovery session started
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  data:
+                    type: object
+                    properties:
+                      session_id:
+                        type: string
+                      tag:
+                        type: integer
+                      status:
+                        type: string
+                      timeout:
+                        type: number
+                      filter_mask:
+                        type: integer
+                      since:
+                        type: integer
+                      prefix_only:
+                        type: boolean
+                      created_at:
+                        type: number
+                      started_at:
+                        type: number
+                        nullable: true
+                      completed_at:
+                        type: number
+                        nullable: true
+                      count:
+                        type: integer
+                      error:
+                        type: string
+                        nullable: true
+                  message:
+                    type: string
+                  error:
+                    type: string
+
+  /discover_neighbors_stream:
+    get:
+      tags: [Network Policy]
+      summary: Stream discovery events
+      description: Stream live neighbor discovery session events via Server-Sent Events (SSE).
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      parameters:
+        - name: session_id
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: last_event_id
+          in: query
+          required: false
+          schema:
+            type: integer
+        - name: token
+          in: query
+          required: false
+          schema:
+            type: string
+          description: JWT token for EventSource clients that cannot send Authorization headers.
+      responses:
+        '200':
+          description: SSE event stream
+          content:
+            text/event-stream:
+              schema:
+                type: string
+
+  /add_discovered_neighbor:
+    post:
+      tags: [Network Policy]
+      summary: Add discovered node as neighbor
+      description: Persist a discovered node into the adverts/neighbors store for future management.
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [pub_key]
+              properties:
+                pub_key:
+                  type: string
+                  description: Hex pubkey (8-byte or 32-byte form).
+                node_name:
+                  type: string
+                  nullable: true
+                node_type:
+                  type: integer
+                rssi:
+                  type: integer
+                  nullable: true
+                response_snr:
+                  type: number
+                  nullable: true
+                snr:
+                  type: number
+                  nullable: true
+      responses:
+        '200':
+          description: Node added
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  data:
+                    type: object
                   message:
                     type: string
                   error:
@@ -1918,6 +2421,18 @@ paths:
                       type: string
                       description: Advertised node name (companion only; defaults to identity name)
                       example: "My Companion"
+                    flood_advert_interval_hours:
+                      type: integer
+                      minimum: 0
+                      maximum: 168
+                      description: Room-server flood advert interval in hours (0 = off)
+                      example: 6
+                    direct_advert_interval_hours:
+                      type: integer
+                      minimum: 0
+                      maximum: 168
+                      description: Room-server additional advert interval in hours (0 = off)
+                      example: 2
                     tcp_port:
                       type: integer
                       minimum: 1
@@ -2079,7 +2594,7 @@ paths:
                   description: New identity key (optional)
                 settings:
                   type: object
-                  description: Updated settings
+                  description: Updated settings (room server settings may include flood_advert_interval_hours and direct_advert_interval_hours)
       responses:
         '200':
           description: Identity updated
@@ -2927,7 +3442,23 @@ paths:
               schema:
                 type: object
 
+  /web_frontends:
+    get:
+      tags: [System]
+      summary: List selectable primary web frontends
+      description: >
+        Returns built-in Repeater UI, openHop Console (if installed), and enabled
+        application UI plugins that can be selected via web.web_path.
+      responses:
+        '200':
+          description: Frontend catalogue for the Web Frontend switcher
+          content:
+            application/json:
+              schema:
+                type: object
+
   /check_pymc_console:
+
     get:
       tags: [System]
       summary: Check pyMC console availability
@@ -2962,6 +3493,140 @@ paths:
             application/json:
               schema:
                 type: object
+
+  /publish_neighbors:
+    post:
+      tags: [System]
+      summary: Publish the neighbours table now
+      description: >
+        Runs one neighbours cycle immediately: a zero-hop discovery broadcast, a
+        serialized scope query per neighbour, then a publish to every opted-in
+        broker. Returns as soon as the cycle is scheduled; the cycle itself takes
+        minutes. Poll /mqtt_status for the outcome.
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      responses:
+        '200':
+          description: Cycle started, or an error when one is already running
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+        '405':
+          description: Method not allowed
+
+  /neighbor_scopes:
+    get:
+      tags: [Network Policy]
+      summary: Last known region scopes per neighbour
+      description: >
+        Region scopes learned from the anon-regions query the neighbours publisher
+        issues, keyed by lowercase pubkey hex. One row per neighbour that has been
+        queried; neighbours never queried are simply absent. `scopes` is the last
+        answer given and an empty string is a real answer meaning the neighbour
+        serves unscoped traffic only. `status`/`queried_at` describe the most
+        recent query, which may have failed after a good answer, so `responded_at`
+        is what says how fresh `scopes` is. `served` carries this node's own scopes
+        in the same comma-separated form — the very string it sends when a neighbour
+        asks it the same question — so a client can tell which of a neighbour's
+        scopes it already shares.
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      responses:
+        '200':
+          description: >
+            Stored scope records, or an error when storage is unavailable (as it
+            briefly is during daemon startup) — `data` is absent in that case.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success]
+                properties:
+                  success:
+                    type: boolean
+                  error:
+                    type: string
+                  count:
+                    type: integer
+                  served:
+                    type: object
+                    required: [scopes]
+                    properties:
+                      scopes:
+                        type: string
+                        description: >
+                          This node's own advertised scopes, comma-separated, `*`
+                          first when it floods unscoped. Empty when they cannot be
+                          read.
+                  data:
+                    type: object
+                    additionalProperties:
+                      $ref: '#/components/schemas/NeighborScopeRecord'
+
+  /query_neighbor_scopes:
+    post:
+      tags: [Network Policy]
+      summary: Query one neighbour's region scopes now
+      description: >
+        Sends a single route-direct anon-regions request and waits for the reply,
+        then stores and returns the outcome. Nothing is published to MQTT; the
+        periodic cycle owns the neighbors topic. The request only reaches a
+        zero-hop neighbour, and the responder rate-limits anonymous replies (4 per
+        3 minutes), so both a multi-hop target and a repeated query show up as
+        `timeout`. Errors when a neighbours cycle already holds the scope helper.
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [pubkey]
+              properties:
+                pubkey:
+                  type: string
+                  description: Full 64-character public key hex of the neighbour
+      responses:
+        '200':
+          description: Query outcome, or an error when it could not be run
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success]
+                properties:
+                  success:
+                    type: boolean
+                  error:
+                    type: string
+                  data:
+                    type: object
+                    required: [pubkey, status, scopes, transmitted]
+                    properties:
+                      pubkey:
+                        type: string
+                      status:
+                        type: string
+                        enum: [responded, timeout, send_failed]
+                      scopes:
+                        type: string
+                        description: Comma-separated scope names; empty when unscoped
+                      transmitted:
+                        type: boolean
+                        description: Whether the request actually reached the air
+                      queried_at:
+                        type: number
+                        nullable: true
+                      responded_at:
+                        type: number
+                        nullable: true
+        '405':
+          description: Method not allowed
 
   /update_web_config:
     post:
@@ -3909,8 +4574,616 @@ paths:
               schema:
                 type: object
 
+  # ============================================================================
+  # Plugins
+  # ============================================================================
+  /plugins:
+    get:
+      tags: [Plugins]
+      summary: List installed plugins
+      description: |
+        List plugins installed by the local plugin manager.
+        Returns 503 when the plugin manager process is not running.
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      responses:
+        '504':
+          $ref: '#/components/responses/PluginOutcomeUnknown'
+        '200':
+          description: Plugin list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  plugins:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/PluginStatus'
+        '503':
+          description: Plugin manager unavailable
+
+  /plugins/catalogue:
+    get:
+      tags:
+        - Plugins
+      summary: List curated plugin catalogue
+      description: >
+        Fetch the curated openHop plugin catalogue and annotate entries with
+        install state and the currently approved catalogue version.
+        Failures contacting the R2 catalogue do not affect installed plugins.
+      parameters:
+        - name: refresh
+          in: query
+          required: false
+          schema:
+            type: boolean
+          description: Force refresh of the catalogue cache
+      responses:
+        '504':
+          $ref: '#/components/responses/PluginOutcomeUnknown'
+        '200':
+          description: Catalogue entries
+        '502':
+          description: Catalogue unavailable
+        '503':
+          description: Plugin manager unavailable
+  /plugins/catalogue_install:
+    post:
+      tags:
+        - Plugins
+      summary: Install a plugin from the catalogue
+      description: >
+        Download the exact GitHub Release wheel approved by the R2 catalogue
+        version and SHA-256, verify its manifest, install it, and enable the plugin.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id]
+              properties:
+                id:
+                  type: string
+                version:
+                  type: string
+                  description: Optional assertion of the currently approved version
+      responses:
+        '504':
+          $ref: '#/components/responses/PluginOutcomeUnknown'
+        '200':
+          description: Installed plugin status
+        '400':
+          description: Invalid request or manifest id mismatch
+        '503':
+          description: Plugin manager unavailable
+  /plugins/updates:
+    get:
+      tags:
+        - Plugins
+      summary: Check plugin update availability
+      parameters:
+        - name: id
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: refresh
+          in: query
+          required: false
+          schema:
+            type: boolean
+      responses:
+        '504':
+          $ref: '#/components/responses/PluginOutcomeUnknown'
+        '200':
+          description: Update check result
+        '404':
+          description: Plugin not found
+  /plugins/update:
+    post:
+      tags:
+        - Plugins
+      summary: Update an installed plugin to the approved catalogue version
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id]
+              properties:
+                id:
+                  type: string
+                version:
+                  type: string
+      responses:
+        '504':
+          $ref: '#/components/responses/PluginOutcomeUnknown'
+        '200':
+          description: Updated plugin status
+        '400':
+          description: Update unavailable or invalid
+  /plugins/progress:
+    get:
+      tags: [Plugins]
+      summary: Stream an install or update's progress
+      description: |
+        Server-sent events for a plugin's last catalogue install or update, as
+        /update/progress streams the repeater's own updater. JSON events:
+        `connected`, `line`, `status` (idle, running, complete, error),
+        `keepalive`, and one `done` that ends the stream. Idle streams end after
+        a minute. Uploaded wheels are not reported.
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      parameters:
+        - name: id
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: since
+          in: query
+          required: false
+          description: Resume from this line index
+          schema:
+            type: integer
+            default: 0
+        - name: fresh
+          in: query
+          required: false
+          description: Ignore a log already finished when the stream opens; wait for the next operation.
+          schema:
+            type: boolean
+            default: false
+      responses:
+        '504':
+          $ref: '#/components/responses/PluginOutcomeUnknown'
+        '200':
+          description: Event stream
+          content:
+            text/event-stream:
+              schema:
+                type: string
+        '503':
+          description: Plugin manager unavailable
+  /plugins/settings:
+    get:
+      tags: [Plugins]
+      summary: Get plugin config.json
+      description: Read the opaque plugin-owned data/config.json object.
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      parameters:
+        - name: id
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        '504':
+          $ref: '#/components/responses/PluginOutcomeUnknown'
+        '200':
+          description: Config object
+        '404':
+          description: Plugin not found
+        '503':
+          description: Plugin manager unavailable
+    post:
+      tags: [Plugins]
+      summary: Set plugin config.json
+      description: |
+        Replace plugin-owned data/config.json with a JSON object.
+        Optional restart applies to enabled service plugins.
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id, config]
+              properties:
+                id:
+                  type: string
+                config:
+                  type: object
+                  additionalProperties: true
+                restart:
+                  type: boolean
+                  default: false
+      responses:
+        '504':
+          $ref: '#/components/responses/PluginOutcomeUnknown'
+        '200':
+          description: Saved
+        '400':
+          description: Invalid config
+        '503':
+          description: Plugin manager unavailable
+
+  /plugins/runtime:
+    get:
+      tags: [Plugins]
+      summary: Get plugin runtime.json
+      description: Read the plugin-owned data/runtime.json object.
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      parameters:
+        - name: id
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        '504':
+          $ref: '#/components/responses/PluginOutcomeUnknown'
+        '200':
+          description: Runtime object
+        '404':
+          description: Plugin not found
+        '503':
+          description: Plugin manager unavailable
+
+
+  /plugins/install:
+    post:
+      tags: [Plugins]
+      summary: Install a local plugin wheel
+      description: |
+        Install a Python wheel containing openhop-plugin.json into an isolated
+        virtualenv. Accepts multipart field `wheel` or JSON `wheel_path`.
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                wheel:
+                  type: string
+                  format: binary
+          application/json:
+            schema:
+              type: object
+              properties:
+                wheel_path:
+                  type: string
+                  description: Absolute path to a .whl on the Repeater host
+      responses:
+        '504':
+          $ref: '#/components/responses/PluginOutcomeUnknown'
+        '200':
+          description: Installed
+        '400':
+          description: Invalid wheel or manifest
+        '503':
+          description: Plugin manager unavailable
+
+  /plugins/enable:
+    post:
+      tags: [Plugins]
+      summary: Enable a plugin
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id]
+              properties:
+                id:
+                  type: string
+                  example: openhop.nomad
+      responses:
+        '504':
+          $ref: '#/components/responses/PluginOutcomeUnknown'
+        '200':
+          description: Enabled
+        '404':
+          description: Not found
+        '503':
+          description: Plugin manager unavailable
+
+  /plugins/disable:
+    post:
+      tags: [Plugins]
+      summary: Disable a plugin
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id]
+              properties:
+                id:
+                  type: string
+      responses:
+        '504':
+          $ref: '#/components/responses/PluginOutcomeUnknown'
+        '200':
+          description: Disabled
+        '404':
+          description: Not found
+        '503':
+          description: Plugin manager unavailable
+
+  /plugins/start:
+    post:
+      tags: [Plugins]
+      summary: Start a plugin process
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id]
+              properties:
+                id:
+                  type: string
+      responses:
+        '504':
+          $ref: '#/components/responses/PluginOutcomeUnknown'
+        '200':
+          description: Started
+        '409':
+          description: Plugin disabled
+        '503':
+          description: Plugin manager unavailable
+
+  /plugins/stop:
+    post:
+      tags: [Plugins]
+      summary: Stop a plugin process
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id]
+              properties:
+                id:
+                  type: string
+      responses:
+        '504':
+          $ref: '#/components/responses/PluginOutcomeUnknown'
+        '200':
+          description: Stopped
+        '503':
+          description: Plugin manager unavailable
+
+  /plugins/restart:
+    post:
+      tags: [Plugins]
+      summary: Restart a plugin process
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id]
+              properties:
+                id:
+                  type: string
+      responses:
+        '504':
+          $ref: '#/components/responses/PluginOutcomeUnknown'
+        '200':
+          description: Restarted
+        '503':
+          description: Plugin manager unavailable
+
+  /plugins/logs:
+    get:
+      tags: [Plugins]
+      summary: Tail plugin logs
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      parameters:
+        - name: id
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: tail
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 200
+      responses:
+        '504':
+          $ref: '#/components/responses/PluginOutcomeUnknown'
+        '200':
+          description: Log lines
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  id:
+                    type: string
+                  lines:
+                    type: array
+                    items:
+                      type: string
+        '503':
+          description: Plugin manager unavailable
+
+  /plugins/uninstall:
+    post:
+      tags: [Plugins]
+      summary: Uninstall a plugin
+      description: Stops the plugin and removes release code. Keeps data/ unless delete_data is true.
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id]
+              properties:
+                id:
+                  type: string
+                delete_data:
+                  type: boolean
+                  default: false
+      responses:
+        '504':
+          $ref: '#/components/responses/PluginOutcomeUnknown'
+        '200':
+          description: Uninstalled
+        '503':
+          description: Plugin manager unavailable
+
+  /plugins/{id}:
+    get:
+      tags: [Plugins]
+      summary: Get plugin status
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '504':
+          $ref: '#/components/responses/PluginOutcomeUnknown'
+        '200':
+          description: Status
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - type: object
+                    properties:
+                      success:
+                        type: boolean
+                  - $ref: '#/components/schemas/PluginStatus'
+        '404':
+          description: Not found
+        '503':
+          description: Plugin manager unavailable
+    delete:
+      tags: [Plugins]
+      summary: Uninstall plugin by id
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: delete_data
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+      responses:
+        '504':
+          $ref: '#/components/responses/PluginOutcomeUnknown'
+        '200':
+          description: Uninstalled
+        '503':
+          description: Plugin manager unavailable
+
+
 components:
+  responses:
+    PluginOutcomeUnknown:
+      description: |
+        The manager response was lost or its completion deadline expired.
+        This is not cancellation: the operation may still complete. Check plugin
+        status before retrying. A busy manager instead returns 503; conflicting
+        lifecycle operations on the same plugin return 409.
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [success, error, outcome]
+            properties:
+              success:
+                type: boolean
+                enum: [false]
+              error:
+                type: string
+              outcome:
+                type: string
+                enum: [unknown]
   schemas:
+
+    PluginStatus:
+      type: object
+      properties:
+        id:
+          type: string
+          example: openhop.nomad
+        name:
+          type: string
+        version:
+          type: string
+        enabled:
+          type: boolean
+        state:
+          type: string
+          enum: [DISABLED, STOPPED, STARTING, RUNNING, STOPPING, FAILED]
+        pid:
+          type: integer
+          nullable: true
+        has_runtime:
+          type: boolean
+        has_ui:
+          type: boolean
+        ui_entry:
+          type: string
+          nullable: true
+        data_dir:
+          type: string
+        description:
+          type: string
     SuccessResponse:
       type: object
       properties:
@@ -3930,6 +5203,530 @@ components:
         error:
           type: string
           description: Error message
+
+    NeighborScopeRecord:
+      type: object
+      required: [scopes, status, queried_at]
+      properties:
+        scopes:
+          type: string
+          description: >
+            Comma-separated region scope names from the neighbour's last answer.
+            Empty means it answered that it serves unscoped traffic only.
+        responded_at:
+          type: number
+          nullable: true
+          description: Epoch seconds of the answer `scopes` came from
+        status:
+          type: string
+          enum: [responded, timeout, send_failed]
+          description: Outcome of the most recent query
+        queried_at:
+          type: number
+          description: Epoch seconds of the most recent query
+
+    NeighborLinkSnapshot:
+      type: object
+      properties:
+        peer_hash:
+          type: string
+        path_hash_size:
+          type: integer
+          minimum: 1
+          maximum: 3
+        sample_count:
+          type: integer
+        duplicate_sample_count:
+          type: integer
+        first_seen:
+          type: integer
+        last_seen:
+          type: integer
+        age_seconds:
+          type: number
+        active:
+          type: boolean
+        last_rssi:
+          type: number
+        last_snr:
+          type: number
+        last_score:
+          type: number
+        ewma_rssi:
+          type: number
+        ewma_snr:
+          type: number
+        ewma_score:
+          type: number
+        best_score:
+          type: number
+        worst_score:
+          type: number
+
+    NeighborLinksData:
+      type: object
+      properties:
+        links:
+          type: array
+          items:
+            $ref: '#/components/schemas/NeighborLinkSnapshot'
+        active_within_seconds:
+          type: integer
+        count:
+          type: integer
+
+    NeighborLinksResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        data:
+          $ref: '#/components/schemas/NeighborLinksData'
+
+    NeighborLinkHistoryRow:
+      type: object
+      properties:
+        timestamp:
+          type: integer
+        rssi:
+          type: number
+          nullable: true
+        snr:
+          type: number
+          nullable: true
+        score:
+          type: number
+          nullable: true
+        is_duplicate:
+          type: boolean
+        packet_hash:
+          type: string
+        packet_type:
+          type: integer
+        route_type:
+          type: integer
+        path_hop_count:
+          type: integer
+          nullable: true
+
+    NeighborLinkHistoryData:
+      type: object
+      properties:
+        peer_hash:
+          type: string
+        path_hash_size:
+          type: integer
+        hours:
+          type: integer
+        limit:
+          type: integer
+        rows:
+          type: array
+          description: Observations, oldest first; absent when `bucket_seconds` was requested.
+          items:
+            $ref: '#/components/schemas/NeighborLinkHistoryRow'
+        bucket_seconds: {type: integer, description: Bucket width in seconds; only when requested}
+        buckets:
+          type: array
+          description: One summary per non-empty bucket, oldest first; only when `bucket_seconds` was requested.
+          items:
+            $ref: '#/components/schemas/NeighborLinkHistoryBucket'
+        count:
+          type: integer
+
+    NeighborLinkHistoryBucket:
+      type: object
+      properties:
+        timestamp: {type: integer, description: Bucket start (Unix timestamp)}
+        last_ts: {type: number, description: The bucket's last observation}
+        n: {type: integer, description: Observations in the bucket}
+        dup: {type: integer, description: Observations flagged as duplicates}
+        score: {type: number, nullable: true, description: Mean score}
+        rssi: {type: number, nullable: true, description: Mean RSSI}
+        snr: {type: number, nullable: true, description: Mean SNR}
+
+    NeighborLinkHistoryResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        data:
+          $ref: '#/components/schemas/NeighborLinkHistoryData'
+
+    LbtDiagnosticsResponse:
+      type: object
+      required: [start_time, end_time, bucket_seconds, severe_attempt_threshold, summary, buckets, packet_types, packet_type_buckets, correlations, limitations]
+      properties:
+        start_time:
+          type: integer
+          description: Selected range start timestamp (Unix epoch seconds)
+        end_time:
+          type: integer
+          description: Selected range end timestamp (Unix epoch seconds)
+        bucket_seconds:
+          type: integer
+          minimum: 60
+          maximum: 3600
+          description: Aggregation interval in seconds
+        severe_attempt_threshold:
+          type: integer
+          minimum: 2
+          maximum: 16
+          description: Attempt count threshold used for severe contention classification
+        summary:
+          $ref: '#/components/schemas/LbtSummary'
+        buckets:
+          type: array
+          items:
+            $ref: '#/components/schemas/LbtBucket'
+        packet_types:
+          type: array
+          description: Packet types present in the selected range, sorted by transmission volume.
+          items:
+            $ref: '#/components/schemas/LbtPacketTypeSummary'
+        packet_type_buckets:
+          type: array
+          description: Sparse per-packet-type bucket diagnostics (only combinations with transmissions).
+          items:
+            $ref: '#/components/schemas/LbtPacketTypeBucket'
+        correlations:
+          $ref: '#/components/schemas/LbtCorrelationSet'
+        limitations:
+          type: array
+          items:
+            type: string
+
+    LbtPacketTypeSummary:
+      type: object
+      required: [packet_type, packet_type_label, transmissions, retry_packets]
+      properties:
+        packet_type:
+          type: integer
+          description: Raw packet type code from packet records.
+        packet_type_label:
+          type: string
+          description: Human-readable packet type label.
+        transmissions:
+          type: integer
+          minimum: 0
+        retry_packets:
+          type: integer
+          minimum: 0
+        retry_rate_pct:
+          type: number
+          format: float
+          nullable: true
+
+    LbtPacketTypeBucket:
+      type: object
+      required: [timestamp, packet_type, packet_type_label, transmissions, total_attempts, first_attempt_success, retry_packets, attempts_1, attempts_2, attempts_3, attempts_4_plus, attempts_3_plus, max_attempts, failed_transmissions, severe_contention_count, rf]
+      properties:
+        timestamp:
+          type: integer
+          description: Bucket timestamp (Unix epoch seconds)
+        packet_type:
+          type: integer
+          description: Raw packet type code from packet records.
+        packet_type_label:
+          type: string
+          description: Human-readable packet type label.
+        transmissions:
+          type: integer
+          minimum: 0
+        total_attempts:
+          type: integer
+          minimum: 0
+        first_attempt_success:
+          type: integer
+          minimum: 0
+        retry_packets:
+          type: integer
+          minimum: 0
+        retry_rate_pct:
+          type: number
+          format: float
+          nullable: true
+        first_attempt_success_rate_pct:
+          type: number
+          format: float
+          nullable: true
+        avg_attempts:
+          type: number
+          format: float
+          nullable: true
+        attempts_1:
+          type: integer
+          minimum: 0
+        attempts_2:
+          type: integer
+          minimum: 0
+        attempts_3:
+          type: integer
+          minimum: 0
+        attempts_4_plus:
+          type: integer
+          minimum: 0
+        attempts_3_plus:
+          type: integer
+          minimum: 0
+        attempts_3_plus_pct:
+          type: number
+          format: float
+          nullable: true
+        max_attempts:
+          type: integer
+          minimum: 0
+        failed_transmissions:
+          type: integer
+          minimum: 0
+        severe_contention_count:
+          type: integer
+          minimum: 0
+        rf:
+          $ref: '#/components/schemas/LbtRfBucket'
+
+    LbtSummary:
+      type: object
+      required: [total_transmissions, total_attempts, first_attempt_success, retry_packets, max_attempts, attempts_1, attempts_2, attempts_3, attempts_4_plus, attempts_3_plus, failed_transmissions, busy_channel_events, severe_contention_count, severe_attempt_threshold, has_lbt_data]
+      properties:
+        total_transmissions:
+          type: integer
+          minimum: 0
+        total_attempts:
+          type: integer
+          minimum: 0
+        first_attempt_success:
+          type: integer
+          minimum: 0
+        retry_packets:
+          type: integer
+          minimum: 0
+        retry_rate_pct:
+          type: number
+          format: float
+          nullable: true
+        first_attempt_success_rate_pct:
+          type: number
+          format: float
+          nullable: true
+        avg_attempts:
+          type: number
+          format: float
+          nullable: true
+        median_attempts:
+          type: number
+          format: float
+          nullable: true
+        p95_attempts:
+          type: number
+          format: float
+          nullable: true
+        max_attempts:
+          type: integer
+          minimum: 0
+        attempts_1:
+          type: integer
+          minimum: 0
+        attempts_2:
+          type: integer
+          minimum: 0
+        attempts_3:
+          type: integer
+          minimum: 0
+        attempts_4_plus:
+          type: integer
+          minimum: 0
+        attempts_3_plus:
+          type: integer
+          minimum: 0
+        attempts_3_plus_pct:
+          type: number
+          format: float
+          nullable: true
+        attempts_4_plus_pct:
+          type: number
+          format: float
+          nullable: true
+        failed_transmissions:
+          type: integer
+          minimum: 0
+        busy_channel_events:
+          type: integer
+          minimum: 0
+        severe_contention_count:
+          type: integer
+          minimum: 0
+        severe_contention_pct:
+          type: number
+          format: float
+          nullable: true
+        severe_attempt_threshold:
+          type: integer
+          minimum: 2
+          maximum: 16
+        has_lbt_data:
+          type: boolean
+        worst_bucket:
+          $ref: '#/components/schemas/LbtWorstBucket'
+          nullable: true
+
+    LbtWorstBucket:
+      type: object
+      required: [timestamp, retry_rate_pct, attempts_3_plus_pct, max_attempts, transmissions]
+      properties:
+        timestamp:
+          type: integer
+        retry_rate_pct:
+          type: number
+          format: float
+        attempts_3_plus_pct:
+          type: number
+          format: float
+        max_attempts:
+          type: integer
+          minimum: 0
+        transmissions:
+          type: integer
+          minimum: 0
+
+    LbtBucket:
+      type: object
+      required: [timestamp, transmissions, total_attempts, first_attempt_success, retry_packets, max_attempts, attempts_1, attempts_2, attempts_3, attempts_4_plus, attempts_3_plus, failed_transmissions, busy_channel_events, severe_contention_count, rf]
+      properties:
+        timestamp:
+          type: integer
+          description: Bucket timestamp (Unix epoch seconds)
+        transmissions:
+          type: integer
+          minimum: 0
+        total_attempts:
+          type: integer
+          minimum: 0
+        first_attempt_success:
+          type: integer
+          minimum: 0
+        retry_packets:
+          type: integer
+          minimum: 0
+        retry_rate_pct:
+          type: number
+          format: float
+          nullable: true
+        first_attempt_success_rate_pct:
+          type: number
+          format: float
+          nullable: true
+        avg_attempts:
+          type: number
+          format: float
+          nullable: true
+        median_attempts:
+          type: number
+          format: float
+          nullable: true
+        p95_attempts:
+          type: number
+          format: float
+          nullable: true
+        max_attempts:
+          type: integer
+          minimum: 0
+        attempts_1:
+          type: integer
+          minimum: 0
+        attempts_2:
+          type: integer
+          minimum: 0
+        attempts_3:
+          type: integer
+          minimum: 0
+        attempts_4_plus:
+          type: integer
+          minimum: 0
+        attempts_3_plus:
+          type: integer
+          minimum: 0
+        attempts_3_plus_pct:
+          type: number
+          format: float
+          nullable: true
+        attempts_4_plus_pct:
+          type: number
+          format: float
+          nullable: true
+        failed_transmissions:
+          type: integer
+          minimum: 0
+        busy_channel_events:
+          type: integer
+          minimum: 0
+        severe_contention_count:
+          type: integer
+          minimum: 0
+        severe_contention_pct:
+          type: number
+          format: float
+          nullable: true
+        rf:
+          $ref: '#/components/schemas/LbtRfBucket'
+
+    LbtRfBucket:
+      type: object
+      required: [traffic_volume, rx_count, tx_count, drop_count]
+      properties:
+        avg_rssi:
+          type: number
+          format: float
+          nullable: true
+        avg_snr:
+          type: number
+          format: float
+          nullable: true
+        packet_loss_rate_pct:
+          type: number
+          format: float
+          nullable: true
+        traffic_volume:
+          type: integer
+          minimum: 0
+        rx_count:
+          type: integer
+          minimum: 0
+        tx_count:
+          type: integer
+          minimum: 0
+        drop_count:
+          type: integer
+          minimum: 0
+
+    LbtCorrelationSet:
+      type: object
+      required: [retry_rate_vs_avg_snr, retry_rate_vs_avg_rssi, retry_rate_vs_packet_loss_rate, retry_rate_vs_traffic_volume]
+      properties:
+        retry_rate_vs_avg_snr:
+          $ref: '#/components/schemas/LbtCorrelationValue'
+        retry_rate_vs_avg_rssi:
+          $ref: '#/components/schemas/LbtCorrelationValue'
+        retry_rate_vs_packet_loss_rate:
+          $ref: '#/components/schemas/LbtCorrelationValue'
+        retry_rate_vs_traffic_volume:
+          $ref: '#/components/schemas/LbtCorrelationValue'
+
+    LbtCorrelationValue:
+      type: object
+      required: [coefficient, sample_count]
+      properties:
+        coefficient:
+          type: number
+          format: float
+          nullable: true
+          description: Pearson coefficient in range [-1, 1] when enough samples exist
+        sample_count:
+          type: integer
+          minimum: 0
+        note:
+          type: string
+          nullable: true
 
     RoomMessage:
       type: object
@@ -4097,12 +5894,14 @@ components:
           example: "e1"
         permissions:
           type: string
-          enum: [admin, guest, read_only]
+          enum: [admin, read_write, read_only, guest]
           description: |
-            Client permission level:
-            - admin: Full access
-            - guest: Limited access
+            Client ACL role (low two bits of the permissions byte, matching
+            MeshCore ClientACL.h):
+            - admin: Full access, including settings and CLI
+            - read_write: May send and receive messages (room server guests)
             - read_only: Read-only access
+            - guest: Base telemetry only (repeater guests, read-only logins)
           example: "admin"
         last_activity:
           type: integer

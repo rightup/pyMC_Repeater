@@ -15,23 +15,36 @@ or:
 """
 
 import asyncio
+import functools
+import hashlib
 import time
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from openhop_core.companion import CompanionBridge
 from openhop_core.node.handlers.ack import AckHandler
 from openhop_core.node.handlers.advert import AdvertHandler
 from openhop_core.node.handlers.control import ControlHandler
 from openhop_core.node.handlers.group_text import GroupTextHandler
 from openhop_core.node.handlers.login_response import LoginResponseHandler
 from openhop_core.node.handlers.login_server import LoginServerHandler
+from openhop_core.node.handlers.multipart import MultipartAckHandler
 from openhop_core.node.handlers.path import PathHandler
 from openhop_core.node.handlers.protocol_request import ProtocolRequestHandler
 from openhop_core.node.handlers.protocol_response import ProtocolResponseHandler
+from openhop_core.node.handlers.result import HandlerResult
 from openhop_core.node.handlers.text import TextMessageHandler
 from openhop_core.node.handlers.trace import TraceHandler
-from openhop_core.protocol.constants import ROUTE_TYPE_DIRECT
+from openhop_core.protocol.constants import (
+    PAYLOAD_TYPE_GRP_DATA,
+    PAYLOAD_TYPE_GRP_TXT,
+    ROUTE_TYPE_DIRECT,
+    ROUTE_TYPE_FLOOD,
+    ROUTE_TYPE_TRANSPORT_DIRECT,
+)
+from openhop_core.protocol import LocalIdentity, Packet, PacketBuilder
 
+from repeater.companion.bridge import RepeaterCompanionBridge
 from repeater.packet_router import (
     PacketRouter,
     _companion_dedup_key,
@@ -48,6 +61,7 @@ def _make_daemon():
     """Minimal daemon that satisfies PacketRouter without touching hardware."""
     daemon = MagicMock()
     daemon.repeater_handler = AsyncMock(return_value=True)
+    daemon.repeater_handler.record_packet_only = MagicMock()
     daemon.trace_helper = None
     daemon.discovery_helper = None
     daemon.advert_helper = None
@@ -56,6 +70,9 @@ def _make_daemon():
     daemon.text_helper = None
     daemon.path_helper = None
     daemon.protocol_request_helper = None
+    daemon.dispatcher = MagicMock()
+    daemon.dispatcher._register_ack_received = AsyncMock()
+    daemon.dispatcher.wait_for_ack = AsyncMock(return_value=True)
     return daemon
 
 
@@ -69,6 +86,7 @@ def _make_packet(payload_type: int = 0xFF):
     pkt.snr = 5.0
     pkt.timestamp = time.time()
     pkt._injected_for_tx = False
+    pkt._injected_origin_hash = None
     pkt.path = bytearray()
     pkt.calculate_packet_hash.return_value = b"\x01" * 32
     pkt.mark_do_not_retransmit = MagicMock()
@@ -279,6 +297,71 @@ class TestInFlightCap(unittest.IsolatedAsyncioTestCase):
         bridge.process_received_packet.assert_awaited_once()
         daemon.repeater_handler.assert_awaited_once()
 
+    async def test_route_grp_data_fans_out_to_companions_and_forwards(self):
+        """GRP_DATA reaches each companion for channel matching, then reaches the engine."""
+        daemon = _make_daemon()
+        first_bridge = _make_bridge()
+        second_bridge = _make_bridge()
+        daemon.companion_bridges = {0x01: first_bridge, 0x02: second_bridge}
+        router = PacketRouter(daemon)
+        pkt = _make_packet(PAYLOAD_TYPE_GRP_DATA)
+        # Firmware wire vector: GRP_DATA (0x06), version 0, FLOOD (0x01).
+        pkt.header = (PAYLOAD_TYPE_GRP_DATA << 2) | ROUTE_TYPE_FLOOD
+        self.assertEqual(pkt.header, 0x19)
+
+        await router._route_packet(pkt)
+
+        first_bridge.process_received_packet.assert_awaited_once_with(pkt)
+        second_bridge.process_received_packet.assert_awaited_once_with(pkt)
+        daemon.repeater_handler.assert_awaited_once()
+
+    async def test_route_grp_data_decrypts_in_a_companion_and_forwards(self):
+        """A firmware-format GRP_DATA packet is both delivered locally and forwarded."""
+        channel_secret = b"\x11" * 32
+
+        async def inject_packet(packet, wait_for_ack=False):
+            return True
+
+        bridge = CompanionBridge(LocalIdentity(), inject_packet, node_name="Test")
+        assert bridge.set_channel(0, "Public", channel_secret)
+        packet = PacketBuilder.create_group_data_packet(
+            PAYLOAD_TYPE_GRP_DATA,
+            channel_hash=hashlib.sha256(channel_secret).digest()[0],
+            channel_secret=channel_secret,
+            plaintext=b"\x34\x12\x02\xaa\xbb",
+            secret=channel_secret,
+        )
+        self.assertEqual(packet.header, 0x19)
+
+        daemon = _make_daemon()
+        daemon.companion_bridges = {0x01: bridge}
+        router = PacketRouter(daemon)
+
+        await router._route_packet(packet)
+
+        queued = bridge.sync_next_message()
+        self.assertIsNotNone(queued)
+        self.assertTrue(queued.is_channel)
+        self.assertEqual(queued.channel_idx, 0)
+        self.assertEqual(queued.channel_data_type, 0x1234)
+        self.assertEqual(queued.channel_data_payload, b"\xaa\xbb")
+        daemon.repeater_handler.assert_awaited_once()
+
+    async def test_route_direct_grp_data_intermediate_skips_companion_delivery(self):
+        """A direct GRP_DATA packet with a remaining hop is only offered to the engine."""
+        daemon = _make_daemon()
+        bridge = _make_bridge()
+        daemon.companion_bridges = {0x01: bridge}
+        router = PacketRouter(daemon)
+        packet = _make_packet(PAYLOAD_TYPE_GRP_DATA)
+        packet.header = (PAYLOAD_TYPE_GRP_DATA << 2) | ROUTE_TYPE_DIRECT
+        packet.path = bytearray([0x42])
+
+        await router._route_packet(packet)
+
+        bridge.process_received_packet.assert_not_awaited()
+        daemon.repeater_handler.assert_awaited_once()
+
     async def test_non_injected_handler_false_is_logged(self):
         """Inbound packets should log when repeater_handler reports TX failure."""
         daemon = _make_daemon()
@@ -297,7 +380,7 @@ class TestInFlightCap(unittest.IsolatedAsyncioTestCase):
         daemon = _make_daemon()
 
         async def _handler(packet, metadata):
-            packet._repeater_drop_reason = "Max flood hops limit reached (21/20)"
+            metadata["_repeater_drop_reason"] = "Max flood hops limit reached"
             return False
 
         daemon.repeater_handler = AsyncMock(side_effect=_handler)
@@ -541,6 +624,19 @@ class TestPacketRouterRoutingBranches(unittest.IsolatedAsyncioTestCase):
         daemon.deliver_control_data.assert_awaited_once()
         daemon.repeater_handler.assert_awaited_once()
 
+    async def test_route_control_marks_do_not_retransmit_when_discovery_disabled(self):
+        """With discovery disabled (discovery_helper is None), control packets must
+        still be marked do-not-retransmit so the engine does not relay them. MeshCore
+        never forwards control packets regardless of whether discovery is enabled."""
+        daemon = _make_daemon()
+        daemon.discovery_helper = None
+        daemon.deliver_control_data = AsyncMock()
+        router = PacketRouter(daemon)
+        pkt = _make_packet(ControlHandler.payload_type())
+        pkt.path_len = 0
+        await router._route_packet(pkt)
+        pkt.mark_do_not_retransmit.assert_called_once()
+
     async def test_route_advert_delivers_to_helpers_and_engine(self):
         daemon = _make_daemon()
         daemon.advert_helper = MagicMock()
@@ -589,6 +685,64 @@ class TestPacketRouterRoutingBranches(unittest.IsolatedAsyncioTestCase):
         bridge.process_received_packet.assert_awaited_once()
         daemon.repeater_handler.assert_not_awaited()
 
+    async def test_route_login_server_hash_collision_offers_to_both(self):
+        """A one-byte dest hash shared by a companion and a room-server identity
+        must be offered to BOTH handlers; only the one whose key decrypts replies.
+        Regression: previously the companion shadowed the room server, so the
+        room-server login never ran and failed with Invalid HMAC."""
+        daemon = _make_daemon()
+        bridge = _make_bridge()
+        daemon.companion_bridges = {0xF5: bridge}
+        daemon.login_helper = MagicMock()
+        daemon.login_helper.handlers = {0xF5: MagicMock()}
+        daemon.login_helper.process_login_packet = AsyncMock(return_value=True)
+        daemon.repeater_handler = AsyncMock()
+        daemon.repeater_handler.storage = MagicMock()
+        daemon.repeater_handler.record_packet_only = MagicMock()
+        router = PacketRouter(daemon)
+        pkt = _make_packet(LoginServerHandler.payload_type())
+        pkt.payload = bytes([0xF5, 0x99])
+        await router._route_packet(pkt)
+        bridge.process_received_packet.assert_awaited_once()
+        daemon.login_helper.process_login_packet.assert_awaited_once()
+        daemon.repeater_handler.assert_not_awaited()
+
+    async def test_route_login_server_companion_only_skips_login_helper(self):
+        """No collision: a companion-owned hash with no room server registered
+        there must not also invoke login_helper."""
+        daemon = _make_daemon()
+        bridge = _make_bridge()
+        daemon.companion_bridges = {0x7A: bridge}
+        daemon.login_helper = MagicMock()
+        daemon.login_helper.handlers = {}  # no room-server identity at this hash
+        daemon.login_helper.process_login_packet = AsyncMock(return_value=False)
+        daemon.repeater_handler = AsyncMock()
+        daemon.repeater_handler.storage = MagicMock()
+        daemon.repeater_handler.record_packet_only = MagicMock()
+        router = PacketRouter(daemon)
+        pkt = _make_packet(LoginServerHandler.payload_type())
+        pkt.payload = bytes([0x7A, 0x99])
+        await router._route_packet(pkt)
+        bridge.process_received_packet.assert_awaited_once()
+        daemon.login_helper.process_login_packet.assert_not_awaited()
+
+    async def test_route_login_server_room_server_without_companion(self):
+        """No local companion claims the hash: login_helper handles the
+        room-server (or forwards a remote) login as before."""
+        daemon = _make_daemon()
+        daemon.companion_bridges = {}
+        daemon.login_helper = MagicMock()
+        daemon.login_helper.handlers = {0xF5: MagicMock()}
+        daemon.login_helper.process_login_packet = AsyncMock(return_value=True)
+        daemon.repeater_handler = AsyncMock()
+        daemon.repeater_handler.storage = MagicMock()
+        daemon.repeater_handler.record_packet_only = MagicMock()
+        router = PacketRouter(daemon)
+        pkt = _make_packet(LoginServerHandler.payload_type())
+        pkt.payload = bytes([0xF5, 0x99])
+        await router._route_packet(pkt)
+        daemon.login_helper.process_login_packet.assert_awaited_once()
+
     async def test_route_text_to_helper_marks_processed(self):
         daemon = _make_daemon()
         daemon.text_helper = MagicMock()
@@ -602,6 +756,44 @@ class TestPacketRouterRoutingBranches(unittest.IsolatedAsyncioTestCase):
         daemon.text_helper.process_text_packet.assert_awaited_once()
         daemon.repeater_handler.assert_not_awaited()
 
+    async def test_route_text_hash_collision_offers_to_both(self):
+        """A dest hash shared by a companion and a room-server text identity must
+        reach both handlers so a companion never shadows a room-server message."""
+        daemon = _make_daemon()
+        bridge = _make_bridge()
+        daemon.companion_bridges = {0xF5: bridge}
+        daemon.text_helper = MagicMock()
+        daemon.text_helper.handlers = {0xF5: MagicMock()}
+        daemon.text_helper.process_text_packet = AsyncMock(return_value=True)
+        daemon.repeater_handler = AsyncMock()
+        daemon.repeater_handler.storage = MagicMock()
+        daemon.repeater_handler.record_packet_only = MagicMock()
+        router = PacketRouter(daemon)
+        pkt = _make_packet(TextMessageHandler.payload_type())
+        pkt.payload = bytes([0xF5, 0x01])
+        await router._route_packet(pkt)
+        bridge.process_received_packet.assert_awaited_once()
+        daemon.text_helper.process_text_packet.assert_awaited_once()
+        daemon.repeater_handler.assert_not_awaited()
+
+    async def test_route_text_companion_only_skips_text_helper(self):
+        """No collision: a companion-owned text hash must not also hit text_helper."""
+        daemon = _make_daemon()
+        bridge = _make_bridge()
+        daemon.companion_bridges = {0xEE: bridge}
+        daemon.text_helper = MagicMock()
+        daemon.text_helper.handlers = {}  # no room-server text identity here
+        daemon.text_helper.process_text_packet = AsyncMock(return_value=False)
+        daemon.repeater_handler = AsyncMock()
+        daemon.repeater_handler.storage = MagicMock()
+        daemon.repeater_handler.record_packet_only = MagicMock()
+        router = PacketRouter(daemon)
+        pkt = _make_packet(TextMessageHandler.payload_type())
+        pkt.payload = bytes([0xEE, 0x01])
+        await router._route_packet(pkt)
+        bridge.process_received_packet.assert_awaited_once()
+        daemon.text_helper.process_text_packet.assert_not_awaited()
+
     async def test_route_ack_delivers_to_all_bridges_and_engine(self):
         daemon = _make_daemon()
         b1 = _make_bridge()
@@ -612,6 +804,97 @@ class TestPacketRouterRoutingBranches(unittest.IsolatedAsyncioTestCase):
         await router._route_packet(pkt)
         b1.process_received_packet.assert_awaited_once()
         b2.process_received_packet.assert_awaited_once()
+        daemon.repeater_handler.assert_awaited_once()
+
+    async def test_route_ack_registers_crc_with_dispatcher(self):
+        """Discrete ACKs must feed dispatcher ACK matching or wait_for_ack never resolves."""
+        daemon = _make_daemon()
+        router = PacketRouter(daemon)
+        pkt = _make_packet(AckHandler.payload_type())
+        # 6-byte firmware ACK: 4-byte CRC (LE) + ext-attempt + random byte
+        pkt.payload = bytes.fromhex("4dabaf95") + b"\x00\x7f"
+        await router._route_packet(pkt)
+        daemon.dispatcher._register_ack_received.assert_awaited_once_with(0x95AFAB4D)
+
+    async def test_route_ack_short_payload_not_registered(self):
+        daemon = _make_daemon()
+        router = PacketRouter(daemon)
+        pkt = _make_packet(AckHandler.payload_type())
+        pkt.payload = b"\x01\x02"
+        await router._route_packet(pkt)
+        daemon.dispatcher._register_ack_received.assert_not_awaited()
+
+    async def test_route_locally_injected_ack_registers_crc(self):
+        """ACKs from same-instance companions never cross the radio: the injected
+        packet re-entering the router is the only chance to resolve local waiters
+        (e.g. a room server pushing to a virtual companion on this repeater)."""
+        daemon = _make_daemon()
+        router = PacketRouter(daemon)
+        pkt = _make_packet(AckHandler.payload_type())
+        pkt.payload = b"\xaa\xbb\xcc\xdd"
+        pkt._injected_for_tx = True
+        await router._route_packet(pkt)
+        daemon.dispatcher._register_ack_received.assert_awaited_once_with(0xDDCCBBAA)
+        daemon.repeater_handler.assert_not_awaited()  # already transmitted
+
+    async def test_inject_packet_waits_on_expected_ack_crc(self):
+        """Callers that know the crypto ACK CRC pass it; packet.get_crc() is a
+        packet-hash CRC no ACK sender ever produces."""
+        daemon = _make_daemon()
+        router = PacketRouter(daemon)
+        pkt = _make_packet(TextMessageHandler.payload_type())
+        ok = await router.inject_packet(
+            pkt, wait_for_ack=True, expected_crc=0x1234ABCD, ack_timeout_s=12.0
+        )
+        self.assertTrue(ok)
+        daemon.dispatcher.wait_for_ack.assert_awaited_once_with(0x1234ABCD, timeout=12.0)
+        pkt.get_crc.assert_not_called()
+
+    async def test_route_path_to_local_identity_runs_path_helper_despite_bridges(self):
+        """PATH addressed to a room server/repeater identity must reach the path
+        helper (out_path update + embedded ACK) even when companion bridges exist;
+        previously the all-bridges branch swallowed it."""
+        daemon = _make_daemon()
+        bridge = _make_bridge()
+        daemon.companion_bridges = {0x01: bridge}
+        daemon.path_helper = MagicMock()
+        daemon.path_helper.acl_dict = {0x48: MagicMock()}
+        daemon.path_helper.process_path_packet = AsyncMock(return_value=False)
+        router = PacketRouter(daemon)
+        pkt = _make_packet(PathHandler.payload_type())
+        pkt.payload = bytes([0x48, 0x77, 0xAA, 0xBB])
+        await router._route_packet(pkt)
+        daemon.path_helper.process_path_packet.assert_awaited_once_with(pkt)
+
+    async def test_authenticated_flood_path_skips_engine(self):
+        daemon = _make_daemon()
+        daemon.path_helper = MagicMock()
+        daemon.path_helper.process_path_packet = AsyncMock(return_value=True)
+        bridge = _make_bridge()
+        bridge.process_received_packet = AsyncMock(return_value=HandlerResult.consumed())
+        daemon.companion_bridges = {0x01: bridge}
+        router = PacketRouter(daemon)
+        pkt = _make_packet(PathHandler.payload_type())
+        pkt.payload = bytes([0x01, 0x22])
+
+        await router._route_packet(pkt)
+
+        bridge.process_received_packet.assert_awaited_once_with(pkt)
+        daemon.repeater_handler.assert_not_awaited()
+
+    async def test_unauthenticated_flood_path_reaches_engine(self):
+        daemon = _make_daemon()
+        daemon.path_helper = MagicMock()
+        daemon.path_helper.process_path_packet = AsyncMock(return_value=False)
+        bridge = _make_bridge()
+        bridge.process_received_packet = AsyncMock(return_value=HandlerResult.not_for_us())
+        daemon.companion_bridges = {0x01: bridge}
+        router = PacketRouter(daemon)
+        pkt = _make_packet(PathHandler.payload_type())
+        pkt.payload = bytes([0x01, 0x22])
+
+        await router._route_packet(pkt)
+
         daemon.repeater_handler.assert_awaited_once()
 
     async def test_route_path_dedupes_companion_delivery(self):
@@ -641,6 +924,33 @@ class TestPacketRouterRoutingBranches(unittest.IsolatedAsyncioTestCase):
         await router._route_packet(pkt)
         b1.process_received_packet.assert_awaited_once()
         daemon.repeater_handler.assert_not_awaited()
+
+    async def test_authenticated_flood_response_skips_engine(self):
+        daemon = _make_daemon()
+        bridge = _make_bridge()
+        bridge.process_received_packet = AsyncMock(return_value=HandlerResult.consumed())
+        daemon.companion_bridges = {0x01: bridge}
+        router = PacketRouter(daemon)
+        pkt = _make_packet(LoginResponseHandler.payload_type())
+        pkt.payload = bytes([0x01, 0x22])
+
+        await router._route_packet(pkt)
+
+        bridge.process_received_packet.assert_awaited_once_with(pkt)
+        daemon.repeater_handler.assert_not_awaited()
+
+    async def test_unauthenticated_flood_response_reaches_engine(self):
+        daemon = _make_daemon()
+        bridge = _make_bridge()
+        bridge.process_received_packet = AsyncMock(return_value=HandlerResult.not_for_us())
+        daemon.companion_bridges = {0x01: bridge}
+        router = PacketRouter(daemon)
+        pkt = _make_packet(LoginResponseHandler.payload_type())
+        pkt.payload = bytes([0x01, 0x22])
+
+        await router._route_packet(pkt)
+
+        daemon.repeater_handler.assert_awaited_once()
 
     async def test_route_protocol_response_final_hop_skips_engine(self):
         daemon = _make_daemon()
@@ -674,6 +984,84 @@ class TestPacketRouterRoutingBranches(unittest.IsolatedAsyncioTestCase):
         b1.process_received_packet.assert_awaited_once()
         daemon.repeater_handler.assert_not_awaited()
 
+    async def test_route_protocol_request_companion_collision_forwards(self):
+        """A REQ whose dest prefix matches a companion but does not decrypt for
+        it must be forwarded, not swallowed."""
+        daemon = _make_daemon()
+        b1 = _make_bridge()
+        # Collision: the packet is not really for this companion.
+        b1.process_received_packet = AsyncMock(return_value=HandlerResult.not_for_us())
+        daemon.companion_bridges = {0x01: b1}
+        router = PacketRouter(daemon)
+        pkt = _make_packet(ProtocolRequestHandler.payload_type())
+        pkt.header = 0x00  # transport-flood: not a direct final hop
+        pkt.path = bytearray([0xAA])
+        pkt.payload = bytes([0x01, 0xBB])
+        await router._route_packet(pkt)
+        b1.process_received_packet.assert_awaited_once()
+        # Not consumed -> handed to the forwarding engine.
+        daemon.repeater_handler.assert_awaited_once()
+
+    async def test_route_text_companion_collision_forwards(self):
+        """A TXT_MSG whose dest prefix matches a companion but does not decrypt
+        for it must be forwarded, not swallowed."""
+        daemon = _make_daemon()
+        b1 = _make_bridge()
+        b1.process_received_packet = AsyncMock(return_value=HandlerResult.not_for_us())
+        daemon.companion_bridges = {0x01: b1}
+        router = PacketRouter(daemon)
+        pkt = _make_packet(TextMessageHandler.payload_type())
+        pkt.header = 0x00
+        pkt.path = bytearray([0xAA])
+        pkt.payload = bytes([0x01, 0xBB])
+        await router._route_packet(pkt)
+        b1.process_received_packet.assert_awaited_once()
+        daemon.repeater_handler.assert_awaited_once()
+
+    async def test_route_text_tries_all_candidates_room_server_wins(self):
+        """A companion and a room-server text identity share a hash. The router
+        must try both; when the companion fails to decrypt but the room server
+        authenticates, the packet is consumed (not forwarded)."""
+        daemon = _make_daemon()
+        companion = _make_bridge()
+        companion.process_received_packet = AsyncMock(return_value=HandlerResult.not_for_us())
+        daemon.companion_bridges = {0x42: companion}
+        daemon.text_helper = MagicMock()
+        daemon.text_helper.handlers = {0x42: {"name": "room-a"}}
+        daemon.text_helper.process_text_packet = AsyncMock(return_value=True)
+        daemon.repeater_handler.storage = MagicMock()
+        daemon.repeater_handler.record_packet_only = MagicMock()
+        router = PacketRouter(daemon)
+        pkt = _make_packet(TextMessageHandler.payload_type())
+        pkt.header = 0x00
+        pkt.path = bytearray([0xAA])
+        pkt.payload = bytes([0x42, 0xBB])
+        await router._route_packet(pkt)
+        # Both local candidates were tried; the room server consumed it.
+        companion.process_received_packet.assert_awaited_once()
+        daemon.text_helper.process_text_packet.assert_awaited_once()
+        daemon.repeater_handler.assert_not_awaited()
+
+    async def test_route_text_all_local_candidates_fail_forwards(self):
+        """When neither the companion nor the room-server identity at the hash
+        authenticates, the packet is left for the forwarding engine."""
+        daemon = _make_daemon()
+        companion = _make_bridge()
+        companion.process_received_packet = AsyncMock(return_value=HandlerResult.not_for_us())
+        daemon.companion_bridges = {0x42: companion}
+        daemon.text_helper = MagicMock()
+        daemon.text_helper.handlers = {0x42: {"name": "room-a"}}
+        daemon.text_helper.process_text_packet = AsyncMock(return_value=False)
+        router = PacketRouter(daemon)
+        pkt = _make_packet(TextMessageHandler.payload_type())
+        pkt.header = 0x00
+        pkt.path = bytearray([0xAA])
+        pkt.payload = bytes([0x42, 0xBB])
+        await router._route_packet(pkt)
+        companion.process_received_packet.assert_awaited_once()
+        daemon.text_helper.process_text_packet.assert_awaited_once()
+        daemon.repeater_handler.assert_awaited_once()
+
     async def test_route_group_text_delivers_and_forwards(self):
         daemon = _make_daemon()
         b1 = _make_bridge()
@@ -683,6 +1071,193 @@ class TestPacketRouterRoutingBranches(unittest.IsolatedAsyncioTestCase):
         await router._route_packet(pkt)
         b1.process_received_packet.assert_awaited_once()
         daemon.repeater_handler.assert_awaited_once()
+
+    async def test_direct_intermediate_bypasses_all_local_payload_handlers(self):
+        """Direct intermediate hops must reach the engine before local payload handling."""
+        payload_types = (
+            AdvertHandler.payload_type(),
+            LoginServerHandler.payload_type(),
+            TextMessageHandler.payload_type(),
+            PathHandler.payload_type(),
+            LoginResponseHandler.payload_type(),
+            ProtocolRequestHandler.payload_type(),
+            GroupTextHandler.payload_type(),
+            PAYLOAD_TYPE_GRP_DATA,
+        )
+        for route_type in (ROUTE_TYPE_DIRECT, ROUTE_TYPE_TRANSPORT_DIRECT):
+            for payload_type in payload_types:
+                with self.subTest(route_type=route_type, payload_type=payload_type):
+                    daemon = _make_daemon()
+                    bridge = _make_bridge()
+                    daemon.companion_bridges = {0x01: bridge}
+                    daemon.advert_helper = MagicMock(process_advert_packet=AsyncMock())
+                    daemon.login_helper = MagicMock(
+                        handlers={0x01: object()}, process_login_packet=AsyncMock(return_value=True)
+                    )
+                    daemon.text_helper = MagicMock(
+                        handlers={0x01: object()}, process_text_packet=AsyncMock(return_value=True)
+                    )
+                    daemon.path_helper = MagicMock(process_path_packet=AsyncMock(return_value=True))
+                    daemon.protocol_request_helper = MagicMock(
+                        handlers={0x01: object()},
+                        process_request_packet=AsyncMock(return_value=True),
+                    )
+                    router = PacketRouter(daemon)
+                    packet = _make_packet(payload_type)
+                    packet.header = (payload_type << 2) | route_type
+                    packet.path = bytearray([0x42])
+                    packet.payload = bytes([0x01, 0x02, 0x03, 0x04])
+
+                    await router._route_packet(packet)
+
+                    bridge.process_received_packet.assert_not_awaited()
+                    daemon.advert_helper.process_advert_packet.assert_not_awaited()
+                    daemon.login_helper.process_login_packet.assert_not_awaited()
+                    daemon.text_helper.process_text_packet.assert_not_awaited()
+                    daemon.path_helper.process_path_packet.assert_not_awaited()
+                    daemon.protocol_request_helper.process_request_packet.assert_not_awaited()
+                    daemon.repeater_handler.assert_awaited_once_with(packet, unittest.mock.ANY)
+
+    async def test_direct_intermediate_firmware_vectors_bypass_local_text_candidates(self):
+        """Decoded direct and transport-direct wire vectors skip local text handling."""
+        # header | [transport codes] | path_len | remaining path | payload
+        vectors = (
+            b"\x0a\x01\x42\x01\x02\x03\x04",
+            b"\x0b\x34\x12\x78\x56\x01\x42\x01\x02\x03\x04",
+        )
+        for wire in vectors:
+            with self.subTest(wire=wire.hex()):
+                daemon = _make_daemon()
+                bridge = _make_bridge()
+                daemon.companion_bridges = {0x01: bridge}
+                daemon.text_helper = MagicMock(
+                    handlers={0x01: object()}, process_text_packet=AsyncMock(return_value=True)
+                )
+                router = PacketRouter(daemon)
+                packet = Packet()
+                packet.read_from(wire)
+
+                await router._route_packet(packet)
+
+                bridge.process_received_packet.assert_not_awaited()
+                daemon.text_helper.process_text_packet.assert_not_awaited()
+                daemon.repeater_handler.assert_awaited_once_with(packet, unittest.mock.ANY)
+
+    async def test_final_direct_firmware_vectors_deliver_to_local_companion(self):
+        """Decoded zero-hop direct vectors reach their local companion rather than forwarding."""
+        # header | [transport codes] | path_len=0 | dest hash | source hash | payload
+        vectors = (
+            b"\x0a\x00\x01\x02\x03\x04",
+            b"\x0b\x34\x12\x78\x56\x00\x01\x02\x03\x04",
+        )
+        for wire in vectors:
+            with self.subTest(wire=wire.hex()):
+                daemon = _make_daemon()
+                bridge = _make_bridge()
+                bridge.process_received_packet = AsyncMock(return_value=HandlerResult.consumed())
+                daemon.companion_bridges = {0x01: bridge}
+                router = PacketRouter(daemon)
+                packet = Packet()
+                packet.read_from(wire)
+
+                await router._route_packet(packet)
+
+                bridge.process_received_packet.assert_awaited_once_with(packet)
+                daemon.repeater_handler.assert_not_awaited()
+
+    async def test_direct_intermediate_ack_notifies_waiter_without_companion_delivery(self):
+        """MeshCore's early ACK notification does not make an intermediate hop a recipient."""
+        daemon = _make_daemon()
+        bridge = _make_bridge()
+        daemon.companion_bridges = {0x01: bridge}
+        router = PacketRouter(daemon)
+        packet = _make_packet(AckHandler.payload_type())
+        packet.header = (AckHandler.payload_type() << 2) | ROUTE_TYPE_DIRECT
+        packet.path = bytearray([0x42])
+        packet.payload = bytes.fromhex("4dabaf95") + b"\x00\x7f"
+
+        await router._route_packet(packet)
+
+        daemon.dispatcher._register_ack_received.assert_awaited_once_with(0x95AFAB4D)
+        bridge.process_received_packet.assert_not_awaited()
+        daemon.repeater_handler.assert_awaited_once()
+
+    async def test_direct_intermediate_control_high_bit_is_released_without_local_delivery(self):
+        """A high-bit CONTROL packet with remaining direct hops is not locally processed."""
+        daemon = _make_daemon()
+        daemon.discovery_helper = MagicMock(control_handler=AsyncMock())
+        daemon.deliver_control_data = AsyncMock()
+        router = PacketRouter(daemon)
+        packet = _make_packet(ControlHandler.payload_type())
+        packet.header = (ControlHandler.payload_type() << 2) | ROUTE_TYPE_DIRECT
+        packet.path = bytearray([0x42])
+        packet.payload = b"\x90\x00\x01\x00\x00\x00"
+
+        await router._route_packet(packet)
+
+        daemon.discovery_helper.control_handler.assert_not_awaited()
+        daemon.deliver_control_data.assert_not_awaited()
+        packet.mark_do_not_retransmit.assert_not_called()
+        daemon.repeater_handler.assert_not_awaited()
+
+    async def test_direct_intermediate_control_without_high_bit_reaches_engine(self):
+        """Only high-bit CONTROL is zero-hop-only; other direct control remains routing traffic."""
+        daemon = _make_daemon()
+        daemon.discovery_helper = MagicMock(control_handler=AsyncMock())
+        daemon.deliver_control_data = AsyncMock()
+        router = PacketRouter(daemon)
+        packet = _make_packet(ControlHandler.payload_type())
+        packet.header = (ControlHandler.payload_type() << 2) | ROUTE_TYPE_DIRECT
+        packet.path = bytearray([0x42])
+        packet.payload = b"\x01\x00"
+
+        await router._route_packet(packet)
+
+        daemon.discovery_helper.control_handler.assert_not_awaited()
+        daemon.deliver_control_data.assert_not_awaited()
+        packet.mark_do_not_retransmit.assert_not_called()
+        daemon.repeater_handler.assert_awaited_once()
+
+    async def test_direct_intermediate_multipart_ack_does_not_notify_local_waiter(self):
+        """A direct intermediate MULTIPART ACK remains forwarding traffic, not a local ACK."""
+        daemon = _make_daemon()
+        router = PacketRouter(daemon)
+        packet = _make_packet(MultipartAckHandler.payload_type())
+        packet.header = (MultipartAckHandler.payload_type() << 2) | ROUTE_TYPE_DIRECT
+        packet.path = bytearray([0x42])
+        packet.payload = b"\x03" + bytes.fromhex("4dabaf95")
+
+        await router._route_packet(packet)
+
+        daemon.dispatcher._register_ack_received.assert_not_awaited()
+        daemon.repeater_handler.assert_awaited_once()
+
+    async def test_direct_intermediate_trace_uses_trace_handler(self):
+        """TRACE keeps its MeshCore-specific forwarding path ahead of generic direct routing."""
+        daemon = _make_daemon()
+        daemon.trace_helper = MagicMock(process_trace_packet=AsyncMock())
+        router = PacketRouter(daemon)
+        packet = _make_packet(TraceHandler.payload_type())
+        packet.header = (TraceHandler.payload_type() << 2) | ROUTE_TYPE_DIRECT
+        packet.path = bytearray([0x42])
+
+        await router._route_packet(packet)
+
+        daemon.trace_helper.process_trace_packet.assert_awaited_once_with(packet)
+        daemon.repeater_handler.assert_not_awaited()
+
+    async def test_direct_intermediate_trace_without_helper_is_released(self):
+        """TRACE remains MeshCore-owned even if a helper is unavailable during startup."""
+        daemon = _make_daemon()
+        daemon.trace_helper = None
+        router = PacketRouter(daemon)
+        packet = _make_packet(TraceHandler.payload_type())
+        packet.header = (TraceHandler.payload_type() << 2) | ROUTE_TYPE_DIRECT
+        packet.path = bytearray([0x42])
+
+        await router._route_packet(packet)
+
+        daemon.repeater_handler.assert_not_awaited()
 
 
 class TestInjectedTxRawEcho(unittest.IsolatedAsyncioTestCase):
@@ -750,3 +1325,219 @@ class TestInjectedTxRawEcho(unittest.IsolatedAsyncioTestCase):
         ok = await router.inject_packet(_make_packet())
 
         self.assertTrue(ok)
+
+
+class TestInjectedOriginExclusion(unittest.IsolatedAsyncioTestCase):
+    """A companion never hears its own transmission back through the router.
+
+    inject_packet tags the packet with the originating companion's "0xHH" hash
+    and _companion_bridges_for_packet withholds that bridge from every fan-out,
+    the same rule the 0x88 raw-RX echo already applies to the frame servers.
+    """
+
+    @staticmethod
+    def _daemon_with_two_bridges():
+        daemon = _make_daemon()
+        daemon._on_raw_rx_for_companions = None
+        origin = _make_bridge()
+        other = _make_bridge()
+        daemon.companion_bridges = {0x1A: origin, 0x2B: other}
+        return daemon, origin, other
+
+    @staticmethod
+    async def _inject_and_drain(router, pkt, origin_hash):
+        await router.start()
+        try:
+            injected = await router.inject_packet(pkt, origin_hash=origin_hash)
+            await asyncio.sleep(0.05)  # let queue drain into _route_packet
+        finally:
+            await router.stop()
+        return injected
+
+    async def test_injected_advert_is_not_redelivered_to_the_originating_bridge(self):
+        """A companion's own advert reaches the other bridge only."""
+        daemon, origin, other = self._daemon_with_two_bridges()
+        router = PacketRouter(daemon)
+        pkt = _make_packet(AdvertHandler.payload_type())
+
+        self.assertTrue(await self._inject_and_drain(router, pkt, "0x1a"))
+
+        origin.process_received_packet.assert_not_awaited()
+        other.process_received_packet.assert_awaited_once()
+
+    async def test_inject_without_origin_hash_still_fans_out_to_all_bridges(self):
+        """Repeater-originated injects (trace, discovery, login, text) have no
+        origin companion, so every bridge must still be offered the packet."""
+        daemon, origin, other = self._daemon_with_two_bridges()
+        router = PacketRouter(daemon)
+        pkt = _make_packet(AdvertHandler.payload_type())
+
+        self.assertTrue(await self._inject_and_drain(router, pkt, None))
+
+        origin.process_received_packet.assert_awaited_once()
+        other.process_received_packet.assert_awaited_once()
+
+    async def test_ota_advert_still_reaches_every_bridge(self):
+        """Anti-over-blocking control: an advert heard off the air is untagged,
+        so the origin filter must leave both bridges in place."""
+        daemon, origin, other = self._daemon_with_two_bridges()
+        router = PacketRouter(daemon)
+
+        await router._route_packet(_make_packet(AdvertHandler.payload_type()))
+
+        origin.process_received_packet.assert_awaited_once()
+        other.process_received_packet.assert_awaited_once()
+
+    async def test_injected_group_message_is_not_returned_to_its_origin(self):
+        """GRP_TXT fans out to every companion, so it needs the same exclusion."""
+        daemon, origin, other = self._daemon_with_two_bridges()
+        router = PacketRouter(daemon)
+        pkt = _make_packet(PAYLOAD_TYPE_GRP_TXT)
+
+        self.assertTrue(await self._inject_and_drain(router, pkt, "0x1a"))
+
+        origin.process_received_packet.assert_not_awaited()
+        other.process_received_packet.assert_awaited_once()
+
+    async def test_injected_advert_skips_advert_helper_neighbour_tracking(self):
+        """Our own TX is not a neighbour observation: feeding it to the helper
+        would record a phantom neighbour from the zeroed rssi/snr and burn a
+        rate-limit token. An advert heard off the air must still reach it."""
+        daemon, _origin, _other = self._daemon_with_two_bridges()
+        daemon.advert_helper = MagicMock()
+        daemon.advert_helper.process_advert_packet = AsyncMock()
+        router = PacketRouter(daemon)
+
+        injected = _make_packet(AdvertHandler.payload_type())
+        self.assertTrue(await self._inject_and_drain(router, injected, "0x1a"))
+        daemon.advert_helper.process_advert_packet.assert_not_awaited()
+
+        await router._route_packet(_make_packet(AdvertHandler.payload_type()))
+        daemon.advert_helper.process_advert_packet.assert_awaited_once()
+
+    async def test_self_advert_never_returns_to_its_own_companion_end_to_end(self):
+        """A real bridge advertising through the real injector must not end up
+        holding itself as a contact once the router queue has drained."""
+        identity = LocalIdentity()
+        companion_hash = identity.get_public_key()[0]
+        daemon = _make_daemon()
+        daemon._on_raw_rx_for_companions = None
+        router = PacketRouter(daemon)
+        bridge = RepeaterCompanionBridge(
+            identity,
+            functools.partial(router.inject_packet, origin_hash=f"0x{companion_hash:02x}"),
+            companion_hash=f"0x{companion_hash:02x}",
+        )
+        daemon.companion_bridges = {companion_hash: bridge}
+
+        await router.start()
+        try:
+            self.assertTrue(await bridge.advertise())
+            await asyncio.sleep(0.05)  # let queue drain into _route_packet
+        finally:
+            await router.stop()
+
+        self.assertEqual(bridge.get_contact_count(), 0)
+
+
+class TestCompanionDeliveryFailureHandling(unittest.IsolatedAsyncioTestCase):
+    """Dedupe marking and candidate-loop behaviour when companion bridges raise."""
+
+    async def test_path_all_bridges_raising_is_retried_on_next_copy(self):
+        """A PATH delivery where every bridge raised must not be marked
+        delivered; the next mesh copy gets another delivery attempt."""
+        daemon = _make_daemon()
+        bridge = _make_bridge()
+        bridge.process_received_packet = AsyncMock(side_effect=RuntimeError("bridge down"))
+        daemon.companion_bridges = {0x01: bridge}
+        router = PacketRouter(daemon)
+        pkt = _make_packet(PathHandler.payload_type())
+        pkt.payload = bytes([0x01, 0xAA])
+
+        await router._route_packet(pkt)
+        self.assertEqual(bridge.process_received_packet.await_count, 1)
+
+        # Bridge recovers; the second copy must be delivered, not TTL-suppressed.
+        recovered = AsyncMock(return_value=HandlerResult.not_for_us())
+        bridge.process_received_packet = recovered
+        await router._route_packet(pkt)
+        recovered.assert_awaited_once()
+
+    async def test_path_partial_bridge_failure_still_marks_delivered(self):
+        """One healthy bridge is a delivery: the duplicate copy stays suppressed."""
+        daemon = _make_daemon()
+        raising = _make_bridge()
+        raising.process_received_packet = AsyncMock(side_effect=RuntimeError("boom"))
+        healthy = _make_bridge()
+        healthy.process_received_packet = AsyncMock(return_value=HandlerResult.not_for_us())
+        daemon.companion_bridges = {0x01: raising, 0x02: healthy}
+        router = PacketRouter(daemon)
+        pkt = _make_packet(PathHandler.payload_type())
+        # Dest not in bridges: anon path-return, delivered to all bridges.
+        pkt.payload = bytes([0xEE, 0xAA])
+
+        await router._route_packet(pkt)
+        await router._route_packet(pkt)
+
+        healthy.process_received_packet.assert_awaited_once()
+        raising.process_received_packet.assert_awaited_once()
+
+    async def test_protocol_response_all_bridges_raising_is_retried_on_next_copy(self):
+        daemon = _make_daemon()
+        bridge = _make_bridge()
+        bridge.process_received_packet = AsyncMock(side_effect=RuntimeError("bridge down"))
+        daemon.companion_bridges = {0x01: bridge}
+        router = PacketRouter(daemon)
+        pkt = _make_packet(ProtocolResponseHandler.payload_type())
+        pkt.header = ROUTE_TYPE_FLOOD  # not a final hop: dedupe decides delivery
+
+        with patch("repeater.packet_router.PathHandler.payload_type", return_value=0x55):
+            await router._route_packet(pkt)
+            self.assertEqual(bridge.process_received_packet.await_count, 1)
+
+            recovered = AsyncMock(return_value=HandlerResult.not_for_us())
+            bridge.process_received_packet = recovered
+            await router._route_packet(pkt)
+            recovered.assert_awaited_once()
+
+    async def test_login_candidate_bridge_error_still_offers_local_identity(self):
+        """A raising companion bridge must not abort the candidate loop: the
+        hash-colliding room-server/repeater identity still gets the packet."""
+        daemon = _make_daemon()
+        bridge = _make_bridge()
+        bridge.process_received_packet = AsyncMock(side_effect=RuntimeError("bridge down"))
+        daemon.companion_bridges = {0xF5: bridge}
+        daemon.login_helper = MagicMock()
+        daemon.login_helper.handlers = {0xF5: MagicMock()}
+        daemon.login_helper.process_login_packet = AsyncMock(return_value=True)
+        daemon.repeater_handler = AsyncMock()
+        daemon.repeater_handler.storage = MagicMock()
+        daemon.repeater_handler.record_packet_only = MagicMock()
+        router = PacketRouter(daemon)
+        pkt = _make_packet(LoginServerHandler.payload_type())
+        pkt.payload = bytes([0xF5, 0x01])
+
+        await router._route_packet(pkt)
+
+        bridge.process_received_packet.assert_awaited_once()
+        daemon.login_helper.process_login_packet.assert_awaited_once()
+        # The colliding identity consumed it, so the engine must not re-forward.
+        daemon.repeater_handler.assert_not_awaited()
+
+    async def test_text_candidate_bridge_error_leaves_packet_for_engine(self):
+        """Bridge raises and no local identity claims the text: the packet must
+        still reach the forwarding engine instead of dying with the exception."""
+        daemon = _make_daemon()
+        bridge = _make_bridge()
+        bridge.process_received_packet = AsyncMock(side_effect=RuntimeError("bridge down"))
+        daemon.companion_bridges = {0xF5: bridge}
+        daemon.text_helper = MagicMock()
+        daemon.text_helper.handlers = {}
+        daemon.text_helper.process_text_packet = AsyncMock(return_value=False)
+        router = PacketRouter(daemon)
+        pkt = _make_packet(TextMessageHandler.payload_type())
+        pkt.payload = bytes([0xF5, 0x01])
+
+        await router._route_packet(pkt)
+
+        daemon.repeater_handler.assert_awaited_once()

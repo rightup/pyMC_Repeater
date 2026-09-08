@@ -440,6 +440,52 @@ def test_do_install_wrapper_success_then_restart_failure(isolated_state, monkeyp
     assert "restart failed" in (st.error_message or "")
 
 
+def test_do_install_leaves_plugin_manager_provisioning_to_wrapper(isolated_state, monkeypatch):
+    st = isolated_state
+    st.channel = "main"
+    st.latest_version = "4.0.0"
+
+    monkeypatch.setattr(ue.os, "geteuid", lambda: 1000)
+    monkeypatch.setattr(ue, "is_buildroot", lambda: False)
+    monkeypatch.setattr(ue, "_cleanup_stale_dist_info", lambda *args, **kwargs: None)
+    monkeypatch.setattr(ue.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(
+        ue.os.path,
+        "isfile",
+        lambda p: (
+            p
+            in {
+                "/usr/local/bin/pymc-do-upgrade",
+                "/etc/systemd/system/openhop-plugin-manager.service",
+            }
+        ),
+    )
+    monkeypatch.setattr("repeater.service_utils.restart_service", lambda: (True, "ok"))
+
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    class _Proc:
+        def __init__(self, cmd):
+            self.cmd = cmd
+            self.stdout = ["ok\n"]
+            self.returncode = 0
+
+        def wait(self):
+            return None
+
+    monkeypatch.setattr(ue.subprocess, "Popen", lambda cmd, **kwargs: _Proc(cmd))
+    monkeypatch.setattr(ue.subprocess, "run", fake_run)
+
+    ue._do_install()
+
+    assert calls == []
+    assert st.state == "complete"
+
+
 def test_do_install_wrapper_success_container_path(isolated_state, monkeypatch):
     st = isolated_state
     st.channel = "main"
@@ -470,3 +516,115 @@ def test_do_install_wrapper_success_container_path(isolated_state, monkeypatch):
     assert st.state == "complete"
     assert st.error_message is None
     assert any("container will restart" in line for line in st.progress_lines)
+
+
+def test_fetch_latest_version_refuses_to_guess_on_failure(monkeypatch):
+    # The value returned here is stored as the channel's latest version and is
+    # what the UI compares against, so a guess is worse than an error.
+    monkeypatch.setattr(ue, "_get_latest_tag", lambda: "1.1.1")
+    monkeypatch.setattr(ue, "_branch_is_dynamic", lambda _ch: True)
+    monkeypatch.setattr(
+        ue,
+        "_fetch_url",
+        lambda _url, timeout=10: (_ for _ in ()).throw(RuntimeError("compare unavailable")),
+    )
+
+    with pytest.raises(RuntimeError, match="Could not compare"):
+        ue._fetch_latest_version("dev")
+
+
+def test_fetch_latest_version_propagates_rate_limit(monkeypatch):
+    # A rate-limited check must reach _do_check as a _RateLimitError so the
+    # existing backoff path runs instead of being reported as a version.
+    monkeypatch.setattr(ue, "_get_latest_tag", lambda: "1.1.1")
+    monkeypatch.setattr(ue, "_branch_is_dynamic", lambda _ch: True)
+    monkeypatch.setattr(
+        ue,
+        "_fetch_url",
+        lambda _url, timeout=10: (_ for _ in ()).throw(ue._RateLimitError("limited")),
+    )
+
+    with pytest.raises(ue._RateLimitError):
+        ue._fetch_latest_version("dev")
+
+
+def test_fetch_latest_version_static_channel_without_pin_raises(monkeypatch):
+    monkeypatch.setattr(ue, "_get_latest_tag", lambda: "1.1.1")
+    monkeypatch.setattr(ue, "_branch_is_dynamic", lambda _ch: False)
+    monkeypatch.setattr(ue, "_fetch_url", lambda _url, timeout=8: 'name = "x"\n')
+
+    with pytest.raises(RuntimeError, match="No pinned version"):
+        ue._fetch_latest_version("main")
+
+
+def _capturing_popen(monkeypatch, calls):
+    class _Proc:
+        def __init__(self, cmd, env):
+            calls.append({"cmd": cmd, "env": env or {}})
+            self.stdout = ["ok\n"]
+            self.returncode = 0
+
+        def wait(self):
+            return None
+
+    monkeypatch.setattr(ue.subprocess, "Popen", lambda cmd, **kwargs: _Proc(cmd, kwargs.get("env")))
+
+    def fake_run(cmd, **kwargs):
+        calls.append({"cmd": cmd, "env": kwargs.get("env", {}), "run": True})
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(ue.subprocess, "run", fake_run)
+
+
+def test_do_install_root_does_not_force_a_predicted_version(isolated_state, monkeypatch):
+    st = isolated_state
+    st.channel = "dev"
+    # A stale prediction, e.g. left by a check that fell back to a tag.
+    st.latest_version = "1.1.1"
+
+    monkeypatch.setattr(ue.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(ue, "is_buildroot", lambda: False)
+    monkeypatch.setattr(ue, "is_container", lambda: False)
+    monkeypatch.setattr(ue, "_migrate_service_unit", lambda: None)
+    monkeypatch.setattr(ue, "_disable_legacy_services", lambda: None)
+    monkeypatch.setattr(ue, "_cleanup_stale_dist_info", lambda *args, **kwargs: None)
+    monkeypatch.setattr(ue.os.path, "isfile", lambda p: True)
+    monkeypatch.setattr(ue.os.path, "isdir", lambda p: False)
+    monkeypatch.setattr(ue.time, "sleep", lambda _s: None)
+    monkeypatch.setattr("repeater.service_utils.restart_service", lambda: (True, "ok"))
+
+    calls = []
+    _capturing_popen(monkeypatch, calls)
+
+    ue._do_install()
+
+    assert calls, "expected the installer to run at least one command"
+    for call in calls:
+        assert "SETUPTOOLS_SCM_PRETEND_VERSION" not in call["env"]
+    install = [c for c in calls if any("git+https://github.com" in str(x) for x in c["cmd"])]
+    assert install, "expected a pip install from git"
+    assert install[-1]["cmd"][:4] == ["/opt/openhop_repeater/venv/bin/python", "-I", "-m", "pip"]
+    assert install[-1]["env"] == ue._native_upgrade_environment()
+    assert any("@dev" in str(x) for x in install[-1]["cmd"])
+
+
+def test_do_install_wrapper_call_omits_pretend_version(isolated_state, monkeypatch):
+    st = isolated_state
+    st.channel = "dev"
+    st.latest_version = "1.1.1"
+
+    monkeypatch.setattr(ue.os, "geteuid", lambda: 1000)
+    monkeypatch.setattr(ue, "is_buildroot", lambda: False)
+    monkeypatch.setattr(ue, "is_container", lambda: False)
+    monkeypatch.setattr(ue, "_cleanup_stale_dist_info", lambda *args, **kwargs: None)
+    monkeypatch.setattr(ue.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(ue.os.path, "isfile", lambda p: p == "/usr/local/bin/pymc-do-upgrade")
+    monkeypatch.setattr("repeater.service_utils.restart_service", lambda: (True, "ok"))
+
+    calls = []
+    _capturing_popen(monkeypatch, calls)
+
+    ue._do_install()
+
+    assert calls[-1]["cmd"] == [ue._SUDO_BIN, "/usr/local/bin/pymc-do-upgrade", "dev"]
+    assert "SETUPTOOLS_SCM_PRETEND_VERSION" not in calls[-1]["env"]

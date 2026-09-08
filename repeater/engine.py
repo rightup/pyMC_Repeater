@@ -1,28 +1,42 @@
 import asyncio
 import copy
 import logging
+import math
 import secrets
 import time
 from collections import OrderedDict, deque
+from collections.abc import Mapping
+from enum import Enum
 from typing import Optional, Tuple
 
 from openhop_core.node.handlers.base import BaseHandler
 from openhop_core.protocol import Packet
 from openhop_core.protocol.constants import (
     MAX_PATH_SIZE,
+    PAYLOAD_TYPE_ACK,
     PAYLOAD_TYPE_ADVERT,
     PAYLOAD_TYPE_ANON_REQ,
+    PAYLOAD_TYPE_MULTIPART,
     PAYLOAD_TYPE_TRACE,
     PH_ROUTE_MASK,
+    PH_TYPE_SHIFT,
     ROUTE_TYPE_DIRECT,
     ROUTE_TYPE_FLOOD,
     ROUTE_TYPE_TRANSPORT_DIRECT,
     ROUTE_TYPE_TRANSPORT_FLOOD,
 )
-from openhop_core.protocol.packet_utils import PacketHeaderUtils, PathUtils
+from openhop_core.protocol.packet_utils import (
+    PacketHashingUtils,
+    PacketHeaderUtils,
+    PathUtils,
+    flood_rx_metrics,
+    packet_score,
+)
 
 from repeater.airtime import AirtimeManager
 from repeater.data_acquisition import StorageCollector
+from repeater.modem_config import normalize_modem_config, redact_modem_tokens_in_place
+from repeater.neighbour_links import NeighbourLinkTracker
 from repeater.policy_engine import PolicyDecision, PolicyEngine
 
 logger = logging.getLogger("RepeaterHandler")
@@ -34,14 +48,64 @@ LOOP_DETECT_MINIMAL = "minimal"
 LOOP_DETECT_MODERATE = "moderate"
 LOOP_DETECT_STRICT = "strict"
 
-# Thresholds for flood loop detection (hash-size-aware: 1, 2, or 3 bytes per hop).
-# Count how many times our own hash already exists in the incoming FLOOD path.
-# If occurrences >= threshold, treat as loop and drop.
+# Thresholds for flood loop detection, keyed by loop mode and path-hash width.
+# MeshCore treats 4-byte hashes as reserved, so only 1-3 byte widths are valid here.
 LOOP_DETECT_MAX_COUNTERS = {
-    LOOP_DETECT_MINIMAL: 4,
-    LOOP_DETECT_MODERATE: 2,
-    LOOP_DETECT_STRICT: 1,
+    LOOP_DETECT_MINIMAL: {1: 4, 2: 2, 3: 1},
+    LOOP_DETECT_MODERATE: {1: 2, 2: 1, 3: 1},
+    LOOP_DETECT_STRICT: {1: 1, 2: 1, 3: 1},
 }
+
+
+class DropReason(str, Enum):
+    """Canonical, non-alarming reasons a packet was intentionally not retransmitted.
+
+    Single source of truth shared with the packet router, replacing the string
+    prefixes that used to be duplicated there. Members subclass ``str`` so they
+    compare equal to their text, JSON-serialize, and persist to SQLite as plain
+    strings unchanged. Where the engine still needs a detail suffix (hop counts,
+    loop mode, multipart sub-case) it formats the member into a larger string;
+    the router accepts both the bare member and any string that begins with one.
+    """
+
+    DUPLICATE = "Duplicate"
+    MAX_FLOOD_HOPS = "Max flood hops limit reached"
+    PATH_HOP_COUNT_MAX = "Path hop count at maximum"
+    PATH_EXCEEDS_MAX_SIZE = "Path would exceed MAX_PATH_SIZE"
+    DIRECT_NO_PATH = "Direct: no path"
+    DIRECT_NOT_FOR_US = "Direct: not for us"
+    UNSCOPED_FLOOD_DISABLED = "Unscoped flood policy disabled"
+    TRANSPORT_CODE_NOT_ALLOWED = "Transport code not allowed to flood"
+    FLOOD_LOOP_DETECTED = "FLOOD loop detected"
+    MARKED_DO_NOT_RETRANSMIT = "Marked do not retransmit"
+    REPEAT_DISABLED = "Repeat disabled"
+    NO_TX_MODE = "No TX mode"
+    DUTY_CYCLE_LIMIT = "Duty cycle limit"
+    EMPTY_PAYLOAD = "Empty payload"
+    PATH_TOO_LONG = "Path too long"
+    INVALID_ADVERT = "Invalid advert packet"
+    MULTIPART = "Multipart"
+
+    # Python 3.11+ formats a (str, Enum) member as "DropReason.X" under str()/%s;
+    # return the value so log lines and stored records keep the plain reason text.
+    def __str__(self) -> str:
+        return self.value
+
+
+class ForwardResult(tuple):
+    """A forwarding decision that unpacks as a plain ``(packet, delay_seconds)`` pair.
+
+    ``extras`` carries additional ``(packet, delay_seconds)`` transmissions that
+    accompany the primary packet: MeshCore's routeDirectRecvAcks queues its
+    optional multi-ack redundancy copies ahead of the plain ACK at the same
+    scheduled time, so the caller must create the extra TX tasks before the
+    primary one.
+    """
+
+    def __new__(cls, packet: Packet, delay_s: float, extras=()):
+        result = super().__new__(cls, (packet, delay_s))
+        result.extras = tuple(extras)
+        return result
 
 
 class RepeaterHandler(BaseHandler):
@@ -58,6 +122,7 @@ class RepeaterHandler(BaseHandler):
         *,
         local_hash_bytes=None,
         send_advert_func=None,
+        periodic_advert_tick_func=None,
     ):
 
         self.config = config
@@ -65,6 +130,7 @@ class RepeaterHandler(BaseHandler):
         self.local_hash = local_hash
         self.local_hash_bytes = local_hash_bytes or bytes([local_hash])
         self.send_advert_func = send_advert_func
+        self.periodic_advert_tick_func = periodic_advert_tick_func
         self.airtime_mgr = AirtimeManager(config)
         self.policy_engine = PolicyEngine.from_runtime_config(config)
         self.seen_packets = OrderedDict()
@@ -75,8 +141,17 @@ class RepeaterHandler(BaseHandler):
         self.max_duplicates_per_packet = 20
         self.tx_delay_factor = config.get("delays", {}).get("tx_delay_factor", 1.0)
         self.direct_tx_delay_factor = config.get("delays", {}).get("direct_tx_delay_factor", 0.5)
+        # These are airtime multipliers, not seconds: TX delay is a random value in
+        # [0, 5 * airtime * factor] (matching MeshCore getRetransmitDelay). Flood and
+        # direct share the formula and differ only in the factor.
+        logger.info(
+            "TX delay factors (airtime multipliers, not seconds): "
+            f"flood random 0-5*airtime*F (F={self.tx_delay_factor}), "
+            f"direct random 0-5*airtime*F (F={self.direct_tx_delay_factor})"
+        )
         self.use_score_for_tx = config.get("repeater", {}).get("use_score_for_tx", False)
         self.score_threshold = config.get("repeater", {}).get("score_threshold", 0.3)
+        self.multi_acks = self._normalize_multi_acks(config)
         self.max_flood_hops = config.get("repeater", {}).get("max_flood_hops", 64)
         self.send_advert_interval_hours = config.get("repeater", {}).get(
             "send_advert_interval_hours", 10
@@ -85,6 +160,7 @@ class RepeaterHandler(BaseHandler):
         self.loop_detect_mode = self._normalize_loop_detect_mode(
             config.get("mesh", {}).get("loop_detect", LOOP_DETECT_OFF)
         )
+        self.neighbour_link_tracker = NeighbourLinkTracker(config)
 
         radio = dispatcher.radio if dispatcher else None
         if radio:
@@ -185,6 +261,8 @@ class RepeaterHandler(BaseHandler):
 
         route_type = packet.header & PH_ROUTE_MASK
         pkt_hash_full = packet.calculate_packet_hash().hex().upper()
+        snr = metadata.get("snr", 0.0)
+        rssi = metadata.get("rssi", 0)
 
         # TX mode: forward (repeat on), monitor (no repeat, tenants can TX), no_tx (all TX off)
         mode = self.config.get("repeater", {}).get("mode", "forward")
@@ -207,6 +285,9 @@ class RepeaterHandler(BaseHandler):
             else None,
             "rssi": metadata.get("rssi", 0),
             "snr": metadata.get("snr", 0.0),
+            "rx_radio_id": metadata.get("rx_radio_id")
+            or getattr(packet, "_rx_radio_id", None)
+            or getattr(packet, "rx_radio_id", None),
             "local_transmission": local_transmission,
             "mode": mode,
         }
@@ -235,17 +316,45 @@ class RepeaterHandler(BaseHandler):
         # clone the packet to avoid modifying the original
         processed_packet = copy.deepcopy(packet)
 
-        snr = metadata.get("snr", 0.0)
-        rssi = metadata.get("rssi", 0)
         transmitted = False
         tx_delay_ms = 0.0
         drop_reason = None
+        tx_radio_id = None
         lbt_attempts = 0
         lbt_backoff_delays_ms = None
         lbt_channel_busy = False
+        rx_radio_id = (
+            metadata.get("rx_radio_id")
+            or getattr(packet, "_rx_radio_id", None)
+            or getattr(packet, "rx_radio_id", None)
+        )
+        preferred_tx_radio_id = self._resolve_bridge_pair_tx_radio(rx_radio_id)
 
         original_path_hashes = packet.get_path_hashes_hex()
         path_hash_size = packet.get_path_hash_size()
+
+        if not local_transmission:
+            payload_type = (
+                packet.get_payload_type() if hasattr(packet, "get_payload_type") else None
+            )
+            frame_len = packet.get_raw_length() if hasattr(packet, "get_raw_length") else 0
+            score = flood_rx_metrics(
+                frame_len,
+                snr,
+                self.radio_config["spreading_factor"],
+                self.radio_config["bandwidth"],
+                self.radio_config["coding_rate"],
+                self.radio_config["preamble_length"],
+            ).score
+            self.neighbour_link_tracker.observe(
+                packet,
+                route_type=route_type,
+                payload_type=payload_type,
+                rssi=rssi,
+                snr=snr,
+                score=score,
+                is_duplicate=(pkt_hash_full in self.seen_packets),
+            )
 
         # Process for forwarding (skip if repeat disabled or if this is a local transmission).
         # Pass pkt_hash_full so flood_forward / direct_forward don't recompute SHA-256.
@@ -274,6 +383,21 @@ class RepeaterHandler(BaseHandler):
             # Capture the forwarded path (after modification)
             forwarded_path_hashes = fwd_pkt.get_path_hashes_hex()
 
+            # MeshCore queues multi-ack redundancy copies ahead of the primary
+            # ACK at the same scheduled time, so create their TX tasks first.
+            # Each task re-checks the duty-cycle gate before transmitting.
+            extra_tx_tasks = []
+            for extra_pkt, extra_delay in getattr(result, "extras", ()):
+                extra_airtime_ms = self.airtime_mgr.calculate_airtime(extra_pkt.get_raw_length())
+                extra_tx_tasks.append(
+                    await self.schedule_retransmit(
+                        extra_pkt,
+                        extra_delay,
+                        extra_airtime_ms,
+                        preferred_tx_radio_id=preferred_tx_radio_id,
+                    )
+                )
+
             # Check duty-cycle before scheduling TX
             airtime_ms = self.airtime_mgr.calculate_airtime(fwd_pkt.get_raw_length())
 
@@ -294,7 +418,11 @@ class RepeaterHandler(BaseHandler):
                         f"(airtime={airtime_ms:.1f}ms)"
                     )
                     tx_task = await self.schedule_retransmit(
-                        fwd_pkt, deferred_delay, airtime_ms, local_transmission=True
+                        fwd_pkt,
+                        deferred_delay,
+                        airtime_ms,
+                        local_transmission=True,
+                        preferred_tx_radio_id=preferred_tx_radio_id,
                     )
                     try:
                         tx_success = await tx_task
@@ -312,6 +440,7 @@ class RepeaterHandler(BaseHandler):
                         transmitted = True
                     tx_metadata = getattr(fwd_pkt, "_tx_metadata", None)
                     if tx_metadata:
+                        tx_radio_id = tx_metadata.get("radio_id") or tx_metadata.get("tx_radio_id")
                         lbt_attempts = tx_metadata.get("lbt_attempts", 0)
                         lbt_backoff_delays_ms = tx_metadata.get("lbt_backoff_delays_ms", [])
                         lbt_channel_busy = tx_metadata.get("lbt_channel_busy", False)
@@ -328,10 +457,14 @@ class RepeaterHandler(BaseHandler):
                         f"wait={wait_time:.1f}s before retry"
                     )
                     self.dropped_count += 1
-                    drop_reason = "Duty cycle limit"
+                    drop_reason = DropReason.DUTY_CYCLE_LIMIT
             else:
                 tx_task = await self.schedule_retransmit(
-                    fwd_pkt, delay, airtime_ms, local_transmission=local_transmission
+                    fwd_pkt,
+                    delay,
+                    airtime_ms,
+                    local_transmission=local_transmission,
+                    preferred_tx_radio_id=preferred_tx_radio_id,
                 )
                 try:
                     tx_success = await tx_task
@@ -349,6 +482,7 @@ class RepeaterHandler(BaseHandler):
                     transmitted = True
                 tx_metadata = getattr(fwd_pkt, "_tx_metadata", None)
                 if tx_metadata:
+                    tx_radio_id = tx_metadata.get("radio_id") or tx_metadata.get("tx_radio_id")
                     lbt_attempts = tx_metadata.get("lbt_attempts", 0)
                     lbt_backoff_delays_ms = tx_metadata.get("lbt_backoff_delays_ms", [])
                     lbt_channel_busy = tx_metadata.get("lbt_channel_busy", False)
@@ -359,13 +493,22 @@ class RepeaterHandler(BaseHandler):
                             f"LBT: {lbt_attempts} attempts, {total_lbt_delay:.0f}ms delay, "
                             f"backoffs={lbt_backoff_delays_ms}"
                         )
+
+            # Redundancy copies ride alongside the primary result: collect them
+            # without letting a failed extra change the primary outcome.
+            for extra_task in extra_tx_tasks:
+                try:
+                    if await extra_task:
+                        self.forwarded_count += 1
+                except Exception as e:
+                    logger.warning(f"Multi-ack redundancy TX failed: {e}")
         else:
             self.dropped_count += 1
             # Determine drop reason
             if local_transmission and not allow_local_tx:
-                drop_reason = policy_reason or "No TX mode"
+                drop_reason = policy_reason or DropReason.NO_TX_MODE
             elif not allow_forward:
-                drop_reason = policy_reason or "Repeat disabled"
+                drop_reason = policy_reason or DropReason.REPEAT_DISABLED
             else:
                 # Check if packet has a specific drop reason set by handlers
                 drop_reason = processed_packet.drop_reason or self._get_drop_reason(
@@ -393,12 +536,20 @@ class RepeaterHandler(BaseHandler):
 
         # Set drop reason for duplicates and count flood vs direct dups
         if is_dupe and drop_reason is None:
-            drop_reason = "Duplicate"
+            drop_reason = DropReason.DUPLICATE
         if is_dupe:
             if route_type in (ROUTE_TYPE_FLOOD, ROUTE_TYPE_TRANSPORT_FLOOD):
                 self.flood_dup_count += 1
             elif route_type in (ROUTE_TYPE_DIRECT, ROUTE_TYPE_TRANSPORT_DIRECT):
                 self.direct_dup_count += 1
+
+        # Expose effective drop reason to PacketRouter.
+        # Some Packet implementations are slot-based and cannot accept dynamic attrs.
+        metadata["_repeater_drop_reason"] = drop_reason
+        try:
+            setattr(packet, "_repeater_drop_reason", drop_reason)
+        except (AttributeError, TypeError):
+            pass
 
         display_hashes = (
             original_path_hashes if original_path_hashes else packet.get_path_hashes_hex()
@@ -423,6 +574,8 @@ class RepeaterHandler(BaseHandler):
             is_duplicate=is_dupe,
             forwarded_path=forwarded_path_hashes,
             tx_delay_ms=tx_delay_ms,
+            rx_radio_id=rx_radio_id,
+            tx_radio_id=tx_radio_id,
             lbt_attempts=lbt_attempts,
             lbt_backoff_delays_ms=lbt_backoff_delays_ms,
             lbt_channel_busy=lbt_channel_busy,
@@ -434,7 +587,11 @@ class RepeaterHandler(BaseHandler):
         if self.storage:
             try:
                 # Only skip mqtt for actual invalid/bad packets
-                invalid_reasons = ["Invalid advert packet", "Empty payload", "Path too long"]
+                invalid_reasons = (
+                    DropReason.INVALID_ADVERT,
+                    DropReason.EMPTY_PAYLOAD,
+                    DropReason.PATH_TOO_LONG,
+                )
                 skip_mqtt = drop_reason in invalid_reasons if drop_reason else False
                 self.storage.record_packet(packet_record, skip_mqtt_if_invalid=skip_mqtt)
             except Exception as e:
@@ -518,6 +675,11 @@ class RepeaterHandler(BaseHandler):
             path_hash,
             src_hash,
             dst_hash,
+            rx_radio_id=(
+                metadata.get("rx_radio_id")
+                or getattr(packet, "_rx_radio_id", None)
+                or getattr(packet, "rx_radio_id", None)
+            ),
             packet_hash=packet.calculate_packet_hash().hex().upper(),
         )
         try:
@@ -550,6 +712,26 @@ class RepeaterHandler(BaseHandler):
         path_hash_size = packet.get_path_hash_size()
         path_hash = self._path_hash_display(original_path_hashes)
         src_hash, dst_hash = self._packet_record_src_dst(packet, payload_type)
+        pkt_hash_full = packet.calculate_packet_hash().hex().upper()
+
+        frame_len = packet.get_raw_length() if hasattr(packet, "get_raw_length") else 0
+        score = flood_rx_metrics(
+            frame_len,
+            snr,
+            self.radio_config["spreading_factor"],
+            self.radio_config["bandwidth"],
+            self.radio_config["coding_rate"],
+            self.radio_config["preamble_length"],
+        ).score
+        self.neighbour_link_tracker.observe(
+            packet,
+            route_type=route_type,
+            payload_type=payload_type,
+            rssi=float(rssi),
+            snr=float(snr),
+            score=score,
+            is_duplicate=True,
+        )
 
         packet_record = self._build_packet_record(
             packet,
@@ -563,9 +745,12 @@ class RepeaterHandler(BaseHandler):
             src_hash,
             dst_hash,
             transmitted=False,
-            drop_reason="Duplicate",
+            drop_reason=DropReason.DUPLICATE,
             is_duplicate=True,
-            packet_hash=packet.calculate_packet_hash().hex().upper(),
+            rx_radio_id=(
+                getattr(packet, "_rx_radio_id", None) or getattr(packet, "rx_radio_id", None)
+            ),
+            packet_hash=pkt_hash_full,
         )
 
         if self.storage:
@@ -639,6 +824,8 @@ class RepeaterHandler(BaseHandler):
         is_duplicate: bool = False,
         forwarded_path=None,
         tx_delay_ms: float = 0.0,
+        rx_radio_id: Optional[str] = None,
+        tx_radio_id: Optional[str] = None,
         lbt_attempts: int = 0,
         lbt_backoff_delays_ms=None,
         lbt_channel_busy: bool = False,
@@ -648,6 +835,13 @@ class RepeaterHandler(BaseHandler):
         pkt_hash = packet_hash or packet.calculate_packet_hash().hex().upper()
         payload = getattr(packet, "payload", None)
         payload_len = len(payload or b"")
+        upstream_hash, upstream_hash_size = self.neighbour_link_tracker.get_upstream_peer_identity(
+            packet,
+            route_type,
+            payload_type,
+            path_hashes=original_path_hashes,
+            path_hash_size=path_hash_size,
+        )
 
         # LoRa time-on-air for this packet (Semtech reference formula).
         # Computed once here so every downstream consumer (MQTT, SQLite, Glass,
@@ -676,10 +870,19 @@ class RepeaterHandler(BaseHandler):
             "length": payload_len,
             "rssi": rssi,
             "snr": snr,
-            "score": self.calculate_packet_score(
-                snr, payload_len, self.radio_config["spreading_factor"]
-            ),
+            "score": flood_rx_metrics(
+                packet.get_raw_length() if hasattr(packet, "get_raw_length") else 0,
+                snr,
+                self.radio_config["spreading_factor"],
+                self.radio_config["bandwidth"],
+                self.radio_config["coding_rate"],
+                self.radio_config["preamble_length"],
+            ).score,
             "tx_delay_ms": tx_delay_ms,
+            "rx_radio_id": rx_radio_id
+            or getattr(packet, "_rx_radio_id", None)
+            or getattr(packet, "rx_radio_id", None),
+            "tx_radio_id": tx_radio_id,
             "airtime_ms": airtime_ms,
             "transmitted": transmitted,
             "is_duplicate": is_duplicate,
@@ -691,6 +894,8 @@ class RepeaterHandler(BaseHandler):
             "original_path": original_path_hashes or None,
             "forwarded_path": forwarded_path,
             "path_hash_size": path_hash_size,
+            "upstream_hash": upstream_hash,
+            "upstream_hash_size": upstream_hash_size,
             "raw_packet": packet.write_to().hex() if hasattr(packet, "write_to") else None,
             "lbt_attempts": lbt_attempts,
             "lbt_backoff_delays_ms": lbt_backoff_delays_ms,
@@ -713,13 +918,13 @@ class RepeaterHandler(BaseHandler):
     def _get_drop_reason(self, packet: Packet, packet_hash: Optional[str] = None) -> str:
 
         if self.is_duplicate(packet, packet_hash=packet_hash):
-            return "Duplicate"
+            return DropReason.DUPLICATE
 
         if not packet or not packet.payload:
-            return "Empty payload"
+            return DropReason.EMPTY_PAYLOAD
 
-        if len(packet.path or []) >= MAX_PATH_SIZE:
-            return "Path too long"
+        if len(packet.path or []) > MAX_PATH_SIZE:
+            return DropReason.PATH_TOO_LONG
 
         route_type = packet.header & PH_ROUTE_MASK
 
@@ -729,15 +934,15 @@ class RepeaterHandler(BaseHandler):
                 "unscoped_flood_allow", self.config.get("mesh", {}).get("global_flood_allow", True)
             )
             if not unscoped_flood_allow:
-                return "Unscoped flood policy disabled"
+                return DropReason.UNSCOPED_FLOOD_DISABLED
 
         if route_type == ROUTE_TYPE_DIRECT:
             hash_size = packet.get_path_hash_size()
             if not packet.path or len(packet.path) < hash_size:
-                return "Direct: no path"
+                return DropReason.DIRECT_NO_PATH
             next_hop = bytes(packet.path[:hash_size])
             if next_hop != self.local_hash_bytes[:hash_size]:
-                return "Direct: not for us"
+                return DropReason.DIRECT_NOT_FOR_US
 
         # Default reason
         return "Unknown"
@@ -768,15 +973,28 @@ class RepeaterHandler(BaseHandler):
     def validate_packet(self, packet: Packet) -> Tuple[bool, str]:
 
         if not packet or not packet.payload:
-            return False, "Empty payload"
+            return False, DropReason.EMPTY_PAYLOAD
 
-        if len(packet.path or []) >= MAX_PATH_SIZE:
+        if packet.get_path_hash_size() > 3:
+            return False, "Reserved path hash size is invalid"
+
+        if len(packet.path or []) > MAX_PATH_SIZE:
             return (
                 False,
                 f"Path length {len(packet.path or [])} exceeds MAX_PATH_SIZE ({MAX_PATH_SIZE})",
             )
 
         return True, ""
+
+    @staticmethod
+    def _normalize_multi_acks(config: dict) -> int:
+        """Read ``repeater.multi_acks``, constrained to 0..1 like MeshCore's
+        CommonCLI prefs load."""
+        try:
+            value = int(config.get("repeater", {}).get("multi_acks", 0))
+        except (TypeError, ValueError):
+            return 0
+        return max(0, min(1, value))
 
     def _normalize_loop_detect_mode(self, mode) -> str:
         if isinstance(mode, str):
@@ -798,11 +1016,15 @@ class RepeaterHandler(BaseHandler):
         if mode == LOOP_DETECT_OFF:
             return False
 
-        max_counter = LOOP_DETECT_MAX_COUNTERS.get(mode)
-        if max_counter is None:
+        max_counters = LOOP_DETECT_MAX_COUNTERS.get(mode)
+        if max_counters is None:
             return False
 
         hash_size = packet.get_path_hash_size()
+        if hash_size not in max_counters:
+            return False
+
+        max_counter = max_counters[hash_size]
         hop_count = packet.get_path_hash_count()
         path = packet.path or bytearray()
         local_hash = self.local_hash_bytes[:hash_size]
@@ -917,7 +1139,7 @@ class RepeaterHandler(BaseHandler):
         if packet.is_marked_do_not_retransmit():
             # Check if packet has custom drop reason
             if not packet.drop_reason:
-                packet.drop_reason = "Marked do not retransmit"
+                packet.drop_reason = DropReason.MARKED_DO_NOT_RETRANSMIT
             return None
 
         # Check unscoped flood policy
@@ -927,24 +1149,24 @@ class RepeaterHandler(BaseHandler):
         route_type = packet.header & PH_ROUTE_MASK
         if route_type == ROUTE_TYPE_FLOOD:
             if not unscoped_flood_allow:
-                packet.drop_reason = "Unscoped flood policy disabled"
+                packet.drop_reason = DropReason.UNSCOPED_FLOOD_DISABLED
                 return None
 
         # Check transport scopes flood policy
         if route_type == ROUTE_TYPE_TRANSPORT_FLOOD:
             allowed, check_reason = self._check_transport_codes(packet)
             if not allowed:
-                packet.drop_reason = "Transport code not allowed to flood"
+                packet.drop_reason = DropReason.TRANSPORT_CODE_NOT_ALLOWED
                 return None
 
         mode = self._get_loop_detect_mode()
         if self._is_flood_looped(packet, mode):
-            packet.drop_reason = f"FLOOD loop detected ({mode})"
+            packet.drop_reason = f"{DropReason.FLOOD_LOOP_DETECTED} ({mode})"
             return None
 
         # Suppress duplicates — pass pre-computed hash to avoid a second SHA-256.
         if self.is_duplicate(packet, packet_hash=packet_hash):
-            packet.drop_reason = "Duplicate"
+            packet.drop_reason = DropReason.DUPLICATE
             return None
 
         if packet.path is None:
@@ -956,17 +1178,17 @@ class RepeaterHandler(BaseHandler):
         hop_count = packet.get_path_hash_count()
 
         if self.max_flood_hops > 0 and hop_count >= self.max_flood_hops:
-            packet.drop_reason = f"Max flood hops limit reached ({hop_count}/{self.max_flood_hops})"
+            packet.drop_reason = f"{DropReason.MAX_FLOOD_HOPS} ({hop_count}/{self.max_flood_hops})"
             return None
 
         # path_len encodes hop count in 6 bits (0-63); adding ourselves must not exceed 63
         if hop_count >= 63:
-            packet.drop_reason = "Path hop count at maximum (63), cannot append"
+            packet.drop_reason = f"{DropReason.PATH_HOP_COUNT_MAX} (63), cannot append"
             return None
 
         # Check path won't exceed MAX_PATH_SIZE after append
         if (hop_count + 1) * hash_size > MAX_PATH_SIZE:
-            packet.drop_reason = "Path would exceed MAX_PATH_SIZE"
+            packet.drop_reason = DropReason.PATH_EXCEEDS_MAX_SIZE
             return None
 
         self.mark_seen(packet, packet_hash=packet_hash)
@@ -993,7 +1215,7 @@ class RepeaterHandler(BaseHandler):
         # Check if packet is marked do-not-retransmit
         if packet.is_marked_do_not_retransmit():
             if not packet.drop_reason:
-                packet.drop_reason = "Marked do not retransmit"
+                packet.drop_reason = DropReason.MARKED_DO_NOT_RETRANSMIT
             return None
 
         hash_size = packet.get_path_hash_size()
@@ -1001,17 +1223,17 @@ class RepeaterHandler(BaseHandler):
 
         # Check if we're the next hop
         if not packet.path or len(packet.path) < hash_size:
-            packet.drop_reason = "Direct: no path"
+            packet.drop_reason = DropReason.DIRECT_NO_PATH
             return None
 
         next_hop = bytes(packet.path[:hash_size])
         if next_hop != self.local_hash_bytes[:hash_size]:
-            packet.drop_reason = "Direct: not for us"
+            packet.drop_reason = DropReason.DIRECT_NOT_FOR_US
             return None
 
         # Suppress duplicates — pass pre-computed hash to avoid a second SHA-256.
         if self.is_duplicate(packet, packet_hash=packet_hash):
-            packet.drop_reason = "Duplicate"
+            packet.drop_reason = DropReason.DUPLICATE
             return None
 
         self.mark_seen(packet, packet_hash=packet_hash)
@@ -1022,56 +1244,204 @@ class RepeaterHandler(BaseHandler):
 
         return packet
 
+    # Multipart ACKs are spaced ~300ms apart per remaining fragment, matching
+    # MeshCore's forwardMultipartDirect (`(remaining + 1) * 300`).
+    MULTIPART_ACK_SPACING_MS = 300
+
+    def forward_multipart_direct(
+        self, packet: Packet, snr: float = 0.0, packet_hash: Optional[str] = None
+    ) -> Optional["ForwardResult"]:
+        """Forward a MULTIPART packet the way MeshCore's forwardMultipartDirect does.
+
+        MeshCore never relays the multipart wrapper as an ordinary directed
+        packet.  Only a multipart-ACK at an intermediate direct hop is relayed,
+        and it is relayed by regenerating the embedded ACK as a plain DIRECT ACK
+        (the wrapper byte stripped) rather than repeating the wrapper.  Every
+        other multipart case — flood routing, a final hop, or a non-ACK embedded
+        type — is dropped.  Returns a ``ForwardResult`` — ``(ack_packet,
+        delay_seconds)`` plus any multi-ack redundancy ``extras`` — when a
+        regenerated ACK should be sent, otherwise ``None``.
+
+        INVARIANT: purely synchronous, mirroring flood_forward / direct_forward —
+        the is_duplicate + mark_seen pair must stay atomic within the event loop.
+        """
+        # MeshCore only forwards multipart on the direct-route branch; the flood
+        # switch case updates ACK state locally but never re-routes it.
+        if not packet.is_route_direct():
+            packet.drop_reason = f"{DropReason.MULTIPART}: not direct-routed"
+            return None
+
+        valid, reason = self.validate_packet(packet)
+        if not valid:
+            packet.drop_reason = reason
+            return None
+
+        if packet.is_marked_do_not_retransmit():
+            packet.drop_reason = packet.drop_reason or DropReason.MARKED_DO_NOT_RETRANSMIT
+            return None
+
+        payload = packet.payload or b""
+        remaining = payload[0] >> 4
+        embedded_type = payload[0] & 0x0F
+        # Only multipart-ACKs are relayed; MeshCore leaves other types for future
+        # use and does not forward them.
+        if embedded_type != PAYLOAD_TYPE_ACK or len(payload) < 5:
+            packet.drop_reason = f"{DropReason.MULTIPART}: unsupported embedded type"
+            return None
+
+        hash_size = packet.get_path_hash_size()
+        hop_count = packet.get_path_hash_count()
+
+        # We must be the next hop (a final-hop multipart has no remaining path and
+        # is handled locally, not forwarded).
+        if not packet.path or len(packet.path) < hash_size:
+            packet.drop_reason = DropReason.DIRECT_NO_PATH
+            return None
+        if bytes(packet.path[:hash_size]) != self.local_hash_bytes[:hash_size]:
+            packet.drop_reason = DropReason.DIRECT_NOT_FOR_US
+            return None
+
+        # Dedupe before regenerating, on MeshCore's exact seen key: hasSeen()
+        # runs on a copy that keeps the MULTIPART payload type but carries the
+        # unwrapped ACK payload (the `remaining` count is stripped).  Keeping
+        # that key distinct from the plain ACK's is what lets a multi-ack
+        # redundancy pair — MULTIPART copy plus plain ACK — survive every hop
+        # instead of the second half being swallowed as a duplicate.  The
+        # pre-computed hash belongs to the wrapper as received, so recompute.
+        seen_key = (
+            PacketHashingUtils.calculate_packet_hash(
+                PAYLOAD_TYPE_MULTIPART, packet.path_len, bytes(payload[1:])
+            )
+            .hex()
+            .upper()
+        )
+        if self.is_duplicate(packet, packet_hash=seen_key):
+            packet.drop_reason = DropReason.DUPLICATE
+            return None
+        self.mark_seen(packet, packet_hash=seen_key)
+
+        # Rebuild the received wrapper as the plain DIRECT ACK MeshCore would emit:
+        # drop the multipart header byte and force the ACK payload/route type, then
+        # remove this node from the path (hasSeen()/removeSelfFromPath() order).
+        packet.payload = bytearray(payload[1:])
+        packet.payload_len = len(packet.payload)
+        packet.header = (PAYLOAD_TYPE_ACK << PH_TYPE_SHIFT) | ROUTE_TYPE_DIRECT
+        packet.transport_codes = [0, 0]
+        packet.path = bytearray(packet.path[hash_size:])
+        packet.path_len = PathUtils.encode_path_len(hash_size, hop_count - 1)
+
+        extras, delay_ms = self._multi_ack_extras(
+            packet, float((remaining + 1) * self.MULTIPART_ACK_SPACING_MS), snr
+        )
+        return ForwardResult(packet, delay_ms / 1000.0, extras)
+
+    def _multi_ack_extras(
+        self, ack_packet: Packet, base_delay_ms: float, snr: float
+    ) -> Tuple[list, float]:
+        """Build MeshCore's optional multi-ack redundancy copies for a relayed ACK.
+
+        With ``multi_acks`` enabled, routeDirectRecvAcks precedes the plain ACK
+        with a MULTIPART-wrapped copy (``remaining<<4 | ACK`` prefix byte) on the
+        already self-removed path, pushing the accumulated delay out by a direct
+        retransmit delay + 300 ms per copy; the plain ACK itself slides to the
+        final accumulated delay.  Returns ``(extras, plain_ack_delay_ms)``.
+        """
+        extra = self.multi_acks
+        extras = []
+        delay_ms = base_delay_ms
+        while extra > 0:
+            delay_ms += (
+                self._calculate_tx_delay(ack_packet, snr) * 1000.0 + self.MULTIPART_ACK_SPACING_MS
+            )
+            wrapped = Packet()
+            wrapped.header = (PAYLOAD_TYPE_MULTIPART << PH_TYPE_SHIFT) | ROUTE_TYPE_DIRECT
+            wrapped.payload = bytearray(
+                bytes([(extra << 4) | PAYLOAD_TYPE_ACK]) + bytes(ack_packet.payload)
+            )
+            wrapped.payload_len = len(wrapped.payload)
+            wrapped.path = bytearray(ack_packet.path)
+            wrapped.path_len = ack_packet.path_len
+            extras.append((wrapped, delay_ms / 1000.0))
+            extra -= 1
+        return extras, delay_ms
+
+    def forward_routed_ack(
+        self, packet: Packet, snr: float = 0.0, packet_hash: Optional[str] = None
+    ) -> Optional["ForwardResult"]:
+        """Relay a routed ACK the way MeshCore's routeDirectRecvAcks does.
+
+        An ACK at an intermediate direct hop is not repeated verbatim: MeshCore
+        regenerates it (createAck) as a plain DIRECT ACK — transport codes
+        dropped, every other header bit cleared — removes this node from the
+        path, and transmits it with zero retransmit delay rather than the
+        generic direct forwarding delay.  With ``multi_acks`` enabled, the plain
+        ACK is preceded by a MULTIPART-wrapped redundancy copy and both slide
+        out by a direct retransmit delay + 300 ms.
+
+        INVARIANT: purely synchronous, mirroring direct_forward — the
+        is_duplicate + mark_seen pair must stay atomic within the event loop.
+        """
+        valid, reason = self.validate_packet(packet)
+        if not valid:
+            packet.drop_reason = reason
+            return None
+
+        if packet.is_marked_do_not_retransmit():
+            packet.drop_reason = packet.drop_reason or DropReason.MARKED_DO_NOT_RETRANSMIT
+            return None
+
+        hash_size = packet.get_path_hash_size()
+        hop_count = packet.get_path_hash_count()
+
+        # A final-hop ACK (no remaining path) is consumed locally, never relayed.
+        if not packet.path or len(packet.path) < hash_size:
+            packet.drop_reason = DropReason.DIRECT_NO_PATH
+            return None
+        if bytes(packet.path[:hash_size]) != self.local_hash_bytes[:hash_size]:
+            packet.drop_reason = DropReason.DIRECT_NOT_FOR_US
+            return None
+
+        # The packet hash covers only the payload type and payload, so the
+        # received form and the regenerated plain ACK share one key — matching
+        # MeshCore's hasSeen() on the incoming ACK before removeSelfFromPath().
+        if self.is_duplicate(packet, packet_hash=packet_hash):
+            packet.drop_reason = DropReason.DUPLICATE
+            return None
+        self.mark_seen(packet, packet_hash=packet_hash)
+
+        packet.header = (PAYLOAD_TYPE_ACK << PH_TYPE_SHIFT) | ROUTE_TYPE_DIRECT
+        packet.transport_codes = [0, 0]
+        packet.path = bytearray(packet.path[hash_size:])
+        packet.path_len = PathUtils.encode_path_len(hash_size, hop_count - 1)
+
+        extras, delay_ms = self._multi_ack_extras(packet, 0.0, snr)
+        return ForwardResult(packet, delay_ms / 1000.0, extras)
+
     @staticmethod
     def calculate_packet_score(snr: float, packet_len: int, spreading_factor: int = 8) -> float:
-
-        # SNR thresholds per SF (from MeshCore RadioLibWrappers.cpp)
-        snr_thresholds = {7: -7.5, 8: -10.0, 9: -12.5, 10: -15.0, 11: -17.5, 12: -20.0}
-
-        if spreading_factor < 7:
-            return 0.0
-
-        threshold = snr_thresholds.get(spreading_factor, -10.0)
-
-        # Below threshold = no chance of success
-        if snr < threshold:
-            return 0.0
-
-        # Success rate based on SNR above threshold
-        success_rate_based_on_snr = (snr - threshold) / 10.0
-
-        # Collision penalty: longer packets more likely to collide (max 256 bytes)
-        collision_penalty = 1.0 - (packet_len / 256.0)
-
-        # Combined score
-        score = success_rate_based_on_snr * collision_penalty
-
-        return max(0.0, min(1.0, score))
+        """Reception-quality score in [0, 1] via the shared core scorer
+        (MeshCore RadioLibWrappers packetScoreInt)."""
+        return packet_score(snr, spreading_factor, packet_len)
 
     def _calculate_tx_delay(self, packet: Packet, snr: float = 0.0) -> float:
 
         packet_len = packet.get_raw_length()
         airtime_ms = self.airtime_mgr.calculate_airtime(packet_len)
 
-        route_type = packet.header & PH_ROUTE_MASK
+        if packet.is_route_flood():
+            delay_factor = self.tx_delay_factor
+        elif packet.is_route_direct():
+            delay_factor = self.direct_tx_delay_factor
+        else:
+            delay_factor = self.direct_tx_delay_factor
 
-        # Base delay calculations
-        # this part took me along time to get right well i hope i got it right ;-)
+        # MeshCore uses the same random window for flood and direct variants:
+        # choose a value from 0 through 5 * airtime * factor.
+        base_delay_ms = airtime_ms * delay_factor
+        random_mult = secrets.randbelow(5001) / 1000.0
+        delay_s = (base_delay_ms * random_mult) / 1000.0
 
-        if route_type == ROUTE_TYPE_FLOOD:
-            # Flood packets: random(0-5) * (airtime * 52/50 / 2) * tx_delay_factor
-            # This creates collision avoidance with tunable delay
-            base_delay_ms = (airtime_ms * 52 / 50) / 2.0  # From C++ implementation
-            random_mult = secrets.randbelow(5001) / 1000.0
-            delay_ms = base_delay_ms * random_mult * self.tx_delay_factor
-            delay_s = delay_ms / 1000.0
-        else:  # DIRECT
-            # Direct packets: use direct_tx_delay_factor (already in seconds)
-            # direct_tx_delay_factor is stored as seconds in config
-            delay_s = self.direct_tx_delay_factor
-
-        # Apply score-based delay adjustment ONLY if delay >= 50ms threshold
-        # (matching C++ reactive behavior in Dispatcher::calcRxDelay)
+        # OpenHop's optional score gate is applied only after the 50 ms threshold.
         if delay_s >= 0.05 and self.use_score_for_tx:
             score = self.calculate_packet_score(snr, packet_len)
             # Higher score = shorter delay: max(0.2, 1.0 - score)
@@ -1090,7 +1460,7 @@ class RepeaterHandler(BaseHandler):
 
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
-                f"Route={'FLOOD' if route_type == ROUTE_TYPE_FLOOD else 'DIRECT'}, "
+                f"Route={'FLOOD' if packet.is_route_flood() else 'DIRECT'}, "
                 f"len={packet_len}B, airtime={airtime_ms:.1f}ms, delay={delay_s:.3f}s"
             )
 
@@ -1111,6 +1481,23 @@ class RepeaterHandler(BaseHandler):
         """
         route_type = packet.header & PH_ROUTE_MASK
 
+        # MeshCore routes multipart traffic through its own branch, never the
+        # generic flood/direct path — it regenerates embedded ACKs and drops
+        # everything else.  Its delay is fixed by the fragment count, so return
+        # the (packet, delay) pair directly instead of _calculate_tx_delay.
+        payload_type = packet.get_payload_type()
+        if payload_type == PAYLOAD_TYPE_MULTIPART:
+            return self.forward_multipart_direct(packet, snr, packet_hash=packet_hash)
+
+        # Routed ACKs also get their own MeshCore branch: an intermediate direct
+        # hop re-emits the ACK immediately (routeDirectRecvAcks) instead of the
+        # delayed generic direct forward.  Flood ACKs stay on the generic path.
+        if payload_type == PAYLOAD_TYPE_ACK and route_type in (
+            ROUTE_TYPE_DIRECT,
+            ROUTE_TYPE_TRANSPORT_DIRECT,
+        ):
+            return self.forward_routed_ack(packet, snr, packet_hash=packet_hash)
+
         if route_type == ROUTE_TYPE_FLOOD or route_type == ROUTE_TYPE_TRANSPORT_FLOOD:
             fwd_pkt = self.flood_forward(packet, packet_hash=packet_hash)
             if fwd_pkt is None:
@@ -1129,12 +1516,109 @@ class RepeaterHandler(BaseHandler):
             packet.drop_reason = f"Unknown route type: {route_type}"
             return None
 
+    # A local transmit whose radio link has dropped waits this long for it to come
+    # back before giving up, polling at LOCAL_TX_LINK_POLL_S. Kept well inside the
+    # companion client's own command timeout (meshcore_py: 15s), which is already
+    # partly spent on the TX delay by the time we get here.
+    DEFAULT_LOCAL_TX_LINK_WAIT_S = 5.0
+    # Hard ceiling regardless of configuration: the companion client is already
+    # waiting on this send, and an unbounded (or infinite) value would hold its
+    # command open forever rather than reporting a failure it can act on.
+    MAX_LOCAL_TX_LINK_WAIT_S = 30.0
+    LOCAL_TX_LINK_POLL_S = 0.1
+
+    def _local_tx_link_wait_s(self) -> float:
+        """Configured ceiling for waiting out a radio-link outage on a local TX."""
+        delays = self.config.get("delays") or {}
+        try:
+            wait = float(
+                delays.get("local_tx_link_wait_seconds", self.DEFAULT_LOCAL_TX_LINK_WAIT_S)
+            )
+        except (TypeError, ValueError):
+            return self.DEFAULT_LOCAL_TX_LINK_WAIT_S
+        if not math.isfinite(wait):
+            logger.warning(
+                "local_tx_link_wait_seconds=%r is not a finite number; using %.1fs",
+                wait,
+                self.DEFAULT_LOCAL_TX_LINK_WAIT_S,
+            )
+            return self.DEFAULT_LOCAL_TX_LINK_WAIT_S
+        return min(max(0.0, wait), self.MAX_LOCAL_TX_LINK_WAIT_S)
+
+    def _resolve_tx_radio(self, radio_id: Optional[str] = None):
+        """The radio a send will actually use, or None when that cannot be told.
+
+        Attribute access on a FabricRadio passes through to its *default* endpoint
+        (rf_fabric/fabric.py), so reading link state off it while the send targets
+        another radio_id answers about the wrong radio -- suppressing a healthy one,
+        or waving through a dead one. Resolve the named endpoint instead, and return
+        None rather than guess: no answer leaves the send to proceed as before.
+        """
+        radio = getattr(self.dispatcher, "radio", None)
+        if radio is None:
+            return None
+        fabric = getattr(radio, "fabric", None)
+        if fabric is None and hasattr(radio, "get_radio"):
+            fabric = radio  # an RFFabric handed to the dispatcher directly
+        radios = getattr(fabric, "radios", None) if fabric is not None else None
+        # isinstance, not truthiness: RFFabric.radios is an OrderedDict, so this
+        # recognises a real multi-endpoint fabric without mistaking a stand-in
+        # attribute on a single-radio wrapper for one.
+        if not isinstance(radios, Mapping) or len(radios) <= 1:
+            return radio  # one radio, and it is the one that transmits
+        if not radio_id:
+            # The fabric picks its endpoint at send time, so there is nothing here
+            # to inspect. Say so rather than answer about whichever radio happens
+            # to be the default -- a wrong "down" would suppress a healthy send.
+            return None
+        getter = getattr(fabric, "get_radio", None)
+        if getter is None:
+            return None
+        try:
+            return getter(str(radio_id))
+        except Exception:
+            return None
+
+    def _radio_link_down(self, radio_id: Optional[str] = None) -> bool:
+        """True when the radio this send will use reports its link unusable.
+
+        Only radios that track a link state answer this -- a KISS modem over serial
+        does, a directly-driven SX1262 has none to lose -- so it reads False for the
+        rest and leaves their timing untouched.
+        """
+        radio = self._resolve_tx_radio(radio_id)
+        if radio is None:
+            return False
+        # Identity checks, not truthiness: a radio that does not track link state
+        # answers with something that is neither True nor False (or nothing at all),
+        # and that has to read as "no opinion" rather than "down".
+        if getattr(radio, "is_connected", None) is False:
+            return True
+        return getattr(radio, "is_degraded", None) is True
+
+    async def _await_radio_link(self, timeout: float, radio_id: Optional[str] = None) -> bool:
+        """Wait up to *timeout* seconds for the radio link, True if it is usable."""
+        if not self._radio_link_down(radio_id):
+            return True
+        if timeout <= 0:
+            return False
+        logger.info("Local TX: radio link down, waiting up to %.1fs for it", timeout)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            await asyncio.sleep(self.LOCAL_TX_LINK_POLL_S)
+            if not self._radio_link_down(radio_id):
+                logger.info("Local TX: radio link back, transmitting now")
+                return True
+        logger.warning("Local TX: radio link still down after %.1fs, giving up", timeout)
+        return False
+
     async def schedule_retransmit(
         self,
         fwd_pkt: Packet,
         delay: float,
         airtime_ms: float = 0.0,
         local_transmission: bool = False,
+        preferred_tx_radio_id: Optional[str] = None,
     ):
         """Schedule a packet retransmission with delay and return the task.
 
@@ -1154,10 +1638,21 @@ class RepeaterHandler(BaseHandler):
             #   attempt 0 — initial try (no pre-sleep)
             #   attempt 1 — retry after 1s backoff outside the lock
             for attempt in range(2 if local_transmission else 1):
-                if attempt > 0:
-                    # Back-off OUTSIDE the lock — other tasks can transmit here.
+                if attempt > 0 and not self._radio_link_down(preferred_tx_radio_id):
+                    # A transient failure with the link still up: back off OUTSIDE
+                    # the lock — other tasks can transmit here.
                     logger.info("Retrying local TX in 1s (lock released during backoff)...")
                     await asyncio.sleep(1.0)
+
+                # A dropped link is not a transient failure to back off from. A KISS
+                # modem that falls off USB re-enumerates and re-handshakes in ~2s, so
+                # the flat backoff above would land inside the outage and spend the
+                # retry on a link that is still down — which is exactly what turned
+                # one modem hiccup into a failed message. Wait for the link instead.
+                if local_transmission and not await self._await_radio_link(
+                    self._local_tx_link_wait_s(), preferred_tx_radio_id
+                ):
+                    return False
 
                 async with self._tx_lock:
                     # ── Authoritative duty-cycle gate ──────────────────────────
@@ -1181,7 +1676,19 @@ class RepeaterHandler(BaseHandler):
                             return False
 
                     try:
-                        sent = await self.dispatcher.send_packet(fwd_pkt, wait_for_ack=False)
+                        if preferred_tx_radio_id:
+                            try:
+                                sent = await self.dispatcher.send_packet(
+                                    fwd_pkt,
+                                    wait_for_ack=False,
+                                    radio_id=preferred_tx_radio_id,
+                                )
+                            except TypeError:
+                                sent = await self.dispatcher.send_packet(
+                                    fwd_pkt, wait_for_ack=False
+                                )
+                        else:
+                            sent = await self.dispatcher.send_packet(fwd_pkt, wait_for_ack=False)
                         if not sent:
                             logger.warning(
                                 "Retransmit failed (attempt %d): dispatcher returned false",
@@ -1209,6 +1716,36 @@ class RepeaterHandler(BaseHandler):
 
         return asyncio.create_task(delayed_send())
 
+    def _resolve_bridge_pair_tx_radio(self, rx_radio_id: Optional[str]) -> Optional[str]:
+        """Return deterministic pair TX radio for bridge mode (A->B, B->A).
+
+        This applies only when fabric.tx_mode=bridge and exactly two radios are
+        registered. For all other layouts, return None and let the dispatcher/
+        fabric choose via existing logic.
+        """
+        fabric_cfg = self.config.get("fabric")
+        if not isinstance(fabric_cfg, dict):
+            return None
+        if str(fabric_cfg.get("tx_mode", "default")).strip().lower() != "bridge":
+            return None
+        if not rx_radio_id:
+            return None
+
+        radio = getattr(self.dispatcher, "radio", None)
+        fabric = getattr(radio, "fabric", None)
+        radios = getattr(fabric, "radios", None)
+        if radios is None:
+            return None
+
+        ids = list(radios.keys())
+        if len(ids) != 2:
+            return None
+
+        rx_id = str(rx_radio_id)
+        if rx_id not in ids:
+            return None
+        return ids[1] if ids[0] == rx_id else ids[0]
+
     def _record_packet_sent(self, packet: Packet) -> None:
         """Record a packet send for flood/direct stats (forwarded and originated)."""
         route = getattr(packet, "header", 0) & PH_ROUTE_MASK
@@ -1232,6 +1769,8 @@ class RepeaterHandler(BaseHandler):
         return self._cached_noise_floor
 
     def get_stats(self) -> dict:
+        runtime_config = normalize_modem_config(self.config, warn=False)
+        redact_modem_tokens_in_place(runtime_config)
 
         uptime_seconds = time.time() - self.start_time
 
@@ -1296,6 +1835,9 @@ class RepeaterHandler(BaseHandler):
                     "send_advert_interval_hours": repeater_config.get(
                         "send_advert_interval_hours", 10
                     ),
+                    "direct_advert_interval_hours": repeater_config.get(
+                        "direct_advert_interval_hours", 0
+                    ),
                     "latitude": repeater_config.get("latitude", 0.0),
                     "longitude": repeater_config.get("longitude", 0.0),
                     "max_flood_hops": repeater_config.get("max_flood_hops", 64),
@@ -1307,6 +1849,14 @@ class RepeaterHandler(BaseHandler):
                 "radio": self.config.get(
                     "radio", {}
                 ),  # Read from live config, not cached radio_config
+                "radios": runtime_config.get("radios") or [],
+                "fabric": self.config.get("fabric") or {},
+                "radio_type": runtime_config.get("radio_type"),
+                "sx1262": self.config.get("sx1262", {}),
+                "ch341": self.config.get("ch341", {}),
+                "kiss": self.config.get("kiss", {}),
+                "modem_usb": runtime_config.get("modem_usb", {}),
+                "modem_tcp": runtime_config.get("modem_tcp", {}),
                 "duty_cycle": {
                     "max_airtime_percent": max_duty_cycle_percent,
                     "enforcement_enabled": duty_cycle_config.get("enforcement_enabled", True),
@@ -1349,8 +1899,12 @@ class RepeaterHandler(BaseHandler):
                     await self._record_crc_errors_async()
                     self.last_noise_measurement = current_time
 
-                # Check advert sending (every N hours)
-                if self.send_advert_interval_hours > 0 and self.send_advert_func:
+                # Check advert scheduling.
+                # Prefer daemon-managed scheduling so repeater + room-server
+                # intervals can share one loop and stagger transmissions.
+                if self.periodic_advert_tick_func:
+                    await self.periodic_advert_tick_func()
+                elif self.send_advert_interval_hours > 0 and self.send_advert_func:
                     interval_seconds = self.send_advert_interval_hours * 3600
                     if current_time - self.last_advert_time >= interval_seconds:
                         await self._send_periodic_advert_async()
@@ -1365,12 +1919,13 @@ class RepeaterHandler(BaseHandler):
                 if current_time - self.last_db_cleanup >= 21600:
                     if self.storage:
                         try:
-                            retention_days = (
-                                self.config.get("storage", {})
-                                .get("retention", {})
-                                .get("sqlite_cleanup_days", 31)
+                            retention_cfg = self.config.get("storage", {}).get("retention", {})
+                            retention_days = retention_cfg.get("sqlite_cleanup_days", 31)
+                            companion_events_days = retention_cfg.get("companion_events_days", 31)
+                            self.storage.cleanup_old_data(
+                                days=retention_days,
+                                companion_events_days=companion_events_days,
                             )
-                            self.storage.cleanup_old_data(days=retention_days)
                             logger.info("Cleaned up SQLite data older than %d days", retention_days)
                         except Exception as e:
                             logger.warning(f"SQLite cleanup failed: {e}")
@@ -1451,15 +2006,25 @@ class RepeaterHandler(BaseHandler):
             repeater_config = self.config.get("repeater", {})
             self.use_score_for_tx = repeater_config.get("use_score_for_tx", False)
             self.score_threshold = repeater_config.get("score_threshold", 0.3)
+            self.multi_acks = self._normalize_multi_acks(self.config)
             self.send_advert_interval_hours = repeater_config.get("send_advert_interval_hours", 10)
             self.cache_ttl = repeater_config.get("cache_ttl", 60)
             self.max_flood_hops = repeater_config.get("max_flood_hops", 64)
+            self.neighbour_link_tracker.refresh_config(self.config)
             self.loop_detect_mode = self._normalize_loop_detect_mode(
                 self.config.get("mesh", {}).get("loop_detect", LOOP_DETECT_OFF)
             )
 
-            # Note: Radio config changes require restart as they affect hardware
-            # Note: Airtime manager has its own config reference that gets updated
+            with self.neighbour_link_tracker.lock:
+                now_monotonic = time.monotonic()
+                self.neighbour_link_tracker.purge_expired_locked(now_monotonic)
+                while (
+                    len(self.neighbour_link_tracker.links) > self.neighbour_link_tracker.max_entries
+                ):
+                    self.neighbour_link_tracker.evict_stalest_locked()
+
+            # Radio hardware apply and AirtimeManager modulation refresh are
+            # handled by ConfigManager after a successful live radio update.
 
             logger.info("Runtime configuration reloaded successfully")
         except Exception as e:

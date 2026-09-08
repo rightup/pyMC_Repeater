@@ -35,11 +35,24 @@ repeater:
   # Enable quality-based packet filtering and adaptive delays
   use_score_for_tx: false
 
+  # Multi-ack redundancy (0 = off, 1 = on; matches MeshCore's multi.acks pref).
+  # When on, a relayed routed ACK is preceded by a MULTIPART-wrapped copy so
+  # ACKs survive lossy links. Also settable via the mesh CLI: set multi.acks
+  multi_acks: 0
+
   # Score threshold for quality monitoring (future use)
   # Currently reserved for potential future features like dashboard alerts,
   # proactive statistics collection, or advanced filtering strategies.
   # Changing this value has no effect on current packet processing.
   score_threshold: 0.3
+
+  # Observation-only upstream neighbour link metrics.
+  # These metrics are currently not used for forwarding, dedupe, TX delay,
+  # route selection, or packet acceptance decisions yet ;-0.
+  neighbour_link_metrics_enabled: true
+  neighbour_link_ewma_alpha: 0.20
+  neighbour_link_ttl_seconds: 86400
+  neighbour_link_max_entries: 512
 
   # Automatic advertisement interval in hours
   # The repeater will send an advertisement packet at this interval
@@ -47,6 +60,12 @@ repeater:
   # Range: 0 (disabled) to 24+ hours
   # Recommended: 10 hours for typical deployments
   send_advert_interval_hours: 10
+
+  # Additional periodic advert stream in hours.
+  # Uses the same advert packet type and scheduler loop, but independent cadence.
+  # Set to 0 to disable.
+  # Range: 0 (disabled) or 1-168 hours
+  direct_advert_interval_hours: 0
 
   # Respond to discovery requests from other nodes
   # When enabled, the repeater will automatically respond to discovery packets
@@ -103,7 +122,7 @@ repeater:
   # Security settings for login/authentication (shared across all identities)
   security:
     # Maximum number of authenticated clients (across all identities)
-    max_clients: 1
+    max_clients: 5
 
     # Admin password for full access
     admin_password: "admin123"
@@ -126,6 +145,11 @@ repeater:
 # Relative paths are resolved from this config file directory.
 policy:
   policy_file: "policy.yaml"
+
+metrics:
+  # Store historical metrics in RRDtool when available.
+  # When disabled, chart APIs calculate metrics from repeater.db.
+  rrd_enabled: true
 
 # Local GPS receiver. When enabled, the daemon reads NMEA sentences from the
 # configured source and exposes parsed data at /api/gps.
@@ -166,12 +190,12 @@ gps:
 
   # ---------------------------------------------------------------------------
   # Location behaviour
-  # Three independent controls — read the comments carefully, they do
+  # Three independent controls - read the comments carefully, they do
   # different things:
   #
-  #   api_fallback_to_config_location  — what the API *displays* before a fix
-  #   advertise_gps_location           — what the mesh *advertises* in adverts
-  #   persist_gps_fix_to_config        — whether the fix is *written* to config
+  #   api_fallback_to_config_location  - what the API *displays* before a fix
+  #   advertise_gps_location           - what the mesh *advertises* in adverts
+  #   persist_gps_fix_to_config        - whether the fix is *written* to config
   # ---------------------------------------------------------------------------
 
   # API display: while GPS has no valid fix, show repeater.latitude/longitude
@@ -268,6 +292,15 @@ sensors:
     #     i2c_address: 0x70
     #     bus_number: 1
 
+    # Example BME280 temperature/pressure/humidity sensor (commented out by default)
+    # - type: bme280
+    #   name: ambient
+    #   enabled: true
+    #   auto_install_packages: false
+    #   settings:
+    #     i2c_address: 0x76     # 0x77 when SDO is tied high
+    #     bus_number: 1         # I2C bus number (1 for Raspberry Pi default)
+
     # Example Waveshare UPS D Hat 
     # - type: waveshare_ups_d
     #   name: battery
@@ -287,11 +320,11 @@ sensors:
     #     bus_number: 1       # I2C bus number (1 for Raspberry Pi default)
     #     low_cell_mv: 3150   # Per-cell warning threshold in mV
 
-    # Example pyMC modem sensor. This reads a networked pyMC modem's
+    # Example openHop Modem sensor. This reads a networked openHop Modem's
     # HTTP /api/stats JSON API for modem diagnostics, including GPS fields
     # when the modem exposes them. If password is set to the same value as
-    # pymc_tcp.token, the repeater can use one shared modem secret.
-    # - type: pymc_modem
+    # modem_tcp.token, the repeater can use one shared modem secret.
+    # - type: openhop_modem
     #   name: modem
     #   enabled: true
     #   settings:
@@ -299,7 +332,7 @@ sensors:
     #     port: 80
     #     endpoint: "/api/stats"
     #     username: "admin"
-    #     password: ""              # modem HTTP password; may match pymc_tcp.token
+    #     password: ""              # modem HTTP password; may match modem_tcp.token
     #     poll_interval_seconds: 60.0  # avoid contending with modem traffic
     #     timeout_seconds: 2.0
 
@@ -311,6 +344,10 @@ mesh:
   # true = allow unscoped flooding, false = deny flooding globally
   unscoped_flood_allow: true
 
+  # Legacy alias for unscoped flood policy. Keep in sync with unscoped_flood_allow.
+  # true = allow unscoped flooding, false = deny
+  global_flood_allow: true
+
   # Path hash mode for flood packets (0-hop): per-hop hash size in path encoding
   # 0 = 1-byte hashes (legacy), 1 = 2-byte, 2 = 3-byte. Must match mesh convention.
   # Affects originated adverts and any other flood packets sent by the repeater.
@@ -319,6 +356,10 @@ mesh:
   # Flood loop detection mode
   # off = disabled, minimal = allow up to 3 self-hashes, moderate = allow up to 1, strict = allow 0
   loop_detect: minimal
+
+  # Default flood scope for locally-originated flood adverts.
+  # Use null or "<null>" via CLI command "region default <null>" to clear.
+  default_region: null
 
 # Multiple Identity Configuration (Optional)
 # Define additional identities for the repeater to manage
@@ -337,6 +378,8 @@ identities:
     #     node_name: "Test BBS Room"
     #     latitude: 0.0
     #     longitude: 0.0
+    #     flood_advert_interval_hours: 6
+    #     direct_advert_interval_hours: 2
     #     admin_password: "room_admin_password"
     #     guest_password: "room_guest_password"
     # Add more room servers as needed
@@ -347,6 +390,8 @@ identities:
     #     node_name: "Social Hub"
     #     latitude: 0.0
     #     longitude: 0.0
+    #     flood_advert_interval_hours: 12
+    #     direct_advert_interval_hours: 0
     #     admin_password: "social_admin_123"
     #     guest_password: "social_guest_123"
 
@@ -368,21 +413,96 @@ identities:
     #     tcp_port: 5001
     #     tcp_timeout: 120   # seconds; default 120 when omitted; 0 = disable (no timeout)
 
-# Radio hardware type
+# ---------------------------------------------------------------------------
+# Multi-radio / LoRa backhaul (optional)
+# ---------------------------------------------------------------------------
+# Leave ``radios:`` unset to keep the legacy single-radio config below.
+# When present, each entry is built with the same fields as the top-level
+# single-radio config (radio_type + radio air settings + hardware section).
+# Different entries may use different frequency / SF / modem type.
+#
+# fabric:
+#   default_radio: local          # TX default (first entry if omitted)
+#   tx_mode: bridge               # default | sticky | bridge
+#     # default: always TX default_radio
+#     # sticky:  TX on the radio that last received (same-band reply)
+#     # bridge:  TX on the *other* radio (dual-freq LoRa backhaul)
+#     #          RX local -> TX link, RX link -> TX local
+#
+# Dual CH341 USB adapters example (different USB bus/address per radio):
+# radios:
+#   - id: local
+#     radio_type: sx1262_ch341
+#     radio: { frequency: 869618000, tx_power: 14, bandwidth: 62500, spreading_factor: 8, coding_rate: 8, preamble_length: 32 }
+#     sx1262: { bus_id: 0, cs_id: 0, cs_pin: 0, reset_pin: 1, busy_pin: 2, irq_pin: 3, txen_pin: -1, rxen_pin: -1 }
+#     ch341: { vid: 0x1A86, pid: 0x5512, bus: 1, address: 5 }
+#   - id: link
+#     radio_type: sx1262_ch341
+#     radio: { frequency: 864200000, tx_power: 22, bandwidth: 62500, spreading_factor: 11, coding_rate: 8, preamble_length: 32 }
+#     sx1262: { bus_id: 0, cs_id: 0, cs_pin: 0, reset_pin: 1, busy_pin: 2, irq_pin: 3, txen_pin: -1, rxen_pin: -1 }
+#     ch341: { vid: 0x1A86, pid: 0x5512, bus: 1, address: 8 }
+#   use_fabric: false             # true wraps even a single radio in FabricRadio
+#
+# radios:
+#   - id: local
+#     radio_type: sx1262
+#     radio:
+#       frequency: 869618000
+#       tx_power: 14
+#       bandwidth: 62500
+#       spreading_factor: 8
+#       coding_rate: 8
+#       preamble_length: 32
+#     sx1262:
+#       bus_id: 0
+#       cs_id: 0
+#       cs_pin: 21
+#       reset_pin: 18
+#       busy_pin: 20
+#       irq_pin: 16
+#       txen_pin: -1
+#       rxen_pin: -1
+#   - id: link
+#     radio_type: sx1262
+#     radio:
+#       frequency: 864200000      # different freq = LoRa backhaul band
+#       tx_power: 22
+#       bandwidth: 62500
+#       spreading_factor: 11       # different SF ok
+#       coding_rate: 8
+#       preamble_length: 32
+#     sx1262:
+#       bus_id: 0
+#       cs_id: 1                  # distinct CS / pins from local
+#       cs_pin: 7
+#       reset_pin: 5
+#       busy_pin: 6
+#       irq_pin: 12
+#       txen_pin: -1
+#       rxen_pin: -1
+#
+# Radio hardware type (legacy single-radio; ignored for construction when radios: is set)
 # Supported:
 #   - sx1262        (Linux spidev + system GPIO)
 #   - sx1262_ch341  (CH341 USB-to-SPI + CH341 GPIO 0-7)
 #   - kiss          (KISS-modem over a serial port; alias: kiss-modem)
-#   - pymc_tcp      (pymc_usb firmware modem over Wi-Fi/TCP)
-#   - pymc_usb      (pymc_usb firmware modem over USB-CDC)
+#   - modem_tcp      (openHop Modem over Wi-Fi/Ethernet TCP)
+#   - modem_usb      (openHop Modem over USB-CDC)
 #   - null/none     (disable radio hardware; daemon starts without RF I/O)
 radio_type: null
 
 # CH341 USB-to-SPI adapter settings (only used when radio_type: sx1262_ch341)
 # NOTE: VID/PID are integers. Hex is also accepted in YAML, e.g. 0x1A86.
+# With two+ CH341 adapters, select each device by USB location and/or serial:
+#   bus / address  - from `lsusb -t` or `python -c "from openhop_core.hardware.ch341 import CH341Async; print(CH341Async.list_devices())"`
+#   serial_number  - USB iSerial if the adapter exposes one
+# Single-adapter setups may omit bus/address/serial_number.
 ch341:
   vid: 6790   # 0x1A86
   pid: 21778  # 0x5512
+  # bus: 1
+  # address: 5
+  # serial_number: "ABC123"
 
 radio:
   # Frequency in Hz (869.618 MHz for EU)
@@ -408,7 +528,10 @@ radio:
 
 # KISS modem (when radio_type: kiss). Requires openhop-core with KISS support.
 # kiss:
-#   port: "/dev/ttyUSB0"
+#   port: "/dev/ttyUSB0"        # 99-openhop-modem.rules symlinks to /dev/openhop-modem.
+#                               # Prefer that over /dev/serial/by-id/ in Docker: an
+#                               # ESP32-S3 by-id name contains colons and Docker reads
+#                               # those as its host:container separator.
 #   baud_rate: 9600
 #   # Optional KISS key-up / CSMA tuning, forwarded to the modem firmware.
 #   # Omit to keep the wrapper/firmware defaults. For a host-managed repeater the
@@ -421,19 +544,19 @@ radio:
 #   # kiss_txtail_ms: 0          # tail after TX (rarely needed)
 #   # kiss_full_duplex: false    # disable carrier-sense/CSMA entirely (not recommended)
 
-# pymc_usb firmware modem over Wi-Fi/TCP (when radio_type: pymc_tcp).
+# openHop Modem over Wi-Fi/Ethernet TCP (when radio_type: modem_tcp).
 # Requires openhop-core with the TCPLoRaRadio driver
-# pymc_tcp:
-#   host: "pymc-3e2834.local"   # modem hostname / mDNS name / LAN IP
+# modem_tcp:
+#   host: "openhop-modem.local" # modem hostname / mDNS name / LAN IP
 #   port: 5055                  # firmware default
 #   token: ""                   # empty = no auth; set to match firmware NVS token
 #   connect_timeout: 5.0        # seconds; deferred-connect retries with backoff on failure
 #   lbt_enabled: true           # Listen-Before-Talk via firmware CAD
 #   lbt_max_attempts: 5
 
-# pymc_usb firmware modem over USB-CDC (when radio_type: pymc_usb).
+# openHop Modem over USB-CDC (when radio_type: modem_usb).
 # Requires openhop-core with the USBLoRaRadio driver
-# pymc_usb:
+# modem_usb:
 #   port: "/dev/ttyACM0"        # USB-CDC device; udev rule may symlink to /dev/lora-modem
 #   baudrate: 921600            # must match firmware monitor_speed
 #   lbt_enabled: true
@@ -475,10 +598,12 @@ sx1262:
   is_waveshare: false
 
 delays:
-  # TX delay factor for flood mode (multiplier)
+  # Flood TX delay: airtime multiplier, NOT seconds. The actual pre-transmit
+  # delay is a random value in [0, 5 * packet_airtime * factor] seconds.
   tx_delay_factor: 1.0
 
-  # TX delay factor for direct mode (faster)
+  # Direct TX delay: same random 0-5*airtime*factor window, usually lower so
+  # directed traffic clears faster.
   direct_tx_delay_factor: 0.5
 
 duty_cycle:
@@ -499,11 +624,28 @@ storage:
   retention:
     # Clean up SQLite records older than this many days
     sqlite_cleanup_days: 31
+    # Companion event journal / soft-consumed message history retention.
+    # Independent of sqlite_cleanup_days so packet RF history and companion
+    # sync history can be sized separately. Defaults to 31 when omitted.
+    companion_events_days: 31
 
     # RRD archives are managed automatically:
     # - 1 minute resolution for 1 week
     # - 5 minute resolution for 1 month
     # - 1 hour resolution for 1 year
+
+
+# Plugin manager (optional external process lifecycle)
+# plugins:
+#   # Master switch for the openhop-plugin-manager service (default: enabled when omitted)
+#   enabled: true
+#   # Install root (default: {storage.storage_dir}/plugins)
+#   # root: "/var/lib/openhop_repeater/plugins"
+#   # Unix domain socket used by Repeater HTTP → plugin manager IPC
+#   # socket: "/var/lib/openhop_repeater/plugin-manager.sock"
+  # Optional override for the curated catalogue hosted on openHop's R2 endpoint
+  # catalogue_url: "https://repeater-plugins.openhop.dev/catalogue.json"
+
 
 
 mqtt_brokers:
@@ -512,6 +654,32 @@ mqtt_brokers:
   owner: ""
   email: ""
   brokers: []
+
+  # Periodic neighbours publication (the "neighbors" topic).
+  #
+  # Each cycle runs a zero-hop node-discovery broadcast to refresh the neighbour
+  # table, then asks each zero-hop repeater for its region scopes with an
+  # anonymous regions request, then publishes the assembled table. Scope queries
+  # are issued ONE AT A TIME - firing them as a burst makes the responses collide.
+  #
+  # Off unless a broker opts in below with `neighbors: true`; `enabled` here is a
+  # master kill switch for the whole feature.
+  # neighbors:
+  #   enabled: true                     # master on/off (default true)
+  #   interval_hours: 24                # 12-336, how often a cycle runs
+  #   discovery_timeout_seconds: 60     # node-discovery collection window
+  #   scope_response_timeout_seconds: 0 # 0 = size the window from radio settings
+  #   max_neighbors: 32                 # cap on neighbours queried per cycle
+  #   max_neighbor_age_seconds: 86400   # ignore zero-hop rows older than this
+  #   max_sweep_seconds: 900            # give up on a cycle after this long
+  #   duty_cycle_abort_seconds: 30      # abandon the sweep when the airtime
+  #                                     # backlog exceeds this
+  #
+  # This must be a block, not a boolean - `neighbors: true` here is ignored (with
+  # a startup warning) because the on/off switch that matters is the per-broker
+  # `neighbors: true` flag documented in the broker schema below.
+  #
+  # `discover.scopes` over the mesh CLI runs one cycle immediately.
 
   # Below is the broker object schema:
   # enabled: true|false # Enable this specific mqtt broker
@@ -528,6 +696,7 @@ mqtt_brokers:
   #   letsmesh, waev - MC2MQTT family flavors (same topic structure, network-specific identity)
   #   mqtt           - legacy openhop-repeater local-broker convention (custom topic, singular 'packet')
   # retain_status: true|false # Sets MQTT "retain" on status messages so they remain on the broker when disconnected. Also enforces a QOS of 1 (guaranteed delivery)
+  # neighbors: true|false # Publish the periodic neighbours table to this broker's "neighbors" topic (default false). Only enable for brokers that expect the topic - some reject unknown topics and close the connection.
   # tls:
   #   enabled: true|false # Enable TLS. If the endpoint's certificate is self-signed, the Root CA should be added to the OS's certificate store. 
   #   insecure: true|false # Validate TLS certificates
@@ -605,17 +774,44 @@ glass:
   cert_store_dir: "/etc/openhop_repeater/glass"
 
 logging:
-  # Log level: DEBUG, INFO, WARNING, ERROR
+  # Log level: TRACE, DEBUG, INFO, WARNING, ERROR
   level: INFO
 
   # Log format
   format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+
+# HTTP server configuration (web UI + API)
+http:
+  # Enable/disable the embedded HTTP server at runtime.
+  # Changes are applied live via ConfigManager (no daemon restart required).
+  enabled: true
+
+  # Listen address and port for the web UI/API server.
+  host: "0.0.0.0"
+  port: 8000
+
+  # CherryPy worker/thread tuning.
+  # thread_pool is the initial worker count (minimum enforced by server: 2).
+  thread_pool: 8
+  # thread_pool_max is the max worker count (always >= thread_pool).
+  thread_pool_max: 16
+
+  # Socket tuning.
+  # socket_timeout closes idle sockets so worker threads can be reused (min: 15 seconds).
+  socket_timeout: 65
+  # socket_queue_size controls pending TCP connection backlog (min: 10).
+  socket_queue_size: 100
 
 # Web interface configuration
 web:
   # Enable Cross-Origin Resource Sharing (CORS) headers
   # Allows web frontends from different origins to access the API
   cors_enabled: false
+
+  # Optional CARTO Basemaps API key for theme-matched light and dark map tiles.
+  # The key is sent to CARTO by each browser; do not treat it as a server-side secret.
+  # When unset, the web interface uses light OpenStreetMap tiles in both themes.
+  carto_api_key: ""
 
   # Custom path to web frontend files (optional)
   # If not specified, uses the default built-in path

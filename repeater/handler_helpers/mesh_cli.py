@@ -1,7 +1,7 @@
+import concurrent.futures
 import logging
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
-
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +38,104 @@ class MeshCLI:
 
         # Get repeater config shortcut
         self.repeater_config = config.get("repeater", {})
+        self.mesh_config = config.setdefault("mesh", {})
+
+    def _save_config_and_apply(self, sections=None) -> bool:
+        """Persist the config, then live-apply the changed sections.
+
+        ``ConfigManager.save_to_file`` returns a bare bool; the tuple form is
+        tolerated for older manager doubles. Live update only runs after a
+        successful save so a failed write never half-applies a change. Pass
+        no sections to stage a change: saved to disk, applied on restart
+        (radio parameters, matching firmware's reboot-to-apply).
+        """
+        result = self.config_manager.save_to_file()
+        saved = result[0] if isinstance(result, tuple) else bool(result)
+        if not saved:
+            return False
+        if sections:
+            self.config_manager.live_update_daemon(sections)
+        return True
+
+    def _get_security_config(self) -> Dict[str, Any]:
+        """Return the repeater login security section (the one LoginHelper reads)."""
+        security = self.repeater_config.get("security")
+        return security if isinstance(security, dict) else {}
+
+    def _get_node_name(self) -> str:
+        """Return the configured node name, preferring the newer key when present."""
+        return self.repeater_config.get("node_name") or self.repeater_config.get("name", "Unknown")
+
+    def _set_node_name(self, value: str) -> None:
+        """Persist node name to both legacy and current config keys for compatibility."""
+        self.repeater_config["node_name"] = value
+        self.repeater_config["name"] = value
+
+    def _get_local_pubkey_hex(self) -> Optional[str]:
+        """Return local node public key (hex) when available."""
+        try:
+            if self.identity and hasattr(self.identity, "get_public_key"):
+                pubkey = self.identity.get_public_key()
+                if isinstance(pubkey, (bytes, bytearray)):
+                    return bytes(pubkey).hex().lower()
+                if isinstance(pubkey, str):
+                    normalized = pubkey.strip().lower()
+                    if normalized.startswith("0x"):
+                        normalized = normalized[2:]
+                    if normalized:
+                        return normalized
+        except Exception as exc:
+            logger.debug("Unable to read local identity pubkey: %s", exc)
+
+        key = self.repeater_config.get("identity_key")
+        if isinstance(key, (bytes, bytearray)):
+            return bytes(key).hex().lower()
+        if isinstance(key, str):
+            normalized = key.strip().lower()
+            if normalized.startswith("0x"):
+                normalized = normalized[2:]
+            if normalized and all(ch in "0123456789abcdef" for ch in normalized):
+                return normalized
+
+        return None
+
+    def _is_local_pubkey(self, pubkey_hex: str) -> bool:
+        """Return True when a discovery result pubkey matches the local node."""
+        candidate = (pubkey_hex or "").strip().lower()
+        if not candidate:
+            return False
+        if candidate.startswith("0x"):
+            candidate = candidate[2:]
+
+        local_pubkey = self._get_local_pubkey_hex()
+        if not local_pubkey:
+            return False
+
+        # Prefix-only discovery may return fewer bytes than full identity pubkey.
+        return local_pubkey.startswith(candidate) or candidate.startswith(local_pubkey)
+
+    def _auto_add_discovery_result(self, result: Dict[str, Any]) -> Dict[str, Any]:
+        """Persist discovered neighbors automatically, excluding this node itself."""
+        enriched = dict(result)
+        pub_key = str(enriched.get("pub_key") or "").strip().lower()
+        if not pub_key:
+            return enriched
+
+        if self._is_local_pubkey(pub_key):
+            enriched["is_self"] = True
+            enriched["known_neighbor"] = True
+            return enriched
+
+        if not self.storage_handler:
+            return enriched
+
+        from repeater.handler_helpers.discovery import persist_discovery_result
+
+        if persist_discovery_result(self.storage_handler, enriched):
+            enriched["known_neighbor"] = True
+            enriched["auto_added"] = True
+
+        return enriched
 
     def handle_command(self, sender_pubkey: bytes, command: str, is_admin: bool) -> str:
 
@@ -81,6 +179,10 @@ class MeshCLI:
             return self._cmd_clock(command)
         elif command.startswith("time "):
             return self._cmd_time(command)
+        elif command == "http start":
+            return self._cmd_http_start()
+        elif command == "http stop":
+            return self._cmd_http_stop()
         elif command == "start ota":
             return "Error: OTA not supported in Python repeater"
         elif command.startswith("password "):
@@ -116,6 +218,10 @@ class MeshCLI:
             return self._cmd_neighbors()
         elif command.startswith("neighbor.remove "):
             return self._cmd_neighbor_remove(command)
+        elif command.startswith("discover.scopes"):
+            return self._cmd_discover_scopes(command)
+        elif command.startswith("discover.neighbors"):
+            return self._cmd_discover_neighbors(command)
 
         # Temporary radio params
         elif command.startswith("tempradio "):
@@ -149,13 +255,15 @@ class MeshCLI:
             return self._help_detail(parts[1])
 
         lines = [
-            "=== pyMC CLI Commands ===",
+            "=== openHop CLI Commands ===",
             "",
             "System:",
             "  reboot              Restart the repeater service",
             "  advert              Send self advertisement",
             "  clock               Show current UTC time",
             "  clock sync          Sync clock (no-op, uses system time)",
+            "  http start          Start the HTTP server",
+            "  http stop           Stop the HTTP server",
             "  ver                 Show version info",
             "  password <pw>       Change admin password",
             "  clear stats         Clear statistics",
@@ -169,11 +277,14 @@ class MeshCLI:
             "  get repeat          Repeat mode (on/off)",
             "  get lat / get lon   GPS coordinates",
             "  get role            Identity role",
+            "  get owner.info      Owner info text",
             "  get guest.password  Guest password",
             "  get allow.read.only Read-only access setting",
             "  get advert.interval Advert interval (minutes)",
             "  get flood.advert.interval  Flood advert interval (hours)",
             "  get flood.max       Max flood hops",
+            "  get path.hash.mode  Flood advert path hash mode (0-2)",
+            "  get loop.detect     Flood loop detection mode",
             "  get rxdelay         RX delay base",
             "  get txdelay         TX delay factor",
             "  get direct.txdelay  Direct TX delay factor",
@@ -187,6 +298,8 @@ class MeshCLI:
             "Other:",
             "  neighbors           List neighbors",
             "  neighbor.remove <key>  Remove neighbor by pubkey",
+            "  discover.neighbors  Send zero-hop neighbor discovery",
+            "  discover.scopes     Discover neighbor scopes, publish to MQTT",
             "  tempradio <freq> <bw> <sf> <cr> <timeout_mins>",
             "  setperm <pubkey> <perm>  Set ACL permissions",
             "  log start|stop|erase    Logging control",
@@ -211,13 +324,16 @@ class MeshCLI:
                 "  set lat <deg>          Latitude\n"
                 "  set lon <deg>          Longitude\n"
                 "  set guest.password <pw> Guest password\n"
+                "  set owner.info <text>  Owner info text\n"
                 "  set allow.read.only on|off  Read-only access\n"
                 "  set advert.interval <min>   60-240 minutes\n"
-                "  set flood.advert.interval <hr>  3-48 hours\n"
-                "  set flood.max <hops>   Max flood hops (max 64)\n"
-                "  set rxdelay <val>      RX delay base (>=0)\n"
-                "  set txdelay <val>      TX delay factor (>=0)\n"
-                "  set direct.txdelay <val>  Direct TX delay (>=0)\n"
+                "  set flood.advert.interval <hr>  3-168 hours\n"
+                "  set flood.max <hops>   Max flood hops (max 64; 0 = unlimited, unlike firmware)\n"
+                "  set path.hash.mode <0-2>  Path hash mode (0=1B,1=2B,2=3B)\n"
+                "  set loop.detect <off|minimal|moderate|strict>  Flood loop detection\n"
+                "  set rxdelay <val>      RX delay base (0-20)\n"
+                "  set txdelay <val>      TX delay factor (0-2)\n"
+                "  set direct.txdelay <val>  Direct TX delay (0-2)\n"
                 "  set multi.acks <n>     Multi-ack count\n"
                 "  set int.thresh <dbm>   Interference threshold\n"
                 "  set agc.reset.interval <n>  AGC reset (rounded to x4)"
@@ -226,6 +342,9 @@ class MeshCLI:
             "reboot": "Restart the repeater service via systemd.",
             "advert": "Trigger a self-advertisement flood packet.",
             "clock": "'clock' shows UTC time. 'clock sync' is a no-op (system time used).",
+            "http": "http start|stop - Control the HTTP server.",
+            "http start": "Start the HTTP server.",
+            "http stop": "Stop the HTTP server.",
             "ver": "Show repeater version and identity type.",
             "password": "password <new_password> \u2014 Change the admin password.",
             "tempradio": (
@@ -234,6 +353,13 @@ class MeshCLI:
                 "  freq: 300-2500 MHz, bw: 7-500 kHz, sf: 5-12, cr: 5-8"
             ),
             "neighbors": "List known neighbor nodes from the routing table.",
+            "discover.neighbors": "Send a neighbor discovery request.",
+            "discover.scopes": (
+                "discover.scopes\n"
+                "  Refresh the zero-hop neighbor table, query each neighbor for its\n"
+                "  region scopes, then publish the table to the MQTT neighbors topic.\n"
+                "  Requires a broker configured with neighbors: true."
+            ),
             "setperm": "setperm <pubkey_hex> <permission_int> \u2014 Set ACL permissions for a node.",
             "log": "log start|stop|erase \u2014 Control logging.",
         }
@@ -296,6 +422,26 @@ class MeshCLI:
         """Set time - not supported in Python (use system time)."""
         return "Error: Time setting not supported (system time is used)"
 
+    def _cmd_http_start(self) -> str:
+        """Start HTTP server."""
+        from repeater.service_utils import start_http_server
+
+        daemon_instance = getattr(self.config_manager, "daemon", None)
+        success, message = start_http_server(daemon_instance)
+        if success:
+            return f"OK - {message}"
+        return f"Error: {message}"
+
+    def _cmd_http_stop(self) -> str:
+        """Stop HTTP server."""
+        from repeater.service_utils import stop_http_server
+
+        daemon_instance = getattr(self.config_manager, "daemon", None)
+        success, message = stop_http_server(daemon_instance)
+        if success:
+            return f"OK - {message}"
+        return f"Error: {message}"
+
     def _cmd_password(self, command: str) -> str:
         """Change admin password."""
         new_password = command[9:].strip()
@@ -303,19 +449,14 @@ class MeshCLI:
         if not new_password:
             return "Error: Password cannot be empty"
 
-        # Update security config
-        if "security" not in self.config:
-            self.config["security"] = {}
-
-        self.config["security"]["password"] = new_password
+        # LoginHelper authenticates from repeater.security.admin_password.
+        self.repeater_config.setdefault("security", {})["admin_password"] = new_password
 
         # Save config and live update
         try:
-            saved, err = self.config_manager.save_to_file()
-            if not saved:
-                logger.error(f"Failed to save password: {err}")
-                return f"Error: Failed to save config: {err}"
-            self.config_manager.live_update_daemon(["security"])
+            if not self._save_config_and_apply(["repeater"]):
+                logger.error("Failed to save password: config save failed")
+                return "Error: Failed to save config"
             return f"password now: {new_password}"
         except Exception as e:
             logger.error(f"Failed to save password: {e}")
@@ -329,8 +470,8 @@ class MeshCLI:
     def _cmd_version(self) -> str:
         """Get version information."""
         role = "room_server" if self.identity_type == "room_server" else "repeater"
-        version = self.config.get("version", "1.0.0")
-        return f"pyMC_{role} v{version}"
+        version = self.config.get("version", "13")
+        return f"openHop_{role} v{version}"
 
     # ==================== Get Commands ====================
 
@@ -344,8 +485,7 @@ class MeshCLI:
             return f"> {af}"
 
         elif param == "name":
-            name = self.repeater_config.get("name", "Unknown")
-            return f"> {name}"
+            return f"> {self._get_node_name()}"
 
         elif param == "repeat":
             mode = self.repeater_config.get("mode", "forward")
@@ -395,11 +535,15 @@ class MeshCLI:
             return f"> {role}"
 
         elif param == "guest.password":
-            guest_pw = self.config.get("security", {}).get("guest_password", "")
+            guest_pw = self._get_security_config().get("guest_password") or ""
             return f"> {guest_pw}"
 
+        elif param == "owner.info":
+            owner_info = self.repeater_config.get("owner_info", "")
+            return f"> {owner_info}"
+
         elif param == "allow.read.only":
-            allow = self.config.get("security", {}).get("allow_read_only", False)
+            allow = self._get_security_config().get("allow_read_only", False)
             return f"> {'on' if allow else 'off'}"
 
         elif param == "advert.interval":
@@ -407,23 +551,38 @@ class MeshCLI:
             return f"> {interval}"
 
         elif param == "flood.advert.interval":
-            interval = self.repeater_config.get("flood_advert_interval_hours", 24)
+            # The engine's flood-advert timer consumes send_advert_interval_hours.
+            interval = self.repeater_config.get("send_advert_interval_hours", 10)
             return f"> {interval}"
 
         elif param == "flood.max":
             max_flood = self.repeater_config.get("max_flood_hops", 64)
             return f"> {max_flood}"
 
+        elif param == "path.hash.mode":
+            path_hash_mode = self.mesh_config.get("path_hash_mode", 0)
+            return f"> {path_hash_mode}"
+
+        elif param == "loop.detect":
+            loop_detect = self.mesh_config.get("loop_detect", "off")
+            return f"> {loop_detect}"
+
         elif param == "rxdelay":
-            delay = self.repeater_config.get("rx_delay_base", 0.0)
+            # The flood RX delay base lives in the delays section (the value
+            # the dispatcher and web API use), not the repeater section.
+            delay = self.config.get("delays", {}).get("rx_delay_base", 0.0)
             return f"> {delay}"
 
         elif param == "txdelay":
-            delay = self.repeater_config.get("tx_delay_factor", 1.0)
+            # The TX delay factor lives in the delays section (the value the
+            # engine consumes), not the repeater section.
+            delay = self.config.get("delays", {}).get("tx_delay_factor", 1.0)
             return f"> {delay}"
 
         elif param == "direct.txdelay":
-            delay = self.repeater_config.get("direct_tx_delay_factor", 0.5)
+            # The direct TX delay factor lives in the delays section (the
+            # value the engine consumes), not the repeater section.
+            delay = self.config.get("delays", {}).get("direct_tx_delay_factor", 0.5)
             return f"> {delay}"
 
         elif param == "multi.acks":
@@ -454,81 +613,95 @@ class MeshCLI:
         try:
             if key == "af":
                 self.repeater_config["airtime_factor"] = float(value)
-                saved, _ = self.config_manager.save_to_file()
-                self.config_manager.live_update_daemon(["repeater"])
+                if not self._save_config_and_apply(["repeater"]):
+                    return "Error: Failed to save config"
                 return "OK"
 
             elif key == "name":
-                self.repeater_config["node_name"] = value
-                saved, _ = self.config_manager.save_to_file()
-                self.config_manager.live_update_daemon(["repeater"])
+                self._set_node_name(value)
+                if not self._save_config_and_apply(["repeater"]):
+                    return "Error: Failed to save config"
                 return "OK"
 
             elif key == "repeat":
                 self.repeater_config["mode"] = "forward" if value.lower() == "on" else "monitor"
-                saved, _ = self.config_manager.save_to_file()
-                self.config_manager.live_update_daemon(["repeater"])
+                if not self._save_config_and_apply(["repeater"]):
+                    return "Error: Failed to save config"
                 return f"OK - repeat is now {'ON' if self.repeater_config['mode'] == 'forward' else 'OFF'}"
 
             elif key == "lat":
                 self.repeater_config["latitude"] = float(value)
-                saved, _ = self.config_manager.save_to_file()
-                self.config_manager.live_update_daemon(["repeater"])
+                if not self._save_config_and_apply(["repeater"]):
+                    return "Error: Failed to save config"
                 return "OK"
 
             elif key == "lon":
                 self.repeater_config["longitude"] = float(value)
-                saved, _ = self.config_manager.save_to_file()
-                self.config_manager.live_update_daemon(["repeater"])
+                if not self._save_config_and_apply(["repeater"]):
+                    return "Error: Failed to save config"
                 return "OK"
 
             elif key == "radio":
-                # Format: freq bw sf cr
+                # Format: freq(MHz) bw(kHz) sf cr — the config stores Hz.
                 radio_parts = value.split()
                 if len(radio_parts) != 4:
                     return "Error: Expected freq bw sf cr"
 
-                if "radio" not in self.config:
-                    self.config["radio"] = {}
+                freq_mhz = float(radio_parts[0])
+                bw_khz = float(radio_parts[1])
+                sf = int(radio_parts[2])
+                cr = int(radio_parts[3])
+                if not (
+                    150.0 <= freq_mhz <= 2500.0
+                    and 7.0 <= bw_khz <= 500.0
+                    and 5 <= sf <= 12
+                    and 5 <= cr <= 8
+                ):
+                    return "Error, invalid radio params"
 
-                self.config["radio"]["frequency"] = float(radio_parts[0])
-                self.config["radio"]["bandwidth"] = float(radio_parts[1])
-                self.config["radio"]["spreading_factor"] = int(radio_parts[2])
-                self.config["radio"]["coding_rate"] = int(radio_parts[3])
-                saved, _ = self.config_manager.save_to_file()
-                self.config_manager.live_update_daemon(["radio"])
+                radio_config = self.config.setdefault("radio", {})
+                radio_config["frequency"] = int(round(freq_mhz * 1_000_000))
+                radio_config["bandwidth"] = int(round(bw_khz * 1_000))
+                radio_config["spreading_factor"] = sf
+                radio_config["coding_rate"] = cr
+                if not self._save_config_and_apply():
+                    return "Error: Failed to save config"
                 return "OK - restart repeater to apply"
 
             elif key == "freq":
-                if "radio" not in self.config:
-                    self.config["radio"] = {}
-                self.config["radio"]["frequency"] = float(value)
-                saved, _ = self.config_manager.save_to_file()
-                self.config_manager.live_update_daemon(["radio"])
+                # CLI input is MHz (firmware parity); the config stores Hz.
+                freq_mhz = float(value)
+                self.config.setdefault("radio", {})["frequency"] = int(round(freq_mhz * 1_000_000))
+                if not self._save_config_and_apply():
+                    return "Error: Failed to save config"
                 return "OK - restart repeater to apply"
 
             elif key == "tx":
-                if "radio" not in self.config:
-                    self.config["radio"] = {}
-                self.config["radio"]["tx_power"] = int(value)
-                saved, _ = self.config_manager.save_to_file()
-                self.config_manager.live_update_daemon(["radio"])
-                return "OK"
+                self.config.setdefault("radio", {})["tx_power"] = int(value)
+                if not self._save_config_and_apply():
+                    return "Error: Failed to save config"
+                return "OK - restart repeater to apply"
 
             elif key == "guest.password":
-                if "security" not in self.config:
-                    self.config["security"] = {}
-                self.config["security"]["guest_password"] = value
-                saved, _ = self.config_manager.save_to_file()
-                self.config_manager.live_update_daemon(["security"])
+                # LoginHelper authenticates from repeater.security.guest_password.
+                self.repeater_config.setdefault("security", {})["guest_password"] = value
+                if not self._save_config_and_apply(["repeater"]):
+                    return "Error: Failed to save config"
+                return "OK"
+
+            elif key == "owner.info":
+                self.repeater_config["owner_info"] = value.replace("|", "\n")
+                if not self._save_config_and_apply(["repeater"]):
+                    return "Error: Failed to save config"
                 return "OK"
 
             elif key == "allow.read.only":
-                if "security" not in self.config:
-                    self.config["security"] = {}
-                self.config["security"]["allow_read_only"] = value.lower() == "on"
-                saved, _ = self.config_manager.save_to_file()
-                self.config_manager.live_update_daemon(["security"])
+                # LoginHelper reads repeater.security.allow_read_only.
+                self.repeater_config.setdefault("security", {})["allow_read_only"] = (
+                    value.lower() == "on"
+                )
+                if not self._save_config_and_apply(["repeater"]):
+                    return "Error: Failed to save config"
                 return "OK"
 
             elif key == "advert.interval":
@@ -536,17 +709,18 @@ class MeshCLI:
                 if mins > 0 and (mins < 60 or mins > 240):
                     return "Error: interval range is 60-240 minutes"
                 self.repeater_config["advert_interval_minutes"] = mins
-                saved, _ = self.config_manager.save_to_file()
-                self.config_manager.live_update_daemon(["repeater"])
+                if not self._save_config_and_apply(["repeater"]):
+                    return "Error: Failed to save config"
                 return "OK"
 
             elif key == "flood.advert.interval":
                 hours = int(value)
-                if (hours > 0 and hours < 3) or hours > 48:
-                    return "Error: interval range is 3-48 hours"
-                self.repeater_config["flood_advert_interval_hours"] = hours
-                saved, _ = self.config_manager.save_to_file()
-                self.config_manager.live_update_daemon(["repeater"])
+                if (hours > 0 and hours < 3) or hours > 168:
+                    return "Error: interval range is 3-168 hours"
+                # The engine's flood-advert timer consumes send_advert_interval_hours.
+                self.repeater_config["send_advert_interval_hours"] = hours
+                if not self._save_config_and_apply(["repeater"]):
+                    return "Error: Failed to save config"
                 return "OK"
 
             elif key == "flood.max":
@@ -554,47 +728,65 @@ class MeshCLI:
                 if max_val > 64:
                     return "Error: max 64"
                 self.repeater_config["max_flood_hops"] = max_val
-                saved, _ = self.config_manager.save_to_file()
-                self.config_manager.live_update_daemon(["repeater"])
+                if not self._save_config_and_apply(["repeater"]):
+                    return "Error: Failed to save config"
+                return "OK"
+
+            elif key == "path.hash.mode":
+                mode = int(value)
+                if mode not in (0, 1, 2):
+                    return "Error: path.hash.mode must be 0, 1, or 2"
+                self.mesh_config["path_hash_mode"] = mode
+                if not self._save_config_and_apply(["mesh"]):
+                    return "Error: Failed to save config"
+                return "OK"
+
+            elif key == "loop.detect":
+                mode = str(value).strip().lower()
+                if mode not in ("off", "minimal", "moderate", "strict"):
+                    return "Error: loop.detect must be off, minimal, moderate, or strict"
+                self.mesh_config["loop_detect"] = mode
+                if not self._save_config_and_apply(["mesh"]):
+                    return "Error: Failed to save config"
                 return "OK"
 
             elif key == "rxdelay":
                 delay = float(value)
-                if delay < 0:
-                    return "Error: cannot be negative"
-                self.repeater_config["rx_delay_base"] = delay
-                saved, _ = self.config_manager.save_to_file()
-                self.config_manager.live_update_daemon(["repeater", "delays"])
+                if delay < 0 or delay > 20.0:
+                    return "Error, must be 0-20"
+                self.config.setdefault("delays", {})["rx_delay_base"] = delay
+                if not self._save_config_and_apply(["repeater", "delays"]):
+                    return "Error: Failed to save config"
                 return "OK"
 
             elif key == "txdelay":
                 delay = float(value)
-                if delay < 0:
-                    return "Error: cannot be negative"
-                self.repeater_config["tx_delay_factor"] = delay
-                saved, _ = self.config_manager.save_to_file()
-                self.config_manager.live_update_daemon(["repeater", "delays"])
+                if delay < 0 or delay > 2.0:
+                    return "Error, must be 0-2"
+                self.config.setdefault("delays", {})["tx_delay_factor"] = delay
+                if not self._save_config_and_apply(["repeater", "delays"]):
+                    return "Error: Failed to save config"
                 return "OK"
 
             elif key == "direct.txdelay":
                 delay = float(value)
-                if delay < 0:
-                    return "Error: cannot be negative"
-                self.repeater_config["direct_tx_delay_factor"] = delay
-                saved, _ = self.config_manager.save_to_file()
-                self.config_manager.live_update_daemon(["repeater", "delays"])
+                if delay < 0 or delay > 2.0:
+                    return "Error, must be 0-2"
+                self.config.setdefault("delays", {})["direct_tx_delay_factor"] = delay
+                if not self._save_config_and_apply(["repeater", "delays"]):
+                    return "Error: Failed to save config"
                 return "OK"
 
             elif key == "multi.acks":
                 self.repeater_config["multi_acks"] = int(value)
-                saved, _ = self.config_manager.save_to_file()
-                self.config_manager.live_update_daemon(["repeater"])
+                if not self._save_config_and_apply(["repeater"]):
+                    return "Error: Failed to save config"
                 return "OK"
 
             elif key == "int.thresh":
                 self.repeater_config["interference_threshold"] = int(value)
-                saved, _ = self.config_manager.save_to_file()
-                self.config_manager.live_update_daemon(["repeater"])
+                if not self._save_config_and_apply(["repeater"]):
+                    return "Error: Failed to save config"
                 return "OK"
 
             elif key == "agc.reset.interval":
@@ -602,8 +794,8 @@ class MeshCLI:
                 # Round to nearest multiple of 4
                 rounded = (interval // 4) * 4
                 self.repeater_config["agc_reset_interval"] = rounded
-                saved, _ = self.config_manager.save_to_file()
-                self.config_manager.live_update_daemon(["repeater"])
+                if not self._save_config_and_apply(["repeater"]):
+                    return "Error: Failed to save config"
                 return f"OK - interval rounded to {rounded}"
 
             else:
@@ -637,22 +829,336 @@ class MeshCLI:
     # ==================== Region Commands ====================
 
     def _cmd_region(self, command: str) -> str:
-        """Handle region commands."""
+        """Handle region commands with MeshCore-compatible response shapes."""
         parts = command.split()
 
         if len(parts) == 1:
-            return "Error: Region commands not implemented in Python repeater"
+            return self._region_export_tree()
 
         subcommand = parts[1]
 
         if subcommand == "load":
-            return "Error: Region commands not implemented"
-        elif subcommand == "save":
-            return "Error: Region commands not implemented"
-        elif subcommand in ("allowf", "denyf", "get", "home", "put", "remove"):
-            return "Error: Region commands not implemented"
-        else:
-            return "Err - ??"
+            return "Err - region load not supported"
+        if subcommand == "def":
+            return "Err - region def not supported"
+        if subcommand == "save":
+            return self._region_save()
+        if subcommand == "allowf" and len(parts) >= 3:
+            return self._region_set_flood(parts[2], allow=True)
+        if subcommand == "denyf" and len(parts) >= 3:
+            return self._region_set_flood(parts[2], allow=False)
+        if subcommand == "get" and len(parts) >= 3:
+            return self._region_get(parts[2])
+        if subcommand == "home":
+            if len(parts) >= 3:
+                return self._region_home_set(parts[2])
+            return self._region_home_get()
+        if subcommand == "default":
+            if len(parts) >= 3:
+                return self._region_default_set(parts[2])
+            return self._region_default_get()
+        if subcommand == "put" and len(parts) >= 3:
+            parent = parts[3] if len(parts) >= 4 else "*"
+            return self._region_put(parts[2], parent)
+        if subcommand == "remove" and len(parts) >= 3:
+            return self._region_remove(parts[2])
+        if subcommand == "list" and len(parts) >= 3:
+            return self._region_list(parts[2])
+
+        return "Err - ??"
+
+    def _region_storage_available(self) -> bool:
+        return bool(
+            self.storage_handler
+            and hasattr(self.storage_handler, "get_transport_keys")
+            and callable(getattr(self.storage_handler, "get_transport_keys"))
+        )
+
+    def _region_load_records(self) -> list[dict]:
+        if not self._region_storage_available():
+            return []
+        records = self.storage_handler.get_transport_keys()
+        return records if isinstance(records, list) else []
+
+    @staticmethod
+    def _region_display_name(raw_name: str) -> str:
+        name = str(raw_name or "").strip()
+        if name.startswith("#"):
+            return name[1:]
+        return name
+
+    def _region_find_prefix(self, query: str) -> Optional[dict]:
+        q = str(query or "").strip()
+        if not q:
+            return None
+        if q == "*":
+            return {
+                "id": 0,
+                "name": "*",
+                "display_name": "*",
+                "flood_policy": "allow" if self._region_unscoped_allow() else "deny",
+                "parent_id": None,
+            }
+
+        q_lower = q.lower()
+        for rec in self._region_load_records():
+            display = self._region_display_name(rec.get("name", ""))
+            if display.lower().startswith(q_lower):
+                return {**rec, "display_name": display}
+        return None
+
+    def _region_find_exact(self, query: str) -> Optional[dict]:
+        q = str(query or "").strip()
+        if not q:
+            return None
+        if q == "*":
+            return {
+                "id": 0,
+                "name": "*",
+                "display_name": "*",
+                "flood_policy": "allow" if self._region_unscoped_allow() else "deny",
+                "parent_id": None,
+            }
+
+        q_lower = q.lower()
+        for rec in self._region_load_records():
+            display = self._region_display_name(rec.get("name", ""))
+            if display.lower() == q_lower:
+                return {**rec, "display_name": display}
+        return None
+
+    def _region_unscoped_allow(self) -> bool:
+        return bool(
+            self.mesh_config.get(
+                "unscoped_flood_allow",
+                self.mesh_config.get("global_flood_allow", True),
+            )
+        )
+
+    def _region_set_unscoped_allow(self, allow: bool) -> bool:
+        self.mesh_config["unscoped_flood_allow"] = bool(allow)
+        self.mesh_config["global_flood_allow"] = bool(allow)
+        save_result = self.config_manager.save_to_file()
+        saved = save_result[0] if isinstance(save_result, tuple) else bool(save_result)
+        self.config_manager.live_update_daemon(["mesh"])
+        return bool(saved)
+
+    def _region_get_default_name(self) -> Optional[str]:
+        default_name = self.mesh_config.get("default_region")
+        text = str(default_name).strip() if default_name is not None else ""
+        return text or None
+
+    def _region_set_default_name(self, value: Optional[str]) -> bool:
+        self.mesh_config["default_region"] = value
+        save_result = self.config_manager.save_to_file()
+        saved = save_result[0] if isinstance(save_result, tuple) else bool(save_result)
+        self.config_manager.live_update_daemon(["mesh"])
+        return bool(saved)
+
+    def _region_export_tree(self) -> str:
+        records = self._region_load_records()
+        children_by_parent: Dict[int, list[dict]] = {}
+        for rec in records:
+            parent_id = rec.get("parent_id")
+            parent_key = int(parent_id) if isinstance(parent_id, int) and parent_id > 0 else 0
+            children_by_parent.setdefault(parent_key, []).append(rec)
+
+        for parent_list in children_by_parent.values():
+            parent_list.sort(key=lambda r: str(r.get("name", "")).lower())
+
+        home_name = str(self.repeater_config.get("region_home") or "").strip().lower()
+
+        lines: list[str] = []
+
+        def append_line(indent: int, display_name: str, flood_policy: str):
+            home_mark = "^" if home_name and display_name.lower() == home_name else ""
+            flood_mark = " F" if flood_policy == "allow" else ""
+            lines.append(f"{' ' * indent}{display_name}{home_mark}{flood_mark}")
+
+        append_line(0, "*", "allow" if self._region_unscoped_allow() else "deny")
+
+        def walk(parent_id: int, indent: int):
+            for rec in children_by_parent.get(parent_id, []):
+                display_name = self._region_display_name(rec.get("name", ""))
+                append_line(indent, display_name, str(rec.get("flood_policy", "deny")))
+                walk(int(rec.get("id", 0)), indent + 1)
+
+        walk(0, 1)
+        return "\n".join(lines)
+
+    def _region_save(self) -> str:
+        save_result = self.config_manager.save_to_file()
+        saved = save_result[0] if isinstance(save_result, tuple) else bool(save_result)
+        return "OK" if saved else "Err - save failed"
+
+    def _region_set_flood(self, name_prefix: str, allow: bool) -> str:
+        region = self._region_find_prefix(name_prefix)
+        if not region:
+            return "Err - unknown region"
+
+        if region.get("id") == 0:
+            return "OK" if self._region_set_unscoped_allow(allow) else "Err - save failed"
+
+        update_fn = getattr(self.storage_handler, "update_transport_key", None)
+        if not callable(update_fn):
+            return "Error: Region commands not supported by storage backend"
+
+        ok = update_fn(int(region["id"]), flood_policy="allow" if allow else "deny")
+        return "OK" if ok else "Err - unknown region"
+
+    def _region_get(self, name_prefix: str) -> str:
+        region = self._region_find_prefix(name_prefix)
+        if not region:
+            return "Err - unknown region"
+
+        display_name = str(
+            region.get("display_name") or self._region_display_name(region.get("name", ""))
+        )
+        flood_suffix = "F" if region.get("flood_policy") == "allow" else ""
+
+        parent_name = None
+        parent_id = region.get("parent_id")
+        if isinstance(parent_id, int) and parent_id > 0:
+            for rec in self._region_load_records():
+                if int(rec.get("id", -1)) == parent_id:
+                    parent_name = self._region_display_name(rec.get("name", ""))
+                    break
+
+        if parent_name:
+            return f" {display_name} ({parent_name}) {flood_suffix}".rstrip()
+        return f" {display_name} {flood_suffix}".rstrip()
+
+    def _region_home_get(self) -> str:
+        home = str(self.repeater_config.get("region_home") or "").strip()
+        return f" home is {home or '*'}"
+
+    def _region_home_set(self, name_prefix: str) -> str:
+        region = self._region_find_prefix(name_prefix)
+        if not region:
+            return "Err - unknown region"
+
+        display_name = str(region.get("display_name") or "*")
+        self.repeater_config["region_home"] = display_name
+        save_result = self.config_manager.save_to_file()
+        saved = save_result[0] if isinstance(save_result, tuple) else bool(save_result)
+        return f" home is now {display_name}" if saved else "Err - save failed"
+
+    def _region_default_get(self) -> str:
+        default_region = self._region_get_default_name()
+        if default_region is None:
+            return " default scope is <null>"
+        return f" default scope is {default_region}"
+
+    def _region_default_set(self, value: str) -> str:
+        text = str(value or "").strip()
+        if text == "<null>":
+            saved = self._region_set_default_name(None)
+            return " default scope is now <null>" if saved else "Err - save failed"
+
+        region = self._region_find_prefix(text)
+        if region:
+            display_name = str(region.get("display_name") or text)
+            if region.get("id") not in (None, 0):
+                update_fn = getattr(self.storage_handler, "update_transport_key", None)
+                if callable(update_fn):
+                    update_fn(int(region["id"]), flood_policy="allow")
+            saved = self._region_set_default_name(display_name)
+            return f" default scope is now {display_name}" if saved else "Err - save failed"
+
+        put_result = self._region_put(text, "*")
+        if not put_result.startswith("OK"):
+            return "Err - region table full"
+
+        saved = self._region_set_default_name(text)
+        return f" default scope is now {text}" if saved else "Err - save failed"
+
+    def _region_put(self, name: str, parent_name: str) -> str:
+        region_name = str(name or "").strip()
+        if not region_name:
+            return "Err - unable to put"
+
+        parent = self._region_find_prefix(parent_name)
+        if not parent:
+            return "Err - unknown parent"
+
+        parent_id = int(parent.get("id", 0))
+        parent_storage_id = None if parent_id == 0 else parent_id
+
+        existing = self._region_find_exact(region_name)
+        if existing and existing.get("id") != 0:
+            update_fn = getattr(self.storage_handler, "update_transport_key", None)
+            if not callable(update_fn):
+                return "Err - unable to put"
+            ok = update_fn(
+                int(existing["id"]),
+                flood_policy="allow",
+                parent_id=parent_storage_id,
+            )
+            return "OK - (flood allowed)" if ok else "Err - unable to put"
+
+        create_fn = getattr(self.storage_handler, "create_transport_key", None)
+        if not callable(create_fn):
+            return "Err - unable to put"
+
+        key_id = create_fn(
+            region_name,
+            "allow",
+            None,
+            parent_storage_id,
+            None,
+        )
+        return "OK - (flood allowed)" if key_id else "Err - unable to put"
+
+    def _region_remove(self, name: str) -> str:
+        region = self._region_find_exact(name)
+        if not region or region.get("id") == 0:
+            return "Err - not found"
+
+        region_id = int(region["id"])
+        for rec in self._region_load_records():
+            if int(rec.get("parent_id") or 0) == region_id:
+                return "Err - not empty"
+
+        delete_fn = getattr(self.storage_handler, "delete_transport_key", None)
+        if not callable(delete_fn):
+            return "Err - not found"
+
+        ok = delete_fn(region_id)
+        if not ok:
+            return "Err - not found"
+
+        removed_name = str(region.get("display_name") or "")
+        if (
+            str(self.repeater_config.get("region_home") or "").strip().lower()
+            == removed_name.lower()
+        ):
+            self.repeater_config["region_home"] = ""
+        default_name = self._region_get_default_name()
+        if str(default_name or "").strip().lower() == removed_name.lower():
+            self.mesh_config["default_region"] = None
+        return "OK"
+
+    def _region_list(self, filter_name: str) -> str:
+        mode = str(filter_name or "").strip().lower()
+        if mode not in ("allowed", "denied"):
+            return "Err - use 'allowed' or 'denied'"
+
+        names: list[str] = []
+        unscoped_allowed = self._region_unscoped_allow()
+        if (mode == "allowed" and unscoped_allowed) or (mode == "denied" and not unscoped_allowed):
+            names.append("*")
+
+        records = sorted(
+            self._region_load_records(),
+            key=lambda r: self._region_display_name(r.get("name", "")).lower(),
+        )
+        for rec in records:
+            flood_policy = str(rec.get("flood_policy", "deny")).lower()
+            allowed = flood_policy == "allow"
+            if (mode == "allowed" and allowed) or (mode == "denied" and not allowed):
+                names.append(self._region_display_name(rec.get("name", "")))
+
+        return ",".join(names) if names else "-none-"
 
     # ==================== Neighbor Commands ====================
 
@@ -667,15 +1173,15 @@ class MeshCLI:
             if not neighbors:
                 return "No neighbors discovered yet"
 
-            # Filter to only show repeaters and zero hop nodes
+            # Match MeshCore behavior: show only zero-hop repeaters.
             filtered_neighbors = {
                 pubkey: info
                 for pubkey, info in neighbors.items()
-                if info.get("is_repeater", False) or info.get("zero_hop", False)
+                if info.get("is_repeater", False) and info.get("zero_hop", False)
             }
 
             if not filtered_neighbors:
-                return "No repeaters or zero hop neighbors discovered yet"
+                return "No zero hop repeaters discovered yet"
 
             # Format output similar to C++ version
             # Format: "<pubkey_prefix> heard Xs ago"
@@ -703,14 +1209,123 @@ class MeshCLI:
 
     def _cmd_neighbor_remove(self, command: str) -> str:
         """Remove a neighbor."""
-        pubkey_hex = command[16:].strip()
+        raw_suffix = command[16:]
+        pubkey_hex = raw_suffix.strip()
 
-        if not pubkey_hex:
+        # Keep MeshCore parity: plain empty is invalid, whitespace-only means remove all.
+        if raw_suffix == "":
             return "ERR: Missing pubkey"
 
-        # TODO: Remove neighbor from routing table
-        logger.info(f"neighbor.remove: {pubkey_hex}")
-        return "Error: Not yet implemented"
+        if not self.storage_handler:
+            return "Error: Storage not available"
+
+        delete_fn = getattr(self.storage_handler, "delete_neighbors_by_pubkey_prefix", None)
+        if not callable(delete_fn):
+            return "Error: neighbor.remove not supported by storage backend"
+
+        try:
+            if pubkey_hex == "":
+                delete_fn(None)
+                return "OK"
+
+            if any(ch not in "0123456789abcdefABCDEF" for ch in pubkey_hex):
+                return "ERR: bad pubkey"
+
+            delete_fn(pubkey_hex)
+            return "OK"
+        except Exception as e:
+            logger.error(f"neighbor.remove failed: {e}", exc_info=True)
+            return f"Error: {e}"
+
+    def _cmd_discover_neighbors(self, command: str) -> str:
+        """Send a discovery request for nearby repeaters."""
+        sub = command[18:]
+        if sub.strip():
+            return "Err - discover.neighbors has no options"
+
+        daemon_instance = getattr(self.config_manager, "daemon", None)
+        discovery_helper = getattr(daemon_instance, "discovery_helper", None)
+        if not discovery_helper:
+            return "Error: Discovery helper not available"
+
+        import asyncio
+
+        loop = self._event_loop
+        if loop is None:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+
+        if loop is None or not loop.is_running():
+            return "Error: Event loop not available"
+
+        try:
+            discovery_helper.cleanup_sessions()
+            session = discovery_helper.create_session(
+                timeout=5,
+                filter_mask=(1 << 2),
+                since=0,
+                prefix_only=False,
+                result_enricher=self._auto_add_discovery_result,
+            )
+            loop.call_soon_threadsafe(discovery_helper.start_session_task, session["session_id"])
+            return "OK - Discover sent"
+        except Exception as e:
+            logger.error(f"discover.neighbors failed: {e}", exc_info=True)
+            return f"Error: {e}"
+
+    def _cmd_discover_scopes(self, command: str) -> str:
+        """Refresh the neighbour table, query each neighbour's scopes, publish once.
+
+        Manual trigger for the periodic MQTT neighbors cycle (firmware
+        ``discover.scopes``). The cycle takes minutes -- a node-discovery window
+        plus one serialized scope query per neighbour -- so this schedules it and
+        returns immediately rather than holding the CLI reply open.
+        """
+        sub = command[15:]
+        if sub.strip():
+            return "Err - discover.scopes has no options"
+
+        daemon_instance = getattr(self.config_manager, "daemon", None)
+        publisher = getattr(daemon_instance, "neighbors_publisher", None)
+        if not publisher:
+            return "Error: Neighbors publisher not available"
+
+        if not publisher.enabled():
+            return "Err - neighbors publishing is disabled (no broker opted in)"
+
+        import asyncio
+
+        loop = self._event_loop
+        if loop is None:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+
+        if loop is None or not loop.is_running():
+            return "Error: Event loop not available"
+
+        try:
+            # trigger_cycle owns the "already running" check and tracks the task
+            # so shutdown can cancel it. Doing it here instead would race: this
+            # runs on the CLI thread, the cycle starts on the event loop.
+            started = concurrent.futures.Future()
+
+            def _start():
+                try:
+                    started.set_result(publisher.trigger_cycle())
+                except Exception as exc:  # pragma: no cover - defensive
+                    started.set_exception(exc)
+
+            loop.call_soon_threadsafe(_start)
+            if started.result(timeout=5):
+                return "OK - neighbor scope discovery started"
+            return "Err - neighbors cycle already active"
+        except Exception as e:
+            logger.error(f"discover.scopes failed: {e}", exc_info=True)
+            return f"Error: {e}"
 
     # ==================== Temporary Radio Commands ====================
 

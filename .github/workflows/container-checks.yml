@@ -1,0 +1,45 @@
+name: Container Checks
+
+on:
+  pull_request:
+    paths:
+      - dockerfile
+      - .dockerignore
+      - docker-compose.yml
+      - docker-compose.build.yml
+      - docker-entrypoint.sh
+      - repeater/plugins/**
+      - scripts/docker-plugin-smoke.sh
+      - tests/test_container_workflow.py
+      - tests/test_plugin_container_supervisor.py
+      - .github/workflows/container-checks.yml
+  workflow_dispatch:
+
+concurrency:
+  group: container-checks-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check Dockerfile
+        run: docker buildx build --check -f dockerfile .
+
+      - name: Check Compose configuration
+        run: docker compose -f docker-compose.yml -f docker-compose.build.yml config --quiet
+
+      - name: Lint Dockerfile
+        run: docker run --rm -i hadolint/hadolint:v2.15.1 hadolint --failure-threshold error - < dockerfile
+
+      - name: Build runtime image
+        run: docker build --build-arg PACKAGE_VERSION=0.0.0.dev0 -t openhop-repeater:plugin-smoke -f dockerfile .
+
+      - name: Exercise plugin runtime in Docker
+        run: scripts/docker-plugin-smoke.sh openhop-repeater:plugin-smoke

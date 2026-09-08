@@ -12,18 +12,18 @@ integrations.
 
 ## Contents
 
-- [Overview](#overview)
-- [Screenshots](#screenshots)
-- [Supported Hardware](#supported-hardware)
-- [Installation](#installation)
-- [Configuration](#configuration)
-- [Policy Engine](#policy-engine)
-- [Upgrading](#upgrading)
-- [Proxmox LXC Installation](#proxmox-lxc-installation)
-- [Uninstallation](#uninstallation)
-- [Docker Compose](#docker-compose)
+- [Overview](https://docs.openhop.dev/projects/openhop-repeater/what-is-openhop-repeater/)
+- [Screenshots and dashboard](https://docs.openhop.dev/projects/openhop-repeater/web-dashboard/)
+- [Supported Hardware](https://docs.openhop.dev/projects/openhop-repeater/hardware-setup/)
+- [Installation](https://docs.openhop.dev/projects/openhop-repeater/installation/)
+- [Configuration](https://docs.openhop.dev/projects/openhop-repeater/config-file/)
+- [Policy Engine](https://docs.openhop.dev/projects/openhop-repeater/web-dashboard/)
+- [Upgrading](https://docs.openhop.dev/projects/openhop-repeater/installation/#upgrading-an-older-pymc-installation)
+- [Proxmox LXC Installation](https://docs.openhop.dev/projects/openhop-repeater/installation/#proxmox-lxc-with-ch341)
+- [Uninstallation](https://docs.openhop.dev/projects/openhop-repeater/uninstallation/)
+- [Docker Compose](https://docs.openhop.dev/projects/openhop-repeater/docker/)
 - [Roadmap](#roadmap)
-- [Contributing](#contributing)
+- [Contributing](https://docs.openhop.dev/projects/openhop-repeater/development/)
 - [Support](#support)
 - [Disclaimer](#disclaimer)
 - [License](#license)
@@ -39,7 +39,7 @@ hackable architecture:
 - Packet routing, policy checks, storage, sensors, GPS, MQTT, and optional
   pyMC_Glass integration are kept in modular components.
 - Hardware support covers direct SPI radios, CH341 USB-to-SPI adapters,
-  pyMC TCP/USB modem firmware, and KISS serial modems.
+  openHop TCP/USB modem firmware, and KISS serial modems.
 
 Real-world deployment feedback is especially welcome. Dense networks, unusual
 hardware, and production-style installations are the best way to find the rough
@@ -65,8 +65,8 @@ openHop Repeater supports these radio backends:
 
 - **SX1262 over Linux SPI**: set `radio_type: sx1262`
 - **SX1262 over CH341 USB-to-SPI**: set `radio_type: sx1262_ch341`
-- **pyMC TCP modem**: set `radio_type: pymc_tcp`
-- **pyMC USB-CDC modem**: set `radio_type: pymc_usb`
+- **openHop Modem over Wi-Fi/Ethernet**: set `radio_type: modem_tcp`
+- **openHop Modem over USB-CDC**: set `radio_type: modem_usb`
 - **KISS serial modem**: set `radio_type: kiss`
 - **No radio hardware**: set `radio_type: null` for setup, testing, or API-only work
 
@@ -81,8 +81,8 @@ openHop Repeater supports these radio backends:
 |-----------|--------|
 | Native SX1262 SPI radio | Supported |
 | CH341 USB-to-SPI bridge | Supported |
-| pyMC TCP modem | Supported |
-| pyMC USB-CDC modem | Supported |
+| openHop TCP modem | Supported |
+| openHop USB-CDC modem | Supported |
 | KISS serial modem | Supported |
 | UART-only HATs | Not supported |
 | SX1302/SX1303 concentrator boards | Not supported |
@@ -255,6 +255,11 @@ The web interface can upgrade an installation or switch branches.
 > Docker installs cannot be upgraded or branch-switched from the web interface.
 > Update the container image instead.
 
+Existing native installations must run the updated `sudo bash ./manage.sh upgrade`
+once as an administrator to replace the privileged OTA helper after the security
+update. Updating only the Python package or using the old web updater does not
+refresh that helper. See [native upgrade prerequisites](docs/plugins.md#native-upgrade-prerequisite).
+
 ![Upgrade](docs/webui-upgrade.png)
 
 ### CLI
@@ -275,22 +280,26 @@ The upgrade script will:
 ## Proxmox LXC Installation
 
 openHop Repeater can run inside a Proxmox LXC container using a CH341 USB-to-SPI
-adapter or a TCP modem. This is useful for headless, always-on deployments
-without dedicating a full Raspberry Pi.
+adapter or an openHop Modem over TCP or USB. This is useful for headless,
+always-on deployments without dedicating a full Raspberry Pi.
 
 ### Requirements
 
 Software:
 
-- Proxmox VE 7.x or 8.x host
-- Internet access for the container
+- Proxmox VE 8.x or 9.x host; 9.x is recommended for new deployments
+- A matching Debian 13 standard LXC template available through `pveam`
+- Internet access from the container during installation and updates
 
 Hardware, choose one:
 
 - CH341 USB-to-SPI adapter with VID `1a86` and PID `5512`, connected to the
   Proxmox host and wired to an SX1262-based LoRa module such as an Ebyte
-  E22-900M30S
-- TCP modem, such as MeshSmith EtherMesh
+  E22-900M30S. Select the optional host-side CH341 udev rule for this setup.
+- openHop Modem over TCP, such as MeshSmith EtherMesh-1W, reachable from the
+  container network. This does not need the CH341 udev rule or a USB device.
+- openHop Modem over USB, connected to the Proxmox host. The installer enables
+  general USB passthrough by default; the CH341 udev rule is not needed.
 
 ### One-Line Install
 
@@ -303,14 +312,25 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/openhop-dev/openhop_repe
 Replace `main` in the URL with another branch name if needed.
 
 The installer will prompt for container settings (container ID, hostname, RAM,
-disk, bridge, etc.) and then:
+disk, bridge, etc.), whether to install the host-side CH341 udev rule, and
+whether to download the optional openHop Console WebUI. It will then:
 
-1. Download a Debian 12 LXC template.
+1. Download a Debian 13 LXC template matching the Proxmox host architecture.
 2. Create a privileged container with USB passthrough.
-3. Install a host-side udev rule for the CH341 device.
-4. Clone the repository and pre-seed CH341 GPIO pin mappings.
-5. Run `manage.sh install` inside the container.
-6. Display the dashboard URL.
+3. Install the host-side CH341 udev rule only when selected. This is not needed
+   for openHop Modem TCP or USB connections and defaults to No.
+4. Start the container, wait for network access, then run a full Debian package
+   update and upgrade.
+5. Clone the repository and pre-seed CH341 GPIO pin mappings.
+6. Install an `update` command for Debian and openHop Repeater updates.
+7. Run `manage.sh install` inside the container.
+8. Optionally install openHop Console WebUI assets after Repeater installation.
+   The public Console distribution repository is cloned as a depth-one,
+   single-branch checkout without tags at `/root/pymc_console`, minimizing disk
+   usage while keeping it upgradeable in the same way as Repeater. Console is
+   not selected as the default frontend, allowing the Repeater setup wizard to
+   be completed first.
+9. Display the dashboard URL.
 
 ### Default Container Settings
 
@@ -322,8 +342,11 @@ disk, bridge, etc.) and then:
 | Disk | 4 GB |
 | CPU cores | 2 |
 | Bridge | `vmbr0` |
+| VLAN ID | None |
 | Storage | `local-lvm` |
-| Password | `pymc` |
+| Password | `openHop1!` |
+| Host-side CH341 udev rule | No |
+| openHop Console WebUI | No |
 
 ### After Installation
 
@@ -338,6 +361,18 @@ journalctl -u openhop-repeater -f
 cd /opt/openhop_repeater
 bash manage.sh
 ```
+
+Run `update` inside the LXC to update Debian packages, fast-forward the branch
+selected during installation, and run `manage.sh upgrade`. The command first
+lists every action and requires a `y/N` confirmation. When Console is installed,
+it also updates `/root/pymc_console` and refreshes the Console assets:
+
+```bash
+update
+```
+
+If openHop Console WebUI was installed, complete the Repeater setup wizard
+before selecting `openHop Console` from Web Settings.
 
 Open the dashboard at:
 
@@ -381,18 +416,19 @@ The installer also enables `use_dio3_tcxo` and `use_dio2_rf` for E22 modules.
 
 ## Uninstallation
 
+Read the [Uninstallation guide](https://docs.openhop.dev/projects/openhop-repeater/uninstallation/)
+and make a durable backup before continuing. The native uninstaller performs a
+complete removal after one confirmation: it deletes the current and legacy
+installation, configuration, logs, data, and the `repeater` service user.
+
 ```bash
 sudo bash ./manage.sh uninstall
 ```
 
-The uninstaller will:
-
-- Stop and disable the systemd service
-- Remove the installation directory
-- Optionally remove configuration, logs, and user data
-- Optionally remove the service user account
-
-The script prompts before each optional removal step.
+The script attempts a best-effort configuration-only backup under `/tmp`, but that
+is not a durable or complete backup and may be removed automatically. It does not
+prompt separately for individual paths. Docker Compose removal and persistent
+volume cleanup are separate operations covered by the guide.
 
 ## Docker Compose
 
@@ -420,13 +456,80 @@ that source as a directory, which breaks startup.
 1. Copy `.env.example` to `.env`.
 2. Review `.env` and update `OPENHOP_REPEATER_IMAGE`, `DIALOUT_GID`,
    `GPIO_GID`, or `SPI_GID` if needed.
-3. Configure `docker-compose.yml` for your hardware and device paths.
-4. Uncomment the USB device mapping only if your host has that device path.
+3. Configure `docker-compose.yml` for your hardware. Remove every device mapping
+   that is absent or unnecessary: the shipped file enables SPI, GPIO, and USB
+   bus examples. Network-radio installations do not need those mappings.
+4. Add a serial-modem mapping only after preparing its host device path.
 5. Pull and start the container.
 
 ```bash
 docker compose up -d
 ```
+
+The Docker image includes the default RepeaterUI but no longer downloads or bundles
+openHop Console. Install optional Console functionality through the plugin catalogue.
+
+Before upgrading an older image with `/opt/pymc_console/web/html` selected as its
+frontend, switch back to the default RepeaterUI. The old bundled directory is absent
+from new images. Existing plugin data remains in the persistent data volume.
+
+### Image updates and persistent plugins
+
+For a published image, select the intended image tag in `.env`, then run:
+
+```bash
+docker compose pull
+docker compose up -d
+```
+
+For a local source build, after updating the intended branch:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+```
+
+Pulling Git changes or restarting a container alone does not rebuild its image.
+The Dockerfile packages the frontend assets present in the build context; it does
+not fetch or build the default RepeaterUI. Frontend changes belong in
+[RepeaterUI](https://github.com/openhop-dev/openHop_RepeaterUI), using the matching
+UI branch (`feat-plugin-ui` for `feat-plugin-manager`). Stage the complete verified
+UI build for packaging; do not hand-edit generated JavaScript. Optional Console
+installation is managed through the plugin catalogue, independently of image builds.
+
+Back up both config and data volumes before upgrading. Do **not** use
+`docker compose down -v` if you want to retain configuration and plugins.
+The default data volume contains plugin releases, retained wheels, venvs,
+settings, logs, and manager state. A custom `plugins.root` outside that volume
+needs its own persistent writable mount.
+
+Plugin venvs can rebuild after a Python minor-version change. Keep retained wheels;
+plugins with external dependencies may need network access and compatible packages
+to rebuild. Older installations without retained wheels need plugin reinstallation.
+Changing CPU architecture or absolute storage paths is not covered by minor-version
+rebuild detection.
+
+The image runs Repeater and its plugin manager as an unprivileged user under a
+supervisor and `tini`. To run without the manager, set `plugins.enabled: false` in
+configuration, or explicitly add this to the Compose service:
+
+```yaml
+environment:
+  OPENHOP_PLUGIN_MANAGER: "0"
+```
+
+Putting that variable only in `.env` does not pass it through the shipped Compose
+file. Repeater remains available without the manager; plugin operations are then
+unavailable. Plugins are trusted applications, not sandboxed code.
+
+On startup, existing user configuration overrides defaults from the current image's
+bundled example; an older example in the config volume is preserved but is not the
+upgrade merge source. Keep config writable by the image user. The temporary merged
+config fallback is not persistent; use an absolute `storage.storage_dir` inside the
+mounted data directory.
+
+The volume variables accept the default named volumes or absolute bind paths. If
+you choose another named volume, also declare it under top-level `volumes:`; use
+`external: true` when intentionally attaching an existing volume.
 
 ### Example `docker-compose.yml`
 
@@ -447,6 +550,10 @@ services:
       # USB devices. Uncomment/change only if needed.
       # - /dev/bus/usb/002:/dev/bus/usb/002
 
+      # USB serial modem. See "USB serial modems" below before using a
+      # /dev/serial/by-id/ path here.
+      # - /dev/openhop-modem:/dev/openhop-modem
+
     cap_add:
       - SYS_RAWIO
 
@@ -464,6 +571,52 @@ volumes:
   openhop-repeater-config:
   openhop-repeater-data:
 ```
+
+### USB serial modems
+
+A `/dev/serial/by-id/` path is the stable way to name a USB modem, but it cannot
+always be handed to a container. ESP32-S3 boards that use the chip's native
+USB-Serial-JTAG peripheral report their factory MAC address as the USB serial
+number, colons included, so udev produces a name like:
+
+```
+/dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_60:55:F9:C0:27:18-if00
+```
+
+Docker parses `devices:` entries as `host:container[:permissions]` and has no way
+to escape a colon inside the path, so that name is rejected. `/dev/serial/by-path/`
+does not help either, since those contain PCI addresses with colons of their own.
+
+Two further things to know: `/dev/serial/by-id` is built by udev on the host, and
+udev does not run inside the container, so the directory is not visible in there
+unless you bind-mount it. And a bare `/dev/ttyACM0` is not stable across re-plugs
+or reboots.
+
+Install the udev rule shipped with openHop Core, which creates a colon-free
+symlink that survives re-plugs:
+
+```bash
+sudo cp 99-openhop-modem.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules
+sudo udevadm trigger --subsystem-match=tty --action=change
+```
+
+Then map the symlink and point the config at the same path:
+
+```yaml
+devices:
+  - /dev/openhop-modem:/dev/openhop-modem
+```
+
+```yaml
+kiss:
+  port: "/dev/openhop-modem"
+```
+
+The rule matches USB ID `303a:1001`, which every ESP32-S3 board using native USB
+shares. With more than one attached, pin the rule to a single board's serial
+number — the rules file has a commented example and the `udevadm` command to read
+it.
 
 ## Roadmap
 
@@ -511,7 +664,9 @@ pre-commit run --all-files
 ```
 
 Hardware support for LoRa radio drivers is included in the base installation
-through `openhop_core[hardware]`.
+through `openhop_core[hardware]` on Linux. On other platforms (e.g. macOS),
+`openhop_core` is installed without the hardware extra, since `spidev` and
+similar packages only build against the Linux SPI kernel headers.
 
 Pre-commit hooks will automatically:
 - Lint and auto-fix Python issues with Ruff
@@ -520,7 +675,7 @@ Pre-commit hooks will automatically:
 
 ## Support
 
-- [pyMC Core](https://github.com/openhop-dev/openhop_core)
+- [openHop Core](https://github.com/openhop-dev/openhop_core)
 - [MeshCore Discord](https://meshcore.gg)
 
 ## Disclaimer

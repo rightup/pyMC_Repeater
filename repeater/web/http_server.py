@@ -1,9 +1,11 @@
 import json
 import logging
+import mimetypes
 import os
 import queue
 import re
 import secrets
+import sys
 import threading
 from collections import deque
 from datetime import datetime
@@ -27,6 +29,7 @@ try:
     from repeater.data_acquisition.websocket_handler import (
         PacketWebSocket,
         init_websocket,
+        shutdown_websocket,
     )
 
     from .companion_ws_proxy import CompanionFrameWebSocket
@@ -39,6 +42,50 @@ except ImportError:
     logger.warning("ws4py not available - WebSocket support disabled")
 
 logger = logging.getLogger("HTTPServer")
+_ORIGINAL_UNRAISABLEHOOK = sys.unraisablehook
+_CHEROOT_UNRAISABLE_HOOK_INSTALLED = False
+
+
+def _cors_response_headers(
+    methods: str = "GET, POST, PUT, DELETE, OPTIONS",
+) -> list[tuple[str, str]]:
+    """Return wildcard CORS headers for header-authenticated API requests.
+
+    Browser credentials are intentionally disabled: wildcard origins cannot be
+    combined with Access-Control-Allow-Credentials.
+    """
+    return [
+        ("Access-Control-Allow-Origin", "*"),
+        ("Access-Control-Allow-Methods", methods),
+        ("Access-Control-Allow-Headers", "Authorization, Content-Type, X-API-Key"),
+    ]
+
+
+def _looks_like_cheroot_makefile_context(unraisable: object) -> bool:
+    context = (
+        f"{getattr(unraisable, 'object', '')!r} {getattr(unraisable, 'err_msg', '')!r}".lower()
+    )
+    return "cheroot" in context and "makefile" in context
+
+
+def _install_cheroot_bad_fd_unraisable_filter() -> None:
+    global _CHEROOT_UNRAISABLE_HOOK_INSTALLED
+    if _CHEROOT_UNRAISABLE_HOOK_INSTALLED:
+        return
+
+    def _filtered_unraisablehook(unraisable):
+        exc = getattr(unraisable, "exc_value", None)
+        if (
+            isinstance(exc, OSError)
+            and getattr(exc, "errno", None) == 9
+            and "bad file descriptor" in str(exc).lower()
+            and _looks_like_cheroot_makefile_context(unraisable)
+        ):
+            return
+        _ORIGINAL_UNRAISABLEHOOK(unraisable)
+
+    sys.unraisablehook = _filtered_unraisablehook
+    _CHEROOT_UNRAISABLE_HOOK_INSTALLED = True
 
 
 # In-memory log buffer
@@ -144,7 +191,7 @@ class LogBuffer(logging.Handler):
 
 
 # Global log buffer instance
-_log_buffer = LogBuffer(max_lines=1000)
+_log_buffer = LogBuffer(max_lines=300)
 
 
 class DocEndpoint:
@@ -204,12 +251,16 @@ class StatsApp:
         self.pub_key = pub_key
         self.dashboard_template = None
         self.config = config or {}
+        self._config_path = config_path
+        self.default_html_dir = os.path.join(os.path.dirname(__file__), "html")
 
         # Path to the compiled Vue.js application
         # Use web_path from config if provided, otherwise use default
-        default_html_dir = os.path.join(os.path.dirname(__file__), "html")
         web_path = self.config.get("web", {}).get("web_path")
-        self.html_dir = web_path if web_path is not None else default_html_dir
+        plugin_dir = self._resolve_plugin_frontend_dir(web_path)
+        self.html_dir = plugin_dir or (
+            web_path if web_path is not None and os.path.isdir(web_path) else self.default_html_dir
+        )
 
         # Create nested API object for routing
         self.api = APIEndpoints(
@@ -219,11 +270,219 @@ class StatsApp:
         # Create doc endpoint for API documentation
         self.doc = DocEndpoint(self.api)
 
+    def _resolve_plugin_frontend_dir(self, web_path: object) -> Optional[str]:
+        value = str(web_path or "").strip()
+        if not value:
+            return None
+
+        try:
+            from repeater.plugins.manifest import ui_subtree
+            from repeater.plugins.storage import PluginStorage, resolve_plugins_root
+
+            storage_dir = resolve_storage_dir(self.config, config_path=self._config_path)
+            plugins_root = resolve_plugins_root(self.config, storage_dir=storage_dir).resolve()
+            plugin_id: Optional[str] = None
+
+            if value.startswith("plugin:"):
+                plugin_id = value.split(":", 1)[1].strip() or None
+            elif value.startswith("/plugins/"):
+                suffix = value[len("/plugins/") :].strip("/")
+                plugin_id = (suffix.split("/", 1)[0] if suffix else "").strip() or None
+            else:
+                try:
+                    rel = Path(value).expanduser().resolve(strict=False).relative_to(plugins_root)
+                    parts = rel.parts
+                    if len(parts) >= 2 and parts[1] in {"current", "releases"}:
+                        plugin_id = parts[0] or None
+                except Exception:
+                    plugin_id = None
+
+            if not plugin_id:
+                return None
+
+            storage = PluginStorage(plugins_root)
+            state = storage.read_state(plugin_id) or {}
+            manifest = storage.load_current_manifest(plugin_id)
+            if manifest is None or manifest.ui is None:
+                return None
+
+            paths = storage.paths_for(plugin_id)
+            if paths.current_link.exists() or paths.current_link.is_symlink():
+                release_root = paths.current_link
+            else:
+                version = state.get("version") or manifest.version
+                if not version:
+                    return None
+                release_root = paths.release_dir(str(version))
+
+            entry = str(manifest.ui.entry or "").replace("\\", "/")
+            ui_subtree(entry)
+            entry_parts = tuple(p for p in entry.split("/") if p)
+            if not entry_parts:
+                return None
+
+            if len(entry_parts) > 1:
+                doc_root = release_root.joinpath(*entry_parts[:-1])
+                entry_name = entry_parts[-1]
+            else:
+                doc_root = release_root
+                entry_name = entry_parts[0]
+
+            if not doc_root.is_dir() or not (doc_root / entry_name).is_file():
+                return None
+            return str(doc_root)
+        except Exception as exc:
+            logger.debug("Plugin frontend resolve error for %r: %s", web_path, exc)
+            return None
+
+    def _resolve_html_dir(self) -> str:
+        web_path = self.config.get("web", {}).get("web_path")
+        plugin_dir = self._resolve_plugin_frontend_dir(web_path)
+        candidate = (
+            plugin_dir
+            if plugin_dir is not None
+            else web_path
+            if web_path is not None and os.path.isdir(web_path)
+            else self.default_html_dir
+        )
+        self.html_dir = candidate
+        return candidate
+
+    def apply_web_config(self) -> bool:
+        previous = self.html_dir
+        current = self._resolve_html_dir()
+        return previous != current
+
+    _IMMUTABLE_CACHE = "public, max-age=31536000, immutable"
+    _REVALIDATE_CACHE = "no-cache"
+    # Vite names hashed files ``name-XXXXXXXX.ext``; a hash carries an uppercase letter or a
+    # digit, which a plain two-word name such as ``red-btn-down.svg`` does not.
+    _HASHED_NAME = re.compile(r"-([A-Za-z0-9_-]{8})\.[A-Za-z0-9]+$")
+
+    @classmethod
+    def _is_hashed(cls, name: str) -> bool:
+        match = cls._HASHED_NAME.search(name)
+        return match is not None and re.search(r"[A-Z0-9]", match.group(1)) is not None
+
+    @classmethod
+    def _send_static(cls, target: Path, *, immutable: bool) -> bytes:
+        """Send a file, its precompressed sibling when accepted, with cache headers and 304."""
+        guessed_type, _ = mimetypes.guess_type(str(target))
+        chosen, encoding = target, None
+        accepted = {
+            e.value.lower()
+            for e in cherrypy.request.headers.elements("Accept-Encoding")
+            if e.qvalue > 0
+        }
+        for token, suffix in (("br", ".br"), ("gzip", ".gz")):
+            candidate = target.with_name(target.name + suffix)
+            if (
+                token in accepted
+                and candidate.is_file()
+                and not candidate.is_symlink()
+                and candidate.stat().st_mtime >= target.stat().st_mtime
+            ):
+                chosen, encoding = candidate, token
+                break
+
+        stat = chosen.stat()
+        etag = f'W/"{stat.st_size:x}-{int(stat.st_mtime):x}{"-" + encoding if encoding else ""}"'
+        headers = cherrypy.response.headers
+        headers["Content-Type"] = guessed_type or "application/octet-stream"
+        headers["Cache-Control"] = cls._IMMUTABLE_CACHE if immutable else cls._REVALIDATE_CACHE
+        headers["ETag"] = etag
+        headers["Vary"] = "Accept-Encoding"
+        if encoding:
+            headers["Content-Encoding"] = encoding
+
+        if_none_match = str(cherrypy.request.headers.get("If-None-Match", "") or "")
+        if etag in [tag.strip() for tag in if_none_match.split(",")]:
+            cherrypy.response.status = 304
+            return b""
+        return chosen.read_bytes()
+
+    def _serve_static_file(self, root_dir: str, relative_parts: tuple[str, ...]):
+        if not relative_parts:
+            raise cherrypy.NotFound()
+        root = Path(root_dir).resolve()
+        target = (root.joinpath(*relative_parts)).resolve()
+        if not target.is_relative_to(root) or not target.is_file():
+            raise cherrypy.NotFound()
+        return self._send_static(target, immutable=self._is_hashed(target.name))
+
+    def _serve_plugin_ui(self, plugin_id: str, relative_parts: tuple[str, ...]):
+        """Serve static assets for an enabled application UI plugin."""
+        from repeater.plugins.manifest import ui_subtree
+        from repeater.plugins.storage import PluginStorage, resolve_plugins_root, safe_join
+
+        try:
+            plugins_root = resolve_plugins_root(self.config)
+            storage = PluginStorage(plugins_root)
+            state = storage.read_state(plugin_id)
+            if state is None or not state.get("enabled", False):
+                raise cherrypy.NotFound()
+            manifest = storage.load_current_manifest(plugin_id)
+            if manifest is None or manifest.ui is None:
+                raise cherrypy.NotFound()
+            paths = storage.paths_for(plugin_id)
+            if paths.current_link.exists() or paths.current_link.is_symlink():
+                release_root = paths.current_link.resolve()
+            else:
+                version = state.get("version")
+                if not version:
+                    raise cherrypy.NotFound()
+                release_root = paths.release_dir(str(version))
+            if not release_root.is_dir():
+                raise cherrypy.NotFound()
+
+            entry = manifest.ui.entry.replace("\\", "/")
+            ui_subtree(entry)
+            entry_parts = tuple(entry.split("/"))
+
+            # Check the resolved subtree too: an old release may contain a UI
+            # symlink pointing at a reserved directory or at the release root.
+            doc_root = safe_join(release_root, *entry_parts[:-1])
+            public_parts = doc_root.relative_to(release_root.resolve()).parts
+            entry_name = entry_parts[-1]
+            ui_subtree("/".join((*public_parts, entry_name)))
+
+            if not relative_parts:
+                serve_parts = (entry_name,)
+            else:
+                serve_parts = relative_parts
+
+            try:
+                target = safe_join(doc_root, *serve_parts)
+            except ValueError:
+                raise cherrypy.HTTPError(400, "invalid path")
+
+            if target.is_file():
+                return self._send_static(target, immutable=self._is_hashed(target.name))
+
+            # SPA fallback to entry HTML for client-side routes
+            entry_target = safe_join(doc_root, entry_name)
+            if entry_target.is_file():
+                return self._send_static(entry_target, immutable=False)
+            raise cherrypy.NotFound()
+        except cherrypy.HTTPError:
+            raise
+        except Exception as exc:
+            logger.debug("Plugin UI serve error for %s: %s", plugin_id, exc)
+            raise cherrypy.NotFound()
+
+    @cherrypy.expose
+    def favicon_ico(self):
+        """Serve the favicon bundled with the compiled frontend."""
+        self._resolve_html_dir()
+        return self._serve_static_file(self.html_dir, ("favicon.ico",))
+
     @cherrypy.expose
     def index(self, **kwargs):
         """Serve the Vue.js application index.html."""
+        self._resolve_html_dir()
         index_path = os.path.join(self.html_dir, "index.html")
         try:
+            cherrypy.response.headers["Cache-Control"] = self._REVALIDATE_CACHE
             with open(index_path, "r", encoding="utf-8") as f:
                 return f.read()
         except FileNotFoundError:
@@ -235,6 +494,7 @@ class StatsApp:
     @cherrypy.expose
     def default(self, *args, **kwargs):
         """Handle client-side routing - serve index.html for all non-API routes."""
+        self._resolve_html_dir()
         # Handle OPTIONS requests for any path
         if cherrypy.request.method == "OPTIONS":
             return ""
@@ -242,6 +502,13 @@ class StatsApp:
         # Let API routes pass through
         if args and args[0] == "api":
             raise cherrypy.NotFound()
+
+        # Application UI plugins: /plugins/{id}/...
+        if args and args[0] == "plugins":
+            if len(args) < 2:
+                return self.index()
+            plugin_id = args[1]
+            return self._serve_plugin_ui(plugin_id, tuple(args[2:]))
 
         # Handle WebSocket routes
         if (
@@ -252,6 +519,15 @@ class StatsApp:
         ):
             # WebSocket tool will intercept this
             return ""
+        # Serve frontend static assets dynamically from active html_dir
+        if args and args[0] == "assets":
+            return self._serve_static_file(os.path.join(self.html_dir, "assets"), tuple(args[1:]))
+
+        if args and args[0] == "_next":
+            return self._serve_static_file(os.path.join(self.html_dir, "_next"), tuple(args[1:]))
+
+        if args and args[0] == "favicon.ico":
+            return self._serve_static_file(self.html_dir, ("favicon.ico",))
 
         # For all other routes, serve the Vue.js app (client-side routing)
         return self.index()
@@ -371,17 +647,13 @@ class HTTPStatsServer:
     def start(self):
 
         try:
+            _install_cheroot_bad_fd_unraisable_filter()
             register_require_auth_tool()
 
             if self._cors_enabled:
                 self._setup_server_cors()
 
-            default_html_dir = os.path.join(os.path.dirname(__file__), "html")
-            web_path = self.config.get("web", {}).get("web_path")
-            html_dir = web_path if web_path is not None else default_html_dir
-
-            assets_dir = os.path.join(html_dir, "assets")
-            next_dir = os.path.join(html_dir, "_next")
+            self.app.apply_web_config()
 
             # Build config with conditional CORS settings
             config = {
@@ -434,9 +706,8 @@ class HTTPStatsServer:
                 "/api/setup_wizard": {
                     "tools.require_auth.on": False,
                 },
-                "/favicon.ico": {
-                    "tools.staticfile.on": True,
-                    "tools.staticfile.filename": os.path.join(html_dir, "favicon.ico"),
+                "/api/config_import": {
+                    "tools.require_auth.on": False,
                 },
             }
 
@@ -475,12 +746,7 @@ class HTTPStatsServer:
                 cors_config = {
                     "cors.expose.on": True,
                     "tools.response_headers.on": True,
-                    "tools.response_headers.headers": [
-                        ("Access-Control-Allow-Origin", "*"),
-                        ("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS"),
-                        ("Access-Control-Allow-Headers", "Authorization, Content-Type, X-API-Key"),
-                        ("Access-Control-Allow-Credentials", "true"),
-                    ],
+                    "tools.response_headers.headers": _cors_response_headers(),
                     # Disable automatic trailing slash redirects to prevent CORS issues
                     "tools.trailing_slash.on": False,
                 }
@@ -488,40 +754,6 @@ class HTTPStatsServer:
                 # Apply CORS to paths
                 config["/"].update(cors_config)
                 config["/api"].update(cors_config)
-
-            # Add Vue.js assets support only if assets directory exists
-            if os.path.isdir(assets_dir):
-                config["/assets"] = {
-                    "tools.staticdir.on": True,
-                    "tools.staticdir.dir": assets_dir,
-                    # Set proper content types for assets
-                    "tools.staticdir.content_types": {
-                        "js": "application/javascript",
-                        "css": "text/css",
-                        "map": "application/json",
-                    },
-                }
-
-            # Add Next.js support only if _next directory exists
-            if os.path.isdir(next_dir):
-                config["/_next"] = {
-                    "tools.staticdir.on": True,
-                    "tools.staticdir.dir": next_dir,
-                    # Set proper content types for Next.js assets
-                    "tools.staticdir.content_types": {
-                        "js": "application/javascript",
-                        "css": "text/css",
-                        "map": "application/json",
-                    },
-                }
-
-            # Only add CORS to static assets if CORS is enabled
-            if self._cors_enabled:
-                if "/assets" in config:
-                    config["/assets"]["cors.expose.on"] = True
-                if "/_next" in config:
-                    config["/_next"]["cors.expose.on"] = True
-                config["/favicon.ico"]["cors.expose.on"] = True
 
             http_cfg = self.config.get("http", {}) if isinstance(self.config, dict) else {}
             thread_pool = max(2, int(http_cfg.get("thread_pool", 8)))
@@ -579,14 +811,7 @@ class HTTPStatsServer:
             if self._cors_enabled:
                 auth_config["/"]["cors.expose.on"] = True
                 # Add CORS headers for OPTIONS requests
-                auth_config["/"]["tools.response_headers.headers"].extend(
-                    [
-                        ("Access-Control-Allow-Origin", "*"),
-                        ("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS"),
-                        ("Access-Control-Allow-Headers", "Authorization, Content-Type, X-API-Key"),
-                        ("Access-Control-Allow-Credentials", "true"),
-                    ]
-                )
+                auth_config["/"]["tools.response_headers.headers"].extend(_cors_response_headers())
 
             cherrypy.tree.mount(self.auth_app, "/auth", auth_config)
 
@@ -604,11 +829,7 @@ class HTTPStatsServer:
             if self._cors_enabled:
                 doc_config["/"]["cors.expose.on"] = True
                 doc_config["/"]["tools.response_headers.headers"].extend(
-                    [
-                        ("Access-Control-Allow-Origin", "*"),
-                        ("Access-Control-Allow-Methods", "GET, POST, OPTIONS"),
-                        ("Access-Control-Allow-Headers", "Authorization, Content-Type, X-API-Key"),
-                    ]
+                    _cors_response_headers("GET, POST, OPTIONS")
                 )
 
             cherrypy.tree.mount(self.doc_app, "/doc", doc_config)
@@ -636,6 +857,11 @@ class HTTPStatsServer:
 
     def stop(self):
         try:
+            if WEBSOCKET_AVAILABLE:
+                try:
+                    shutdown_websocket()
+                except Exception as e:
+                    logger.debug(f"WebSocket shutdown skipped/failed: {e}")
             cherrypy.engine.exit()
             logger.info("HTTP stats server stopped")
         except Exception as e:

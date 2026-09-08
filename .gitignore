@@ -70,3 +70,7 @@ syncpi.sh
 # Docker
 /data
 Installing
+syncproxmox.sh
+
+#dev
+pyproject_dev.toml

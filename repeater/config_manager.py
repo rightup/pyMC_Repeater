@@ -1,9 +1,20 @@
+import copy
 import logging
 import os
+import stat
+import tempfile
+import threading
+from typing import Any, Dict, List, Optional
+
 import yaml
-from typing import Optional, Dict, Any, List
+
+from repeater.logging_utils import normalize_log_level
+from repeater.modem_config import normalize_modem_config_in_place
 
 logger = logging.getLogger("ConfigManager")
+
+# Serialize staging, persistence and publication across managers in this process.
+_CONFIG_WRITE_LOCK = threading.RLock()
 
 
 class ConfigManager:
@@ -139,38 +150,162 @@ class ConfigManager:
                         return False
 
             self._sync_repeater_handler_radio_config(radio_cfg)
+            self._refresh_airtime_radio_params()
             logger.info("Applied live radio configuration to running daemon")
             return True
         except Exception as e:
             logger.error(f"Failed to apply live radio config: {e}", exc_info=True)
             return False
 
-    def save_to_file(self) -> bool:
-        """
-        Save current config to YAML file.
+    def _refresh_airtime_radio_params(self) -> None:
+        repeater_handler = getattr(self.daemon, "repeater_handler", None)
+        airtime_mgr = getattr(repeater_handler, "airtime_mgr", None) if repeater_handler else None
+        if airtime_mgr is None or not hasattr(airtime_mgr, "refresh_radio_params"):
+            return
+        # Use the full radio section so preamble_length is included; the live
+        # hardware snapshot intentionally omits fields the radio API does not set.
+        airtime_mgr.refresh_radio_params(self.config.get("radio", {}) or {})
 
-        Returns:
-            True if successful, False otherwise
-        """
+    @staticmethod
+    def _parse_bool(value: Any, default: bool = True) -> bool:
+        if value is None:
+            return default
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
+
+    def _apply_live_http_config(self) -> bool:
+        if not self.daemon:
+            logger.warning("Daemon not available for HTTP live update")
+            return False
+
+        http_server = getattr(self.daemon, "http_server", None)
+        if http_server is None:
+            # Early in daemon lifecycle, there is nothing to control yet.
+            logger.info("HTTP server not initialized yet; skipping live HTTP update")
+            return True
+
+        http_cfg = self.config.get("http", {}) if isinstance(self.config, dict) else {}
+        enabled = self._parse_bool(http_cfg.get("enabled", True), default=True)
+        host = str(http_cfg.get("host", "0.0.0.0") or "0.0.0.0")  # nosec B104 - intentional LAN bind default
+
         try:
-            os.makedirs(os.path.dirname(self.config_path), exist_ok=True)
-            with open(self.config_path, "w") as f:
-                # Use safe_dump with explicit width to prevent line wrapping
-                # Setting width to a very large number prevents truncation of long strings like identity keys
+            port = int(http_cfg.get("port", 8000))
+        except (TypeError, ValueError):
+            logger.warning("Invalid http.port=%r, falling back to 8000", http_cfg.get("port"))
+            port = 8000
+
+        # Keep runtime server settings aligned with config before start/restart.
+        http_server.host = host
+        http_server.port = port
+
+        from repeater.service_utils import start_http_server, stop_http_server
+
+        if enabled:
+            success, message = start_http_server(self.daemon)
+        else:
+            success, message = stop_http_server(self.daemon)
+
+        if success:
+            logger.info("Applied live HTTP config: %s", message)
+        else:
+            logger.warning("Failed live HTTP config apply: %s", message)
+        return success
+
+    def _apply_live_logging_config(self) -> bool:
+        if not self.daemon:
+            logger.warning("Daemon not available for logging live update")
+            return False
+
+        logging_cfg = self.config.get("logging", {}) if isinstance(self.config, dict) else {}
+        level = normalize_log_level(logging_cfg.get("level", "INFO"))
+
+        root_logger = logging.getLogger()
+        root_logger.setLevel(level)
+
+        repeater_logger = logging.getLogger("RepeaterDaemon")
+        repeater_logger.setLevel(level)
+
+        sx1262_logger = logging.getLogger("SX1262_wrapper")
+        sx1262_logger.setLevel(level)
+
+        mqtt_logger = logging.getLogger("MQTTHandler")
+        mqtt_logger.setLevel(level)
+
+        buffer = getattr(self.daemon, "_log_buffer", None)
+        if buffer is not None:
+            buffer.setLevel(level)
+
+        logger.info(
+            "Applied live logging config: level=%s",
+            logging.getLevelName(level) if isinstance(level, int) else level,
+        )
+        return True
+
+    def save_to_file(self) -> bool:
+        """Atomically save current config, normalizing shared state only on success."""
+        with _CONFIG_WRITE_LOCK:
+            try:
+                candidate = copy.deepcopy(self.config)
+                if not self._persist_config(candidate):
+                    return False
+                normalize_modem_config_in_place(self.config)
+                return True
+            except Exception:
+                logger.exception("Failed to save config to %s", self.config_path)
+                return False
+
+    def _persist_config(self, config: dict) -> bool:
+        """Write a private candidate; the atomic replace is the commit point."""
+        temporary_path = None
+        try:
+            normalize_modem_config_in_place(config)
+            # Follow existing symlinks rather than replacing the link itself.
+            path = os.path.realpath(self.config_path)
+            directory = os.path.dirname(path)
+            os.makedirs(directory, exist_ok=True)
+            try:
+                previous = os.stat(path)
+            except FileNotFoundError:
+                previous = None
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=directory, prefix=".config-", delete=False
+            ) as f:
+                temporary_path = f.name
                 yaml.safe_dump(
-                    self.config,
+                    config,
                     f,
                     default_flow_style=False,
                     indent=2,
-                    width=1000000,  # Very large width to prevent any line wrapping
+                    width=1000000,
                     sort_keys=False,
                     allow_unicode=True,
                 )
-            logger.info(f"Configuration saved to {self.config_path}")
+                f.flush()
+                if previous is not None:
+                    current = os.fstat(f.fileno())
+                    if (current.st_uid, current.st_gid) != (previous.st_uid, previous.st_gid):
+                        os.fchown(f.fileno(), previous.st_uid, previous.st_gid)
+                    os.fchmod(f.fileno(), stat.S_IMODE(previous.st_mode))
+                os.fsync(f.fileno())
+            os.replace(temporary_path, path)
+            temporary_path = None
+            logger.info("Configuration saved to %s", self.config_path)
             return True
-        except Exception as e:
-            logger.error(f"Failed to save config to {self.config_path}: {e}", exc_info=True)
+        except Exception:
+            logger.exception("Failed to save config to %s", self.config_path)
             return False
+        finally:
+            if temporary_path is not None:
+                os.unlink(temporary_path)
+
+    @staticmethod
+    def _apply_updates(config: dict, updates: dict) -> None:
+        for section, values in updates.items():
+            if isinstance(values, dict):
+                config.setdefault(section, {}).update(values)
+            else:
+                config[section] = values
 
     def live_update_daemon(self, sections: Optional[List[str]] = None) -> bool:
         """
@@ -193,7 +328,16 @@ class ConfigManager:
 
             # Default sections to update if not specified
             if sections is None:
-                sections = ["repeater", "delays", "radio", "acl", "identities", "glass"]
+                sections = [
+                    "repeater",
+                    "delays",
+                    "radio",
+                    "acl",
+                    "identities",
+                    "glass",
+                    "http",
+                    "logging",
+                ]
 
             # Update each section
             for section in sections:
@@ -218,12 +362,29 @@ class ConfigManager:
                         self.daemon.repeater_handler.reload_runtime_config()
                         logger.info("Reloaded RepeaterHandler runtime config")
 
+            # Re-apply login security when the repeater section changed; the
+            # repeater ACL captures repeater.security at registration, so a
+            # saved password change must be pushed to the live ACL explicitly.
+            if "repeater" in sections and self.daemon:
+                login_helper = getattr(self.daemon, "login_helper", None)
+                if login_helper is not None and hasattr(login_helper, "refresh_repeater_security"):
+                    login_helper.refresh_repeater_security(daemon_config)
+
             # Also reload advert_helper config if repeater section changed
             if self.daemon and hasattr(self.daemon, "advert_helper") and self.daemon.advert_helper:
                 if "repeater" in sections:
                     if hasattr(self.daemon.advert_helper, "reload_config"):
                         self.daemon.advert_helper.reload_config()
                         logger.info("Reloaded AdvertHelper config")
+
+            # Re-apply the flood reception delay base when delays changed
+            if "delays" in sections and self.daemon and getattr(self.daemon, "dispatcher", None):
+                delays_cfg = self.daemon.config.get("delays", {})
+                self.daemon.dispatcher.rx_delay_base = float(delays_cfg.get("rx_delay_base", 0.0))
+                logger.info(
+                    f"Reloaded flood RX delay base: delays.rx_delay_base="
+                    f"{self.daemon.dispatcher.rx_delay_base}"
+                )
 
             # Re-apply dispatcher path hash mode when mesh section changed
             if "mesh" in sections and self.daemon and hasattr(self.daemon, "dispatcher"):
@@ -237,6 +398,15 @@ class ConfigManager:
                 self.daemon.dispatcher.set_default_path_hash_mode(path_hash_mode)
                 logger.info(f"Reloaded path hash mode: mesh.path_hash_mode={path_hash_mode}")
 
+                # mesh.default_region is firmware's default_scope, which decides
+                # the REPLY_SCOPE_DEFAULT row. Re-resolve it here rather than
+                # leaving it to the transport_keys hook: setting the default region
+                # over the web API writes the config *after* it creates the region,
+                # so that hook has already run against the previous value.
+                refresh_default_scope = getattr(self.daemon, "refresh_default_flood_scope", None)
+                if callable(refresh_default_scope):
+                    refresh_default_scope()
+
             if "radio_type" in sections:
                 logger.info("radio_type change detected; service restart required")
                 live_update_ok = False
@@ -246,6 +416,12 @@ class ConfigManager:
 
             if "radio" in sections:
                 live_update_ok = self._apply_live_radio_config() and live_update_ok
+
+            if "http" in sections:
+                live_update_ok = self._apply_live_http_config() and live_update_ok
+
+            if "logging" in sections:
+                live_update_ok = self._apply_live_logging_config() and live_update_ok
 
             return live_update_ok
 
@@ -279,39 +455,37 @@ class ConfigManager:
         """
         result: Dict[str, Any] = {"success": False, "saved": False, "live_updated": False}
 
-        try:
-            # Apply updates to config
-            for section, values in updates.items():
-                if section not in self.config:
-                    self.config[section] = {}
+        with _CONFIG_WRITE_LOCK:
+            try:
+                # Stage privately so a failed write cannot leak into running state.
+                updates = copy.deepcopy(updates)
+                candidate = copy.deepcopy(self.config)
+                self._apply_updates(candidate, updates)
+                result["saved"] = self._persist_config(candidate)
 
-                if isinstance(values, dict):
-                    self.config[section].update(values)
-                else:
-                    self.config[section] = values
+                if not result["saved"]:
+                    result["error"] = "Failed to save config to file"
+                    return result
 
-            # Save to file
-            result["saved"] = self.save_to_file()
+                # Preserve shared section references used by daemon helpers.
+                self._apply_updates(self.config, updates)
+                normalize_modem_config_in_place(self.config)
 
-            if not result["saved"]:
-                result["error"] = "Failed to save config to file"
+                # Live update daemon if requested
+                if live_update:
+                    # Auto-detect sections if not specified
+                    if live_update_sections is None:
+                        live_update_sections = list(updates.keys())
+
+                    result["live_updated"] = self.live_update_daemon(live_update_sections)
+
+                result["success"] = result["saved"]
                 return result
 
-            # Live update daemon if requested
-            if live_update:
-                # Auto-detect sections if not specified
-                if live_update_sections is None:
-                    live_update_sections = list(updates.keys())
-
-                result["live_updated"] = self.live_update_daemon(live_update_sections)
-
-            result["success"] = result["saved"]
-            return result
-
-        except Exception as e:
-            logger.error(f"Error in update_and_save: {e}", exc_info=True)
-            result["error"] = str(e)
-            return result
+            except Exception as e:
+                logger.error(f"Error in update_and_save: {e}", exc_info=True)
+                result["error"] = str(e)
+                return result
 
     def update_nested(self, path: str, value: Any, live_update: bool = True) -> Dict[str, Any]:
         """

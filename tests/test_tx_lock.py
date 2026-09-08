@@ -17,8 +17,8 @@ or:
 import asyncio
 import time
 import unittest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
-
 
 # ---------------------------------------------------------------------------
 # Minimal handler factory
@@ -261,6 +261,233 @@ class TestTxLockSerialisation(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             send_calls[0], 1, "send_packet called on retry despite duty-cycle rejection"
         )
+
+    # ── Test 6: explicit bridge radio_id is honoured ──────────────────────
+
+    async def test_preferred_tx_radio_id_passed_to_dispatcher(self):
+        """When a packet carries _preferred_tx_radio_id, TX call uses radio_id."""
+        h = _make_handler()
+        pkt = _make_packet()
+
+        task = await h.schedule_retransmit(
+            pkt,
+            delay=0.0,
+            airtime_ms=0,
+            local_transmission=False,
+            preferred_tx_radio_id="link",
+        )
+        result = await task
+
+        self.assertTrue(result)
+        self.assertEqual(h.dispatcher.send_packet.call_count, 1)
+        _, kwargs = h.dispatcher.send_packet.call_args
+        self.assertEqual(kwargs.get("radio_id"), "link")
+        self.assertEqual(kwargs.get("wait_for_ack"), False)
+
+
+class TestLocalTxRadioLinkWait(unittest.IsolatedAsyncioTestCase):
+    """A local TX waits out a radio-link outage instead of spending its retry on it."""
+
+    async def test_waits_for_a_dropped_link_then_transmits(self):
+        """A KISS modem that drops off USB re-handshakes in ~2s; hold the TX for it."""
+        h = _make_handler()
+        h.config["delays"]["local_tx_link_wait_seconds"] = 2.0
+        pkt = _make_packet()
+
+        h.dispatcher.radio.is_connected = False
+        h.dispatcher.radio.is_degraded = True
+
+        async def restore_link():
+            await asyncio.sleep(0.25)
+            h.dispatcher.radio.is_connected = True
+            h.dispatcher.radio.is_degraded = False
+
+        asyncio.create_task(restore_link())
+
+        started = time.monotonic()
+        task = await h.schedule_retransmit(pkt, delay=0.0, airtime_ms=0, local_transmission=True)
+        result = await task
+        elapsed = time.monotonic() - started
+
+        self.assertTrue(result)
+        self.assertEqual(h.dispatcher.send_packet.call_count, 1)  # no attempt wasted
+        self.assertGreaterEqual(elapsed, 0.25)  # it really waited
+
+    async def test_gives_up_when_the_link_never_returns(self):
+        """A wedged link is bounded, not waited on forever, and never transmitted to."""
+        h = _make_handler()
+        h.config["delays"]["local_tx_link_wait_seconds"] = 0.3
+        pkt = _make_packet()
+
+        h.dispatcher.radio.is_connected = False
+        h.dispatcher.radio.is_degraded = True
+
+        started = time.monotonic()
+        task = await h.schedule_retransmit(pkt, delay=0.0, airtime_ms=0, local_transmission=True)
+        result = await task
+        elapsed = time.monotonic() - started
+
+        self.assertFalse(result)
+        h.dispatcher.send_packet.assert_not_called()
+        self.assertLess(elapsed, 2.0)
+
+    async def test_radio_without_link_state_is_not_delayed(self):
+        """Radios that track no link state (direct SPI) must keep their timing."""
+        h = _make_handler()  # MagicMock radio: is_connected/is_degraded are mocks
+        pkt = _make_packet()
+
+        started = time.monotonic()
+        task = await h.schedule_retransmit(pkt, delay=0.0, airtime_ms=0, local_transmission=True)
+        result = await task
+        elapsed = time.monotonic() - started
+
+        self.assertTrue(result)
+        self.assertLess(elapsed, 0.2)
+
+    async def test_relayed_packet_does_not_wait(self):
+        """Only local TX waits; a repeat held back that long is worse than dropped."""
+        h = _make_handler()
+        h.config["delays"]["local_tx_link_wait_seconds"] = 5.0
+        pkt = _make_packet()
+
+        h.dispatcher.radio.is_connected = False
+        h.dispatcher.radio.is_degraded = True
+
+        started = time.monotonic()
+        task = await h.schedule_retransmit(pkt, delay=0.0, airtime_ms=0, local_transmission=False)
+        await task
+        elapsed = time.monotonic() - started
+
+        h.dispatcher.send_packet.assert_called_once()
+        self.assertLess(elapsed, 0.2)
+
+    async def test_waits_for_the_selected_radio_not_the_default(self):
+        """With a fabric, link state must follow preferred_tx_radio_id.
+
+        Attribute access on a FabricRadio passes through to its default endpoint, so
+        reading state off it would suppress a healthy selected radio (or wave through
+        a dead one) whenever the default disagrees.
+        """
+        h = _make_handler()
+        h.config["delays"]["local_tx_link_wait_seconds"] = 0.3
+        pkt = _make_packet()
+
+        up = SimpleNamespace(is_connected=True, is_degraded=False)
+        down = SimpleNamespace(is_connected=False, is_degraded=True)
+        endpoints = {"a": up, "b": down}
+        fabric = MagicMock()
+        fabric.radios = endpoints
+        fabric.get_radio = lambda rid: endpoints[rid]
+        h.dispatcher.radio.fabric = fabric
+        # The default endpoint is down; the selected one is not.
+        h.dispatcher.radio.is_connected = False
+        h.dispatcher.radio.is_degraded = True
+
+        started = time.monotonic()
+        task = await h.schedule_retransmit(
+            pkt, delay=0.0, airtime_ms=0, local_transmission=True, preferred_tx_radio_id="a"
+        )
+        result = await task
+        elapsed = time.monotonic() - started
+
+        self.assertTrue(result)
+        h.dispatcher.send_packet.assert_called_once()
+        self.assertLess(elapsed, 0.2)  # never waited on the default radio
+
+    async def test_waits_when_the_selected_radio_is_the_down_one(self):
+        """The converse: a down selected radio is waited for, default health aside."""
+        h = _make_handler()
+        h.config["delays"]["local_tx_link_wait_seconds"] = 0.3
+        pkt = _make_packet()
+
+        up = SimpleNamespace(is_connected=True, is_degraded=False)
+        down = SimpleNamespace(is_connected=False, is_degraded=True)
+        endpoints = {"a": up, "b": down}
+        fabric = MagicMock()
+        fabric.radios = endpoints
+        fabric.get_radio = lambda rid: endpoints[rid]
+        h.dispatcher.radio.fabric = fabric
+        h.dispatcher.radio.is_connected = True  # default is healthy
+
+        task = await h.schedule_retransmit(
+            pkt, delay=0.0, airtime_ms=0, local_transmission=True, preferred_tx_radio_id="b"
+        )
+        result = await task
+
+        self.assertFalse(result)
+        h.dispatcher.send_packet.assert_not_called()
+
+    async def test_multi_radio_fabric_without_a_target_does_not_wait(self):
+        """The fabric picks at send time, so there is nothing to inspect: fail open."""
+        h = _make_handler()
+        h.config["delays"]["local_tx_link_wait_seconds"] = 5.0
+        pkt = _make_packet()
+
+        endpoints = {
+            "a": SimpleNamespace(is_connected=False, is_degraded=True),
+            "b": SimpleNamespace(is_connected=False, is_degraded=True),
+        }
+        fabric = MagicMock()
+        fabric.radios = endpoints
+        h.dispatcher.radio.fabric = fabric
+        h.dispatcher.radio.is_connected = False
+
+        started = time.monotonic()
+        task = await h.schedule_retransmit(pkt, delay=0.0, airtime_ms=0, local_transmission=True)
+        await task
+        elapsed = time.monotonic() - started
+
+        h.dispatcher.send_packet.assert_called_once()
+        self.assertLess(elapsed, 0.2)
+
+    async def test_retry_waits_when_the_link_drops_after_the_first_attempt(self):
+        """The real sequence: send fails, the link goes, it returns, the retry lands."""
+        h = _make_handler()
+        h.config["delays"]["local_tx_link_wait_seconds"] = 2.0
+        pkt = _make_packet()
+
+        async def restore_link():
+            await asyncio.sleep(0.25)
+            h.dispatcher.radio.is_connected = True
+            h.dispatcher.radio.is_degraded = False
+
+        attempts = []
+
+        async def send_side_effect(*args, **kwargs):
+            attempts.append(1)
+            if len(attempts) == 1:
+                # The modem falls off the bus as the first attempt fails.
+                h.dispatcher.radio.is_connected = False
+                h.dispatcher.radio.is_degraded = True
+                asyncio.create_task(restore_link())
+                return False
+            return True
+
+        h.dispatcher.send_packet.side_effect = send_side_effect
+
+        started = time.monotonic()
+        task = await h.schedule_retransmit(pkt, delay=0.0, airtime_ms=0, local_transmission=True)
+        result = await task
+        elapsed = time.monotonic() - started
+
+        self.assertTrue(result)
+        self.assertEqual(len(attempts), 2)
+        self.assertGreaterEqual(elapsed, 0.25)  # waited for the link
+        self.assertLess(elapsed, 1.0)  # and skipped the flat 1s backoff
+
+    def test_configured_wait_must_be_finite_and_bounded(self):
+        """An infinite or absurd ceiling would hold the companion's command open."""
+        h = _make_handler()
+        for value, expected in (
+            (float("inf"), h.DEFAULT_LOCAL_TX_LINK_WAIT_S),
+            (float("nan"), h.DEFAULT_LOCAL_TX_LINK_WAIT_S),
+            ("not a number", h.DEFAULT_LOCAL_TX_LINK_WAIT_S),
+            (1e9, h.MAX_LOCAL_TX_LINK_WAIT_S),
+            (-5, 0.0),
+            (2.5, 2.5),
+        ):
+            h.config["delays"]["local_tx_link_wait_seconds"] = value
+            self.assertEqual(h._local_tx_link_wait_s(), expected, msg=f"for {value!r}")
 
 
 if __name__ == "__main__":

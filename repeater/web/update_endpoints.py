@@ -671,6 +671,13 @@ def _has_update(installed: str, latest: str) -> bool:
 
 
 def _fetch_latest_version(channel: str) -> str:
+    """Return the version currently published on ``channel``.
+
+    Raises when the version cannot be determined. Returning an approximation
+    (such as the newest tag) would be actively harmful: the caller stores this
+    value as the channel's latest version, so a wrong value both misreports
+    the update state and gets baked into the install as the built version.
+    """
 
     base_tag = _get_latest_tag()  # always needed for dynamic branches
 
@@ -680,22 +687,28 @@ def _fetch_latest_version(channel: str) -> str:
             body = _fetch_url(compare_url, timeout=10)
             data = json.loads(body)
             ahead_by = int(data.get("ahead_by", 0))
-            return _next_dev_version(base_tag, ahead_by)
+        except _RateLimitError:
+            raise
         except Exception as exc:
-            logger.debug(f"[Update] Dynamic version compare failed for {channel!r}: {exc}")
-            return base_tag  # fallback: show the tag
+            raise RuntimeError(
+                f"Could not compare {base_tag}...{channel} on GitHub: {exc}"
+            ) from exc
+        return _next_dev_version(base_tag, ahead_by)
 
     # Static version channel — read the pinned version from pyproject.toml on
     # that branch directly, so tags created on other branches don't affect it.
     try:
         toml_url = f"{GITHUB_RAW_BASE}/{channel}/pyproject.toml"
         toml_text = _fetch_url(toml_url, timeout=8)
-        m = re.search(r'^version\s*=\s*["\']([0-9][^"\']*)["\']', toml_text, re.MULTILINE)
-        if m:
-            return m.group(1)
+    except _RateLimitError:
+        raise
     except Exception as exc:
-        logger.debug(f"[Update] Static version lookup failed for {channel!r}: {exc}")
-    return base_tag  # last-resort fallback
+        raise RuntimeError(f"Could not read pyproject.toml from {channel}: {exc}") from exc
+
+    m = re.search(r'^version\s*=\s*["\']([0-9][^"\']*)["\']', toml_text, re.MULTILINE)
+    if not m:
+        raise RuntimeError(f"No pinned version found in pyproject.toml on {channel}")
+    return m.group(1)
 
 
 def _fetch_changelog(channel: str, installed: str, max_commits: int = 50) -> List[dict]:
@@ -902,6 +915,61 @@ def _disable_legacy_services() -> None:
     subprocess.run([_SYSTEMCTL_BIN, "daemon-reload"], check=False)  # nosec B603
 
 
+def _native_upgrade_environment() -> dict:
+    """Do not forward Python, pip, git or shell hooks into privileged tools."""
+    return {
+        "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
+        "HOME": "/root",
+        "LANG": "C.UTF-8",
+        "PIP_CONFIG_FILE": "/dev/null",
+    }
+
+
+def _ensure_plugin_manager_service() -> bool:
+    """Root-only fallback; the sudo wrapper provisions normal native OTA."""
+    if os.geteuid() != 0 or is_buildroot() or is_container():
+        return True
+    # Resolve with a fresh isolated interpreter: this HTTP process still has
+    # the old package imported, and source checkouts need not exist on OTA hosts.
+    code = """
+from importlib.metadata import distribution
+from pathlib import Path
+import subprocess
+import sys
+unit = Path(distribution('openhop_repeater').locate_file(
+    'repeater/plugins/openhop-plugin-manager.service'))
+if not unit.is_file():
+    print('Selected package has no plugin-manager unit; older channels may not support plugins. '
+          'Re-run manage.sh upgrade from a plugin-capable release if unexpected.', file=sys.stderr)
+    sys.exit(0)
+unit = unit.resolve(strict=True)
+for path in (unit, *unit.parents):
+    info = path.stat()
+    if info.st_uid != 0 or info.st_mode & 0o022:
+        raise PermissionError('Untrusted packaged service path')
+subprocess.run(['/usr/bin/install', '-o', 'root', '-g', 'root', '-m', '0644',
+                str(unit), '/etc/systemd/system/openhop-plugin-manager.service'], check=True)
+for action in ('daemon-reload', 'enable', 'restart'):
+    command = ['/bin/systemctl', action]
+    if action != 'daemon-reload':
+        command.append('openhop-plugin-manager')
+    subprocess.run(command, check=True)
+"""
+    try:
+        result = subprocess.run(
+            ["/opt/openhop_repeater/venv/bin/python", "-I", "-c", code],
+            cwd="/",
+            env=_native_upgrade_environment(),
+            check=False,
+            capture_output=True,
+            text=True,
+        )  # nosec B603
+        return result.returncode == 0
+    except OSError as exc:
+        logger.warning(f"[Update] Could not provision plugin-manager unit: {exc}")
+        return False
+
+
 def _do_install() -> None:
 
     channel = _state.channel
@@ -916,6 +984,7 @@ def _do_install() -> None:
                 text=True,
                 bufsize=1,
                 env=env,
+                cwd="/",
             )  # nosec B603
             if proc.stdout is not None:
                 for line in proc.stdout:
@@ -932,11 +1001,15 @@ def _do_install() -> None:
 
     import os as _os
 
-    env = _os.environ.copy()
-    env["SETUPTOOLS_SCM_PRETEND_VERSION"] = _state.latest_version or "1.0.0"
+    # No SETUPTOOLS_SCM_PRETEND_VERSION here: the version reported by the last
+    # check is a prediction, and pip derives the real one from the checkout it
+    # clones. Forcing the predicted value stamped the build with a version that
+    # did not match its code — and when that value was stale (a failed check, or
+    # a channel switch) pip saw the requirement as already satisfied and skipped
+    # the install, pinning the node to a version it could no longer leave.
+    env = _os.environ.copy() if is_buildroot() else _native_upgrade_environment()
 
     _VENV_DIR = "/opt/openhop_repeater/venv"
-    _VENV_PIP = os.path.join(_VENV_DIR, "bin", "pip")
     _VENV_PYTHON = os.path.join(_VENV_DIR, "bin", "python")
 
     _state.append_line(f"[pyMC updater] Installing from channel '{channel}'…")
@@ -966,14 +1039,32 @@ def _do_install() -> None:
         # Ensure venv exists (migration from system-pip era)
         if not os.path.isfile(_VENV_PYTHON):
             _state.append_line("[pyMC updater] Creating venv (first-time migration)…")
-            _run(["/usr/bin/python3", "-m", "venv", "--system-site-packages", _VENV_DIR], env=env)
-            _run([_VENV_PIP, "install", "--upgrade", "pip", "setuptools", "wheel"], env=env)
+            _run(
+                ["/usr/bin/python3", "-I", "-m", "venv", "--system-site-packages", _VENV_DIR],
+                env=env,
+            )
+            _run(
+                [
+                    _VENV_PYTHON,
+                    "-I",
+                    "-m",
+                    "pip",
+                    "install",
+                    "--upgrade",
+                    "pip",
+                    "setuptools",
+                    "wheel",
+                ],
+                env=env,
+            )
 
         # Clean up system-level packages to avoid shadowing
-        _run(["/usr/bin/python3", "-m", "pip", "uninstall", "-y", "openhop_repeater"], env=env)
-        _run(["/usr/bin/python3", "-m", "pip", "uninstall", "-y", "openhop_core"], env=env)
-        _run(["/usr/bin/python3", "-m", "pip", "uninstall", "-y", "pymc_repeater"], env=env)
-        _run(["/usr/bin/python3", "-m", "pip", "uninstall", "-y", "pymc_core"], env=env)
+        _run(
+            ["/usr/bin/python3", "-I", "-m", "pip", "uninstall", "-y", "openhop_repeater"], env=env
+        )
+        _run(["/usr/bin/python3", "-I", "-m", "pip", "uninstall", "-y", "openhop_core"], env=env)
+        _run(["/usr/bin/python3", "-I", "-m", "pip", "uninstall", "-y", "pymc_repeater"], env=env)
+        _run(["/usr/bin/python3", "-I", "-m", "pip", "uninstall", "-y", "pymc_core"], env=env)
 
         # Remove stale source trees that could shadow the venv package
         _cleanup_stale_source_trees()
@@ -982,7 +1073,10 @@ def _do_install() -> None:
         _state.append_line("[pyMC updater] Running as root – venv pip install")
         _state.append_line(f"[pyMC updater] Target: {install_spec}")
         cmd = [
-            _VENV_PIP,
+            _VENV_PYTHON,
+            "-I",
+            "-m",
+            "pip",
             "install",
             "--upgrade",
             "--no-cache-dir",
@@ -990,8 +1084,14 @@ def _do_install() -> None:
         ]
     elif _os.path.isfile(_UPGRADE_WRAPPER):
         _state.append_line(f"[pyMC updater] Using sudo wrapper: {_UPGRADE_WRAPPER}")
+        _state.append_line(
+            "[pyMC updater] Native OTA security/service provisioning requires the current "
+            "root-owned helper. Existing installations must run manage.sh upgrade once; "
+            "a wheel update cannot replace the privileged helper."
+        )
         # The wrapper handles venv creation/migration internally
-        cmd = [_SUDO_BIN, _UPGRADE_WRAPPER, channel, _state.latest_version or ""]
+        # Second argument (pretend-version) deliberately omitted — see above.
+        cmd = [_SUDO_BIN, _UPGRADE_WRAPPER, channel]
     else:
         msg = (
             f"Upgrade wrapper not found at {_UPGRADE_WRAPPER}. "
@@ -1004,6 +1104,10 @@ def _do_install() -> None:
 
     if success:
         _cleanup_stale_dist_info()
+        if not _ensure_plugin_manager_service():
+            _state.append_line(
+                "[warning] Package updated, but optional plugin-manager service provisioning failed; inspect its service status or re-run manage.sh upgrade."
+            )
         _state.append_line("[pyMC updater] Restarting service in 3 seconds…")
         time.sleep(3)
         restart_ok = False

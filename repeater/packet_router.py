@@ -5,20 +5,23 @@ import time
 from openhop_core.node.handlers.ack import AckHandler
 from openhop_core.node.handlers.advert import AdvertHandler
 from openhop_core.node.handlers.control import ControlHandler
-from openhop_core.node.handlers.group_text import GroupTextHandler
 from openhop_core.node.handlers.login_response import LoginResponseHandler
 from openhop_core.node.handlers.login_server import LoginServerHandler
+from openhop_core.node.handlers.multipart import MultipartAckHandler
 from openhop_core.node.handlers.path import PathHandler
 from openhop_core.node.handlers.protocol_request import ProtocolRequestHandler
 from openhop_core.node.handlers.protocol_response import ProtocolResponseHandler
 from openhop_core.node.handlers.text import TextMessageHandler
 from openhop_core.node.handlers.trace import TraceHandler
 from openhop_core.protocol.constants import (
+    PAYLOAD_TYPE_GRP_DATA,
+    PAYLOAD_TYPE_GRP_TXT,
     PH_ROUTE_MASK,
     ROUTE_TYPE_DIRECT,
     ROUTE_TYPE_TRANSPORT_DIRECT,
 )
 
+from repeater.engine import DropReason
 from repeater.policy_engine import PolicyDecision, PolicyEngine
 
 logger = logging.getLogger("PacketRouter")
@@ -27,26 +30,11 @@ logger = logging.getLogger("PacketRouter")
 # so the client is not spammed with duplicate telemetry when the mesh delivers multiple copies.
 _COMPANION_DEDUPE_TTL_SEC = 60.0
 
-# Drop reasons that are normal policy outcomes and should not be warning-level.
-# TODO: create Enum in engine for drop reasons and use it here and in engine instead of string matching.
-_EXPECTED_DROP_REASON_PREFIXES = (
-    "Duplicate",
-    "Max flood hops limit reached",
-    "Path hop count at maximum",
-    "Path would exceed MAX_PATH_SIZE",
-    "Direct: no path",
-    "Direct: not for us",
-    "Unscoped flood policy disabled",
-    "Transport code not allowed to flood",
-    "FLOOD loop detected",
-    "Marked do not retransmit",
-    "Repeat disabled",
-    "No TX mode",
-    "Duty cycle limit",
-    "Empty payload",
-    "Path too long",
-    "Invalid advert packet",
-)
+# Normal policy/forwarding drop outcomes (logged at debug, not warning). The engine
+# is the single source of truth via DropReason; string-form acceptance is retained
+# because records and the recent_packets fallback still carry detailed text variants
+# (e.g. "Max flood hops limit reached (5/5)").
+_EXPECTED_DROP_REASONS = frozenset(DropReason)
 
 
 def _companion_dedup_key(packet) -> str | None:
@@ -66,10 +54,22 @@ def _is_direct_final_hop(packet) -> bool:
     return not path or len(path) == 0
 
 
-def _is_expected_drop_reason(reason: str | None) -> bool:
+def _is_direct_intermediate_hop(packet) -> bool:
+    """True for a direct packet that still has one or more routing hops."""
+    route = getattr(packet, "header", 0) & PH_ROUTE_MASK
+    return route in (ROUTE_TYPE_DIRECT, ROUTE_TYPE_TRANSPORT_DIRECT) and not _is_direct_final_hop(
+        packet
+    )
+
+
+def _is_expected_drop_reason(reason) -> bool:
+    # Membership is the fast path for a DropReason member or its exact text; the
+    # startswith scan covers detailed variants that embed a suffix.
+    if reason in _EXPECTED_DROP_REASONS:
+        return True
     if not isinstance(reason, str) or not reason:
         return False
-    return any(reason.startswith(prefix) for prefix in _EXPECTED_DROP_REASON_PREFIXES)
+    return any(reason.startswith(expected) for expected in _EXPECTED_DROP_REASONS)
 
 
 def _drop_reason_from_recent_packets(handler, packet) -> str | None:
@@ -170,11 +170,28 @@ class PacketRouter:
             if exc is not None:
                 logger.error("_route_packet raised: %s", exc, exc_info=exc)
 
-    def _should_deliver_path_to_companions(self, packet) -> bool:
-        """Return True if this PATH/protocol-response should be delivered to companions (first of duplicates)."""
+    def _was_delivered_to_companions(self, packet) -> bool:
+        """Pure check: True if this PATH/protocol-response was already delivered (unexpired).
+
+        Does not mutate delivery state, so callers can deliver first and only record
+        the packet as delivered once a bridge has actually received it.
+        """
         key = _companion_dedup_key(packet)
         if not key:
-            return True
+            return False
+        expiry = self._companion_delivered.get(key)
+        return expiry is not None and expiry > time.time()
+
+    def _mark_delivered_to_companions(self, packet) -> None:
+        """Record that this PATH/protocol-response reached companions.
+
+        Called only after a bridge has received the packet, so a delivery that
+        raised for every bridge is retried on the next copy instead of being
+        suppressed for the full dedupe TTL.
+        """
+        key = _companion_dedup_key(packet)
+        if not key:
+            return
         now = time.time()
         # Prune expired entries only when the dict grows large, avoiding a full
         # dict comprehension on every packet.  200 entries × 60 s TTL means a
@@ -185,9 +202,13 @@ class PacketRouter:
             self._companion_delivered = {
                 k: v for k, v in self._companion_delivered.items() if v > now
             }
-        if key in self._companion_delivered:
-            return False
         self._companion_delivered[key] = now + _COMPANION_DEDUPE_TTL_SEC
+
+    def _should_deliver_path_to_companions(self, packet) -> bool:
+        """Atomic check-and-mark: True on the first of duplicate PATH/protocol-responses."""
+        if self._was_delivered_to_companions(packet):
+            return False
+        self._mark_delivered_to_companions(packet)
         return True
 
     def _policy_companion_decision(self, packet, metadata: dict) -> PolicyDecision | None:
@@ -223,6 +244,9 @@ class PacketRouter:
             else None,
             "rssi": metadata.get("rssi", getattr(packet, "rssi", 0)),
             "snr": metadata.get("snr", getattr(packet, "snr", 0.0)),
+            "rx_radio_id": metadata.get("rx_radio_id")
+            or getattr(packet, "_rx_radio_id", None)
+            or getattr(packet, "rx_radio_id", None),
             "local_transmission": False,
             "mode": mode,
         }
@@ -244,13 +268,99 @@ class PacketRouter:
         return False
 
     def _companion_bridges_for_packet(self, packet, metadata: dict) -> dict:
-        """Return companion bridges unless policy drop pre-check blocks delivery."""
+        """Return companion bridges unless policy drop or origin exclusion blocks delivery.
+
+        This is the single choke point every companion fan-out reads, so the
+        "a node never hears its own transmission" rule is applied here once and
+        covers ADVERT, ACK, PATH, RESPONSE, GRP_TXT, GRP_DATA and the dest-hash
+        candidate paths — the same rule ``inject_packet`` already applies to the
+        0x88 raw-RX echo.
+        """
         companion_bridges = getattr(self.daemon, "companion_bridges", {})
         if not companion_bridges:
             return {}
         if self._policy_blocks_companion(packet, metadata):
             return {}
+        # Both isinstance checks are load-bearing, not defensive noise: bridges are
+        # keyed by the int hash byte (main.py:880) while origin_hash is the "0xHH"
+        # text form the frame servers compare against (main.py:787, :1167), and a
+        # non-int key would raise inside the f-string. Do not simplify either away.
+        origin_hash = getattr(packet, "_injected_origin_hash", None)
+        if isinstance(origin_hash, str):
+            companion_bridges = {
+                key: bridge
+                for key, bridge in companion_bridges.items()
+                if not (isinstance(key, int) and f"0x{key:02x}" == origin_hash)
+            }
         return companion_bridges
+
+    async def _fan_out_to_bridges(self, packet, bridges, *, context: str) -> tuple:
+        """Offer packet to each bridge; report ``(delivered, authenticated)``.
+
+        Accepts a dict of bridges — pass a single-entry dict for targeted delivery
+        to the bridge that owns ``dest_hash``. A bridge that raises is logged and
+        skipped; ``result.authenticated`` is read directly (every bridge returns a
+        HandlerResult) so a broken contract surfaces instead of being hidden.
+
+        ``delivered`` is True when at least one bridge completed without raising —
+        the signal callers must use before ``_mark_delivered_to_companions`` so a
+        delivery where every bridge raised is retried on the next copy instead of
+        being suppressed for the dedupe TTL. ``authenticated`` is True when any
+        bridge authenticated the packet.
+        """
+        delivered = False
+        authenticated = False
+        for bridge in bridges.values():
+            try:
+                result = await bridge.process_received_packet(packet)
+            except Exception as e:
+                logger.debug("Companion bridge %s error: %s", context, e)
+                continue
+            delivered = True
+            if result.authenticated is True:
+                authenticated = True
+        return delivered, authenticated
+
+    async def _consume_via_local_candidates(
+        self, packet, metadata: dict, dest_hash, helper, process_method_name: str
+    ) -> bool:
+        """Try every local candidate that shares ``dest_hash`` and report consumption.
+
+        The on-air destination hash is only one byte, so several local identities
+        can share it. The candidates are the companion bridge registered at
+        ``dest_hash`` and the room-server / repeater identity registered in
+        ``helper`` (login, text, or protocol-request) at the same hash. Both are
+        offered the packet; the one whose key MAC-verifies it consumes it, the
+        other fails HMAC and no-ops.
+
+        Returns True only when at least one candidate authenticated (decrypted)
+        the packet. Consuming solely on authenticated handling is what lets a
+        one-byte prefix collision with a remote node — or a forged packet — fall
+        through to the forwarding engine instead of being swallowed.
+        """
+        companion_bridges = self._companion_bridges_for_packet(packet, metadata)
+        helper_handlers = getattr(helper, "handlers", {}) if helper else {}
+        has_companion = dest_hash is not None and dest_hash in companion_bridges
+        has_local_identity = dest_hash is not None and dest_hash in helper_handlers
+
+        consumed = False
+        if has_companion:
+            # A raising bridge must not abort the candidate loop: the colliding
+            # room-server / repeater identity below still gets offered the packet.
+            try:
+                bridge_result = await companion_bridges[dest_hash].process_received_packet(packet)
+            except Exception as e:
+                logger.debug("Companion bridge candidate error: %s", e)
+            else:
+                if bridge_result.authenticated:
+                    consumed = True
+        # Offer to the room-server / repeater identity when it shares the hash
+        # (collision) or when no local companion claims it at all (normal
+        # server-owned + remote-forward handling).
+        if helper and (has_local_identity or not has_companion):
+            if await getattr(helper, process_method_name)(packet):
+                consumed = True
+        return consumed
 
     def _record_for_ui(self, packet, metadata: dict) -> None:
         """Record an injection-only packet for the web UI (storage + recent_packets)."""
@@ -260,6 +370,16 @@ class PacketRouter:
                 handler.record_packet_only(packet, metadata)
             except Exception as e:
                 logger.debug("Record for UI failed: %s", e)
+
+    async def _register_ack_with_dispatcher(self, ack_crc: int, context: str) -> None:
+        """Best-effort ACK CRC registration with the dispatcher waiter path."""
+        dispatcher = getattr(self.daemon, "dispatcher", None)
+        if dispatcher is None or not hasattr(dispatcher, "_register_ack_received"):
+            return
+        try:
+            await dispatcher._register_ack_received(ack_crc)
+        except Exception as e:
+            logger.debug("Dispatcher %s registration error: %s", context, e)
 
     async def enqueue(self, packet):
         """Add packet to router queue."""
@@ -271,13 +391,31 @@ class PacketRouter:
                 pass
         await self.queue.put(packet)
 
-    async def inject_packet(self, packet, wait_for_ack: bool = False, origin_hash=None):
+    async def inject_packet(
+        self,
+        packet,
+        wait_for_ack: bool = False,
+        expected_crc=None,
+        origin_hash=None,
+        ack_timeout_s: float = 5.0,
+    ):
         try:
             metadata = {
-                "rssi": getattr(packet, "rssi", 0),
-                "snr": getattr(packet, "snr", 0.0),
+                "rssi": getattr(packet, "rssi", 0) or getattr(packet, "_rssi", 0),
+                "snr": getattr(packet, "snr", 0.0) or getattr(packet, "_snr", 0.0),
                 "timestamp": getattr(packet, "timestamp", 0),
+                "rx_radio_id": (
+                    getattr(packet, "_rx_radio_id", None) or getattr(packet, "rx_radio_id", None)
+                ),
             }
+
+            # Tag the originating companion before anything reaches the air: enqueue()
+            # is a bare queue.put, so the packet itself is the only carrier that
+            # survives to _route_packet, where the fan-out withholds it from that
+            # bridge — the same "a node never hears its own transmission" rule the
+            # 0x88 echo below applies.  Set ahead of the TX so a core without the
+            # matching Packet slot fails before transmitting rather than after.
+            packet._injected_origin_hash = origin_hash
 
             # Serialize injects so one local TX completes before the next runs
             # (avoids duty-cycle or dispatcher races where a later packet goes out first)
@@ -315,7 +453,10 @@ class PacketRouter:
                 except Exception as e:
                     logger.debug("Failed to echo injected TX to companions: %s", e)
 
-            # Enqueue so router can deliver to companion(s): TXT_MSG -> dest bridge, ACK -> all bridges (sender sees ACK)
+            # Enqueue so router can deliver to the *other* companion(s): TXT_MSG -> dest
+            # bridge, ACK/ADVERT/GRP_TXT/GRP_DATA -> every bridge except the origin.
+            # The originating companion never gets its own packet back: that exclusion
+            # is enforced once in _companion_bridges_for_packet via the tag set above.
             await self.enqueue(packet)
 
             if wait_for_ack:
@@ -327,11 +468,20 @@ class PacketRouter:
                     dispatcher = getattr(self.daemon, "dispatcher", None)
                     if dispatcher and hasattr(dispatcher, "wait_for_ack"):
                         try:
-                            expected_crc = packet.get_crc()
-                            ack_ok = await dispatcher.wait_for_ack(expected_crc, timeout=5.0)
+                            wait_crc = (
+                                expected_crc if expected_crc is not None else packet.get_crc()
+                            )
+                            wait_timeout = (
+                                float(ack_timeout_s)
+                                if isinstance(ack_timeout_s, (int, float)) and ack_timeout_s > 0
+                                else 5.0
+                            )
+                            ack_ok = await dispatcher.wait_for_ack(wait_crc, timeout=wait_timeout)
                             if not ack_ok:
                                 logger.warning(
-                                    "Injected packet ACK timeout (crc=%08X)", expected_crc
+                                    "Injected packet ACK timeout (crc=%08X, timeout=%.1fs)",
+                                    wait_crc,
+                                    wait_timeout,
                                 )
                                 return False
                         except Exception as e:
@@ -391,13 +541,34 @@ class PacketRouter:
         payload_type = packet.get_payload_type()
         processed_by_injection = False
         metadata = {
-            "rssi": getattr(packet, "rssi", 0),
-            "snr": getattr(packet, "snr", 0.0),
+            "rssi": getattr(packet, "rssi", 0) or getattr(packet, "_rssi", 0),
+            "snr": getattr(packet, "snr", 0.0) or getattr(packet, "_snr", 0.0),
             "timestamp": getattr(packet, "timestamp", 0),
+            "rx_radio_id": (
+                getattr(packet, "_rx_radio_id", None) or getattr(packet, "rx_radio_id", None)
+            ),
         }
 
+        # MeshCore routes direct packets with remaining hops before normal
+        # payload dispatch. Only TRACE, high-bit CONTROL, and early ACK handling
+        # have special behavior at an intermediate hop.
+        direct_intermediate = _is_direct_intermediate_hop(packet)
+        if direct_intermediate:
+            if payload_type == TraceHandler.payload_type():
+                processed_by_injection = True
+                if not getattr(packet, "_injected_for_tx", False) and self.daemon.trace_helper:
+                    await self.daemon.trace_helper.process_trace_packet(packet)
+            elif payload_type == ControlHandler.payload_type():
+                if packet.payload and (packet.payload[0] & 0x80):
+                    # Direct high-bit CONTROL is accepted only at zero hops.
+                    processed_by_injection = True
+            elif payload_type == AckHandler.payload_type():
+                if len(getattr(packet, "payload", b"")) >= 4:
+                    ack_crc = int.from_bytes(packet.payload[:4], "little")
+                    await self._register_ack_with_dispatcher(ack_crc, "ACK")
+
         # Route to specific handlers for parsing only
-        if payload_type == TraceHandler.payload_type():
+        elif payload_type == TraceHandler.payload_type():
             # Locally injected TRACE requests are TX-only and re-enter the router so
             # companion delivery can still happen. They are not inbound RF responses,
             # so skip TraceHelper parsing to avoid matching pending ping tags against
@@ -413,10 +584,17 @@ class PacketRouter:
                 # as routing hashes and log bogus duplicate rows.
 
         elif payload_type == ControlHandler.payload_type():
+            # MeshCore never relays control packets: the direct high-bit discovery
+            # subset is explicitly released (Mesh.cpp), and any other control
+            # payload hits the switch default that does not flood-route unknown
+            # types. Mark do-not-retransmit unconditionally so a repeater with
+            # discovery disabled still does not forward control/discovery traffic
+            # to the engine. Discovery responses are injected as their own TX, so
+            # this does not suppress them.
+            packet.mark_do_not_retransmit()
             # Process control/discovery packet
             if self.daemon.discovery_helper:
                 await self.daemon.discovery_helper.control_handler(packet)
-                packet.mark_do_not_retransmit()
             # Deliver to companions via daemon (frame servers push PUSH_CODE_CONTROL_DATA 0x8E)
             deliver = getattr(self.daemon, "deliver_control_data", None)
             if deliver:
@@ -432,108 +610,151 @@ class PacketRouter:
                 await deliver(snr, rssi, path_len, path_bytes, payload_bytes)
 
         elif payload_type == AdvertHandler.payload_type():
-            # Process advertisement packet for neighbor tracking
-            if self.daemon.advert_helper:
+            # Process advertisement packet for neighbor tracking. A locally injected
+            # advert is our own TX, never something heard off the air, so feeding it
+            # to the helper would record a phantom neighbour from the zeroed rssi/snr
+            # and burn a rate-limit token. AdvertHelper's own self-skip
+            # (handler_helpers/advert.py) only knows the repeater identity, not the
+            # co-hosted companions. Same _injected_for_tx idiom as the TRACE branches.
+            if self.daemon.advert_helper and not getattr(packet, "_injected_for_tx", False):
                 rssi = getattr(packet, "rssi", 0)
                 snr = getattr(packet, "snr", 0.0)
                 await self.daemon.advert_helper.process_advert_packet(packet, rssi, snr)
             # Also feed adverts to companion bridges (for contact/path updates),
             # but keep policy drop final just like the other companion paths.
             companion_bridges = self._companion_bridges_for_packet(packet, metadata)
-            for bridge in companion_bridges.values():
-                try:
-                    await bridge.process_received_packet(packet)
-                except Exception as e:
-                    logger.debug(f"Companion bridge advert error: {e}")
+            await self._fan_out_to_bridges(packet, companion_bridges, context="advert")
 
         elif payload_type == LoginServerHandler.payload_type():
-            # Route to companion if dest is a companion; else to login_helper (for logging into this repeater).
-            # When dest is remote (not handled), pass to engine so DIRECT/FLOOD ANON_REQ can be forwarded.
-            # Our own injected ANON_REQ is suppressed by the engine's duplicate (mark_seen) check.
+            # Route ANON_REQ/login to the local identity that owns it. The on-air
+            # dest hash is only one byte, so a companion and a room-server identity
+            # can share it; decryption is the only real disambiguator. Offer the
+            # packet to every local candidate and consume only when one decrypts —
+            # a remote (or forged) ANON_REQ that merely collides on the prefix is
+            # then forwarded by the engine. Our own injected ANON_REQ is suppressed
+            # by the engine's duplicate (mark_seen) check.
             dest_hash = packet.payload[0] if packet.payload else None
-            companion_bridges = self._companion_bridges_for_packet(packet, metadata)
-            if dest_hash is not None and dest_hash in companion_bridges:
-                await companion_bridges[dest_hash].process_received_packet(packet)
+            if await self._consume_via_local_candidates(
+                packet, metadata, dest_hash, self.daemon.login_helper, "process_login_packet"
+            ):
                 processed_by_injection = True
-            elif self.daemon.login_helper:
-                handled = await self.daemon.login_helper.process_login_packet(packet)
-                if handled:
-                    processed_by_injection = True
-            if processed_by_injection:
                 self._record_for_ui(packet, metadata)
 
         elif payload_type == AckHandler.payload_type():
+            # Ensure ACK CRC reaches dispatcher waiter path even when only router fallback is active.
+            if len(getattr(packet, "payload", b"")) >= 4:
+                ack_crc = int.from_bytes(packet.payload[:4], "little")
+                await self._register_ack_with_dispatcher(ack_crc, "ACK")
             # ACK has no dest in payload (4-byte CRC only); deliver to all bridges so sender sees send_confirmed.
             # Do not set processed_by_injection so packet also reaches engine for DIRECT forwarding when we're a middle hop.
             companion_bridges = self._companion_bridges_for_packet(packet, metadata)
-            for bridge in companion_bridges.values():
-                try:
-                    await bridge.process_received_packet(packet)
-                except Exception as e:
-                    logger.debug(f"Companion bridge ACK error: {e}")
+            await self._fan_out_to_bridges(packet, companion_bridges, context="ACK")
+
+        elif payload_type == MultipartAckHandler.payload_type():
+            # MULTIPART ACK wrapper: low nibble of first byte is embedded payload type.
+            if (
+                len(getattr(packet, "payload", b"")) >= 5
+                and (packet.payload[0] & 0x0F) == AckHandler.payload_type()
+            ):
+                ack_crc = int.from_bytes(packet.payload[1:5], "little")
+                await self._register_ack_with_dispatcher(ack_crc, "multi-ACK")
 
         elif payload_type == TextMessageHandler.payload_type():
+            # Same one-byte dest-hash collision handling as the login path above:
+            # a companion and a room-server text identity can share a hash, and
+            # only decryption tells them apart. Offer to every local candidate and
+            # consume only when one decrypts, so a companion never shadows a
+            # room-server message and a prefix collision with a remote node still
+            # forwards.
             dest_hash = packet.payload[0] if packet.payload else None
-            companion_bridges = self._companion_bridges_for_packet(packet, metadata)
-            if dest_hash is not None and dest_hash in companion_bridges:
-                await companion_bridges[dest_hash].process_received_packet(packet)
+            if await self._consume_via_local_candidates(
+                packet, metadata, dest_hash, self.daemon.text_helper, "process_text_packet"
+            ):
                 processed_by_injection = True
                 self._record_for_ui(packet, metadata)
-            elif self.daemon.text_helper:
-                handled = await self.daemon.text_helper.process_text_packet(packet)
-                if handled:
-                    processed_by_injection = True
-                    self._record_for_ui(packet, metadata)
 
         elif payload_type == PathHandler.payload_type():
+            # Always let PathHelper inspect/decrypt PATH first so out_path and bundled ACK state
+            # are updated even when companion routing fan-out also happens for this packet.
+            consumed = False
+            if self.daemon.path_helper:
+                try:
+                    consumed = (await self.daemon.path_helper.process_path_packet(packet)) is True
+                except Exception as e:
+                    logger.debug(f"Path helper processing error: {e}")
+            # The helper/bridge results decide ownership: a direct middle hop
+            # that cannot authenticate remains eligible for engine forwarding,
+            # while a local MAC-authenticated PATH is consumed below.
             dest_hash = packet.payload[0] if packet.payload else None
             companion_bridges = self._companion_bridges_for_packet(packet, metadata)
             if dest_hash is not None and dest_hash in companion_bridges:
-                if self._should_deliver_path_to_companions(packet):
-                    await companion_bridges[dest_hash].process_received_packet(packet)
-                # Do not set processed_by_injection so packet also reaches engine for DIRECT forwarding when we're a middle hop.
-            elif companion_bridges and self._should_deliver_path_to_companions(packet):
+                if not self._was_delivered_to_companions(packet):
+                    delivered, authenticated = await self._fan_out_to_bridges(
+                        packet, {dest_hash: companion_bridges[dest_hash]}, context="PATH"
+                    )
+                    consumed = authenticated or consumed
+                    if delivered:
+                        self._mark_delivered_to_companions(packet)
+            elif companion_bridges and not self._was_delivered_to_companions(packet):
                 # Dest not in bridges: path-return with ephemeral dest (e.g. multi-hop login).
                 # Deliver to all bridges; each will try to decrypt and ignore if not relevant.
-                for bridge in companion_bridges.values():
-                    try:
-                        await bridge.process_received_packet(packet)
-                    except Exception as e:
-                        logger.debug(f"Companion bridge PATH error: {e}")
+                delivered, authenticated = await self._fan_out_to_bridges(
+                    packet, companion_bridges, context="PATH"
+                )
+                consumed = authenticated or consumed
+                if delivered:
+                    self._mark_delivered_to_companions(packet)
                 logger.debug(
                     "PATH dest=0x%02x (anon) delivered to %d bridge(s) for matching",
                     dest_hash or 0,
                     len(companion_bridges),
                 )
-                # Do not set processed_by_injection so packet also reaches engine for DIRECT forwarding when we're a middle hop.
-            elif self.daemon.path_helper:
-                await self.daemon.path_helper.process_path_packet(packet)
+            if consumed:
+                # A local MAC-authenticated PATH belongs to this node. Do not
+                # let the forwarding engine retransmit it, but retain it for UI.
+                processed_by_injection = True
+                self._record_for_ui(packet, metadata)
 
         elif payload_type == LoginResponseHandler.payload_type():
             # PAYLOAD_TYPE_RESPONSE (0x01): payload is dest_hash(1)+src_hash(1)+encrypted.
             # Deliver to the bridge that is the destination, or to all bridges when the
             # response is addressed to this repeater (path-based reply: firmware sends
             # to first hop instead of original requester).
-            # Do not set processed_by_injection so packet also reaches engine for DIRECT forwarding when we're a middle hop.
+            consumed = False
             dest_hash = packet.payload[0] if packet.payload and len(packet.payload) >= 1 else None
-            companion_bridges = self._companion_bridges_for_packet(packet, metadata)
+
+            # A neighbour's answer to our own anon-regions scope query is addressed
+            # to this repeater's identity, and no companion bridge owns it. Offer it
+            # to the scope helper first; it consumes the packet only when the
+            # ciphertext authenticates under the pending neighbour's shared secret
+            # AND echoes that query's tag, so an unrelated RESPONSE still falls
+            # through to the companion paths below.
+            scope_helper = getattr(self.daemon, "neighbor_scope_helper", None)
+            scope_consumed = False
+            if scope_helper is not None:
+                try:
+                    scope_consumed = await scope_helper.process_response_packet(packet)
+                except Exception as e:
+                    logger.debug(f"Neighbor scope response matching failed: {e}")
+
+            if scope_consumed:
+                packet.mark_do_not_retransmit()
+                processed_by_injection = True
+                self._record_for_ui(packet, metadata)
+                companion_bridges = {}
+            else:
+                companion_bridges = self._companion_bridges_for_packet(packet, metadata)
             local_hash = getattr(self.daemon, "local_hash", None)
             if dest_hash is not None and dest_hash in companion_bridges:
-                try:
-                    await companion_bridges[dest_hash].process_received_packet(packet)
-                    logger.info(
-                        "RESPONSE dest=0x%02x delivered to companion bridge",
-                        dest_hash,
-                    )
-                except Exception as e:
-                    logger.debug(f"Companion bridge RESPONSE error: {e}")
+                _, consumed = await self._fan_out_to_bridges(
+                    packet, {dest_hash: companion_bridges[dest_hash]}, context="RESPONSE"
+                )
+                logger.info("RESPONSE dest=0x%02x delivered to companion bridge", dest_hash)
             elif dest_hash == local_hash and companion_bridges:
                 # Response addressed to this repeater (e.g. path-based reply to first hop)
-                for bridge in companion_bridges.values():
-                    try:
-                        await bridge.process_received_packet(packet)
-                    except Exception as e:
-                        logger.debug(f"Companion bridge RESPONSE error: {e}")
+                _, consumed = await self._fan_out_to_bridges(
+                    packet, companion_bridges, context="RESPONSE"
+                )
                 logger.info(
                     "RESPONSE dest=0x%02x (local) delivered to %d companion bridge(s)",
                     dest_hash,
@@ -543,75 +764,78 @@ class PacketRouter:
                 # Dest not in bridges and not local: likely ANON_REQ response (dest = ephemeral
                 # sender hash). Deliver to all bridges; each will try to decrypt and ignore if
                 # not relevant (firmware-like behavior, works with multiple companion bridges).
-                for bridge in companion_bridges.values():
-                    try:
-                        await bridge.process_received_packet(packet)
-                    except Exception as e:
-                        logger.debug(f"Companion bridge RESPONSE error: {e}")
+                _, consumed = await self._fan_out_to_bridges(
+                    packet, companion_bridges, context="RESPONSE"
+                )
                 logger.debug(
                     "RESPONSE dest=0x%02x (anon) delivered to %d bridge(s) for matching",
                     dest_hash or 0,
                     len(companion_bridges),
                 )
-            if companion_bridges and _is_direct_final_hop(packet):
-                # DIRECT with empty path: we're the final hop; don't pass to engine (it would drop with "Direct: no path")
+            if consumed:
+                processed_by_injection = True
+                self._record_for_ui(packet, metadata)
+            elif companion_bridges and _is_direct_final_hop(packet):
+                # DIRECT with empty path is engine release hygiene: there is
+                # no next hop, even when no local identity authenticated it.
                 processed_by_injection = True
                 self._record_for_ui(packet, metadata)
 
         elif payload_type == ProtocolResponseHandler.payload_type():
             # PAYLOAD_TYPE_PATH (0x08): protocol responses (telemetry, binary, etc.).
-            # Deliver at most once per logical packet so the client is not spammed with duplicates.
-            # Do not set processed_by_injection so packet also reaches engine for DIRECT forwarding when we're a middle hop.
+            # Deliver at most once per logical packet so the client is not spammed with duplicates,
+            # but always deliver at a final hop (we are the destination). Do not set
+            # processed_by_injection for a middle hop so the packet still reaches engine forwarding.
             companion_bridges = self._companion_bridges_for_packet(packet, metadata)
-            if companion_bridges and self._should_deliver_path_to_companions(packet):
-                for bridge in companion_bridges.values():
-                    try:
-                        await bridge.process_received_packet(packet)
-                    except Exception as e:
-                        logger.debug(f"Companion bridge RESPONSE error: {e}")
-            if companion_bridges and _is_direct_final_hop(packet):
-                # DIRECT with empty path: we're the final hop; ensure delivery to all bridges (anon)
-                if not self._should_deliver_path_to_companions(packet):
-                    for bridge in companion_bridges.values():
-                        try:
-                            await bridge.process_received_packet(packet)
-                        except Exception as e:
-                            logger.debug(f"Companion bridge RESPONSE (final hop) error: {e}")
+            final_hop = _is_direct_final_hop(packet)
+            if companion_bridges and (final_hop or not self._was_delivered_to_companions(packet)):
+                delivered, _ = await self._fan_out_to_bridges(
+                    packet, companion_bridges, context="RESPONSE"
+                )
+                if delivered:
+                    self._mark_delivered_to_companions(packet)
+            if companion_bridges and final_hop:
+                # DIRECT with empty path: we're the final hop, so consume after delivery.
                 processed_by_injection = True
                 self._record_for_ui(packet, metadata)
 
         elif payload_type == ProtocolRequestHandler.payload_type():
+            # Same one-byte dest-hash collision handling as the login/text paths:
+            # a companion and a server (ACL) identity can share a hash and only
+            # decryption tells them apart. Offer to every local candidate and
+            # consume only when one authenticates the REQ; otherwise leave it for
+            # the engine.
             dest_hash = packet.payload[0] if packet.payload else None
-            companion_bridges = self._companion_bridges_for_packet(packet, metadata)
-            if dest_hash is not None and dest_hash in companion_bridges:
-                await companion_bridges[dest_hash].process_received_packet(packet)
+            if await self._consume_via_local_candidates(
+                packet,
+                metadata,
+                dest_hash,
+                self.daemon.protocol_request_helper,
+                "process_request_packet",
+            ):
                 processed_by_injection = True
                 self._record_for_ui(packet, metadata)
-            elif self.daemon.protocol_request_helper:
-                handled = await self.daemon.protocol_request_helper.process_request_packet(packet)
-                if handled:
+            else:
+                companion_bridges = self._companion_bridges_for_packet(packet, metadata)
+                if companion_bridges and _is_direct_final_hop(packet):
+                    # OpenHop release hygiene: an empty-path DIRECT has no next hop,
+                    # so consume after offering it to bridges even without MAC ownership.
+                    await self._fan_out_to_bridges(packet, companion_bridges, context="REQ")
                     processed_by_injection = True
                     self._record_for_ui(packet, metadata)
-            elif companion_bridges and _is_direct_final_hop(packet):
-                # DIRECT with empty path: we're the final hop; deliver to all bridges for anon matching
-                for bridge in companion_bridges.values():
-                    try:
-                        await bridge.process_received_packet(packet)
-                    except Exception as e:
-                        logger.debug(f"Companion bridge REQ (final hop) error: {e}")
-                processed_by_injection = True
-                self._record_for_ui(packet, metadata)
 
-        elif payload_type == GroupTextHandler.payload_type():
+        elif payload_type == PAYLOAD_TYPE_GRP_TXT:
             # GRP_TXT: pass to all companions (they filter by channel); still forward.
             # Policy drop is final and blocks companion delivery.
             companion_bridges = self._companion_bridges_for_packet(packet, metadata)
-            if companion_bridges:
-                for bridge in companion_bridges.values():
-                    try:
-                        await bridge.process_received_packet(packet)
-                    except Exception as e:
-                        logger.debug(f"Companion bridge GRP_TXT error: {e}")
+            await self._fan_out_to_bridges(packet, companion_bridges, context="GRP_TXT")
+
+        elif payload_type == PAYLOAD_TYPE_GRP_DATA:
+            # MeshCore forwards direct packets with remaining hops before payload
+            # handling. Otherwise, companions authenticate and filter channels.
+            if not _is_direct_intermediate_hop(packet):
+                companion_bridges = self._companion_bridges_for_packet(packet, metadata)
+                await self._fan_out_to_bridges(packet, companion_bridges, context="GRP_DATA")
 
         # Only pass to repeater engine if not already processed by injection
         # Skip engine for packets we injected for TX (already sent; avoid double-send/double-count)
@@ -620,7 +844,9 @@ class PacketRouter:
         if self.daemon.repeater_handler and not processed_by_injection:
             sent = await self.daemon.repeater_handler(packet, metadata)
             if sent is False:
-                drop_reason = getattr(packet, "_repeater_drop_reason", None)
+                drop_reason = metadata.get("_repeater_drop_reason")
+                if not isinstance(drop_reason, str):
+                    drop_reason = getattr(packet, "_repeater_drop_reason", None)
                 if not isinstance(drop_reason, str):
                     drop_reason = _drop_reason_from_recent_packets(
                         self.daemon.repeater_handler, packet

@@ -42,6 +42,14 @@ class CompanionContactCapacityError(Exception):
         )
 
 
+class CompanionStateLoadError(Exception):
+    """Persisted companion state exists in SQLite but could not be loaded.
+
+    Raised at companion init so the companion fails loudly instead of starting
+    with an empty store (which would present to clients as wiped channels or
+    contacts and let subsequent saves overwrite the persisted state)."""
+
+
 def normalize_companion_identity_key(identity_key: str) -> str:
     """Strip whitespace and remove optional 0x prefix so fromhex() is consistent across installs."""
     s = identity_key.strip()
@@ -207,11 +215,15 @@ def trim_companion_contacts_to_fit(
 
     Raises:
         ValueError: favourites alone exceed ``max_contacts`` (cannot trim).
-        RuntimeError: persisting the trimmed contact list failed.
+        RuntimeError: loading or persisting the contact list failed.
     """
     if sqlite_handler is None:
         return 0
     contacts = sqlite_handler.companion_load_contacts(companion_hash)
+    if contacts is None:
+        raise RuntimeError(
+            f"Failed to load persisted contacts for {companion_hash}; refusing to trim"
+        )
     keep, removed = select_companion_contacts_to_trim(contacts, max_contacts)
     if not removed:
         return 0

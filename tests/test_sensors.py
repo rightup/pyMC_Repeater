@@ -8,12 +8,14 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from repeater.sensors import SensorBase, SensorManager, SensorRegistry
+from repeater.sensors import bme280 as bme280_module
 from repeater.sensors import ens210 as ens210_module
 from repeater.sensors import ina219 as ina219_module
 from repeater.sensors import lafvin_ups_3s as lafvin_ups_3s_module
 from repeater.sensors import shtc3 as shtc3_module
 from repeater.sensors import waveshare_ups_d as waveshare_ups_d_module
 from repeater.sensors import waveshare_ups_e as waveshare_ups_e_module
+from repeater.sensors.bme280 import BME280Sensor
 from repeater.sensors.ens210 import ENS210Sensor
 from repeater.sensors.ina219 import INA219Sensor
 from repeater.sensors.lafvin_ups_3s import LafvinUps3sSensor
@@ -232,7 +234,7 @@ def test_pymc_modem_sensor_reads_modem_stats(monkeypatch):
     assert captured["url"] == "http://192.168.0.205/api/stats"
     assert captured["auth"].startswith("Basic ")
     assert captured["timeout"] == 3.5
-    assert reading["data"]["source"] == "pymc_modem"
+    assert reading["data"]["source"] == "openhop_modem"
     assert reading["data"]["latitude"] == 42.360082
     assert reading["data"]["longitude"] == -71.05888
     assert reading["data"]["altitude_m"] == 12.5
@@ -279,7 +281,7 @@ def test_pymc_modem_sensor_accepts_stats_without_gps_coordinates(monkeypatch):
     ).read()
 
     assert reading["ok"] is True
-    assert reading["data"]["source"] == "pymc_modem"
+    assert reading["data"]["source"] == "openhop_modem"
     assert reading["data"]["battery_voltage_mv"] == 3681
     assert reading["data"]["battery_voltage_v"] == 3.681
     assert reading["data"]["battery_percent"] == 37
@@ -393,6 +395,82 @@ def test_ens210_sensor_reads_temperature_and_humidity(monkeypatch):
         "temperature_c": 20.01,
         "humidity_pct": 55.0,
     }
+
+
+# Calibration block and one forced-mode measurement captured from a real BME280
+# (chip id 0x60) indoors at ~32 degC / 1021 hPa / 38 %RH.
+_BME280_CALIB_LOW = list(bytes.fromhex("B26FDE673200B38E9CD6D00B58178C00F9FFB42DE8D18813004B"))
+_BME280_CALIB_HIGH = list(bytes.fromhex("6901001422031E"))
+_BME280_DATA = list(bytes.fromhex("5860008870006BE2"))
+
+
+def _make_fake_bme280_bus(chip_id=0x60, measuring_reads=0):
+    class _Bus:
+        def __init__(self, bus_number):
+            self.bus_number = bus_number
+            self._remaining_measuring = measuring_reads
+
+        def read_byte_data(self, addr, register):
+            if register == bme280_module._REG_ID:
+                return chip_id
+            if register == bme280_module._REG_STATUS:
+                if self._remaining_measuring > 0:
+                    self._remaining_measuring -= 1
+                    return bme280_module._STATUS_MEASURING
+                return 0x00
+            raise AssertionError(f"unexpected register: {register}")
+
+        def write_byte_data(self, addr, register, value):
+            return None
+
+        def read_i2c_block_data(self, addr, register, length):
+            if register == bme280_module._REG_CALIB_LOW:
+                return list(_BME280_CALIB_LOW)
+            if register == bme280_module._REG_CALIB_HIGH:
+                return list(_BME280_CALIB_HIGH)
+            if register == bme280_module._REG_DATA:
+                return list(_BME280_DATA)
+            raise AssertionError(f"unexpected register: {register}")
+
+        def close(self):
+            return None
+
+    return _Bus
+
+
+def test_bme280_sensor_reads_temperature_pressure_and_humidity(monkeypatch):
+    _install_fake_smbus2(monkeypatch, _make_fake_bme280_bus(measuring_reads=2))
+    monkeypatch.setattr(bme280_module.time, "sleep", lambda *_args, **_kwargs: None)
+
+    reading = BME280Sensor("ambient").read()
+
+    assert reading["ok"] is True
+    assert reading["data"] == {
+        "temperature_c": 32.13,
+        "humidity_pct": 38.38,
+        "pressure_hpa": 1021.46,
+    }
+
+
+def test_bme280_sensor_rejects_wrong_chip_id(monkeypatch):
+    _install_fake_smbus2(monkeypatch, _make_fake_bme280_bus(chip_id=0x58))
+
+    sensor = BME280Sensor("ambient")
+
+    assert sensor.available is False
+    reading = sensor.read()
+    assert reading["ok"] is False
+    assert "not available" in reading["error"]
+
+
+def test_bme280_sensor_read_times_out_when_measurement_never_completes(monkeypatch):
+    _install_fake_smbus2(monkeypatch, _make_fake_bme280_bus(measuring_reads=10**6))
+    monkeypatch.setattr(bme280_module.time, "sleep", lambda *_args, **_kwargs: None)
+
+    reading = BME280Sensor("ambient", {"settings": {"read_timeout_seconds": 0.05}}).read()
+
+    assert reading["ok"] is False
+    assert "timed out" in reading["error"]
 
 
 def test_waveshare_ups_d_sensor_reads_battery_state(monkeypatch):

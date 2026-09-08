@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import logging
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+
+from openhop_core.companion import CompanionBridge
+from openhop_core.protocol import LocalIdentity
 
 from repeater.companion.utils import (
     COMPANION_SETTINGS_ALLOWLIST,
@@ -21,6 +24,7 @@ from repeater.companion.utils import (
     trim_companion_contacts_to_fit,
     validate_companion_config_capacity,
 )
+from repeater.main import RepeaterDaemon
 
 # openhop_core defaults (CompanionBridge / ContactStore)
 _DEFAULT_MAX_CONTACTS = 1000
@@ -60,6 +64,72 @@ class TestParseCompanionBridgeKwargs:
     def test_invalid_max_contacts(self):
         with pytest.raises(ValueError):
             parse_companion_bridge_kwargs({"max_contacts": -1})
+
+
+class TestCompanionRadioCapabilities:
+    def test_reads_active_radio_state_and_known_sx1262_limit(self):
+        # The SX1262 driver declares its 22 dBm limit as a backend attribute
+        # (SX1262Radio.max_tx_power_dbm); the daemon no longer string-matches
+        # radio_type to recover it.
+        radio = SimpleNamespace(
+            frequency=868_000_000,
+            bandwidth=125_000,
+            spreading_factor=7,
+            coding_rate=8,
+            tx_power=14,
+            max_tx_power_dbm=22,
+        )
+        daemon = RepeaterDaemon.__new__(RepeaterDaemon)
+        daemon.config = {"radio_type": "sx1262", "radio": {"frequency": 915_000_000}}
+        daemon.repeater_handler = SimpleNamespace(radio_config={"frequency": 915_000_000})
+        daemon.radio = radio
+
+        assert RepeaterDaemon._get_companion_radio_settings(daemon) == {
+            "frequency": 868_000_000,
+            "bandwidth": 125_000,
+            "spreading_factor": 7,
+            "coding_rate": 8,
+            "tx_power": 14,
+        }
+        assert RepeaterDaemon._get_companion_max_tx_power_dbm(daemon) == 22
+
+    def test_prefers_backend_declared_maximum(self):
+        daemon = RepeaterDaemon.__new__(RepeaterDaemon)
+        daemon.config = {"radio_type": "sx1262"}
+        daemon.repeater_handler = SimpleNamespace(radio_config={})
+        daemon.radio = SimpleNamespace(max_tx_power_dbm=19)
+
+        assert RepeaterDaemon._get_companion_max_tx_power_dbm(daemon) == 19
+
+    def test_uses_configured_limit_when_backend_cannot_declare_one(self):
+        daemon = RepeaterDaemon.__new__(RepeaterDaemon)
+        daemon.config = {"radio_type": "kiss"}
+        daemon.repeater_handler = SimpleNamespace(radio_config={"max_tx_power_dbm": 15})
+        daemon.radio = SimpleNamespace()
+
+        assert RepeaterDaemon._get_companion_max_tx_power_dbm(daemon) == 15
+
+    def test_backend_class_attribute_reaches_self_info_max_tx_power(self):
+        # A driver declares its limit as a class attribute (as SX1262Radio
+        # does); no radio_type string match is involved.
+        class _FakeRadio:
+            max_tx_power_dbm = 20
+
+        daemon = RepeaterDaemon.__new__(RepeaterDaemon)
+        daemon.config = {"radio_type": "sx1262_ch341"}
+        daemon.repeater_handler = SimpleNamespace(radio_config={})
+        daemon.radio = _FakeRadio()
+
+        assert RepeaterDaemon._get_companion_max_tx_power_dbm(daemon) == 20
+
+        # The daemon getter is what a bridge is wired with at load time; the
+        # value must surface through the companion SELF_INFO max-tx-power path.
+        bridge = CompanionBridge(
+            LocalIdentity(),
+            AsyncMock(return_value=True),
+            max_tx_power_getter=daemon._get_companion_max_tx_power_dbm,
+        )
+        assert bridge.get_max_tx_power_dbm() == 20
 
 
 class TestEffectiveMaxContacts:
@@ -176,9 +246,54 @@ class TestSqliteRetentionTrim:
 
     def test_trims_to_max_messages(self, tmp_path):
         h = self._handler(tmp_path)
-        for i in range(5):
-            self._push(h, "0x01", i, max_messages=3)
-        assert len(h.companion_load_messages("0x01")) == 3
+        results = [self._push(h, "0x01", i, max_messages=3) for i in range(5)]
+        assert results == [True, True, True, False, False]
+        assert [m["text"] for m in h.companion_load_messages("0x01")] == ["m0", "m1", "m2"]
+
+    def test_evicts_oldest_channel_message_before_direct_message(self, tmp_path):
+        h = self._handler(tmp_path)
+        direct_one = {"text": "direct one", "packet_hash": "d1", "is_channel": False}
+        channel_one = {"text": "channel one", "packet_hash": "c1", "is_channel": True}
+        direct_two = {"text": "direct two", "packet_hash": "d2", "is_channel": False}
+
+        assert h.companion_push_message("0x01", direct_one, max_messages=2)
+        assert h.companion_push_message("0x01", channel_one, max_messages=2)
+        assert h.companion_push_message("0x01", direct_two, max_messages=2)
+
+        messages = h.companion_load_messages("0x01")
+        assert [m["text"] for m in messages] == ["direct one", "direct two"]
+        assert [m["is_channel"] for m in messages] == [0, 0]
+
+    def test_rejects_channel_when_queue_contains_only_direct_messages(self, tmp_path):
+        h = self._handler(tmp_path)
+        for packet_hash in ("d1", "d2"):
+            assert h.companion_push_message(
+                "0x01", {"text": packet_hash, "packet_hash": packet_hash}, max_messages=2
+            )
+
+        assert not h.companion_push_message(
+            "0x01", {"text": "channel", "packet_hash": "c1", "is_channel": True}, max_messages=2
+        )
+        assert [m["text"] for m in h.companion_load_messages("0x01")] == ["d1", "d2"]
+
+    def test_rejected_insert_keeps_existing_channels_when_limit_is_lowered(self, tmp_path):
+        h = self._handler(tmp_path)
+        existing = [
+            {"text": "direct one", "packet_hash": "d1", "is_channel": False},
+            {"text": "channel one", "packet_hash": "c1", "is_channel": True},
+            {"text": "direct two", "packet_hash": "d2", "is_channel": False},
+        ]
+        for message in existing:
+            assert h.companion_push_message("0x01", message)
+
+        assert not h.companion_push_message(
+            "0x01", {"text": "incoming", "packet_hash": "d3"}, max_messages=2
+        )
+        assert [m["text"] for m in h.companion_load_messages("0x01")] == [
+            "direct one",
+            "channel one",
+            "direct two",
+        ]
 
     def test_none_keeps_all(self, tmp_path):
         h = self._handler(tmp_path)
@@ -194,6 +309,164 @@ class TestSqliteRetentionTrim:
             self._push(h, "0x02", i, max_messages=None)
         assert len(h.companion_load_messages("0x01")) == 2
         assert len(h.companion_load_messages("0x02")) == 3
+
+    def test_evicts_insertion_oldest_when_clock_steps_backwards(self, tmp_path, monkeypatch):
+        from repeater.data_acquisition import sqlite_handler
+
+        h = self._handler(tmp_path)
+        for i in range(3):
+            assert h.companion_push_message(
+                "0x01",
+                {"text": f"c{i}", "packet_hash": f"c{i}", "is_channel": True},
+                max_messages=3,
+            )
+
+        # The incoming row records a created_at older than every existing row.
+        # Insertion-order (id) eviction must drop the oldest existing row and
+        # keep the new push, rather than treating the incoming row as oldest.
+        monkeypatch.setattr(sqlite_handler.time, "time", lambda: 1.0)
+        assert h.companion_push_message(
+            "0x01",
+            {"text": "c3", "packet_hash": "c3", "is_channel": True},
+            max_messages=3,
+        )
+
+        assert [m["text"] for m in h.companion_load_messages("0x01")] == ["c1", "c2", "c3"]
+
+    def test_lowered_limit_evicts_multiple_channels_in_one_push(self, tmp_path):
+        h = self._handler(tmp_path)
+        seed = [
+            {"text": "d1", "packet_hash": "d1", "is_channel": False},
+            {"text": "d2", "packet_hash": "d2", "is_channel": False},
+            {"text": "c1", "packet_hash": "c1", "is_channel": True},
+            {"text": "c2", "packet_hash": "c2", "is_channel": True},
+            {"text": "c3", "packet_hash": "c3", "is_channel": True},
+        ]
+        for message in seed:
+            assert h.companion_push_message("0x01", message)
+
+        assert h.companion_push_message(
+            "0x01",
+            {"text": "c4", "packet_hash": "c4", "is_channel": True},
+            max_messages=4,
+        )
+
+        messages = h.companion_load_messages("0x01")
+        assert [m["text"] for m in messages] == ["d1", "d2", "c3", "c4"]
+        assert [m["is_channel"] for m in messages] == [0, 0, 1, 1]
+
+
+class TestSenderPrefixPersistence:
+    """sender_prefix (signed room-post author prefix) survives the SQLite round-trip."""
+
+    PREFIX = b"\xaa\xbb\xcc\xdd"
+
+    @staticmethod
+    def _handler(tmp_path):
+        from repeater.data_acquisition.sqlite_handler import SQLiteHandler
+
+        return SQLiteHandler(tmp_path)
+
+    def _push(self, h, sender_prefix=PREFIX):
+        return h.companion_push_message(
+            "0x01",
+            {
+                "sender_key": b"\x01" * 32,
+                "txt_type": 2,
+                "timestamp": 42,
+                "text": "signed post",
+                "sender_prefix": sender_prefix,
+                "packet_hash": "ph-1",
+            },
+        )
+
+    def test_push_pop_round_trip(self, tmp_path):
+        h = self._handler(tmp_path)
+        assert self._push(h)
+        msg = h.companion_pop_message("0x01")
+        assert msg["sender_prefix"] == self.PREFIX
+        assert msg["text"] == "signed post"
+
+    def test_load_messages_returns_prefix_bytes(self, tmp_path):
+        h = self._handler(tmp_path)
+        assert self._push(h)
+        msgs = h.companion_load_messages("0x01")
+        assert len(msgs) == 1
+        assert msgs[0]["sender_prefix"] == self.PREFIX
+
+    def test_missing_prefix_defaults_empty(self, tmp_path):
+        h = self._handler(tmp_path)
+        assert h.companion_push_message(
+            "0x01", {"text": "plain", "timestamp": 1, "packet_hash": "ph-2"}
+        )
+        msg = h.companion_pop_message("0x01")
+        assert msg["sender_prefix"] == b""
+
+    def test_migration_adds_column_to_existing_db(self, tmp_path):
+        import sqlite3
+
+        # Build a current DB, then rewind companion_messages to the
+        # pre-sender_prefix schema and drop the migration marker.
+        h = self._handler(tmp_path)
+        conn = sqlite3.connect(str(h.sqlite_path))
+        conn.execute(
+            "DELETE FROM migrations "
+            "WHERE migration_name IN ("
+            "'add_sender_prefix_to_companion_messages', "
+            "'add_signal_and_channel_data_to_companion_messages')"
+        )
+        conn.execute("ALTER TABLE companion_messages RENAME TO companion_messages_old")
+        conn.execute(
+            """
+            CREATE TABLE companion_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                companion_hash TEXT NOT NULL,
+                sender_key BLOB NOT NULL,
+                txt_type INTEGER NOT NULL DEFAULT 0,
+                timestamp INTEGER NOT NULL DEFAULT 0,
+                text TEXT NOT NULL,
+                is_channel INTEGER NOT NULL DEFAULT 0,
+                channel_idx INTEGER NOT NULL DEFAULT 0,
+                path_len INTEGER NOT NULL DEFAULT 0,
+                packet_hash TEXT,
+                created_at REAL NOT NULL
+            )
+            """
+        )
+        conn.execute("DROP TABLE companion_messages_old")
+        conn.execute(
+            "INSERT INTO companion_messages "
+            "(companion_hash, sender_key, text, created_at) VALUES ('0x01', X'01', 'old', 1.0)"
+        )
+        conn.commit()
+        conn.close()
+
+        h2 = self._handler(tmp_path)  # re-runs migrations
+        # Pre-migration row decodes with an empty prefix.
+        old = h2.companion_pop_message("0x01")
+        assert old["sender_prefix"] == b""
+        # New rows round-trip through the migrated column.
+        assert self._push(h2)
+        assert h2.companion_pop_message("0x01")["sender_prefix"] == self.PREFIX
+
+    def test_sync_next_from_persistence_rebuilds_prefix(self):
+        from repeater.companion.frame_server import CompanionFrameServer
+
+        fs = CompanionFrameServer.__new__(CompanionFrameServer)
+        fs.sqlite_handler = MagicMock()
+        fs.companion_hash = "0x01"
+        fs.sqlite_handler.companion_pop_message.return_value = {
+            "sender_key": b"\x01" * 32,
+            "txt_type": 2,
+            "timestamp": 42,
+            "text": "signed post",
+            "is_channel": 0,
+            "channel_idx": 0,
+            "path_len": 0,
+            "sender_prefix": self.PREFIX,
+        }
+        msg = fs._sync_next_from_persistence()
+        assert msg.sender_prefix == self.PREFIX
 
 
 class TestTrimContactsOnOverflowPolicy:
@@ -251,17 +524,18 @@ class TestPersistSkipWhenOff:
         fs.sqlite_handler = MagicMock()
         fs.companion_hash = "0x01"
         bridge = MagicMock()
-        bridge.message_queue._max_size = max_size
+        bridge.message_queue.max_size = max_size
         fs.bridge = bridge
         return fs
 
     def test_skips_persistence_when_retention_zero(self):
         import asyncio
 
+        entry = object()
         fs = self._frame_server(0)
-        asyncio.run(fs._persist_companion_message({"text": "x"}))
+        asyncio.run(fs._persist_companion_message({"text": "x"}, entry))
         fs.sqlite_handler.companion_push_message.assert_not_called()
-        fs.bridge.message_queue.pop_last.assert_called_once()
+        fs.bridge.message_queue.remove.assert_called_once_with(entry)
 
     def test_persists_with_retention(self):
         import asyncio
@@ -269,6 +543,14 @@ class TestPersistSkipWhenOff:
         fs = self._frame_server(7)
         asyncio.run(fs._persist_companion_message({"text": "x"}))
         fs.sqlite_handler.companion_push_message.assert_called_once_with("0x01", {"text": "x"}, 7)
+
+    def test_keeps_memory_message_when_sqlite_rejects_it(self):
+        import asyncio
+
+        fs = self._frame_server(7)
+        fs.sqlite_handler.companion_push_message.return_value = False
+        asyncio.run(fs._persist_companion_message({"text": "x"}))
+        fs.bridge.message_queue.pop_last.assert_not_called()
 
 
 class TestImportRepeaterContactsCap:

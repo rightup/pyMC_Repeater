@@ -33,6 +33,9 @@ class LoginHelper:
 
         self.handlers = {}
         self.acls = {}  # Per-identity ACLs keyed by hash_byte
+        # The repeater identity's ACL, kept so live config updates can re-apply
+        # repeater.security without re-registering the identity.
+        self._repeater_acl = None
         self._pending_tasks = set()
         # Shared across all identities so the node's total anon-reply rate is
         # bounded (mirrors firmware anon_limiter: ~4 requests / 2 min).
@@ -116,13 +119,15 @@ class LoginHelper:
         )
 
         self.acls[hash_byte] = identity_acl
+        if identity_type != "room_server":
+            self._repeater_acl = identity_acl
         logger.info(f"Created ACL for {identity_type} '{name}': hash=0x{hash_byte:02X}")
 
         # Create auth callback that uses this identity's ACL
         def auth_callback_with_context(
             client_identity, shared_secret, password, timestamp, sync_since=None
         ):
-            return identity_acl.authenticate_client(
+            success, permissions = identity_acl.authenticate_client(
                 client_identity=client_identity,
                 shared_secret=shared_secret,
                 password=password,
@@ -132,6 +137,26 @@ class LoginHelper:
                 target_identity_name=name,
                 target_identity_config=config,
             )
+            if success and identity_type == "room_server" and self.sqlite_handler is not None:
+                try:
+                    sync_kwargs = {}
+                    if sync_since is not None:
+                        sync_kwargs["sync_since"] = sync_since
+                    self.sqlite_handler.upsert_client_sync(
+                        room_hash=f"0x{hash_byte:02X}",
+                        client_pubkey=client_identity.get_public_key().hex(),
+                        pending_ack_crc=0,
+                        push_post_timestamp=0,
+                        ack_timeout_time=0,
+                        push_failures=0,
+                        last_activity=time.time(),
+                        **sync_kwargs,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to reset room sync guard state after login for hash=0x{hash_byte:02X}: {e}"
+                    )
+            return success, permissions
 
         handler = LoginServerHandler(
             local_identity=identity,
@@ -159,6 +184,34 @@ class LoginHelper:
         self.handlers[hash_byte] = anon_handler
 
         logger.info(f"Registered {identity_type} '{name}' login handler: hash=0x{hash_byte:02X}")
+
+    def refresh_repeater_security(self, config: dict = None) -> bool:
+        """Re-apply ``repeater.security`` from config to the live repeater ACL.
+
+        The ACL captures its passwords at registration, so without this a saved
+        password change would only take effect after a restart. Room-server ACLs
+        keep their per-identity ``settings`` passwords and are not touched.
+        """
+        acl = self._repeater_acl
+        if acl is None:
+            return False
+
+        cfg = config if isinstance(config, dict) else self.config
+        security = (cfg or {}).get("repeater", {}).get("security", {}) or {}
+
+        acl.admin_password = security.get("admin_password") or ""
+        acl.guest_password = security.get("guest_password") or ""
+        acl.allow_read_only = bool(security.get("allow_read_only", False))
+        try:
+            acl.max_clients = int(security.get("max_clients", acl.max_clients))
+        except (TypeError, ValueError):
+            logger.warning(
+                "Ignoring invalid repeater.security.max_clients=%r during security refresh",
+                security.get("max_clients"),
+            )
+
+        logger.info("Refreshed repeater ACL security settings from config")
+        return True
 
     def _format_region_names(self) -> str:
         """Build the comma-separated region-names string for an anon regions reply.
@@ -233,7 +286,17 @@ class LoginHelper:
             handler = self.handlers.get(dest_hash)
             if handler:
                 logger.debug(f"Routing login to identity: hash=0x{dest_hash:02X}")
-                await handler(packet)
+                # The handler authenticates only when the request decrypted for
+                # this identity. Otherwise the dest hash collided with ours but the
+                # ANON_REQ is not really for us — do not consume it, so the engine
+                # can still forward/re-flood it (#353).
+                result = await handler(packet)
+                if not result.authenticated:
+                    logger.debug(
+                        f"ANON_REQ dest 0x{dest_hash:02X} did not decrypt for a local "
+                        f"identity (hash collision), allowing forward"
+                    )
+                    return False
                 packet.mark_do_not_retransmit()
                 return True
             else:

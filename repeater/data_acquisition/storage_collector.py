@@ -3,7 +3,7 @@ import concurrent.futures
 import logging
 import threading
 import time
-from typing import Optional
+from typing import Any, Dict, Optional
 
 from repeater.config import resolve_storage_dir
 
@@ -22,6 +22,11 @@ class StorageCollector:
         self.glass_publish_callback = None
         self._pending_tasks = set()
 
+        metrics_config = config.get("metrics")
+        if not isinstance(metrics_config, dict):
+            metrics_config = {}
+        self.rrd_enabled = bool(metrics_config.get("rrd_enabled", True))
+
         # Dedicated single writer thread for all blocking storage work (the SQLite
         # write, the cumulative-counts aggregate, RRD updates, and network
         # publishing). This keeps that work off the asyncio event loop, which it
@@ -37,13 +42,26 @@ class StorageCollector:
         self.storage_dir.mkdir(parents=True, exist_ok=True)
 
         self.sqlite_handler = SQLiteHandler(self.storage_dir)
-        self.rrd_handler = RRDToolHandler(self.storage_dir)
+        self.rrd_handler = None
+        if self.rrd_enabled:
+            candidate_rrd_handler = RRDToolHandler(self.storage_dir)
+            if candidate_rrd_handler.available and candidate_rrd_handler.rrd_path.exists():
+                self.rrd_handler = candidate_rrd_handler
+                logger.info("RRDtool metrics enabled")
+            else:
+                logger.warning("RRDtool requested but unavailable; using SQLite metrics fallback")
+        else:
+            logger.info("RRDtool metrics disabled; SQLite metrics fallback will be used")
 
-        # Initialize MQTT handler if configured
+        # Initialize MQTT handler only when at least one broker is configured
         self.mqtt_handler = None
-        if (
-            config.get("mqtt_brokers", {}) or config.get("letsmesh", {}) or config.get("mqtt", {})
-        ) and local_identity:
+        mqtt_brokers_config = config.get("mqtt_brokers", {}) or {}
+        letsmesh_config = config.get("letsmesh", {}) or {}
+        mqtt_config = config.get("mqtt", {}) or {}
+        has_brokers_configured = (
+            bool(mqtt_brokers_config.get("brokers")) or bool(letsmesh_config) or bool(mqtt_config)
+        )
+        if has_brokers_configured and local_identity:
             try:
                 # Pass local_identity directly (supports both standard and firmware keys)
                 self.mqtt_handler = MeshCoreToMqttPusher(
@@ -58,6 +76,8 @@ class StorageCollector:
             except Exception as e:
                 logger.error(f"Failed to initialize MQTT handler: {e}")
                 self.mqtt_handler = None
+        else:
+            logger.info("MQTT handler disabled - no brokers configured")
 
         # Initialize hardware stats collector
         from .hardware_stats import HardwareStatsCollector
@@ -68,6 +88,11 @@ class StorageCollector:
         # Initialize WebSocket handler for real-time updates
         self.websocket_available = False
         self.websocket_has_connected_clients = lambda: False
+        # Wired by the daemon once the advert helper exists; returns the
+        # rate-limit stats dict the sidebar's advert tier reads.
+        self.advert_stats_getter = None
+        self._last_noise_floor_dbm: Optional[float] = None
+        self._stats_broadcast_seq = 0
         self._ws_stats_broadcast_interval_sec: float = 5.0
         self._stats_stop_event = threading.Event()
         self._stats_thread: Optional[threading.Thread] = None
@@ -209,9 +234,14 @@ class StorageCollector:
 
     def _record_packet_blocking(self, packet_record: dict, skip_mqtt: bool):
         """Store, aggregate, update metrics, and publish one packet (writer thread)."""
-        self.sqlite_handler.store_packet(packet_record)
-        cumulative_counts = self.sqlite_handler.get_cumulative_counts()
-        self.rrd_handler.update_packet_metrics(packet_record, cumulative_counts)
+        packet_id = self.sqlite_handler.store_packet(packet_record)
+        if packet_id is not None:
+            packet_record["id"] = packet_id
+
+        if self.rrd_handler is not None:
+            cumulative_counts = self.sqlite_handler.get_cumulative_counts()
+            self.rrd_handler.update_packet_metrics(packet_record, cumulative_counts)
+
         self._publish_packet_sync(packet_record, skip_mqtt)
 
     def _publish_packet_sync(self, packet_record: dict, skip_mqtt: bool):
@@ -231,18 +261,49 @@ class StorageCollector:
 
         self._publish_packet_to_mqtt(packet_record)
 
+    # The heavy 24h SQL aggregate rides one beat in six (30s at the 5s
+    # default): nobody reads a 24h cumulative at 5s resolution, and the
+    # sidebar vitals it used to travel with are cheap in-memory scalars.
+    PACKET_STATS_EVERY_N_BEATS = 6
+
     def _broadcast_stats_once(self) -> None:
-        """Compute the 24h aggregate and broadcast it to WebSocket clients."""
-        packet_stats_24h = self.sqlite_handler.get_packet_stats(hours=24)
-        uptime_seconds = (
-            time.time() - self.repeater_handler.start_time if self.repeater_handler else 0
-        )
-        self.websocket_broadcast_stats(
-            {
-                "packet_stats": packet_stats_24h,
-                "system_stats": {"uptime_seconds": uptime_seconds},
-            }
-        )
+        """Broadcast the sidebar vitals; the 24h aggregate is decimated.
+
+        The beat carries scalars only — a few hundred bytes — so the
+        dashboard sidebar can read every vital live on any page. Series
+        (noise-floor history, charts) stay on their own slow HTTP paths.
+        """
+        system_stats: Dict[str, Any] = {
+            "uptime_seconds": (
+                time.time() - self.repeater_handler.start_time if self.repeater_handler else 0
+            ),
+            "mode": self.config.get("repeater", {}).get("mode", "forward"),
+        }
+        airtime_mgr = getattr(self.repeater_handler, "airtime_mgr", None)
+        if airtime_mgr is not None:
+            airtime_stats = airtime_mgr.get_stats()
+            if airtime_stats:
+                system_stats["utilization_percent"] = airtime_stats["utilization_percent"]
+        if self._last_noise_floor_dbm is not None:
+            system_stats["noise_floor_dbm"] = self._last_noise_floor_dbm
+        if self.advert_stats_getter is not None:
+            try:
+                tier = self.advert_stats_getter()
+                system_stats["advert_tier"] = {
+                    "current_tier": tier.get("adaptive", {}).get("current_tier"),
+                    "adverts_allowed": tier.get("stats", {}).get("adverts_allowed", 0),
+                    "adverts_dropped": tier.get("stats", {}).get("adverts_dropped", 0),
+                    "active_penalties": len(tier.get("active_penalties") or {}),
+                }
+            except Exception as e:
+                logger.debug(f"Advert stats unavailable for broadcast: {e}")
+
+        payload: Dict[str, Any] = {"system_stats": system_stats}
+        if self._stats_broadcast_seq % self.PACKET_STATS_EVERY_N_BEATS == 0:
+            payload["packet_stats"] = self.sqlite_handler.get_packet_stats(hours=24)
+        self._stats_broadcast_seq += 1
+
+        self.websocket_broadcast_stats(payload)
 
     def _stats_broadcast_loop(self) -> None:
         """Broadcast aggregate stats every interval while clients are connected.
@@ -312,6 +373,7 @@ class StorageCollector:
 
     def record_noise_floor(self, noise_floor_dbm: float):
         """Record noise floor to storage and defer network publishing to background tasks."""
+        self._last_noise_floor_dbm = noise_floor_dbm
         noise_record = {"timestamp": time.time(), "noise_floor_dbm": noise_floor_dbm}
         self.sqlite_handler.store_noise_floor(noise_record)
         self._schedule_background(
@@ -372,6 +434,20 @@ class StorageCollector:
             bucket_seconds=bucket_seconds,
         )
 
+    def get_lbt_diagnostics(
+        self,
+        start_timestamp: float,
+        end_timestamp: float,
+        bucket_seconds: int = 300,
+        severe_attempt_threshold: int = 4,
+    ) -> dict:
+        return self.sqlite_handler.get_lbt_diagnostics(
+            start_timestamp=start_timestamp,
+            end_timestamp=end_timestamp,
+            bucket_seconds=bucket_seconds,
+            severe_attempt_threshold=severe_attempt_threshold,
+        )
+
     def get_packet_stats(self, hours: int = 24) -> dict:
         return self.sqlite_handler.get_packet_stats(hours)
 
@@ -416,20 +492,84 @@ class StorageCollector:
     def get_packet_by_hash(self, packet_hash: str) -> Optional[dict]:
         return self.sqlite_handler.get_packet_by_hash(packet_hash)
 
+    def get_packet_by_id(self, packet_id: int) -> Optional[dict]:
+        return self.sqlite_handler.get_packet_by_id(packet_id)
+
+    def get_neighbor_link_history(
+        self,
+        *,
+        peer_hash: str,
+        path_hash_size: int,
+        hours: int = 24,
+        limit: int = 1000,
+        bucket_seconds: Optional[int] = None,
+    ) -> list:
+        return self.sqlite_handler.get_neighbor_link_history(
+            peer_hash=peer_hash,
+            path_hash_size=path_hash_size,
+            hours=hours,
+            limit=limit,
+            bucket_seconds=bucket_seconds,
+        )
+
     def get_rrd_data(
         self,
         start_time: Optional[int] = None,
         end_time: Optional[int] = None,
         resolution: str = "average",
     ) -> Optional[dict]:
-        return self.rrd_handler.get_data(start_time, end_time, resolution)
+        return self.get_metrics_data(start_time, end_time, resolution)
+
+    def get_metrics_data(
+        self,
+        start_time: Optional[int] = None,
+        end_time: Optional[int] = None,
+        resolution: str = "average",
+    ) -> dict:
+        if self.rrd_handler is not None:
+            try:
+                rrd_data = self.rrd_handler.get_data(start_time, end_time, resolution)
+            except Exception as e:
+                logger.warning(
+                    f"RRDtool metrics read failed; using SQLite metrics fallback: {e}",
+                    exc_info=True,
+                )
+            else:
+                if self._metrics_data_is_valid(rrd_data):
+                    rrd_data.setdefault("data_source", "rrd")
+                    return rrd_data
+
+                logger.warning(
+                    "RRDtool metrics read returned no usable data; using SQLite metrics fallback"
+                )
+
+        sqlite_data = self.sqlite_handler.get_metrics_data(start_time, end_time, resolution)
+        sqlite_data.setdefault("data_source", "sqlite")
+        return sqlite_data
+
+    def _metrics_data_is_valid(self, metrics_data: Optional[dict]) -> bool:
+        if not isinstance(metrics_data, dict):
+            return False
+        if not isinstance(metrics_data.get("metrics"), dict):
+            return False
+        if not isinstance(metrics_data.get("timestamps"), list):
+            return False
+        return True
 
     def get_packet_type_stats(self, hours: int = 24) -> dict:
-        rrd_stats = self.rrd_handler.get_packet_type_stats(hours)
-        if rrd_stats:
-            return rrd_stats
+        if self.rrd_handler is not None:
+            try:
+                rrd_stats = self.rrd_handler.get_packet_type_stats(hours)
+            except Exception as e:
+                logger.warning(
+                    f"RRDtool packet type stats failed; using SQLite fallback: {e}",
+                    exc_info=True,
+                )
+            else:
+                if rrd_stats:
+                    return rrd_stats
 
-        logger.warning("Falling back to SQLite for packet type stats")
+            logger.warning("Falling back to SQLite for packet type stats")
         return self.sqlite_handler.get_packet_type_stats(hours)
 
     def get_route_stats(self, hours: int = 24) -> dict:
@@ -437,6 +577,24 @@ class StorageCollector:
 
     def get_neighbors(self) -> dict:
         return self.sqlite_handler.get_neighbors()
+
+    def get_neighbor_scopes(self) -> dict:
+        return self.sqlite_handler.get_neighbor_scopes()
+
+    def record_neighbor_scope(
+        self,
+        pubkey: str,
+        status: str,
+        scopes: Optional[str] = None,
+        queried_at: Optional[float] = None,
+    ) -> bool:
+        return self.sqlite_handler.record_neighbor_scope(pubkey, status, scopes, queried_at)
+
+    def get_daemon_state(self, key: str) -> Optional[dict]:
+        return self.sqlite_handler.get_daemon_state(key)
+
+    def set_daemon_state(self, key: str, value: dict) -> bool:
+        return self.sqlite_handler.set_daemon_state(key, value)
 
     def get_node_name_by_pubkey(self, pubkey: str) -> Optional[str]:
         """
@@ -461,11 +619,11 @@ class StorageCollector:
             logger.debug(f"Could not lookup node name for {pubkey[:8] if pubkey else 'None'}: {e}")
             return None
 
-    def cleanup_old_data(self, days: int = 7):
-        self.sqlite_handler.cleanup_old_data(days)
+    def cleanup_old_data(self, days: int = 7, companion_events_days: Optional[int] = None):
+        self.sqlite_handler.cleanup_old_data(days, companion_events_days=companion_events_days)
 
-    def get_noise_floor_history(self, hours: int = 24, limit: int = None) -> list:
-        return self.sqlite_handler.get_noise_floor_history(hours, limit)
+    def get_noise_floor_history(self, hours: int = 24, limit: int = None, offset: int = 0) -> list:
+        return self.sqlite_handler.get_noise_floor_history(hours, limit, offset)
 
     def get_noise_floor_stats(self, hours: int = 24) -> dict:
         return self.sqlite_handler.get_noise_floor_stats(hours)
@@ -539,6 +697,9 @@ class StorageCollector:
 
     def delete_advert(self, advert_id: int) -> bool:
         return self.sqlite_handler.delete_advert(advert_id)
+
+    def delete_neighbors_by_pubkey_prefix(self, pubkey_prefix: str | None) -> int:
+        return self.sqlite_handler.delete_neighbors_by_pubkey_prefix(pubkey_prefix)
 
     def get_hardware_stats(self) -> Optional[dict]:
         """Get current hardware statistics"""

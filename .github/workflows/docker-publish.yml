@@ -10,14 +10,14 @@ on:
       image_repository:
         description: "Docker image repository to publish to"
         required: false
-        default: "openhop/openhop-repeater"
+        default: ""
 
 jobs:
   docker:
     if: |
       github.event_name == 'workflow_dispatch' ||
       github.repository == 'openhop-dev/openhop_repeater' ||
-      github.repository == 'yellowcooln/openhop_repeater'
+      github.repository_owner == 'yellowcooln'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -42,6 +42,10 @@ jobs:
       - name: Compute package version
         id: package_version
         run: |
+          if [ "${{ github.repository }}" != "openhop-dev/openhop_repeater" ]; then
+            git fetch --force https://github.com/openhop-dev/openhop_repeater.git \
+              "refs/tags/*:refs/tags/*"
+          fi
           python -m pip install --disable-pip-version-check setuptools_scm
           version="$(python -m setuptools_scm)"
           echo "version=${version}" >> "$GITHUB_OUTPUT"
@@ -58,7 +62,7 @@ jobs:
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.image_repository }}" ]; then
             image_repository="${{ inputs.image_repository }}"
-          elif [ "${{ github.repository }}" = "yellowcooln/openhop_repeater" ]; then
+          elif [ "${{ github.repository_owner }}" = "yellowcooln" ]; then
             image_repository="yellowcooln/openhop-repeater"
           else
             image_repository="openhop/openhop-repeater"
@@ -75,6 +79,7 @@ jobs:
           tags: |
             type=raw,value=main,enable=${{ github.ref == 'refs/heads/main' }}
             type=raw,value=dev,enable=${{ github.ref == 'refs/heads/dev' }}
+            type=raw,value=v${{ steps.package_version.outputs.version }}
             type=sha,format=short
 
       - name: Build and push
@@ -92,7 +97,9 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Notify Home Assistant add-on repository
-        if: github.repository == 'openhop-dev/openhop_repeater'
+        if: >-
+          github.repository == 'openhop-dev/openhop_repeater' &&
+          (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')
         env:
           DISPATCH_TOKEN: ${{ secrets.HA_ADDON_REPO_DISPATCH_TOKEN }}
           CHANNEL: ${{ github.ref_name }}

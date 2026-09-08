@@ -34,6 +34,7 @@ RUN DEBIAN_FRONTEND=noninteractive apt-get update && apt-get install -y \
     libusb-1.0-0 \
     swig \
     git \
+    tini \
     build-essential \
     python3-dev \
     && rm -rf /var/lib/apt/lists/*
@@ -85,4 +86,4 @@ USER ${USER}
 
 EXPOSE 8000
 
-ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+ENTRYPOINT ["/usr/bin/tini", "-g", "--", "/usr/local/bin/docker-entrypoint.sh"]

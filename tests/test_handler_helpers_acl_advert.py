@@ -37,9 +37,56 @@ def test_acl_blank_password_guest_rules_and_room_server_password_requirements():
         shared_secret=b"secret",
         password="",
         timestamp=10,
+        sync_since=42,
     )
     assert ok is True
     assert perms == PERM_ACL_GUEST
+    guest_client = acl.get_client(identity.get_public_key())
+    assert guest_client is not None
+    assert guest_client.permissions == PERM_ACL_GUEST
+    assert guest_client.shared_secret == b"secret"
+    assert guest_client.last_timestamp == 10
+
+    # Blank-password logins now track replay/timestamp just like password logins.
+    replay_ok, replay_perms = acl.authenticate_client(
+        client_identity=identity,
+        shared_secret=b"secret",
+        password="",
+        timestamp=10,
+    )
+    assert replay_ok is False
+    assert replay_perms == 0
+
+    # The read-only guest must land in the ACL with its shared secret: the
+    # room server's text handler and sync loop only see ACL members, so an
+    # absent entry means posts are dropped un-ACKed and pushes never happen.
+    guest = acl.get_client(b"A" * 32)
+    assert guest is not None
+    assert guest.is_guest() is True
+    assert guest.shared_secret == b"secret"
+    assert guest.sync_since == 42
+
+    # A repeat blank-password login reuses the existing entry.
+    ok_again, perms_again = acl.authenticate_client(
+        client_identity=identity,
+        shared_secret=b"secret",
+        password="",
+        timestamp=11,
+    )
+    assert ok_again is True
+    assert perms_again == PERM_ACL_GUEST
+    assert acl.get_num_clients() == 1
+
+    # A full ACL rejects new blank-password guests.
+    acl_full = ACL(max_clients=0, allow_read_only=True)
+    full_ok, full_perms = acl_full.authenticate_client(
+        client_identity=identity,
+        shared_secret=b"secret",
+        password="",
+        timestamp=10,
+    )
+    assert full_ok is False
+    assert full_perms == 0
 
     acl_ro_disabled = ACL(allow_read_only=False)
     ok2, perms2 = acl_ro_disabled.authenticate_client(
@@ -93,6 +140,29 @@ def test_acl_admin_login_sets_client_state_and_replay_protection():
     )
     assert replay_ok is False
     assert replay_perms == 0
+
+
+def test_acl_touch_client_session_watermark_is_monotonic():
+    """The replay watermark never moves backwards: if another accepted request
+    advanced it between the replay check and the session touch, an older (but
+    already-validated) timestamp must not regress it."""
+    identity = _FakeIdentity(b"B" * 32)
+    acl = ACL(max_clients=5, admin_password="top-secret", guest_password="guest")
+
+    ok, _ = acl.authenticate_client(
+        client_identity=identity,
+        shared_secret=b"k" * 32,
+        password="top-secret",
+        timestamp=2000,
+    )
+    assert ok is True
+    client = acl.get_client(b"B" * 40)
+
+    acl._touch_client_session(client, b"k" * 32, timestamp=1500)
+    assert client.last_timestamp == 2000
+
+    acl._touch_client_session(client, b"k" * 32, timestamp=2500)
+    assert client.last_timestamp == 2500
 
 
 def test_acl_max_clients_invalid_password_and_remove_client_paths():
@@ -296,3 +366,38 @@ def test_advert_reload_config_and_cleanup_old_state_bounds_memory():
     assert "old" not in helper._recent_advert_hashes
     assert "pk" not in helper._penalty_until
     assert "oldpk" not in helper._bucket_state
+
+
+def test_advert_limiter_missing_sections_defaults_disabled():
+    helper = AdvertHelper(local_identity=None, storage=None, config={"repeater": {}})
+
+    assert helper._adaptive_enabled is False
+    assert helper._rate_limit_enabled is False
+    assert helper._penalty_enabled is False
+
+
+def test_advert_limiter_partial_sections_without_enabled_remain_disabled_after_reload():
+    helper = AdvertHelper(local_identity=None, storage=None, config={"repeater": {}})
+    helper.config = {
+        "repeater": {
+            "advert_adaptive": {
+                # enabled intentionally omitted
+                "thresholds": {"normal": 2, "busy": 7, "congested": 12}
+            },
+            "advert_rate_limit": {
+                # enabled intentionally omitted
+                "bucket_capacity": 3,
+                "refill_tokens": 2,
+            },
+            "advert_penalty_box": {
+                # enabled intentionally omitted
+                "violation_threshold": 2,
+            },
+        }
+    }
+
+    helper.reload_config()
+
+    assert helper._adaptive_enabled is False
+    assert helper._rate_limit_enabled is False
+    assert helper._penalty_enabled is False

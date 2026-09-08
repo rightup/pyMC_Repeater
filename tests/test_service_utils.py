@@ -126,103 +126,58 @@ def test_restart_service_buildroot_paths(monkeypatch):
     assert "Restart failed" in msg
 
 
-def test_restart_service_systemctl_and_sudo_paths(monkeypatch):
+@pytest.mark.parametrize(
+    "error, expected",
+    [
+        (FileNotFoundError("systemd-run"), "scheduler unavailable"),
+        (RuntimeError("bad"), "Restart command failed"),
+    ],
+)
+def test_restart_scheduler_launch_errors(monkeypatch, error, expected):
     monkeypatch.setattr(su, "is_container", lambda: False)
     monkeypatch.setattr(su, "is_buildroot", lambda: False)
 
-    def _result(code=0, err=""):
-        return subprocess.CompletedProcess(args=[], returncode=code, stdout="", stderr=err)
+    def fail(*args, **kwargs):
+        raise error
 
-    # systemctl success
-    monkeypatch.setattr(su.subprocess, "run", lambda *args, **kwargs: _result(0))
-    ok, msg = su.restart_service()
-    assert ok is True
-    assert "Service restart initiated" in msg
-
-    # systemctl timeout
-    def _timeout(*_args, **_kwargs):
-        raise subprocess.TimeoutExpired(cmd="x", timeout=5)
-
-    monkeypatch.setattr(su.subprocess, "run", _timeout)
-    ok, msg = su.restart_service()
-    assert ok is True
-    assert "timeout" in msg
-
-    # systemctl missing binary
-    def _missing(*_args, **_kwargs):
-        raise FileNotFoundError("systemctl")
-
-    monkeypatch.setattr(su.subprocess, "run", _missing)
-    ok, msg = su.restart_service()
+    monkeypatch.setattr(su.subprocess, "run", fail)
+    ok, message = su.restart_service()
     assert ok is False
-    assert "systemctl not available" in msg
+    assert expected in message
 
-    # systemctl denied then sudo success
-    calls = {"n": 0}
 
-    def _denied_then_sudo(*args, **kwargs):
-        calls["n"] += 1
-        if calls["n"] == 1:
-            return _result(1, "Access denied")
-        return _result(0)
+def test_ensure_plugin_manager_service_runs_sudo_bootstrap(monkeypatch):
+    monkeypatch.setattr(su, "is_container", lambda: False)
+    monkeypatch.setattr(su, "is_buildroot", lambda: False)
+    monkeypatch.setattr(su.os, "geteuid", lambda: 1000)
+    monkeypatch.setattr(
+        su.os.path, "isfile", lambda p: p == "/opt/openhop_repeater/venv/bin/python"
+    )
+    monkeypatch.setattr(
+        su.shutil, "which", lambda name: "/usr/bin/sudo" if name == "sudo" else None
+    )
 
-    monkeypatch.setattr(su.subprocess, "run", _denied_then_sudo)
-    ok, msg = su.restart_service()
+    calls = []
+
+    def _run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd[:3] == ["/usr/bin/sudo", "--non-interactive", "/bin/systemctl"] and cmd[3:5] == [
+            "is-active",
+            "--quiet",
+        ]:
+            return subprocess.CompletedProcess(args=cmd, returncode=1, stdout="", stderr="")
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(su.subprocess, "run", _run)
+
+    ok, msg = su.ensure_plugin_manager_service()
     assert ok is True
-    assert "Service restart initiated" in msg
-
-    # systemctl generic fail then sudo fail
-    calls = {"n": 0}
-
-    def _fail_then_fail(*args, **kwargs):
-        calls["n"] += 1
-        if calls["n"] == 1:
-            return _result(1, "broken")
-        return _result(2, "sudo denied")
-
-    monkeypatch.setattr(su.subprocess, "run", _fail_then_fail)
-    ok, msg = su.restart_service()
-    assert ok is False
-    assert "Restart failed" in msg
-
-    # systemctl generic fail then sudo timeout
-    calls = {"n": 0}
-
-    def _fail_then_timeout(*args, **kwargs):
-        calls["n"] += 1
-        if calls["n"] == 1:
-            return _result(1, "broken")
-        raise subprocess.TimeoutExpired(cmd="sudo", timeout=5)
-
-    monkeypatch.setattr(su.subprocess, "run", _fail_then_timeout)
-    ok, msg = su.restart_service()
-    assert ok is True
-    assert "timeout" in msg
-
-    # systemctl generic fail then sudo missing
-    calls = {"n": 0}
-
-    def _fail_then_sudo_missing(*args, **kwargs):
-        calls["n"] += 1
-        if calls["n"] == 1:
-            return _result(1, "broken")
-        raise FileNotFoundError("sudo")
-
-    monkeypatch.setattr(su.subprocess, "run", _fail_then_sudo_missing)
-    ok, msg = su.restart_service()
-    assert ok is False
-    assert "Neither polkit nor sudo" in msg
-
-    # systemctl generic fail then sudo unexpected exception
-    calls = {"n": 0}
-
-    def _fail_then_exception(*args, **kwargs):
-        calls["n"] += 1
-        if calls["n"] == 1:
-            return _result(1, "broken")
-        raise RuntimeError("bad")
-
-    monkeypatch.setattr(su.subprocess, "run", _fail_then_exception)
-    ok, msg = su.restart_service()
-    assert ok is False
-    assert "Restart command failed" in msg
+    assert msg == "Plugin-manager service is installed and active"
+    install_call = next(
+        call
+        for call in calls
+        if call[:3] == ["/usr/bin/sudo", "--non-interactive", "/usr/bin/install"]
+    )
+    assert install_call[:3] == ["/usr/bin/sudo", "--non-interactive", "/usr/bin/install"]
+    assert install_call[-1] == "/etc/systemd/system/openhop-plugin-manager.service"
+    assert calls[-1][:3] == ["/usr/bin/sudo", "--non-interactive", "/bin/systemctl"]

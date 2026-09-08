@@ -95,6 +95,8 @@
       "txled_pin": -1,
       "rxled_pin": -1,
       "tx_power": 22,
+      "use_dio3_tcxo": true,
+      "use_dio2_rf": true,
       "preamble_length": 32
     },
     "meshadv": {
@@ -133,35 +135,39 @@
     "zebra-duo-hat-r0": {
       "name": "ZebraHatDuo-R0-1W",
       "bus_id": 0,
+      "busy_pin": 23,
       "cs_id": 0,
       "cs_pin": -1,
-      "reset_pin": 18,
-      "busy_pin": 23,
-      "irq_pin": 24,
-      "txen_pin": -1,
+      "dio3_tcxo_voltage": 1.8,
+      "en_pin": -1,
+      "irq_pin": 18,
+      "is_waveshare": false,
+      "reset_pin": 24,
       "rxen_pin": -1,
-      "txled_pin": -1,
       "rxled_pin": -1,
-      "tx_power": 18,
-      "use_dio3_tcxo": true,
+      "txen_pin": -1,
+      "txled_pin": -1,
       "use_dio2_rf": true,
+      "use_dio3_tcxo": true, 
       "preamble_length": 32
     },
     "zebra-duo-hat-r1": {
       "name": "ZebraHatDuo-R1-1W",
       "bus_id": 0,
+      "busy_pin": 27,
       "cs_id": 1,
       "cs_pin": -1,
-      "reset_pin": 17,
-      "busy_pin": 27,
+      "dio3_tcxo_voltage": 1.8,
+      "en_pin": -1,
       "irq_pin": 22,
-      "txen_pin": -1,
+      "is_waveshare": false,
+      "reset_pin": 17,
       "rxen_pin": -1,
-      "txled_pin": -1,
       "rxled_pin": -1,
-      "tx_power": 18,
-      "use_dio3_tcxo": true,
+      "txen_pin": -1,
+      "txled_pin": -1,
       "use_dio2_rf": true,
+      "use_dio3_tcxo": true,      
       "preamble_length": 32
     },
     "femtofox-1W-SX": {
@@ -233,7 +239,7 @@
       "preamble_length": 32
     },
     "ch341-usb-sx1262": {
-      "name": "CH341 USB-SPI + SX1262 (example)",
+      "name": "CH341 USB-SPI + SX1262",
       "description": "SX1262 via CH341 USB-to-SPI adapter. NOTE: pin numbers are CH341 GPIO 0-7, not BCM.",
       "connection_type": "usb",
       "radio_type": "sx1262_ch341",
@@ -255,6 +261,33 @@
       "dio3_tcxo_voltage": 1.8,
       "preamble_length": 32,
       "is_waveshare": false
+    },
+    "pinedio": {
+      "name": "PineDio CH341 + SX1262",
+      "description": "PineDio CH341 variant for SX1262 over USB-to-SPI. NOTE: pin numbers are CH341 GPIO 0-11, not BCM.",
+      "connection_type": "usb",
+      "radio_type": "sx1262_ch341",
+      "vid": 6790,
+      "pid": 21778,
+      "bus_id": 0,
+      "cs_id": 0,
+      "cs_pin": 0,
+      "reset_pin": -1,
+      "busy_pin": 11,
+      "irq_pin": 10,
+      "txen_pin": -1,
+      "rxen_pin": -1,
+      "txled_pin": -1,
+      "rxled_pin": -1,
+      "frequency": 869618000,
+      "tx_power": 22,
+      "spreading_factor": 8,
+      "bandwidth": 62500,
+      "coding_rate": 8,
+      "preamble_length": 17,
+      "use_dio2_rf": true,
+      "is_waveshare": false,
+      "use_dio3_tcxo": false
     },
     "ultrapeater-e22": {
       "name": "Zindello Industries UltraPeater E22",
@@ -312,9 +345,7 @@
       "use_dio2_rf": true,
       "use_dio3_tcxo": true,
       "dio3_tcxo_voltage": 1.8,
-      "preamble_length": 32,
-      "use_gpiod_backend": true,
-      "gpio_chip": 1
+      "preamble_length": 32
     },
     "rak6421-13300x-slot2": {
       "name": "Rak Wireless RAK6421 with RAK1330x on IO Slot 2",
@@ -333,9 +364,27 @@
       "use_dio2_rf": true,
       "use_dio3_tcxo": true,
       "dio3_tcxo_voltage": 1.8,
-      "preamble_length": 32,
-      "use_gpiod_backend": true,
-      "gpio_chip": 1
+      "preamble_length": 32
+    },        
+    "rak6421-13300x-slot2-hw-mod": {
+      "name": "Rak Wireless RAK6421 with RAK1330x on IO Slot 2",
+      "description": "Use this radio settings preset if you have modded your pi hat to work with dual radios see https://discord.com/channels/1495203904898728149/1512614022913200159 .",
+      "bus_id": 0,
+      "cs_id": 1,
+      "cs_pin": -1,
+      "reset_pin": 27,
+      "busy_pin": 19,
+      "irq_pin": 18,
+      "txen_pin": -1,
+      "rxen_pin": -1,
+      "en_pins": [26, 23],
+      "txled_pin": -1,
+      "rxled_pin": -1,
+      "tx_power": 22,
+      "use_dio2_rf": true,
+      "use_dio3_tcxo": true,
+      "dio3_tcxo_voltage": 1.8,
+      "preamble_length": 32
     },
     "ultrapeaterzero-e22": {
       "name": "Zindello Industries UltraPeaterZero E22",
@@ -389,23 +438,21 @@
       "use_dio2_rf": true,
       "use_dio3_tcxo": true,
       "dio3_tcxo_voltage": 1.8,
-      "preamble_length": 32,
-      "use_gpiod_backend": true,
-      "gpio_chip": 1
+      "preamble_length": 32
     },
-    "pymc_usb": {
-      "name": "pymc_usb modem (USB-CDC)",
-      "description": "ESP32-S3 / nRF52 board running pymc_usb firmware as a USB-CDC LoRa modem. Pick this if the modem is plugged into the host's USB port (e.g. /dev/ttyACM0). Edit the 'pymc_usb' section after first-run to point at the right serial device.",
+    "modem_usb": {
+      "name": "openHop Modem (USB-CDC)",
+      "description": "ESP32-S3 / nRF52 openHop Modem connected over USB-CDC. Pick this if the modem is plugged into the host's USB port (e.g. /dev/ttyACM0). Edit the 'modem_usb' section after first-run to point at the right serial device.",
       "connection_type": "usb",
-      "radio_type": "pymc_usb",
+      "radio_type": "modem_usb",
       "tx_power": 22,
       "preamble_length": 32
     },
-    "pymc_tcp": {
-      "name": "pymc_tcp modem (Wi-Fi / Ethernet)",
-      "description": "ESP32 board running pymc_usb firmware exposed as a TCP server over Wi-Fi or Ethernet. After first-run, set 'pymc_tcp.host' to the modem's LAN address or mDNS name (e.g. pymc-3e2834.local).",
+    "modem_tcp": {
+      "name": "openHop Modem (Wi-Fi / Ethernet)",
+      "description": "openHop Modem exposed as a TCP server over Wi-Fi or Ethernet. After first-run, set 'modem_tcp.host' to the modem's LAN address or mDNS name (e.g. openhop-modem.local).",
       "connection_type": "network",
-      "radio_type": "pymc_tcp",
+      "radio_type": "modem_tcp",
       "tx_power": 22,
       "preamble_length": 32
     },

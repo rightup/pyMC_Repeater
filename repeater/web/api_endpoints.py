@@ -6,6 +6,8 @@ import secrets
 import time
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from datetime import datetime, timezone
+from pathlib import Path
+from threading import RLock
 from typing import Callable, Optional
 
 import cherrypy
@@ -26,16 +28,25 @@ from repeater.companion.utils import (
     validate_companion_config_capacity,
 )
 from repeater.config import resolve_storage_dir
+from repeater.handler_helpers.acl import role_name as acl_role_name
+from repeater.modem_config import (
+    LEGACY_MODEM_RADIO_TYPES,
+    normalize_modem_config,
+    redact_modem_tokens_in_place,
+)
 from repeater.policy_engine import PolicyEngine
 from repeater.service_utils import get_buildroot_image_info
+from repeater.utils_packet import create_scoped_advert_packet
 
 from .auth.middleware import require_auth
 from .auth_endpoints import AuthAPIEndpoints
 from .cad_calibration_engine import CADCalibrationEngine
 from .companion_endpoints import CompanionAPIEndpoints
+from .plugin_endpoints import PluginAPIEndpoints
 from .update_endpoints import UpdateAPIEndpoints
 
 logger = logging.getLogger("HTTPServer")
+REDACTED_CONFIG_VALUE = "*** REDACTED ***"
 
 POLICY_GROUP_KINDS = {
     "channel_hash": "channel_hashes",
@@ -86,6 +97,8 @@ POLICY_GROUP_KINDS = {
 # GET    /api/packet_stats?hours=24 - Get packet statistics
 # GET    /api/packet_type_stats?hours=24 - Get packet type statistics
 # GET    /api/route_stats?hours=24 - Get route statistics
+# GET    /api/neighbor_links?active_within_seconds=900 - Get in-memory observed upstream neighbour links
+# GET    /api/neighbor_link_history?peer_hash=AB&path_hash_size=1&hours=24&limit=1000 - Get observed upstream history from packets table
 # GET    /api/recent_packets?limit=100 - Get recent packets
 # GET    /api/filtered_packets?type=4&route=1&start_timestamp=X&end_timestamp=Y&limit=1000 - Get filtered packets
 # GET    /api/packet_by_hash?packet_hash=abc123 - Get specific packet by hash
@@ -122,6 +135,9 @@ POLICY_GROUP_KINDS = {
 # GET    /api/unscoped_flood_policy - Get unscoped flood policy
 # POST   /api/unscoped_flood_policy - Update unscoped flood policy
 # POST   /api/ping_neighbor - Ping a neighbor node
+# POST   /api/discover_neighbors_start - Start a live repeater discovery session
+# GET    /api/discover_neighbors_stream?session_id=X - Stream repeater discovery results over SSE
+# POST   /api/add_discovered_neighbor - Persist a discovered node into the neighbors/adverts table
 
 # Identity Management
 # GET    /api/identities - List all identities
@@ -155,6 +171,16 @@ POLICY_GROUP_KINDS = {
 # GET    /api/update/channels        - List available release channels (branches)
 # POST   /api/update/set_channel     - Switch release channel {"channel": "dev"}
 
+# Plugins (managed via local plugin-manager IPC)
+# GET    /api/plugins/               - List installed plugins
+# GET    /api/plugins/{id}           - Plugin status
+# POST   /api/plugins/install        - Install local wheel (multipart or wheel_path)
+# POST   /api/plugins/enable         - Enable plugin {"id"}
+# POST   /api/plugins/disable        - Disable plugin {"id"}
+# POST   /api/plugins/start|stop|restart - Lifecycle {"id"}
+# GET    /api/plugins/logs?id=       - Tail plugin logs
+# DELETE /api/plugins/{id}           - Uninstall (keeps data by default)
+
 # Setup Wizard
 # GET    /api/needs_setup - Check if repeater needs initial setup
 # GET    /api/site_info - Get site identification name (public, no auth required)
@@ -185,6 +211,19 @@ POLICY_GROUP_KINDS = {
 
 
 class APIEndpoints:
+    # Serialize both provisioning routes across mounts in this process, from
+    # authorization through persistence. Do not reuse ConfigManager's locks:
+    # imports must retain its normal persistence/live-update callbacks.
+    _provisioning_lock = RLock()
+
+    # How long /api/query_neighbor_scopes holds a request open. The scope helper's
+    # response window is normally its 5 s floor; a slow radio config (SF12) or a
+    # duty-cycle deferral can push a single query past this, in which case the
+    # query is left running so its answer still reaches the stored table and the
+    # client is told to re-read it. Chosen to stay inside a default reverse-proxy
+    # read timeout rather than to cover the helper's 120 s ceiling.
+    SCOPE_QUERY_HTTP_TIMEOUT = 45.0
+
     def __init__(
         self,
         stats_getter: Optional[Callable] = None,
@@ -200,6 +239,7 @@ class APIEndpoints:
         self.event_loop = event_loop
         self.daemon_instance = daemon_instance
         self._config_path = config_path or "/etc/openhop_repeater/config.yaml"
+
         self.cad_calibration = CADCalibrationEngine(daemon_instance, event_loop)
 
         # Initialize ConfigManager for centralized config management
@@ -219,6 +259,9 @@ class APIEndpoints:
 
         # Create nested update object for /api/update/* routes
         self.update = UpdateAPIEndpoints()
+
+        # Create nested plugins object for /api/plugins/* routes
+        self.plugins = PluginAPIEndpoints(self.config, self._config_path)
 
     def _is_cors_enabled(self):
         return self.config.get("web", {}).get("cors_enabled", False)
@@ -286,6 +329,64 @@ class APIEndpoints:
             cherrypy.response.headers["Allow"] = "POST"
             raise cherrypy.HTTPError(405, "Method not allowed. This endpoint requires POST.")
 
+    def _resolve_optional_request_user(self):
+        """Resolve JWT/API credentials when tools.require_auth is disabled.
+
+        Some endpoints (notably config_import) are intentionally public during
+        first-run setup. After setup they still need to accept authenticated
+        UI/API calls, so parse Authorization / X-API-Key here and set
+        cherrypy.request.user when valid.
+        """
+        existing = getattr(cherrypy.request, "user", None)
+        if existing:
+            return existing
+
+        jwt_handler = cherrypy.config.get("jwt_handler")
+        token_manager = cherrypy.config.get("token_manager")
+        request_headers = getattr(cherrypy.request, "headers", None) or {}
+
+        auth_header = request_headers.get("Authorization", "")
+        if jwt_handler and auth_header.startswith("Bearer "):
+            payload = jwt_handler.verify_jwt(auth_header[7:])
+            if payload:
+                user = {
+                    "username": payload.get("sub"),
+                    "client_id": payload.get("client_id"),
+                    "auth_type": "jwt",
+                }
+                cherrypy.request.user = user
+                return user
+
+        request_params = getattr(cherrypy.request, "params", None) or {}
+        query_token = request_params.get("token")
+        if jwt_handler and query_token:
+            payload = jwt_handler.verify_jwt(query_token)
+            if payload:
+                user = {
+                    "username": payload.get("sub"),
+                    "client_id": payload.get("client_id"),
+                    "auth_type": "jwt_query",
+                }
+                cherrypy.request.user = user
+                if hasattr(request_params, "pop"):
+                    request_params.pop("token", None)
+                return user
+
+        api_key = request_headers.get("X-API-Key", "")
+        if token_manager and api_key:
+            token_info = token_manager.verify_token(api_key)
+            if token_info:
+                user = {
+                    "username": "api_token",
+                    "token_name": token_info.get("name"),
+                    "token_id": token_info.get("id"),
+                    "auth_type": "api_token",
+                }
+                cherrypy.request.user = user
+                return user
+
+        return None
+
     def _fmt_hash(self, pubkey: bytes) -> str:
         """Format a node hash as a hex string respecting the configured path_hash_mode.
 
@@ -302,6 +403,129 @@ class APIEndpoints:
     def _get_time_range(self, hours):
         end_time = int(time.time())
         return end_time - (hours * 3600), end_time
+
+    def _encode_sse_event(
+        self, payload, event_name: Optional[str] = None, event_id: Optional[int] = None
+    ) -> str:
+        lines = []
+        if event_name:
+            lines.append(f"event: {event_name}")
+        if event_id is not None:
+            lines.append(f"id: {event_id}")
+        lines.append(f"data: {json.dumps(payload, default=str)}")
+        return "\n".join(lines) + "\n\n"
+
+    @staticmethod
+    def _normalize_discovery_node_name(value) -> Optional[str]:
+        """Normalize placeholder discovery names to None.
+
+        Some peers explicitly advertise "Unknown"-style placeholder names.
+        Treat those as missing so callers can fall back to hash/prefix labels.
+        """
+        text = str(value or "").strip()
+        if not text:
+            return None
+
+        normalized = text.lower()
+        if normalized in {"unknown", "unknown node"}:
+            return None
+
+        return text
+
+    def _enrich_discovery_result(self, result: dict) -> dict:
+        enriched = dict(result)
+        enriched["node_name"] = self._normalize_discovery_node_name(enriched.get("node_name"))
+        pub_key = str(enriched.get("pub_key") or "").lower()
+        if not pub_key:
+            return enriched
+
+        enriched["is_self"] = self._is_local_discovery_pubkey(pub_key)
+
+        try:
+            enriched["node_hash"] = self._fmt_hash(bytes.fromhex(pub_key))
+        except ValueError:
+            enriched["node_hash"] = None
+
+        try:
+            storage = self._get_storage()
+        except Exception:
+            storage = None
+
+        if not storage:
+            enriched["known_neighbor"] = False
+            return enriched
+
+        neighbor_info = {}
+        try:
+            if hasattr(storage, "get_neighbors"):
+                neighbor_info = storage.get_neighbors().get(pub_key, {}) or {}
+        except Exception as exc:
+            logger.debug("Discovery enrichment could not load neighbors: %s", exc)
+
+        if not neighbor_info:
+            try:
+                node_name = storage.get_node_name_by_pubkey(pub_key)
+            except Exception:
+                node_name = None
+            node_name = self._normalize_discovery_node_name(node_name)
+            enriched["known_neighbor"] = bool(node_name)
+            if node_name:
+                enriched["node_name"] = node_name
+            return enriched
+
+        enriched["known_neighbor"] = True
+        enriched["node_name"] = self._normalize_discovery_node_name(neighbor_info.get("node_name"))
+        enriched["contact_type"] = neighbor_info.get("contact_type")
+        enriched["zero_hop"] = neighbor_info.get("zero_hop")
+        enriched["last_seen"] = neighbor_info.get("last_seen")
+        enriched["advert_count"] = neighbor_info.get("advert_count")
+        return enriched
+
+    def _get_local_pubkey_hex(self) -> Optional[str]:
+        """Return local node public key in hex when available."""
+        daemon = getattr(self, "daemon_instance", None)
+        identity = getattr(daemon, "local_identity", None)
+
+        try:
+            if identity and hasattr(identity, "get_public_key"):
+                pubkey = identity.get_public_key()
+                if isinstance(pubkey, (bytes, bytearray)):
+                    return bytes(pubkey).hex().lower()
+                if isinstance(pubkey, str):
+                    normalized = pubkey.strip().lower()
+                    if normalized.startswith("0x"):
+                        normalized = normalized[2:]
+                    if normalized:
+                        return normalized
+        except Exception as exc:
+            logger.debug("Unable to read local identity pubkey: %s", exc)
+
+        repeater_cfg = self.config.get("repeater", {}) if isinstance(self.config, dict) else {}
+        key = repeater_cfg.get("identity_key")
+        if isinstance(key, (bytes, bytearray)):
+            return bytes(key).hex().lower()
+        if isinstance(key, str):
+            normalized = key.strip().lower()
+            if normalized.startswith("0x"):
+                normalized = normalized[2:]
+            if normalized and all(ch in "0123456789abcdef" for ch in normalized):
+                return normalized
+
+        return None
+
+    def _is_local_discovery_pubkey(self, pub_key: str) -> bool:
+        """Return True if discovery pub_key matches the local node key (including prefix form)."""
+        candidate = str(pub_key or "").strip().lower()
+        if not candidate:
+            return False
+        if candidate.startswith("0x"):
+            candidate = candidate[2:]
+
+        local_pubkey = self._get_local_pubkey_hex()
+        if not local_pubkey:
+            return False
+
+        return local_pubkey.startswith(candidate) or candidate.startswith(local_pubkey)
 
     def _process_counter_data(self, data_points, timestamps_ms):
         rates = []
@@ -320,13 +544,147 @@ class APIEndpoints:
         values = [v if v is not None else 0 for v in data_points]
         return [[timestamps_ms[i], values[i]] for i in range(min(len(values), len(timestamps_ms)))]
 
+    @staticmethod
+    def _pearson_correlation(left: list[float], right: list[float]) -> Optional[float]:
+        if len(left) != len(right) or len(left) < 5:
+            return None
+
+        mean_left = sum(left) / len(left)
+        mean_right = sum(right) / len(right)
+
+        numerator = 0.0
+        left_variance = 0.0
+        right_variance = 0.0
+        for i in range(len(left)):
+            dx = left[i] - mean_left
+            dy = right[i] - mean_right
+            numerator += dx * dy
+            left_variance += dx * dx
+            right_variance += dy * dy
+
+        denominator = (left_variance * right_variance) ** 0.5
+        if denominator <= 0:
+            return None
+        return numerator / denominator
+
+    @staticmethod
+    def _auto_bucket_seconds(range_seconds: int) -> int:
+        if range_seconds <= 0:
+            return 60
+        target = max(60, int(range_seconds / 120))
+        rounded = ((target + 59) // 60) * 60
+        return max(60, min(rounded, 3600))
+
+    def _build_rrd_bucket_metrics(self, rrd_data: Optional[dict], bucket_seconds: int) -> dict:
+        if not rrd_data:
+            return {}
+
+        timestamps = rrd_data.get("timestamps") or []
+        metrics = rrd_data.get("metrics") or {}
+        if not isinstance(timestamps, list) or not isinstance(metrics, dict):
+            return {}
+
+        def _counter_delta(values: list) -> list[float]:
+            output = []
+            previous = None
+            for item in values:
+                if item is None:
+                    output.append(0.0)
+                elif previous is None:
+                    output.append(0.0)
+                    previous = item
+                else:
+                    output.append(float(max(0, item - previous)))
+                    previous = item
+            return output
+
+        def _counter_values(values: list) -> list[float]:
+            return [float(item or 0.0) for item in values]
+
+        counter_mode = rrd_data.get("counter_mode")
+        counter_processor = _counter_values if counter_mode == "bucket_count" else _counter_delta
+
+        rx_values = counter_processor(metrics.get("rx_count", []))
+        tx_values = counter_processor(metrics.get("tx_count", []))
+        drop_values = counter_processor(metrics.get("drop_count", []))
+        rssi_values = metrics.get("avg_rssi", []) or []
+        snr_values = metrics.get("avg_snr", []) or []
+
+        bucket_map: dict = {}
+
+        max_len = len(timestamps)
+        for i in range(max_len):
+            ts = int(timestamps[i])
+            bucket_ts = int(ts / bucket_seconds) * bucket_seconds
+            bucket = bucket_map.setdefault(
+                bucket_ts,
+                {
+                    "rx_count": 0.0,
+                    "tx_count": 0.0,
+                    "drop_count": 0.0,
+                    "avg_rssi_sum": 0.0,
+                    "avg_rssi_samples": 0,
+                    "avg_snr_sum": 0.0,
+                    "avg_snr_samples": 0,
+                },
+            )
+
+            if i < len(rx_values):
+                bucket["rx_count"] += float(rx_values[i] or 0.0)
+            if i < len(tx_values):
+                bucket["tx_count"] += float(tx_values[i] or 0.0)
+            if i < len(drop_values):
+                bucket["drop_count"] += float(drop_values[i] or 0.0)
+
+            if i < len(rssi_values) and rssi_values[i] is not None:
+                bucket["avg_rssi_sum"] += float(rssi_values[i])
+                bucket["avg_rssi_samples"] += 1
+
+            if i < len(snr_values) and snr_values[i] is not None:
+                bucket["avg_snr_sum"] += float(snr_values[i])
+                bucket["avg_snr_samples"] += 1
+
+        finalized: dict = {}
+        for bucket_ts, raw in bucket_map.items():
+            rx_count = float(raw["rx_count"])
+            tx_count = float(raw["tx_count"])
+            drop_count = float(raw["drop_count"])
+            tx_drop_total = tx_count + drop_count
+
+            avg_rssi = None
+            if raw["avg_rssi_samples"] > 0:
+                avg_rssi = raw["avg_rssi_sum"] / raw["avg_rssi_samples"]
+
+            avg_snr = None
+            if raw["avg_snr_samples"] > 0:
+                avg_snr = raw["avg_snr_sum"] / raw["avg_snr_samples"]
+
+            packet_loss_rate_pct = None
+            if tx_drop_total > 0:
+                packet_loss_rate_pct = (drop_count * 100.0) / tx_drop_total
+
+            finalized[bucket_ts] = {
+                "rx_count": int(round(rx_count)),
+                "tx_count": int(round(tx_count)),
+                "drop_count": int(round(drop_count)),
+                "traffic_volume": int(round(rx_count + tx_count)),
+                "packet_loss_rate_pct": packet_loss_rate_pct,
+                "avg_rssi": avg_rssi,
+                "avg_snr": avg_snr,
+            }
+
+        return finalized
+
     def _setup_status_from_config(self, config: dict) -> tuple[bool, dict]:
         """Return whether first-run setup should still be available."""
         node_name = config.get("repeater", {}).get("node_name", "")
         has_default_name = node_name in ["mesh-repeater-01", ""]
 
         admin_password = config.get("repeater", {}).get("security", {}).get("admin_password", "")
-        has_default_password = admin_password in ["admin123", ""]
+        has_default_password = admin_password is None or (
+            isinstance(admin_password, str)
+            and (not admin_password.strip() or admin_password == "admin123")  # nosec B105
+        )
 
         radio_type_raw = config.get("radio_type")
         radio_type = "" if radio_type_raw is None else str(radio_type_raw).lower().strip()
@@ -337,7 +695,12 @@ class APIEndpoints:
             "default_password": has_default_password,
             "radio_not_configured": radio_not_configured,
         }
-        return has_default_name or has_default_password or radio_not_configured, reasons
+        # Name and radio settings are diagnostics, not authorization signals:
+        # radio-less installations and default names are valid after provisioning.
+        # Legacy configs have no marker, so a custom password also closes setup.
+        # An explicit false marker must never override existing credentials.
+        setup_completed = config.get("setup_completed") is True
+        return has_default_password and not setup_completed, reasons
 
     def _default_policy_document(self) -> dict:
         return {
@@ -1105,12 +1468,40 @@ class APIEndpoints:
                     for dev in glob.glob(pattern):
                         devices.append({"device": str(dev), "description": str(dev)})
 
-            # De-duplicate by device path while preserving the first description.
+            # Docker deployments may mount the host device namespace separately.
+            import glob
+
+            if os.path.isdir("/host/dev"):
+                for pattern in (
+                    "/host/dev/ttyACM*",
+                    "/host/dev/ttyUSB*",
+                    "/host/dev/serial/by-id/*",
+                ):
+                    try:
+                        for dev in glob.glob(pattern):
+                            devices.append({"device": str(dev), "description": str(dev)})
+                    except (OSError, PermissionError):
+                        continue
+
+            # De-duplicate by resolved target. Prefer stable host by-id aliases.
             dedup = {}
             for item in devices:
                 dev = item.get("device")
-                if dev and dev not in dedup:
-                    dedup[dev] = item
+                if not dev or (os.path.islink(dev) and not os.path.exists(dev)):
+                    continue
+                try:
+                    target = os.path.realpath(dev)
+                except (OSError, PermissionError):
+                    continue
+                preferred = str(dev).startswith("/host/dev/serial/by-id/")
+                existing = dedup.get(target)
+                if existing is None or preferred:
+                    # Docker reads `devices:` entries as host:container[:perms] and
+                    # cannot escape a colon inside the path, so a /dev/serial/by-id/
+                    # name carrying an ESP32-S3 MAC serial is unusable in a
+                    # container. Flag it so the UI can offer a symlink instead.
+                    item["docker_safe"] = ":" not in dev
+                    dedup[target] = item
 
             sorted_devices = sorted(dedup.values(), key=lambda x: x["device"])
             return self._success(sorted_devices)
@@ -1123,6 +1514,10 @@ class APIEndpoints:
     @cherrypy.tools.json_in()
     def setup_wizard(self):
         """Complete initial setup wizard configuration"""
+        with self._provisioning_lock:
+            return self._setup_wizard_locked()
+
+    def _setup_wizard_locked(self):
         try:
             self._require_post()
             data = cherrypy.request.json
@@ -1152,6 +1547,7 @@ class APIEndpoints:
                 return {"success": False, "error": "Node name too long (max 31 bytes in UTF-8)"}
 
             hardware_key = data.get("hardware_key", "").strip()
+            hardware_key = LEGACY_MODEM_RADIO_TYPES.get(hardware_key, hardware_key)
             if not hardware_key:
                 return {"success": False, "error": "Hardware selection is required"}
 
@@ -1233,47 +1629,58 @@ class APIEndpoints:
                 )
                 if "preamble_length" not in config_yaml["radio"]:
                     config_yaml["radio"]["preamble_length"] = 32
-            elif hardware_key == "pymc_usb":
-                # pymc_usb modem: external SX1262 board over USB-CDC.
-                # Accept pymc_usb_port / pymc_usb_baudrate from the request body
+            elif hardware_key == "modem_usb":
+                # modem_usb modem: external SX1262 board over USB-CDC.
+                # Accept modem_usb_port / modem_usb_baudrate from the request body
                 # (mirrors the KISS pattern) so a future SPA can expose inputs;
                 # fall back to /dev/ttyACM0 at 921600 baud, which matches the
                 # firmware default and the typical USB-CDC modem device on Linux.
-                config_yaml["radio_type"] = "pymc_usb"
-                usb_port = (data.get("pymc_usb_port") or "").strip() or "/dev/ttyACM0"
-                usb_baud = int(data.get("pymc_usb_baudrate", data.get("pymc_usb_baud", 921600)))
-                pymc_usb_section = config_yaml.setdefault("pymc_usb", {})
-                pymc_usb_section["port"] = usb_port
-                pymc_usb_section["baudrate"] = usb_baud
-                pymc_usb_section.setdefault("lbt_enabled", True)
-                pymc_usb_section.setdefault("lbt_max_attempts", 5)
+                config_yaml["radio_type"] = "modem_usb"
+                usb_port = (
+                    data.get("modem_usb_port") or data.get("pymc_usb_port") or ""
+                ).strip() or "/dev/ttyACM0"
+                usb_baud = int(
+                    data.get(
+                        "modem_usb_baudrate",
+                        data.get("pymc_usb_baudrate", data.get("pymc_usb_baud", 921600)),
+                    )
+                )
+                modem_usb_section = config_yaml.setdefault("modem_usb", {})
+                modem_usb_section["port"] = usb_port
+                modem_usb_section["baudrate"] = usb_baud
+                modem_usb_section.setdefault("lbt_enabled", True)
+                modem_usb_section.setdefault("lbt_max_attempts", 5)
                 if tx_power_preset is not None:
                     config_yaml["radio"]["tx_power"] = tx_power_preset
                 elif "tx_power" in hw_config:
                     config_yaml["radio"]["tx_power"] = hw_config.get("tx_power", 22)
                 if "preamble_length" in hw_config:
                     config_yaml["radio"]["preamble_length"] = hw_config.get("preamble_length", 32)
-            elif hardware_key == "pymc_tcp":
-                # pymc_tcp modem: external SX1262 board exposed as TCP over Wi-Fi/Ethernet.
+            elif hardware_key == "modem_tcp":
+                # modem_tcp modem: external SX1262 board exposed as TCP over Wi-Fi/Ethernet.
                 # 'host' has no sensible default — must be the modem's LAN address or
                 # mDNS name. Accept it from the request body if the SPA provides it,
                 # otherwise write a clearly-placeholder hostname so the file is valid
                 # YAML and the user gets a startup error pointing them at the right
                 # section to edit (see config.py: ValueError 'Missing host …').
-                config_yaml["radio_type"] = "pymc_tcp"
-                tcp_host = (data.get("pymc_tcp_host") or "").strip() or "REPLACE_WITH_MODEM_HOST"
-                tcp_port = int(data.get("pymc_tcp_port", 5055))
-                pymc_tcp_section = config_yaml.setdefault("pymc_tcp", {})
-                pymc_tcp_section["host"] = tcp_host
-                pymc_tcp_section["port"] = tcp_port
-                tcp_token = data.get("pymc_tcp_token")
+                config_yaml["radio_type"] = "modem_tcp"
+                tcp_host = (
+                    data.get("modem_tcp_host") or data.get("pymc_tcp_host") or ""
+                ).strip() or "REPLACE_WITH_MODEM_HOST"
+                tcp_port = int(data.get("modem_tcp_port", data.get("pymc_tcp_port", 5055)))
+                modem_tcp_section = config_yaml.setdefault("modem_tcp", {})
+                modem_tcp_section["host"] = tcp_host
+                modem_tcp_section["port"] = tcp_port
+                tcp_token = data.get("modem_tcp_token")
+                if tcp_token is None:
+                    tcp_token = data.get("pymc_tcp_token")
                 if tcp_token is not None:
-                    pymc_tcp_section["token"] = str(tcp_token)
+                    modem_tcp_section["token"] = str(tcp_token)
                 else:
-                    pymc_tcp_section.setdefault("token", "")
-                pymc_tcp_section.setdefault("connect_timeout", 5.0)
-                pymc_tcp_section.setdefault("lbt_enabled", True)
-                pymc_tcp_section.setdefault("lbt_max_attempts", 5)
+                    modem_tcp_section.setdefault("token", "")
+                modem_tcp_section.setdefault("connect_timeout", 5.0)
+                modem_tcp_section.setdefault("lbt_enabled", True)
+                modem_tcp_section.setdefault("lbt_max_attempts", 5)
                 if tx_power_preset is not None:
                     config_yaml["radio"]["tx_power"] = tx_power_preset
                 elif "tx_power" in hw_config:
@@ -1349,9 +1756,19 @@ class APIEndpoints:
                     config_yaml["sx1262"]["use_gpiod_backend"] = hw_config.get(
                         "use_gpiod_backend", False
                     )
-            # Write updated config
-            with open(self._config_path, "w") as f:
-                yaml.dump(config_yaml, f, default_flow_style=False, sort_keys=False)
+            # Explicit setup writes canonical names only.
+            config_yaml = normalize_modem_config(config_yaml)
+            config_yaml["setup_completed"] = True
+            with open(self._config_path, "w", encoding="utf-8") as f:
+                yaml.safe_dump(
+                    config_yaml,
+                    f,
+                    default_flow_style=False,
+                    sort_keys=False,
+                    allow_unicode=True,
+                    width=1000000,
+                )
+            self.config["setup_completed"] = True
 
             logger.info(
                 f"Setup wizard completed: node_name={node_name}, hardware={hardware_key}, freq={freq_mhz}MHz"
@@ -1387,14 +1804,14 @@ class APIEndpoints:
             if hardware_key == "kiss":
                 result_config["kiss_port"] = config_yaml.get("kiss", {}).get("port")
                 result_config["kiss_baud_rate"] = config_yaml.get("kiss", {}).get("baud_rate")
-            elif hardware_key == "pymc_usb":
-                pymc_usb_cfg = config_yaml.get("pymc_usb", {})
-                result_config["pymc_usb_port"] = pymc_usb_cfg.get("port")
-                result_config["pymc_usb_baudrate"] = pymc_usb_cfg.get("baudrate")
-            elif hardware_key == "pymc_tcp":
-                pymc_tcp_cfg = config_yaml.get("pymc_tcp", {})
-                result_config["pymc_tcp_host"] = pymc_tcp_cfg.get("host")
-                result_config["pymc_tcp_port"] = pymc_tcp_cfg.get("port")
+            elif hardware_key == "modem_usb":
+                modem_usb_cfg = config_yaml.get("modem_usb", {})
+                result_config["modem_usb_port"] = modem_usb_cfg.get("port")
+                result_config["modem_usb_baudrate"] = modem_usb_cfg.get("baudrate")
+            elif hardware_key == "modem_tcp":
+                modem_tcp_cfg = config_yaml.get("modem_tcp", {})
+                result_config["modem_tcp_host"] = modem_tcp_cfg.get("host")
+                result_config["modem_tcp_port"] = modem_tcp_cfg.get("port")
                 # token deliberately omitted from response (sensitive)
             return {
                 "success": True,
@@ -1417,14 +1834,23 @@ class APIEndpoints:
     def stats(self):
         try:
             stats = self.stats_getter() if self.stats_getter else {}
+            runtime_config = normalize_modem_config(self.config, warn=False)
+            redact_modem_tokens_in_place(runtime_config)
             # Include active radio configuration in stats so UI can hydrate
             # directly from this endpoint without additional config fetches.
-            stats["radio_type"] = self.config.get("radio_type")
-            stats["sx1262"] = self.config.get("sx1262", {})
-            stats["ch341"] = self.config.get("ch341", {})
-            stats["kiss"] = self.config.get("kiss", {})
-            stats["pymc_usb"] = self.config.get("pymc_usb", {})
-            stats["pymc_tcp"] = self.config.get("pymc_tcp", {})
+            stats["radio_type"] = runtime_config.get("radio_type")
+            stats["sx1262"] = runtime_config.get("sx1262", {})
+            stats["ch341"] = runtime_config.get("ch341", {})
+            stats["kiss"] = runtime_config.get("kiss", {})
+            stats["modem_usb"] = runtime_config.get("modem_usb", {})
+            stats["modem_tcp"] = runtime_config.get("modem_tcp", {})
+            stats["radios"] = runtime_config.get("radios") or []
+            stats["fabric"] = self.config.get("fabric") or {}
+            meta = {}
+            daemon = getattr(self, "daemon_instance", None)
+            if daemon is not None:
+                meta = getattr(daemon, "radio_stack_meta", None) or {}
+            stats["radio_stack"] = meta
             stats["site_name"] = self.config.get("web", {}).get("site_name", "")
             stats["version"] = __version__
             try:
@@ -1573,6 +1999,7 @@ class APIEndpoints:
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
+    @cherrypy.tools.json_in()
     def send_advert(self):
         # Enable CORS for this endpoint
         self._set_cors_headers()
@@ -1587,12 +2014,26 @@ class APIEndpoints:
                 return self._error("Send advert function not configured")
             if self.event_loop is None:
                 return self._error("Event loop not available")
+
+            data = cherrypy.request.json or {}
+            mode = str(data.get("mode", "flood")).strip().lower()
+            if mode not in ("flood", "direct"):
+                return self._error("Invalid mode. Must be 'flood' or 'direct'")
+
             import asyncio
 
-            future = asyncio.run_coroutine_threadsafe(self.send_advert_func(), self.event_loop)
+            async def _call_send_advert():
+                try:
+                    return await self.send_advert_func(advert_kind=mode)
+                except TypeError:
+                    # Backward compatibility for older callbacks that don't
+                    # accept advert_kind yet.
+                    return await self.send_advert_func()
+
+            future = asyncio.run_coroutine_threadsafe(_call_send_advert(), self.event_loop)
             result = future.result(timeout=10)
             return (
-                self._success("Advert sent successfully")
+                self._success(f"{mode.title()} advert sent successfully")
                 if result
                 else self._error("Failed to send advert")
             )
@@ -1630,8 +2071,18 @@ class APIEndpoints:
             if "repeater" not in self.config:
                 self.config["repeater"] = {}
             self.config["repeater"]["mode"] = new_mode
+
+            # The engine reads the mode live from the shared config dict;
+            # update_and_save writes it to disk so the choice survives a
+            # restart.
+            result = self.config_manager.update_and_save(
+                updates={}, live_update=True, live_update_sections=["repeater"]
+            )
+            if not result.get("saved", False):
+                return self._error(result.get("error", "Failed to save configuration to file"))
+
             logger.info(f"Mode changed to: {new_mode}")
-            return {"success": True, "mode": new_mode}
+            return {"success": True, "mode": new_mode, "persisted": True}
         except cherrypy.HTTPError:
             # Re-raise HTTP errors (like 405 Method Not Allowed) without logging
             raise
@@ -1893,10 +2344,163 @@ class APIEndpoints:
             logger.error(f"Error updating advert rate limit config: {e}")
             return self._error(str(e))
 
+    @staticmethod
+    def _read_ui_version(html_dir: str) -> Optional[str]:
+        """Best-effort version for a static UI tree (VERSION / version.json / package.json)."""
+        if not html_dir or not os.path.isdir(html_dir):
+            return None
+        version_file = os.path.join(html_dir, "VERSION")
+        if os.path.isfile(version_file):
+            try:
+                value = open(version_file, "r", encoding="utf-8").read().strip()
+                return value or None
+            except OSError:
+                pass
+        for name in ("version.json", "package.json"):
+            candidate = os.path.join(html_dir, name)
+            if not os.path.isfile(candidate):
+                continue
+            try:
+                import json as _json
+
+                data = _json.loads(open(candidate, "r", encoding="utf-8").read())
+            except (OSError, ValueError):
+                continue
+            if isinstance(data, dict):
+                ver = data.get("version")
+                if isinstance(ver, str) and ver.strip():
+                    return ver.strip()
+            elif isinstance(data, str) and data.strip():
+                return data.strip()
+        return None
+
+    def _plugin_ui_frontends(self) -> list:
+        """Installed application-UI plugins usable as primary web frontends."""
+        out = []
+        try:
+            from repeater.config import resolve_storage_dir
+            from repeater.plugins.manifest import ui_subtree
+            from repeater.plugins.storage import PluginStorage, resolve_plugins_root
+        except Exception as exc:
+            logger.debug("plugin UI frontends unavailable: %s", exc)
+            return out
+
+        try:
+            storage_dir = resolve_storage_dir(self.config, config_path=self._config_path)
+            plugins_root = resolve_plugins_root(self.config, storage_dir=storage_dir)
+            storage = PluginStorage(plugins_root)
+        except Exception as exc:
+            logger.debug("plugin storage resolve failed: %s", exc)
+            return out
+
+        for plugin_id in storage.list_plugin_ids():
+            try:
+                state = storage.read_state(plugin_id) or {}
+                manifest = storage.load_current_manifest(plugin_id)
+                if manifest is None or manifest.ui is None:
+                    continue
+                paths = storage.paths_for(plugin_id)
+                if paths.current_link.exists() or paths.current_link.is_symlink():
+                    # Keep a stable filesystem path under "current" so saved
+                    # web.web_path does not pin to a specific release version.
+                    release_root = paths.current_link
+                else:
+                    version = state.get("version") or (manifest.version if manifest else None)
+                    if not version:
+                        continue
+                    release_root = paths.release_dir(str(version))
+                if not release_root.is_dir():
+                    continue
+                entry = str(manifest.ui.entry or "").replace("\\", "/")
+                ui_subtree(entry)
+                entry_parts = tuple(p for p in entry.split("/") if p)
+                if not entry_parts:
+                    continue
+                if len(entry_parts) > 1:
+                    doc_root = release_root.joinpath(*entry_parts[:-1])
+                    entry_name = entry_parts[-1]
+                else:
+                    doc_root = release_root
+                    entry_name = entry_parts[0]
+                if not doc_root.is_dir():
+                    continue
+                index_path = doc_root / entry_name
+                available = bool(state.get("enabled", False)) and index_path.is_file()
+                version = str(state.get("version") or manifest.version or "") or None
+                out.append(
+                    {
+                        "id": f"plugin:{plugin_id}",
+                        "plugin_id": plugin_id,
+                        "kind": "plugin",
+                        "name": manifest.name or plugin_id,
+                        "description": (manifest.description or "Application UI plugin").strip()
+                        or "Application UI plugin",
+                        "path": str(doc_root),
+                        "version": version,
+                        "enabled": bool(state.get("enabled", False)),
+                        "available": available,
+                        "source": state.get("source") or "local",
+                    }
+                )
+            except Exception as exc:
+                logger.debug("skip plugin frontend %s: %s", plugin_id, exc)
+                continue
+        return out
+
+    def _plugin_id_from_web_path(self, web_path: str) -> Optional[str]:
+        value = str(web_path or "").strip()
+        if not value:
+            return None
+        if value.startswith("plugin:"):
+            plugin_id = value.split(":", 1)[1].strip()
+            return plugin_id or None
+        if value.startswith("/plugins/"):
+            suffix = value[len("/plugins/") :].strip("/")
+            plugin_id = suffix.split("/", 1)[0] if suffix else ""
+            return plugin_id or None
+
+        try:
+            from repeater.config import resolve_storage_dir
+            from repeater.plugins.storage import resolve_plugins_root
+
+            storage_dir = resolve_storage_dir(self.config, config_path=self._config_path)
+            plugins_root = resolve_plugins_root(self.config, storage_dir=storage_dir).resolve()
+            rel = Path(value).expanduser().resolve(strict=False).relative_to(plugins_root)
+            parts = rel.parts
+            if len(parts) >= 2 and parts[1] in {"current", "releases"}:
+                return parts[0] or None
+        except Exception:
+            return None
+        return None
+
+    def _normalize_web_path_for_persistence(self, web_path):
+        if web_path is None:
+            return None
+        value = str(web_path).strip()
+        if not value:
+            return None
+
+        plugin_id = self._plugin_id_from_web_path(value)
+        if plugin_id:
+            return f"plugin:{plugin_id}"
+
+        abs_value = os.path.abspath(value)
+        for item in self._plugin_ui_frontends():
+            if item.get("kind") != "plugin":
+                continue
+            item_path = item.get("path")
+            if not item_path:
+                continue
+            if os.path.abspath(str(item_path)) == abs_value:
+                item_plugin_id = str(item.get("plugin_id") or "").strip()
+                if item_plugin_id:
+                    return f"plugin:{item_plugin_id}"
+        return value
+
     @cherrypy.expose
     @cherrypy.tools.json_out()
     def check_pymc_console(self):
-        """Check if PyMC Console directory exists."""
+        """Check if openHop Console directory exists (and report version when known)."""
         self._set_cors_headers()
 
         if cherrypy.request.method == "OPTIONS":
@@ -1905,10 +2509,127 @@ class APIEndpoints:
         try:
             pymc_console_path = "/opt/pymc_console/web/html"
             exists = os.path.isdir(pymc_console_path)
+            version = self._read_ui_version(pymc_console_path) if exists else None
 
-            return self._success({"exists": exists, "path": pymc_console_path})
+            return self._success(
+                {
+                    "exists": exists,
+                    "path": pymc_console_path,
+                    "version": version,
+                }
+            )
         except Exception as e:
             logger.error(f"Error checking PyMC Console directory: {e}")
+            return self._error(str(e))
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    def web_frontends(self):
+        """List selectable primary web frontends (built-in, Console, UI plugins)."""
+        self._set_cors_headers()
+
+        if cherrypy.request.method == "OPTIONS":
+            return ""
+        if cherrypy.request.method not in ("GET", "HEAD"):
+            raise cherrypy.HTTPError(405, "Method Not Allowed")
+
+        try:
+            web_cfg = (self.config or {}).get("web") or {}
+            current_path = web_cfg.get("web_path")
+            if isinstance(current_path, str):
+                current_path = current_path.strip() or None
+            else:
+                current_path = None
+
+            try:
+                from repeater import __version__ as repeater_version
+            except Exception:
+                repeater_version = None
+
+            default_html = os.path.join(os.path.dirname(__file__), "html")
+            frontends = [
+                {
+                    "id": "builtin",
+                    "kind": "builtin",
+                    "name": "Default Frontend",
+                    "description": "Built-in Repeater web interface",
+                    "path": None,
+                    "version": repeater_version,
+                    "available": True,
+                    "enabled": True,
+                }
+            ]
+
+            console_path = "/opt/pymc_console/web/html"
+            console_exists = os.path.isdir(console_path)
+            frontends.append(
+                {
+                    "id": "console",
+                    "kind": "console",
+                    "name": "openHop Console",
+                    "description": "Alternative web interface for Repeater",
+                    "path": console_path,
+                    "version": self._read_ui_version(console_path) if console_exists else None,
+                    "available": console_exists,
+                    "enabled": console_exists,
+                }
+            )
+
+            frontends.extend(self._plugin_ui_frontends())
+
+            selected_id = "builtin"
+            if current_path:
+                # Prefer exact path match; fall back to path prefix for console.
+                matched = None
+                plugin_id = self._plugin_id_from_web_path(current_path)
+                if plugin_id:
+                    candidate_id = f"plugin:{plugin_id}"
+                    if any(item.get("id") == candidate_id for item in frontends):
+                        matched = candidate_id
+                for item in frontends:
+                    if matched is not None:
+                        break
+                    path = item.get("path")
+                    if not path:
+                        continue
+                    if os.path.abspath(str(path)) == os.path.abspath(str(current_path)):
+                        matched = item["id"]
+                        break
+                if matched is None and (
+                    current_path == console_path
+                    or str(current_path).startswith("/opt/pymc_console/")
+                ):
+                    matched = "console"
+                if matched is None:
+                    # Unknown custom path — surface as selected custom entry
+                    frontends.append(
+                        {
+                            "id": "custom",
+                            "kind": "custom",
+                            "name": "Custom path",
+                            "description": "Configured web_path not matching a known frontend",
+                            "path": current_path,
+                            "version": self._read_ui_version(current_path),
+                            "available": os.path.isdir(current_path),
+                            "enabled": True,
+                        }
+                    )
+                    matched = "custom"
+                selected_id = matched
+
+            for item in frontends:
+                item["selected"] = item["id"] == selected_id
+
+            return self._success(
+                {
+                    "frontends": frontends,
+                    "selected_id": selected_id,
+                    "web_path": current_path,
+                    "default_html_dir": default_html,
+                }
+            )
+        except Exception as e:
+            logger.error(f"Error listing web frontends: {e}")
             return self._error(str(e))
 
     @cherrypy.expose
@@ -1928,16 +2649,43 @@ class APIEndpoints:
             if not updates:
                 return self._error("No configuration updates provided")
 
+            if isinstance(updates.get("web"), dict) and "web_path" in updates["web"]:
+                updates = dict(updates)
+                updates["web"] = dict(updates["web"])
+                updates["web"]["web_path"] = self._normalize_web_path_for_persistence(
+                    updates["web"].get("web_path")
+                )
+
             # Use ConfigManager to update and save configuration
-            # Web changes (CORS, web_path) don't require live update
+            # Persist web changes first, then apply to running HTTP server.
             result = self.config_manager.update_and_save(updates=updates, live_update=False)
 
             if result.get("success"):
+                live_applied = False
+                frontend_switched = False
+                app = (
+                    getattr(getattr(self.daemon_instance, "http_server", None), "app", None)
+                    if self.daemon_instance
+                    else None
+                )
+                if app and hasattr(app, "apply_web_config"):
+                    try:
+                        frontend_switched = bool(app.apply_web_config())
+                        live_applied = True
+                    except Exception as exc:
+                        logger.warning("Failed to apply web config live: %s", exc)
                 logger.info(f"Web configuration updated: {list(updates.keys())}")
                 return self._success(
                     {
                         "persisted": result.get("saved", False),
-                        "message": "Web configuration saved successfully. Restart required for changes to take effect.",
+                        "live_applied": live_applied,
+                        "frontend_switched": frontend_switched,
+                        "restart_required": not live_applied,
+                        "message": (
+                            "Web configuration applied immediately."
+                            if live_applied
+                            else "Web configuration saved. Restart required for changes to take effect."
+                        ),
                     }
                 )
             else:
@@ -1978,13 +2726,25 @@ class APIEndpoints:
                                 "reconnecting": conn.has_pending_reconnect(),
                             },
                             "format": conn.format,
+                            "neighbors": getattr(conn, "neighbors_enabled", False),
                         }
                     )
+
+            # Schedule summary for the neighbors topic, the openhop equivalent of
+            # the firmware's trailing "nbr: <next>/<last>" in `get mqtt.status`.
+            neighbors_status = None
+            publisher = getattr(self.daemon_instance, "neighbors_publisher", None)
+            if publisher:
+                try:
+                    neighbors_status = publisher.status()
+                except Exception as exc:
+                    logger.debug(f"mqtt_status could not read neighbors publisher: {exc}")
 
             return self._success(
                 {
                     "handler_active": handler is not None,
                     "brokers": connected_brokers,
+                    "neighbors": neighbors_status,
                 }
             )
         except Exception as e:
@@ -2047,6 +2807,294 @@ class APIEndpoints:
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
+    def publish_neighbors(self):
+        """Run one neighbours discovery + publish cycle now.
+
+        POST /api/publish_neighbors
+
+        The HTTP equivalent of the ``discover.scopes`` mesh CLI command. A cycle
+        runs for minutes -- a discovery window plus one serialized scope query per
+        neighbour -- so this schedules it on the event loop and returns
+        immediately rather than holding the request open. Poll ``mqtt_status``
+        for the outcome.
+        """
+        self._set_cors_headers()
+
+        if cherrypy.request.method == "OPTIONS":
+            return ""
+
+        future = None
+        try:
+            self._require_post()
+            publisher = getattr(self.daemon_instance, "neighbors_publisher", None)
+            if not publisher:
+                return self._error("Neighbors publisher not available")
+            if not publisher.enabled():
+                return self._error(
+                    "Neighbours publishing is disabled - enable it and opt a broker in first"
+                )
+            if self.event_loop is None:
+                return self._error("Event loop not available")
+
+            import asyncio
+
+            # trigger_cycle owns the already-running check and tracks the task so
+            # shutdown can cancel it. Doing either here would race: this runs on a
+            # cherrypy thread while the cycle lives on the event loop.
+            async def _start():
+                return publisher.trigger_cycle()
+
+            future = asyncio.run_coroutine_threadsafe(_start(), self.event_loop)
+            if future.result(timeout=10):
+                return self._success("Neighbours discovery cycle started")
+            return self._error("A neighbours cycle is already running")
+        except FutureTimeoutError:
+            logger.error("Timed out starting the neighbours cycle", exc_info=True)
+            if future is not None:
+                future.cancel()
+            return self._error("Timed out starting the neighbours cycle")
+        except cherrypy.HTTPError:
+            raise
+        except Exception as e:
+            logger.error(f"Error starting neighbours cycle: {e}", exc_info=True)
+            return self._error(str(e))
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    def neighbor_scopes(self):
+        """Last known region scopes per neighbour.
+
+        GET /api/neighbor_scopes
+
+        Served as its own endpoint rather than folded into the advert queries: the
+        advert list is paginated per contact type and read on every neighbours-page
+        load, and this table is small enough (one row per queried neighbour) that
+        the client can hold the whole thing and join on pubkey.
+
+        ``scopes`` is the last answer a neighbour gave; an empty string is a real
+        answer meaning it serves unscoped traffic only. ``status``/``queried_at``
+        describe the most recent query, which may have failed after a good answer,
+        so ``responded_at`` is how fresh the scopes themselves are.
+
+        ``served`` carries this node's own scopes in the same comma-separated form,
+        so a client can tell which of a neighbour's scopes it already shares without
+        re-deriving the rule (the wildcard plus every allow-flood region). It is the
+        very string this node sends when a neighbour asks *it* the same question.
+        """
+        self._set_cors_headers()
+
+        if cherrypy.request.method == "OPTIONS":
+            return ""
+
+        try:
+            storage = self._get_storage()
+            scopes = storage.get_neighbor_scopes() or {}
+            # Keyword cannot be named `self` here -- it would collide with the
+            # method's own first argument.
+            return self._success(
+                scopes, count=len(scopes), served={"scopes": self._served_scopes()}
+            )
+        except Exception as e:
+            logger.error(f"Error reading neighbour scopes: {e}")
+            return self._error(str(e))
+
+    def _served_scopes(self) -> str:
+        """This node's advertised region scopes, or "" when they cannot be read.
+
+        Deliberately the same formatter the anon-regions responder uses, rather
+        than a second reading of the transport-key table: whatever a neighbour
+        would be told is what a client comparing against it has to see.
+        """
+        login_helper = getattr(self.daemon_instance, "login_helper", None)
+        formatter = getattr(login_helper, "_format_region_names", None) if login_helper else None
+        if not callable(formatter):
+            return ""
+        try:
+            return formatter() or ""
+        except Exception as e:
+            logger.debug(f"Could not read served region scopes: {e}")
+            return ""
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    @cherrypy.tools.json_in()
+    def query_neighbor_scopes(self):
+        """Ask one neighbour for its region scopes now.
+
+        POST /api/query_neighbor_scopes  {"pubkey": "<64 hex chars>"}
+
+        Unlike ``publish_neighbors`` this holds the request open for the answer:
+        one query is a single route-direct request whose response window is
+        normally the 5 s floor (only a slow radio config approaches the 120 s
+        ceiling), so a spinner is a better fit than a poll. Nothing is published
+        as a result -- the answer is stored and returned, and the periodic cycle
+        remains the only thing that writes to the MQTT topic.
+
+        The request is route-direct with an empty path, so it only reaches a
+        zero-hop neighbour, and the responder rate-limits anonymous replies (4 per
+        3 minutes, shared across its identities) -- both show up here as a
+        ``timeout``.
+        """
+        self._set_cors_headers()
+
+        if cherrypy.request.method == "OPTIONS":
+            return ""
+
+        try:
+            self._require_post()
+            data = cherrypy.request.json or {}
+            pubkey = str(data.get("pubkey") or "").strip()
+            if not pubkey:
+                return self._error("Missing pubkey parameter")
+
+            publisher = getattr(self.daemon_instance, "neighbors_publisher", None)
+            if not publisher:
+                return self._error("Neighbors publisher not available")
+            if self.event_loop is None:
+                return self._error("Event loop not available")
+
+            import asyncio
+
+            future = asyncio.run_coroutine_threadsafe(publisher.query_one(pubkey), self.event_loop)
+            result = future.result(timeout=self.SCOPE_QUERY_HTTP_TIMEOUT)
+            return self._success(result)
+        except FutureTimeoutError:
+            # Deliberately not cancelled: the query has already spent the airtime,
+            # and it persists its own outcome, so letting it finish means the answer
+            # still shows up on a re-read instead of being thrown away here.
+            logger.warning(
+                "Neighbour scope query still in flight after %.0fs",
+                self.SCOPE_QUERY_HTTP_TIMEOUT,
+            )
+            return self._error("Still waiting for the neighbour to reply - check back in a moment")
+        except cherrypy.HTTPError:
+            raise
+        except ValueError as e:
+            return self._error(str(e))
+        except RuntimeError as e:
+            # query_one raises this when a cycle or another query already holds the
+            # scope helper -- one request in flight at a time, by design. Still
+            # logged, because an unrelated RuntimeError from the event loop lands
+            # here too and would otherwise leave no trace.
+            logger.warning(f"Neighbour scope query refused: {e}")
+            return self._error(str(e))
+        except Exception as e:
+            logger.error(f"Error querying neighbour scopes: {e}", exc_info=True)
+            return self._error(str(e))
+
+    @staticmethod
+    def _validate_neighbors_settings(raw):
+        """Validate the ``mqtt_brokers.neighbors`` block.
+
+        Returns ``(settings, error)``; ``error`` is None on success. The interval
+        is rejected rather than clamped when out of range, matching the firmware's
+        ``set mqtt.neighbors.interval`` behavior.
+        """
+        from repeater.neighbors_publisher import (
+            DEFAULT_INTERVAL_HOURS,
+            MAX_INTERVAL_HOURS,
+            MIN_INTERVAL_HOURS,
+        )
+
+        if not isinstance(raw, dict):
+            return None, "neighbors must be an object"
+
+        # Reject unknown keys rather than accepting them silently: a typo would
+        # otherwise return success while changing nothing the runtime reads.
+        known_keys = {
+            "enabled",
+            "interval_hours",
+            "discovery_timeout_seconds",
+            "scope_response_timeout_seconds",
+            "max_sweep_seconds",
+            "duty_cycle_abort_seconds",
+            "max_neighbors",
+            "max_neighbor_age_seconds",
+        }
+        unknown = sorted(set(raw) - known_keys)
+        if unknown:
+            return None, f"Unknown neighbors settings: {', '.join(unknown)}"
+
+        settings = {}
+
+        if "enabled" in raw:
+            if not isinstance(raw["enabled"], bool):
+                return None, "neighbors.enabled must be true or false"
+            settings["enabled"] = raw["enabled"]
+
+        if "interval_hours" in raw:
+            interval = raw["interval_hours"]
+            if isinstance(interval, bool) or not isinstance(interval, (int, float)):
+                return None, "neighbors.interval_hours must be a number"
+            if float(interval) != int(interval):
+                return None, "neighbors.interval_hours must be a whole number of hours"
+            interval = int(interval)
+            if interval < MIN_INTERVAL_HOURS or interval > MAX_INTERVAL_HOURS:
+                return (
+                    None,
+                    f"neighbors.interval_hours must be between {MIN_INTERVAL_HOURS} "
+                    f"and {MAX_INTERVAL_HOURS} (default {DEFAULT_INTERVAL_HOURS})",
+                )
+            settings["interval_hours"] = interval
+
+        if "discovery_timeout_seconds" in raw:
+            try:
+                timeout = float(raw["discovery_timeout_seconds"])
+            except (TypeError, ValueError):
+                return None, "neighbors.discovery_timeout_seconds must be a number"
+            if timeout < 5 or timeout > 300:
+                return None, "neighbors.discovery_timeout_seconds must be between 5 and 300"
+            settings["discovery_timeout_seconds"] = timeout
+
+        if "scope_response_timeout_seconds" in raw:
+            try:
+                scope_timeout = float(raw["scope_response_timeout_seconds"])
+            except (TypeError, ValueError):
+                return None, "neighbors.scope_response_timeout_seconds must be a number"
+            if scope_timeout < 0 or scope_timeout > 300:
+                return None, "neighbors.scope_response_timeout_seconds must be between 0 and 300"
+            settings["scope_response_timeout_seconds"] = scope_timeout
+
+        if "max_neighbors" in raw:
+            try:
+                max_neighbors = int(raw["max_neighbors"])
+            except (TypeError, ValueError):
+                return None, "neighbors.max_neighbors must be a number"
+            if max_neighbors < 1 or max_neighbors > 255:
+                return None, "neighbors.max_neighbors must be between 1 and 255"
+            settings["max_neighbors"] = max_neighbors
+
+        if "max_neighbor_age_seconds" in raw:
+            try:
+                max_age = float(raw["max_neighbor_age_seconds"])
+            except (TypeError, ValueError):
+                return None, "neighbors.max_neighbor_age_seconds must be a number"
+            if max_age < 60:
+                return None, "neighbors.max_neighbor_age_seconds must be at least 60"
+            settings["max_neighbor_age_seconds"] = max_age
+
+        if "max_sweep_seconds" in raw:
+            try:
+                max_sweep = float(raw["max_sweep_seconds"])
+            except (TypeError, ValueError):
+                return None, "neighbors.max_sweep_seconds must be a number"
+            if max_sweep < 30 or max_sweep > 7200:
+                return None, "neighbors.max_sweep_seconds must be between 30 and 7200"
+            settings["max_sweep_seconds"] = max_sweep
+
+        if "duty_cycle_abort_seconds" in raw:
+            try:
+                abort_after = float(raw["duty_cycle_abort_seconds"])
+            except (TypeError, ValueError):
+                return None, "neighbors.duty_cycle_abort_seconds must be a number"
+            if abort_after < 0 or abort_after > 600:
+                return None, "neighbors.duty_cycle_abort_seconds must be between 0 and 600"
+            settings["duty_cycle_abort_seconds"] = abort_after
+
+        return settings, None
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
     @cherrypy.tools.json_in()
     def update_mqtt_config(self):
         """Update MQTT Observer configuration.
@@ -2085,12 +3133,41 @@ class APIEndpoints:
                 mqtt_updates["owner"] = str(data["owner"]).strip()
             if "email" in data:
                 mqtt_updates["email"] = str(data["email"]).strip()
+            if "neighbors" in data:
+                from repeater.handler_helpers.neighbor_scopes import neighbors_config_block
+
+                neighbors_settings, error = self._validate_neighbors_settings(data["neighbors"])
+                if error:
+                    return self._error(error)
+                # update_and_save replaces a section's key outright, so merge onto
+                # the stored block instead of letting a partial POST drop the
+                # settings it did not mention. neighbors_config_block returns {} for
+                # a hand-edited scalar (`neighbors: true` is an easy mistake, since
+                # the per-broker key of the same name is a boolean), which would
+                # otherwise fail the merge with a TypeError; the save then rewrites
+                # it as a proper block.
+                mqtt_updates["neighbors"] = {
+                    **neighbors_config_block(self.config),
+                    **neighbors_settings,
+                }
             # if "disallowed_packet_types" in data:
             #     mqtt_updates["disallowed_packet_types"] = list(data["disallowed_packet_types"])
             if "brokers" in data:
                 brokers = data["brokers"]
                 if not isinstance(brokers, list):
                     return self._error("brokers must be a list")
+
+                # The rebuild below is a strict field whitelist, so any key a
+                # client omits is reset to its default. For neighbors that would
+                # silently switch the feature off whenever a UI that predates it
+                # saves an unrelated MQTT setting, so fall back to the stored
+                # value per broker name instead of to False.
+                stored_neighbors_by_name = {
+                    str(existing.get("name")): bool(existing.get("neighbors", False))
+                    for existing in (self.config.get("mqtt_brokers", {}) or {}).get("brokers", [])
+                    if isinstance(existing, dict) and existing.get("name")
+                }
+
                 validated = []
                 for i, b in enumerate(brokers):
                     if not isinstance(b, dict):
@@ -2120,8 +3197,22 @@ class APIEndpoints:
                         "host": str(b["host"]).strip(),
                         "port": port,
                         "format": str(b["format"]).strip(),
+                        # Custom base topic for legacy `mqtt` format. Persist
+                        # None when blank so the handler can apply defaults.
+                        "base_topic": (
+                            (str(b["base_topic"]).strip() or None)
+                            if "base_topic" in b and b.get("base_topic") is not None
+                            else None
+                        ),
                         "disallowed_packet_types": list(b.get("disallowed_packet_types", [])),
                         "retain_status": bool(b.get("retain_status", False)),
+                        # Opt-in per broker; brokers that do not expect the
+                        # neighbors topic can reject it and drop the connection.
+                        "neighbors": bool(
+                            b["neighbors"]
+                            if "neighbors" in b
+                            else stored_neighbors_by_name.get(str(b["name"]).strip(), False)
+                        ),
                         "tls": {
                             "enabled": bool(
                                 b.get("tls", {}).get("enabled", True if port == 443 else False)
@@ -2266,6 +3357,7 @@ class APIEndpoints:
                 config_yaml = None
 
             if isinstance(config_yaml, dict):
+                config_yaml = normalize_modem_config(config_yaml)
                 repeater = config_yaml.get("repeater")
                 if not isinstance(repeater, dict):
                     add_error("repeater", "Missing required section 'repeater'")
@@ -2298,8 +3390,8 @@ class APIEndpoints:
                     "sx1262",
                     "sx1262_ch341",
                     "kiss",
-                    "pymc_tcp",
-                    "pymc_usb",
+                    "modem_tcp",
+                    "modem_usb",
                     "none",
                     "null",
                     "disabled",
@@ -2310,7 +3402,7 @@ class APIEndpoints:
                 if radio_type not in known_radio_types:
                     add_error(
                         "radio_type",
-                        "Unsupported radio_type. Supported: sx1262, sx1262_ch341, kiss, pymc_tcp, pymc_usb, none/null",
+                        "Unsupported radio_type. Supported: sx1262, sx1262_ch341, kiss, modem_tcp, modem_usb, none/null",
                     )
 
                 radio_disabled = radio_type in ("", "none", "null", "disabled", "off", "no_radio")
@@ -2443,45 +3535,45 @@ class APIEndpoints:
                     elif baud <= 0:
                         add_error("kiss.baud_rate", "KISS baud_rate must be greater than zero")
 
-                if radio_type == "pymc_usb":
-                    usb_cfg = config_yaml.get("pymc_usb")
+                if radio_type == "modem_usb":
+                    usb_cfg = config_yaml.get("modem_usb")
                     if not isinstance(usb_cfg, dict):
                         add_error(
-                            "pymc_usb",
-                            "Missing required section 'pymc_usb' for radio_type pymc_usb",
+                            "modem_usb",
+                            "Missing required section 'modem_usb' for radio_type modem_usb",
                         )
                         usb_cfg = {}
                     port = (usb_cfg.get("port") if isinstance(usb_cfg, dict) else "") or ""
                     if not str(port).strip():
-                        add_error("pymc_usb.port", "pymc_usb.port is required")
-                    baud = as_int((usb_cfg or {}).get("baudrate"), "pymc_usb.baudrate")
+                        add_error("modem_usb.port", "modem_usb.port is required")
+                    baud = as_int((usb_cfg or {}).get("baudrate"), "modem_usb.baudrate")
                     if baud is not None and baud <= 0:
                         add_error(
-                            "pymc_usb.baudrate", "pymc_usb.baudrate must be greater than zero"
+                            "modem_usb.baudrate", "modem_usb.baudrate must be greater than zero"
                         )
 
-                if radio_type == "pymc_tcp":
-                    tcp_cfg = config_yaml.get("pymc_tcp")
+                if radio_type == "modem_tcp":
+                    tcp_cfg = config_yaml.get("modem_tcp")
                     if not isinstance(tcp_cfg, dict):
                         add_error(
-                            "pymc_tcp",
-                            "Missing required section 'pymc_tcp' for radio_type pymc_tcp",
+                            "modem_tcp",
+                            "Missing required section 'modem_tcp' for radio_type modem_tcp",
                         )
                         tcp_cfg = {}
                     host = (tcp_cfg.get("host") if isinstance(tcp_cfg, dict) else "") or ""
                     host_str = str(host).strip()
                     if not host_str:
-                        add_error("pymc_tcp.host", "pymc_tcp.host is required")
+                        add_error("modem_tcp.host", "modem_tcp.host is required")
                     elif host_str == "REPLACE_WITH_MODEM_HOST":
                         add_error(
-                            "pymc_tcp.host",
+                            "modem_tcp.host",
                             "Replace placeholder host with your modem hostname or IP",
                         )
-                    port = as_int((tcp_cfg or {}).get("port"), "pymc_tcp.port")
+                    port = as_int((tcp_cfg or {}).get("port"), "modem_tcp.port")
                     if port is None:
-                        add_error("pymc_tcp.port", "pymc_tcp.port is required")
+                        add_error("modem_tcp.port", "modem_tcp.port is required")
                     elif port < 1 or port > 65535:
-                        add_error("pymc_tcp.port", "pymc_tcp.port must be 1-65535")
+                        add_error("modem_tcp.port", "modem_tcp.port must be 1-65535")
 
                 if radio_disabled:
                     add_warning("radio_type", "Radio is disabled (radio_type none/null/off)")
@@ -2806,6 +3898,80 @@ class APIEndpoints:
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
+    def neighbor_links(self, active_within_seconds=90, limit=500):
+        try:
+            handler = getattr(self.daemon_instance, "repeater_handler", None)
+            tracker = (
+                getattr(handler, "neighbour_link_tracker", None) if handler is not None else None
+            )
+            if tracker is None or not hasattr(tracker, "snapshot"):
+                return self._error("Repeater handler not initialized")
+
+            active_window = float(active_within_seconds)
+            row_limit = int(limit)
+            if row_limit < 1:
+                raise ValueError("limit must be >= 1")
+
+            links = tracker.snapshot(active_within_seconds=active_window)
+            links = links[:row_limit]
+            return self._success(
+                {
+                    "links": links,
+                    "active_within_seconds": active_window,
+                    "limit": row_limit,
+                    "count": len(links),
+                }
+            )
+        except ValueError as e:
+            return self._error(f"Invalid parameter format: {e}")
+        except Exception as e:
+            logger.error(f"Error getting neighbor links: {e}")
+            return self._error(e)
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    def neighbor_link_history(
+        self, peer_hash=None, path_hash_size=None, hours=24, limit=1000, bucket_seconds=None
+    ):
+        try:
+            if not peer_hash:
+                return self._error("peer_hash parameter required")
+            if path_hash_size is None:
+                return self._error("path_hash_size parameter required")
+
+            size = int(path_hash_size)
+            window_hours = int(hours)
+            row_limit = int(limit)
+            bucket_s = max(60, int(bucket_seconds)) if bucket_seconds is not None else None
+
+            rows = self._get_storage().get_neighbor_link_history(
+                peer_hash=str(peer_hash),
+                path_hash_size=size,
+                hours=window_hours,
+                limit=row_limit,
+                bucket_seconds=bucket_s,
+            )
+            data = {
+                "peer_hash": str(peer_hash).upper(),
+                "path_hash_size": size,
+                "hours": window_hours,
+                "limit": row_limit,
+                "count": len(rows),
+            }
+            if bucket_s is not None:
+                data["bucket_seconds"] = bucket_s
+                data["buckets"] = rows
+            else:
+                data["rows"] = rows
+            return self._success(data)
+        except ValueError as e:
+            return self._error(f"Invalid parameter format: {e}")
+        except Exception as e:
+            logger.error(f"Error getting neighbor link history: {e}")
+            return self._error(e)
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
     def recent_packets(self, limit=100):
         try:
             limit = int(limit)
@@ -2964,13 +4130,25 @@ class APIEndpoints:
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
+    def packet_by_id(self, packet_id=None):
+        try:
+            if packet_id is None:
+                return self._error("packet_id parameter required")
+            packet = self._get_storage().get_packet_by_id(int(packet_id))
+            return self._success(packet) if packet else self._error("Packet not found")
+        except Exception as e:
+            logger.error(f"Error getting packet by id: {e}")
+            return self._error(e)
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
     def rrd_data(self):
         try:
             params = self._get_params(
                 {"start_time": None, "end_time": None, "resolution": "average"}
             )
-            data = self._get_storage().get_rrd_data(**params)
-            return self._success(data) if data else self._error("No RRD data available")
+            data = self._get_storage().get_metrics_data(**params)
+            return self._success(data)
         except ValueError as e:
             return self._error(f"Invalid parameter format: {e}")
         except Exception as e:
@@ -3039,12 +4217,16 @@ class APIEndpoints:
             hours = int(hours)
             start_time, end_time = self._get_time_range(hours)
 
-            rrd_data = self._get_storage().get_rrd_data(
+            metrics_data = self._get_storage().get_metrics_data(
                 start_time=start_time, end_time=end_time, resolution=resolution
             )
 
-            if not rrd_data or "metrics" not in rrd_data:
-                return self._error("No RRD data available")
+            if (
+                not metrics_data
+                or "metrics" not in metrics_data
+                or "timestamps" not in metrics_data
+            ):
+                return self._error("No metrics data available")
 
             metric_names = {
                 "rx_count": "Received Packets",
@@ -3063,18 +4245,18 @@ class APIEndpoints:
             if metrics != "all":
                 requested_metrics = [m.strip() for m in metrics.split(",")]
             else:
-                requested_metrics = list(rrd_data["metrics"].keys())
+                requested_metrics = list(metrics_data["metrics"].keys())
                 requested_metrics.append("policy_events")
 
-            timestamps_ms = [ts * 1000 for ts in rrd_data["timestamps"]]
+            timestamps_ms = [ts * 1000 for ts in metrics_data["timestamps"]]
             series = []
 
             for metric_key in requested_metrics:
                 if metric_key == "policy_events":
-                    bucket_seconds = max(1, int(rrd_data.get("step", 60)))
+                    bucket_seconds = max(1, int(metrics_data.get("step", 60)))
                     policy_rows = self._get_storage().get_policy_event_counts(
-                        start_timestamp=rrd_data["start_time"],
-                        end_timestamp=rrd_data["end_time"],
+                        start_timestamp=metrics_data["start_time"],
+                        end_timestamp=metrics_data["end_time"],
                         bucket_seconds=bucket_seconds,
                     )
                     policy_by_bucket = {
@@ -3082,7 +4264,7 @@ class APIEndpoints:
                         for row in policy_rows
                     }
                     chart_data = []
-                    for ts in rrd_data["timestamps"]:
+                    for ts in metrics_data["timestamps"]:
                         bucket_ts = int(ts / bucket_seconds) * bucket_seconds
                         chart_data.append([ts * 1000, policy_by_bucket.get(bucket_ts, 0)])
 
@@ -3095,14 +4277,19 @@ class APIEndpoints:
                     )
                     continue
 
-                if metric_key in rrd_data["metrics"]:
+                if metric_key in metrics_data["metrics"]:
                     if metric_key in counter_metrics:
-                        chart_data = self._process_counter_data(
-                            rrd_data["metrics"][metric_key], timestamps_ms
-                        )
+                        if metrics_data.get("counter_mode") == "bucket_count":
+                            chart_data = self._process_gauge_data(
+                                metrics_data["metrics"][metric_key], timestamps_ms
+                            )
+                        else:
+                            chart_data = self._process_counter_data(
+                                metrics_data["metrics"][metric_key], timestamps_ms
+                            )
                     else:
                         chart_data = self._process_gauge_data(
-                            rrd_data["metrics"][metric_key], timestamps_ms
+                            metrics_data["metrics"][metric_key], timestamps_ms
                         )
 
                     series.append(
@@ -3114,11 +4301,12 @@ class APIEndpoints:
                     )
 
             graph_data = {
-                "start_time": rrd_data["start_time"],
-                "end_time": rrd_data["end_time"],
-                "step": rrd_data["step"],
-                "timestamps": rrd_data["timestamps"],
+                "start_time": metrics_data["start_time"],
+                "end_time": metrics_data["end_time"],
+                "step": metrics_data["step"],
+                "timestamps": metrics_data["timestamps"],
                 "series": series,
+                "data_source": metrics_data.get("data_source", "rrd"),
             }
 
             return self._success(graph_data)
@@ -3131,6 +4319,171 @@ class APIEndpoints:
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
+    def lbt_diagnostics(
+        self,
+        hours=24,
+        start_timestamp=None,
+        end_timestamp=None,
+        bucket_seconds=None,
+        severe_attempt_threshold=4,
+    ):
+        """Return aggregated LBT diagnostics aligned to RF-health buckets."""
+        try:
+            max_hours = 168
+            hours_int = max(1, min(int(hours), max_hours))
+
+            now = time.time()
+            if start_timestamp is not None or end_timestamp is not None:
+                if start_timestamp is None and end_timestamp is not None:
+                    end_ts = float(end_timestamp)
+                    start_ts = end_ts - (hours_int * 3600)
+                elif end_timestamp is None and start_timestamp is not None:
+                    start_ts = float(start_timestamp)
+                    end_ts = now
+                else:
+                    start_ts = float(start_timestamp)
+                    end_ts = float(end_timestamp)
+            else:
+                start_ts, end_ts = self._get_time_range(hours_int)
+                start_ts = float(start_ts)
+                end_ts = float(end_ts)
+
+            if end_ts < start_ts:
+                start_ts, end_ts = end_ts, start_ts
+
+            range_seconds = int(end_ts - start_ts)
+            if range_seconds <= 0:
+                return self._error("Invalid time range")
+
+            if range_seconds > max_hours * 3600:
+                return self._error(f"Time range too large. Max range is {max_hours} hours")
+
+            if bucket_seconds is None:
+                bucket_s = self._auto_bucket_seconds(range_seconds)
+            else:
+                bucket_s = max(60, min(int(bucket_seconds), 3600))
+
+            severe_threshold = max(2, min(int(severe_attempt_threshold), 16))
+
+            storage = self._get_storage()
+            lbt = storage.get_lbt_diagnostics(
+                start_timestamp=start_ts,
+                end_timestamp=end_ts,
+                bucket_seconds=bucket_s,
+                severe_attempt_threshold=severe_threshold,
+            )
+
+            rrd_data = storage.get_rrd_data(
+                start_time=int(start_ts),
+                end_time=int(end_ts),
+                resolution="average",
+            )
+            rf_by_bucket = self._build_rrd_bucket_metrics(rrd_data, bucket_s)
+
+            merged_buckets = []
+            for bucket in lbt.get("buckets", []):
+                bucket_ts = int(bucket.get("timestamp", 0))
+                rf = rf_by_bucket.get(bucket_ts, {})
+                merged_buckets.append(
+                    {
+                        **bucket,
+                        "rf": {
+                            "avg_rssi": rf.get("avg_rssi"),
+                            "avg_snr": rf.get("avg_snr"),
+                            "packet_loss_rate_pct": rf.get("packet_loss_rate_pct"),
+                            "traffic_volume": rf.get("traffic_volume", 0),
+                            "rx_count": rf.get("rx_count", 0),
+                            "tx_count": rf.get("tx_count", 0),
+                            "drop_count": rf.get("drop_count", 0),
+                        },
+                    }
+                )
+
+            merged_packet_type_buckets = []
+            for bucket in lbt.get("packet_type_buckets", []):
+                bucket_ts = int(bucket.get("timestamp", 0))
+                rf = rf_by_bucket.get(bucket_ts, {})
+                merged_packet_type_buckets.append(
+                    {
+                        **bucket,
+                        "rf": {
+                            "avg_rssi": rf.get("avg_rssi"),
+                            "avg_snr": rf.get("avg_snr"),
+                            "packet_loss_rate_pct": rf.get("packet_loss_rate_pct"),
+                            "traffic_volume": rf.get("traffic_volume", 0),
+                            "rx_count": rf.get("rx_count", 0),
+                            "tx_count": rf.get("tx_count", 0),
+                            "drop_count": rf.get("drop_count", 0),
+                        },
+                    }
+                )
+
+            def _build_correlation(metric_getter):
+                left = []
+                right = []
+                for item in merged_buckets:
+                    retry_rate = item.get("retry_rate_pct")
+                    metric_value = metric_getter(item)
+                    if retry_rate is None or metric_value is None:
+                        continue
+                    left.append(float(retry_rate))
+                    right.append(float(metric_value))
+
+                coeff = self._pearson_correlation(left, right)
+                if coeff is None:
+                    return {
+                        "coefficient": None,
+                        "sample_count": len(left),
+                        "note": "Insufficient or non-varying samples",
+                    }
+                return {
+                    "coefficient": coeff,
+                    "sample_count": len(left),
+                    "note": None,
+                }
+
+            correlations = {
+                "retry_rate_vs_avg_snr": _build_correlation(
+                    lambda item: item.get("rf", {}).get("avg_snr")
+                ),
+                "retry_rate_vs_avg_rssi": _build_correlation(
+                    lambda item: item.get("rf", {}).get("avg_rssi")
+                ),
+                "retry_rate_vs_packet_loss_rate": _build_correlation(
+                    lambda item: item.get("rf", {}).get("packet_loss_rate_pct")
+                ),
+                "retry_rate_vs_traffic_volume": _build_correlation(
+                    lambda item: item.get("rf", {}).get("traffic_volume")
+                ),
+            }
+
+            diagnostics = {
+                "start_time": int(start_ts),
+                "end_time": int(end_ts),
+                "bucket_seconds": int(bucket_s),
+                "severe_attempt_threshold": severe_threshold,
+                "summary": lbt.get("summary", {}),
+                "buckets": merged_buckets,
+                "packet_types": lbt.get("packet_types", []),
+                "packet_type_buckets": merged_packet_type_buckets,
+                "correlations": correlations,
+                "limitations": [
+                    "LBT attempts are derived from stored per-packet retry counts (lbt_attempts + 1).",
+                    "Per-attempt RSSI/SNR and channel frequency are not recorded for each LBT attempt.",
+                    "Airtime utilisation is not available in the current RRD metric set for direct alignment.",
+                ],
+            }
+
+            return self._success(diagnostics)
+
+        except ValueError as e:
+            return self._error(f"Invalid parameter format: {e}")
+        except Exception as e:
+            logger.error(f"Error getting LBT diagnostics: {e}")
+            return self._error(e)
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
     @cherrypy.tools.json_in()
     def cad_calibration_start(self):
 
@@ -3139,6 +4492,28 @@ class APIEndpoints:
             data = cherrypy.request.json or {}
             samples = data.get("samples", 8)
             delay = data.get("delay", 100)
+            known_signal_present = data.get("known_signal_present", False)
+            radio = getattr(self.daemon_instance, "radio", None) if self.daemon_instance else None
+            default_cad_symbol_num = (
+                self.config.get("radio", {}).get("cad", {}).get("symbol_num", 2)
+            )
+            radio_symbol_num = getattr(radio, "_custom_cad_symbol_num", None) if radio else None
+            if radio_symbol_num in {1, 2, 4, 8, 16}:
+                default_cad_symbol_num = radio_symbol_num
+            try:
+                default_cad_symbol_num = int(default_cad_symbol_num)
+            except (TypeError, ValueError):
+                default_cad_symbol_num = 2
+            if default_cad_symbol_num not in {1, 2, 4, 8, 16}:
+                default_cad_symbol_num = 2
+
+            cad_symbol_num = data.get("cad_symbol_num", default_cad_symbol_num)
+            cad_timeout_ms = data.get("cad_timeout_ms", 500)
+            self.cad_calibration.session_config = {
+                "known_signal_present": known_signal_present,
+                "cad_symbol_num": cad_symbol_num,
+                "cad_timeout_ms": cad_timeout_ms,
+            }
             if self.cad_calibration.start_calibration(samples, delay):
                 return self._success("Calibration started")
             else:
@@ -3168,6 +4543,136 @@ class APIEndpoints:
     @cherrypy.expose
     @cherrypy.tools.json_out()
     @cherrypy.tools.json_in()
+    def cad_manual_check(self):
+
+        try:
+            import asyncio
+
+            self._require_post()
+            data = cherrypy.request.json or {}
+
+            radio = getattr(self.daemon_instance, "radio", None) if self.daemon_instance else None
+            if not radio or not hasattr(radio, "perform_cad"):
+                return self._error("Radio CAD support is not available")
+            if self.event_loop is None:
+                return self._error("Event loop not available")
+            default_cad_symbol_num = getattr(
+                radio, "_custom_cad_symbol_num", None
+            ) or self.config.get("radio", {}).get("cad", {}).get("symbol_num", 2)
+            try:
+                default_cad_symbol_num = int(default_cad_symbol_num)
+            except (TypeError, ValueError):
+                default_cad_symbol_num = 2
+            if default_cad_symbol_num not in {1, 2, 4, 8, 16}:
+                default_cad_symbol_num = 2
+
+            samples = self.cad_calibration._normalize_int(
+                data.get("samples", 1), default=1, minimum=1, maximum=32
+            )
+            det_peak = self.cad_calibration._normalize_int(
+                data.get("det_peak", getattr(radio, "_custom_cad_peak", 22) or 22),
+                default=22,
+                minimum=0,
+                maximum=255,
+            )
+            det_min = self.cad_calibration._normalize_int(
+                data.get("det_min", getattr(radio, "_custom_cad_min", 10) or 10),
+                default=10,
+                minimum=0,
+                maximum=255,
+            )
+            cad_symbol_num = self.cad_calibration._normalize_int(
+                data.get("cad_symbol_num", default_cad_symbol_num),
+                default=default_cad_symbol_num,
+                minimum=1,
+                maximum=16,
+            )
+            if cad_symbol_num not in {1, 2, 4, 8, 16}:
+                cad_symbol_num = default_cad_symbol_num
+            cad_timeout_ms = self.cad_calibration._normalize_int(
+                data.get("cad_timeout_ms", 500), default=500, minimum=50, maximum=5000
+            )
+            cad_timeout_seconds = cad_timeout_ms / 1000.0
+            apply_live = self.cad_calibration._normalize_bool(
+                data.get("apply_live", False), default=False
+            )
+
+            if apply_live and hasattr(radio, "set_custom_cad_thresholds"):
+                try:
+                    radio.set_custom_cad_thresholds(peak=det_peak, min_val=det_min)
+                except Exception as exc:
+                    logger.warning("Failed to live-apply CAD thresholds: %s", exc)
+
+            async def run_manual_checks():
+                detections = 0
+                non_detections = 0
+                timeouts = 0
+                errors = 0
+                cad_done_count = 0
+
+                for _ in range(samples):
+                    try:
+                        result = await radio.perform_cad(
+                            det_peak=det_peak,
+                            det_min=det_min,
+                            timeout=cad_timeout_seconds,
+                            calibration=True,
+                            cad_symbol_num=cad_symbol_num,
+                        )
+                    except Exception as exc:
+                        logger.debug("Manual CAD check exception: %s", exc, exc_info=True)
+                        errors += 1
+                        continue
+
+                    if not isinstance(result, dict):
+                        result = {"detected": bool(result), "cad_done": True}
+
+                    if result.get("error"):
+                        errors += 1
+                    elif result.get("timeout"):
+                        timeouts += 1
+                    else:
+                        if bool(result.get("cad_done", False)):
+                            cad_done_count += 1
+                        if bool(result.get("detected", False)):
+                            detections += 1
+                        else:
+                            non_detections += 1
+
+                attempts = detections + non_detections + timeouts + errors
+                return {
+                    "det_peak": det_peak,
+                    "det_min": det_min,
+                    "cad_symbol_num": cad_symbol_num,
+                    "cad_timeout_ms": cad_timeout_ms,
+                    "apply_live": apply_live,
+                    "samples": samples,
+                    "attempts": attempts,
+                    "detections": detections,
+                    "non_detections": non_detections,
+                    "timeouts": timeouts,
+                    "errors": errors,
+                    "cad_done_count": cad_done_count,
+                    "detection_rate": (detections / attempts) * 100 if attempts > 0 else 0.0,
+                    "detected": detections > 0,
+                }
+
+            future = asyncio.run_coroutine_threadsafe(run_manual_checks(), self.event_loop)
+            timeout_seconds = max(2.0, (cad_timeout_seconds * samples) + 2.0)
+            payload = future.result(timeout=timeout_seconds)
+            return self._success(payload)
+        except FutureTimeoutError:
+            logger.error("Manual CAD check timed out")
+            return self._error("Manual CAD check timed out")
+        except cherrypy.HTTPError:
+            raise
+        except Exception as e:
+            logger.error(f"Error running manual CAD check: {e}", exc_info=True)
+            return self._error(e)
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    @cherrypy.tools.json_in()
     def save_cad_settings(self):
 
         try:
@@ -3175,10 +4680,29 @@ class APIEndpoints:
             data = cherrypy.request.json or {}
             peak = data.get("peak")
             min_val = data.get("min_val")
+            cad_symbol_num = data.get("cad_symbol_num")
             detection_rate = data.get("detection_rate", 0)
 
             if peak is None or min_val is None:
                 return self._error("Missing peak or min_val parameters")
+
+            try:
+                peak = int(peak)
+                min_val = int(min_val)
+            except (TypeError, ValueError):
+                return self._error("peak and min_val must be integers")
+
+            if cad_symbol_num is None:
+                cad_symbol_num = self.config.get("radio", {}).get("cad", {}).get("symbol_num", 2)
+            try:
+                cad_symbol_num = int(cad_symbol_num)
+            except (TypeError, ValueError):
+                return self._error("cad_symbol_num must be an integer")
+
+            if not (0 <= peak <= 255) or not (0 <= min_val <= 255):
+                return self._error("CAD thresholds must be between 0 and 255")
+            if cad_symbol_num not in {1, 2, 4, 8, 16}:
+                return self._error("cad_symbol_num must be one of: 1, 2, 4, 8, 16")
 
             if (
                 self.daemon_instance
@@ -3187,7 +4711,14 @@ class APIEndpoints:
             ):
                 if hasattr(self.daemon_instance.radio, "set_custom_cad_thresholds"):
                     self.daemon_instance.radio.set_custom_cad_thresholds(peak=peak, min_val=min_val)
-                    logger.info(f"Applied CAD settings to radio: peak={peak}, min={min_val}")
+                if hasattr(self.daemon_instance.radio, "set_custom_cad_symbol_num"):
+                    self.daemon_instance.radio.set_custom_cad_symbol_num(cad_symbol_num)
+                logger.info(
+                    "Applied CAD settings to radio: peak=%s, min=%s, symbols=%s",
+                    peak,
+                    min_val,
+                    cad_symbol_num,
+                )
 
             if "radio" not in self.config:
                 self.config["radio"] = {}
@@ -3196,18 +4727,30 @@ class APIEndpoints:
 
             self.config["radio"]["cad"]["peak_threshold"] = peak
             self.config["radio"]["cad"]["min_threshold"] = min_val
+            self.config["radio"]["cad"]["symbol_num"] = cad_symbol_num
 
             saved = self.config_manager.save_to_file()
             if not saved:
                 return self._error("Failed to save configuration to file")
 
             logger.info(
-                f"Saved CAD settings to config: peak={peak}, min={min_val}, rate={detection_rate:.1f}%"
+                "Saved CAD settings to config: peak=%s, min=%s, symbols=%s, rate=%.1f%%",
+                peak,
+                min_val,
+                cad_symbol_num,
+                detection_rate,
             )
             return {
                 "success": True,
-                "message": f"CAD settings saved: peak={peak}, min={min_val}",
-                "settings": {"peak": peak, "min_val": min_val, "detection_rate": detection_rate},
+                "message": (
+                    f"CAD settings saved: peak={peak}, min={min_val}, symbols={cad_symbol_num}"
+                ),
+                "settings": {
+                    "peak": peak,
+                    "min_val": min_val,
+                    "cad_symbol_num": cad_symbol_num,
+                    "detection_rate": detection_rate,
+                },
             }
         except cherrypy.HTTPError:
             # Re-raise HTTP errors (like 405 Method Not Allowed) without logging
@@ -3229,14 +4772,15 @@ class APIEndpoints:
             "bandwidth": 62500,          # Bandwidth in Hz (valid: 7.8, 10.4, 15.6, 20.8, 31.25, 41.7, 62.5, 125, 250, 500 kHz)
             "spreading_factor": 8,       # Spreading factor (5-12)
             "coding_rate": 8,            # Coding rate (5-8 for 4/5 to 4/8)
-            "tx_delay_factor": 1.0,      # TX delay factor (0.0-5.0)
-            "direct_tx_delay_factor": 0.5,  # Direct TX delay (0.0-5.0)
+            "tx_delay_factor": 1.0,      # Flood TX delay airtime multiplier (0.0-5.0)
+            "direct_tx_delay_factor": 0.5,  # Direct TX delay airtime multiplier (0.0-5.0)
             "rx_delay_base": 0.0,        # RX delay base (>= 0)
             "node_name": "MyNode",       # Node name
+            "owner_info": "Owner text",   # Owner info text
             "latitude": 0.0,             # Latitude (-90 to 90)
             "longitude": 0.0,            # Longitude (-180 to 180)
             "max_flood_hops": 64,         # Max flood hops (0-64)
-            "flood_advert_interval_hours": 10,  # Flood advert interval (0 or 3-48)
+            "flood_advert_interval_hours": 10,  # Flood advert interval (0 or 3-168)
             "advert_interval_minutes": 120      # Local advert interval (0 or 1-10080)
         }
 
@@ -3266,12 +4810,55 @@ class APIEndpoints:
             if "mesh" not in self.config:
                 self.config["mesh"] = {}
 
+            # Optional multi-radio target. When radios[] exists and radio_id is
+            # provided, LoRa air settings are written into that entry's radio{}
+            # instead of (or in addition to) the legacy top-level radio{}.
+            target_radio_id = data.get("radio_id")
+            radios_list = self.config.get("radios")
+            target_radio_cfg = self.config["radio"]
+            target_entry = None
+            if isinstance(radios_list, list) and target_radio_id:
+                for entry in radios_list:
+                    if not isinstance(entry, dict):
+                        continue
+                    rid = entry.get("id") or entry.get("radio_id")
+                    if str(rid) == str(target_radio_id):
+                        target_entry = entry
+                        if not isinstance(entry.get("radio"), dict):
+                            entry["radio"] = {}
+                        target_radio_cfg = entry["radio"]
+                        break
+                if target_entry is None:
+                    return self._error(f"Unknown radio_id={target_radio_id!r}")
+
+            def _set_radio_param(key, value):
+                target_radio_cfg[key] = value
+                # Keep legacy top-level radio in sync when editing default/first
+                # radio or when no radios[] list is active.
+                if target_entry is None:
+                    self.config["radio"][key] = value
+                else:
+                    default_id = None
+                    fabric = (
+                        self.config.get("fabric")
+                        if isinstance(self.config.get("fabric"), dict)
+                        else {}
+                    )
+                    default_id = fabric.get("default_radio") or fabric.get("default_radio_id")
+                    if default_id is None and radios_list:
+                        first = radios_list[0] if isinstance(radios_list[0], dict) else {}
+                        default_id = first.get("id") or first.get("radio_id")
+                    if default_id is not None and str(default_id) == str(target_radio_id):
+                        if "radio" not in self.config or not isinstance(self.config["radio"], dict):
+                            self.config["radio"] = {}
+                        self.config["radio"][key] = value
+
             # Update TX power (up to 30 dBm for high-power radios)
             if "tx_power" in data:
                 power = int(data["tx_power"])
                 if power < 2 or power > 30:
                     return self._error("TX power must be 2-30 dBm")
-                self.config["radio"]["tx_power"] = power
+                _set_radio_param("tx_power", power)
                 applied.append(f"power={power}dBm")
 
             # Update frequency (in Hz)
@@ -3279,7 +4866,7 @@ class APIEndpoints:
                 freq = float(data["frequency"])
                 if freq < 100_000_000 or freq > 1_000_000_000:
                     return self._error("Frequency must be 100-1000 MHz")
-                self.config["radio"]["frequency"] = freq
+                _set_radio_param("frequency", freq)
                 applied.append(f"freq={freq / 1_000_000:.3f}MHz")
 
             # Update bandwidth (in Hz)
@@ -3290,7 +4877,7 @@ class APIEndpoints:
                     return self._error(
                         f"Bandwidth must be one of {[b / 1000 for b in valid_bw]} kHz"
                     )
-                self.config["radio"]["bandwidth"] = bw
+                _set_radio_param("bandwidth", bw)
                 applied.append(f"bw={bw / 1000}kHz")
 
             # Update spreading factor
@@ -3298,7 +4885,7 @@ class APIEndpoints:
                 sf = int(data["spreading_factor"])
                 if sf < 5 or sf > 12:
                     return self._error("Spreading factor must be 5-12")
-                self.config["radio"]["spreading_factor"] = sf
+                _set_radio_param("spreading_factor", sf)
                 applied.append(f"sf={sf}")
 
             # Update coding rate
@@ -3306,7 +4893,7 @@ class APIEndpoints:
                 cr = int(data["coding_rate"])
                 if cr < 5 or cr > 8:
                     return self._error("Coding rate must be 5-8 (for 4/5 to 4/8)")
-                self.config["radio"]["coding_rate"] = cr
+                _set_radio_param("coding_rate", cr)
                 applied.append(f"cr=4/{cr}")
 
             # Update TX delay factor
@@ -3344,6 +4931,11 @@ class APIEndpoints:
                 self.config["repeater"]["node_name"] = name
                 applied.append(f"name={name}")
 
+            if "owner_info" in data:
+                owner_info = str(data["owner_info"]).replace("|", "\n")
+                self.config["repeater"]["owner_info"] = owner_info
+                applied.append("owner.info")
+
             # Update latitude
             if "latitude" in data:
                 lat = float(data["latitude"])
@@ -3371,8 +4963,8 @@ class APIEndpoints:
             # Update flood advert interval (hours)
             if "flood_advert_interval_hours" in data:
                 hours = int(data["flood_advert_interval_hours"])
-                if hours != 0 and (hours < 3 or hours > 48):
-                    return self._error("Flood advert interval must be 0 (off) or 3-48 hours")
+                if hours != 0 and (hours < 3 or hours > 168):
+                    return self._error("Flood advert interval must be 0 (off) or 3-168 hours")
                 self.config["repeater"]["send_advert_interval_hours"] = hours
                 applied.append(f"flood.advert.interval={hours}h")
 
@@ -3383,6 +4975,14 @@ class APIEndpoints:
                     return self._error("Advert interval must be 0 (off) or 1-10080 minutes")
                 self.config["repeater"]["advert_interval_minutes"] = mins
                 applied.append(f"advert.interval={mins}m")
+
+            # Update direct advert interval (hours)
+            if "direct_advert_interval_hours" in data:
+                hours = int(data["direct_advert_interval_hours"])
+                if hours != 0 and (hours < 1 or hours > 168):
+                    return self._error("Direct advert interval must be 0 (off) or 1-168 hours")
+                self.config["repeater"]["direct_advert_interval_hours"] = hours
+                applied.append(f"direct.advert.interval={hours}h")
 
             # Update path hash mode (mesh: 0=1-byte, 1=2-byte, 2=3-byte)
             if "path_hash_mode" in data:
@@ -3421,6 +5021,8 @@ class APIEndpoints:
                 return self._error("No valid settings provided")
 
             live_sections = ["repeater", "delays", "radio"]
+            if target_entry is not None:
+                live_sections.append("radios")
             if "mesh" in self.config and any(k in data for k in ("path_hash_mode", "loop_detect")):
                 live_sections.append("mesh")
             if "kiss" in self.config:
@@ -3459,15 +5061,34 @@ class APIEndpoints:
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
-    def noise_floor_history(self, hours: int = 24, limit: int = None):
+    def noise_floor_history(self, hours: int = 24, limit: int = None, offset: int = 0):
 
         try:
             storage = self._get_storage()
             hours = int(hours)
-            limit = int(limit) if limit else None
-            history = storage.get_noise_floor_history(hours=hours, limit=limit)
+            offset = max(0, int(offset))
+            # Keep enough points for high-frequency sampling across the selected window.
+            # This avoids falling back to legacy small defaults when query params are absent.
+            if limit is None:
+                normalized_limit = max(2000, min(1_000_000, hours * 300))
+            else:
+                normalized_limit = max(1, min(1_000_000, int(limit)))
 
-            return self._success({"history": history, "hours": hours, "count": len(history)})
+            history = storage.get_noise_floor_history(
+                hours=hours,
+                limit=normalized_limit,
+                offset=offset,
+            )
+
+            return self._success(
+                {
+                    "history": history,
+                    "hours": hours,
+                    "count": len(history),
+                    "limit": normalized_limit,
+                    "offset": offset,
+                }
+            )
         except Exception as e:
             logger.error(f"Error fetching noise floor history: {e}")
             return self._error(e)
@@ -3541,12 +5162,26 @@ class APIEndpoints:
                 yield f"data: {json.dumps({'type': 'connected', 'message': 'Connected to CAD calibration stream'})}\n\n"
 
                 if self.cad_calibration.running:
-                    config = getattr(self.cad_calibration.daemon_instance, "config", {})
-                    radio_config = config.get("radio", {})
-                    sf = radio_config.get("spreading_factor", 8)
-
-                    peak_range, min_range = self.cad_calibration.get_test_ranges(sf)
+                    radio = getattr(self.cad_calibration.daemon_instance, "radio", None)
+                    if radio:
+                        runtime = self.cad_calibration._get_radio_runtime_config(radio)
+                        sf = runtime.get("spreading_factor", 8)
+                        peak_range, min_range = self.cad_calibration.get_test_ranges(
+                            sf,
+                            runtime.get("current_cad_peak"),
+                            runtime.get("current_cad_min"),
+                        )
+                    else:
+                        sf = 8
+                        runtime = {
+                            "bandwidth": None,
+                            "frequency": None,
+                            "current_cad_peak": None,
+                            "current_cad_min": None,
+                        }
+                        peak_range, min_range = self.cad_calibration.get_test_ranges(sf, 22, 10)
                     total_tests = len(peak_range) * len(min_range)
+                    session_cfg = getattr(self.cad_calibration, "session_config", {}) or {}
 
                     status_message = {
                         "type": "status",
@@ -3557,6 +5192,14 @@ class APIEndpoints:
                             "min_min": min(min_range),
                             "min_max": max(min_range),
                             "spreading_factor": sf,
+                            "bandwidth": runtime.get("bandwidth"),
+                            "frequency": runtime.get("frequency"),
+                            "current_peak": runtime.get("current_cad_peak"),
+                            "current_min": runtime.get("current_cad_min"),
+                            "cad_symbol_num": session_cfg.get("cad_symbol_num", 2),
+                            "known_signal_present": bool(
+                                session_cfg.get("known_signal_present", False)
+                            ),
                             "total_tests": total_tests,
                         },
                     }
@@ -3863,6 +5506,90 @@ class APIEndpoints:
     @cherrypy.expose
     @cherrypy.tools.json_out()
     @cherrypy.tools.json_in()
+    def default_region(self):
+        """
+        Get or update mesh default region configuration.
+
+        GET  /default_region
+        POST /default_region
+        Body: {"default_region": "region-name" | null}
+        """
+        if cherrypy.request.method == "GET":
+            try:
+                mesh_cfg = self.config.get("mesh", {}) if isinstance(self.config, dict) else {}
+                default_region = mesh_cfg.get("default_region")
+                value = str(default_region).strip() if default_region not in (None, "") else None
+                return self._success({"default_region": value})
+            except Exception as e:
+                logger.error(f"Error getting default region: {e}")
+                return self._error(e)
+
+        if cherrypy.request.method == "POST":
+            try:
+                data = cherrypy.request.json or {}
+                if "default_region" not in data:
+                    return self._error("Missing required field: default_region")
+
+                raw_value = data.get("default_region")
+                default_region = None
+                if raw_value is not None:
+                    text = str(raw_value).strip()
+                    if text and text != "<null>":
+                        default_region = text
+
+                if "mesh" not in self.config:
+                    self.config["mesh"] = {}
+
+                # Keep region table compatible with firmware "region default": if non-null
+                # and missing, auto-create region and ensure flood allow.
+                if default_region:
+                    storage = self._get_storage()
+                    records = storage.get_transport_keys() or []
+
+                    existing = None
+                    needle = default_region.lower()
+                    for rec in records:
+                        name = str(rec.get("name") or "").strip()
+                        display = name[1:] if name.startswith("#") else name
+                        if display.lower() == needle:
+                            existing = rec
+                            break
+
+                    if existing:
+                        key_id = existing.get("id")
+                        if key_id is not None:
+                            storage.update_transport_key(int(key_id), flood_policy="allow")
+                    else:
+                        storage.create_transport_key(
+                            default_region, "allow", None, None, time.time()
+                        )
+
+                self.config["mesh"]["default_region"] = default_region
+
+                saved = self.config_manager.save_to_file()
+                if not saved:
+                    return self._error("Failed to save configuration to file")
+
+                if hasattr(self.config_manager, "live_update_daemon"):
+                    self.config_manager.live_update_daemon(["mesh"])
+
+                return self._success(
+                    {"default_region": default_region},
+                    message=(
+                        "Default region cleared"
+                        if default_region is None
+                        else f"Default region set to {default_region}"
+                    ),
+                )
+            except Exception as e:
+                logger.error(f"Error updating default region: {e}")
+                return self._error(e)
+
+        return self._error("Method not supported")
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    @cherrypy.tools.json_in()
     def advert(self, advert_id):
         # Enable CORS for this endpoint only if configured
         self._set_cors_headers()
@@ -4032,6 +5759,235 @@ class APIEndpoints:
             logger.error(f"Error pinging neighbor: {e}", exc_info=True)
             return self._error(str(e))
 
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    @cherrypy.tools.json_in()
+    def discover_neighbors_start(self):
+
+        self._set_cors_headers()
+
+        if cherrypy.request.method == "OPTIONS":
+            return ""
+
+        try:
+            self._require_post()
+            data = cherrypy.request.json or {}
+            timeout = float(data.get("timeout", 5))
+            filter_mask = int(data.get("filter_mask", 1 << 2))
+            since = int(data.get("since", 0))
+            prefix_only = bool(data.get("prefix_only", False))
+
+            if timeout < 1 or timeout > 60:
+                return self._error("timeout must be between 1 and 60 seconds")
+            if filter_mask < 0 or filter_mask > 0xFF:
+                return self._error("filter_mask must be between 0x00 and 0xFF")
+            if since < 0:
+                return self._error("since must be non-negative")
+
+            if self.event_loop is None:
+                return self._error("Event loop not available")
+
+            discovery_helper = getattr(self.daemon_instance, "discovery_helper", None)
+            if not discovery_helper:
+                return self._error("Discovery helper not available")
+
+            discovery_helper.cleanup_sessions()
+            session = discovery_helper.create_session(
+                timeout=timeout,
+                filter_mask=filter_mask,
+                since=since,
+                prefix_only=prefix_only,
+                result_enricher=self._enrich_discovery_result,
+            )
+
+            self.event_loop.call_soon_threadsafe(
+                discovery_helper.start_session_task, session["session_id"]
+            )
+
+            return self._success(
+                session,
+                message="Discovery session started",
+            )
+        except cherrypy.HTTPError:
+            raise
+        except Exception as e:
+            logger.error("Error starting discovery session: %s", e, exc_info=True)
+            return self._error(str(e))
+
+    @cherrypy.expose
+    def discover_neighbors_stream(self, session_id=None, last_event_id: Optional[str] = None):
+        self._set_cors_headers()
+        cherrypy.response.headers["Content-Type"] = "text/event-stream"
+        cherrypy.response.headers["Cache-Control"] = "no-cache"
+        cherrypy.response.headers["Connection"] = "keep-alive"
+        cherrypy.response.headers["X-Accel-Buffering"] = "no"
+
+        discovery_helper = getattr(self.daemon_instance, "discovery_helper", None)
+
+        try:
+            cursor = int(last_event_id) if last_event_id is not None else 0
+        except (TypeError, ValueError):
+            cursor = 0
+
+        def generate():
+            if not session_id:
+                yield self._encode_sse_event(
+                    {"type": "error", "error": "Missing session_id"},
+                    event_name="error",
+                )
+                return
+
+            if not discovery_helper:
+                yield self._encode_sse_event(
+                    {"type": "error", "error": "Discovery helper not available"},
+                    event_name="error",
+                )
+                return
+
+            snapshot = discovery_helper.get_session_snapshot(session_id)
+            if not snapshot:
+                yield self._encode_sse_event(
+                    {"type": "error", "error": f"Unknown discovery session: {session_id}"},
+                    event_name="error",
+                )
+                return
+
+            yield self._encode_sse_event(
+                {
+                    "type": "connected",
+                    "session": snapshot,
+                },
+                event_name="connected",
+            )
+
+            current_cursor = cursor
+            try:
+                while True:
+                    event_state = discovery_helper.get_events_since(session_id, current_cursor)
+                    if event_state is None:
+                        yield self._encode_sse_event(
+                            {
+                                "type": "error",
+                                "error": f"Unknown discovery session: {session_id}",
+                            },
+                            event_name="error",
+                        )
+                        return
+
+                    events = event_state.get("events", [])
+                    if events:
+                        for event in events:
+                            current_cursor = max(current_cursor, int(event.get("id", 0)))
+                            yield self._encode_sse_event(
+                                event.get("data", {}),
+                                event_name=event.get("event"),
+                                event_id=event.get("id"),
+                            )
+                        if event_state.get("completed"):
+                            return
+                    else:
+                        if event_state.get("completed"):
+                            return
+                        yield self._encode_sse_event(
+                            {"type": "keepalive", "session_id": session_id},
+                            event_name="keepalive",
+                            event_id=current_cursor if current_cursor > 0 else None,
+                        )
+
+                    time.sleep(0.5)
+            except GeneratorExit:
+                logger.debug("Discovery SSE stream closed by client for session %s", session_id)
+            except Exception as exc:
+                logger.error("Discovery SSE stream error: %s", exc, exc_info=True)
+                yield self._encode_sse_event(
+                    {"type": "error", "error": str(exc), "session_id": session_id},
+                    event_name="error",
+                    event_id=current_cursor if current_cursor > 0 else None,
+                )
+
+        return generate()
+
+    discover_neighbors_stream._cp_config = {"response.stream": True}
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    @cherrypy.tools.json_in()
+    @require_auth
+    def add_discovered_neighbor(self):
+
+        self._set_cors_headers()
+
+        if cherrypy.request.method == "OPTIONS":
+            return ""
+
+        try:
+            self._require_post()
+            data = cherrypy.request.json or {}
+            pub_key = str(data.get("pub_key") or "").strip().lower()
+            node_name = self._normalize_discovery_node_name(data.get("node_name"))
+            node_type = int(data.get("node_type", 0))
+            rssi = data.get("rssi")
+            snr = data.get("response_snr", data.get("snr"))
+
+            if not pub_key:
+                return self._error("pub_key is required")
+            if not re.fullmatch(r"[0-9a-f]{16}|[0-9a-f]{64}", pub_key):
+                return self._error("pub_key must be 8-byte or 32-byte hex")
+
+            if self._is_local_discovery_pubkey(pub_key):
+                enriched = self._enrich_discovery_result(
+                    {
+                        "pub_key": pub_key,
+                        "node_name": node_name,
+                        "node_type": node_type,
+                        "rssi": rssi,
+                        "response_snr": snr,
+                    }
+                )
+                enriched["is_self"] = True
+                return self._success(enriched, message="Skipped local node: not added to neighbors")
+
+            contact_type = {
+                1: "Chat Node",
+                2: "Repeater",
+                3: "Room Server",
+            }.get(node_type, "Unknown")
+
+            advert_record = {
+                "timestamp": time.time(),
+                "pubkey": pub_key,
+                "node_name": node_name,
+                "is_repeater": node_type == 2,
+                "route_type": 2,
+                "contact_type": contact_type,
+                "latitude": None,
+                "longitude": None,
+                "rssi": int(rssi) if rssi is not None else None,
+                "snr": float(snr) if snr is not None else None,
+                "is_new_neighbor": True,
+                "zero_hop": True,
+            }
+
+            storage = self._get_storage()
+            storage.record_advert(advert_record)
+
+            enriched = self._enrich_discovery_result(
+                {
+                    "pub_key": pub_key,
+                    "node_name": node_name,
+                    "node_type": node_type,
+                    "node_type_name": contact_type,
+                    "rssi": advert_record["rssi"],
+                    "response_snr": advert_record["snr"],
+                }
+            )
+            return self._success(enriched, message="Neighbor added to adverts database")
+        except cherrypy.HTTPError:
+            raise
+        except Exception as e:
+            logger.error("Error adding discovered neighbor: %s", e, exc_info=True)
+            return self._error(str(e))
+
     # ========== Identity Management Endpoints ==========
 
     @cherrypy.expose
@@ -4083,6 +6039,12 @@ class APIEndpoints:
                     (r for r in registered_identities if r["name"] == f"room_server:{name}"), None
                 )
 
+                pk_display = None
+                if matching:
+                    pk_display = matching.get("public_key")
+                else:
+                    pk_display = derive_companion_public_key_hex(room_config.get("identity_key"))
+
                 configured.append(
                     {
                         "name": name,
@@ -4094,6 +6056,7 @@ class APIEndpoints:
                         "settings": settings,
                         "hash": matching["hash"] if matching else None,
                         "address": matching["address"] if matching else None,
+                        "public_key": pk_display,
                         "registered": matching is not None,
                     }
                 )
@@ -4236,6 +6199,19 @@ class APIEndpoints:
             identity_type = data.get("type", "room_server")
             settings = data.get("settings", {})
 
+            if not isinstance(settings, dict):
+                return self._error("settings must be an object")
+
+            def _validate_room_server_advert_intervals(room_settings):
+                for field in ("flood_advert_interval_hours", "direct_advert_interval_hours"):
+                    if field not in room_settings:
+                        continue
+                    hours = int(room_settings[field])
+                    if hours != 0 and (hours < 1 or hours > 168):
+                        return f"{field} must be 0 (off) or 1-168 hours"
+                    room_settings[field] = hours
+                return None
+
             if not name:
                 return self._error("Missing required field: name")
 
@@ -4251,14 +6227,19 @@ class APIEndpoints:
                 guest_pw = settings.get("guest_password")
                 if admin_pw and guest_pw and admin_pw == guest_pw:
                     return self._error("admin_password and guest_password must be different")
+                interval_error = _validate_room_server_advert_intervals(settings)
+                if interval_error:
+                    return self._error(interval_error)
 
             # Auto-generate identity key if not provided
             key_was_generated = False
             if not identity_key:
                 try:
-                    # Generate a new random 32-byte key (same method as config.py)
-                    random_key = os.urandom(32)
-                    identity_key = random_key.hex()
+                    # Use MeshCore-compatible keygen and store 32-byte private scalar hex.
+                    from repeater.keygen import generate_meshcore_keypair
+
+                    _, private_key = generate_meshcore_keypair()
+                    identity_key = private_key[:32].hex()
                     key_was_generated = True
                     logger.info(f"Auto-generated identity key for '{name}': {identity_key[:16]}...")
                 except Exception as gen_error:
@@ -4660,6 +6641,13 @@ class APIEndpoints:
                     identity["settings"] = {}
                 identity["settings"].update(data["settings"])
 
+                for field in ("flood_advert_interval_hours", "direct_advert_interval_hours"):
+                    if field in identity["settings"]:
+                        hours = int(identity["settings"][field])
+                        if hours != 0 and (hours < 1 or hours > 168):
+                            return self._error(f"{field} must be 0 (off) or 1-168 hours")
+                        identity["settings"][field] = hours
+
                 # Validate passwords are different if both are now set
                 admin_pw = identity["settings"].get("admin_password")
                 guest_pw = identity["settings"].get("guest_password")
@@ -4971,7 +6959,31 @@ class APIEndpoints:
     ):
         """Send advert for a room server identity"""
         try:
-            from openhop_core.protocol import PacketBuilder
+            if self.daemon_instance and hasattr(self.daemon_instance, "_send_room_server_advert"):
+                identity_manager = getattr(self.daemon_instance, "identity_manager", None)
+                room_name = node_name
+                room_cfg = {
+                    "settings": {
+                        "node_name": node_name,
+                        "latitude": latitude,
+                        "longitude": longitude,
+                    }
+                }
+                if identity_manager is not None:
+                    for n, room_identity, cfg in identity_manager.get_identities_by_type(
+                        "room_server"
+                    ):
+                        if room_identity is identity:
+                            room_name = n
+                            room_cfg = cfg
+                            break
+                return await self.daemon_instance._send_room_server_advert(
+                    room_name=room_name,
+                    identity=identity,
+                    identity_config=room_cfg,
+                    advert_kind="manual",
+                )
+
             from openhop_core.protocol.constants import (
                 ADVERT_FLAG_HAS_NAME,
                 ADVERT_FLAG_IS_ROOM_SERVER,
@@ -4984,28 +6996,38 @@ class APIEndpoints:
             # Build flags - just use HAS_NAME for room servers
             flags = ADVERT_FLAG_IS_ROOM_SERVER | ADVERT_FLAG_HAS_NAME
 
-            packet = PacketBuilder.create_advert(
+            mesh_config = self.config.get("mesh", {}) if isinstance(self.config, dict) else {}
+            default_region = mesh_config.get("default_region")
+            packet, scoped_region_name = create_scoped_advert_packet(
                 local_identity=identity,
-                name=node_name,
-                lat=latitude,
-                lon=longitude,
-                feature1=0,
-                feature2=0,
+                node_name=node_name,
+                latitude=latitude,
+                longitude=longitude,
                 flags=flags,
-                route_type="flood",
+                default_region=default_region,
+                scope_label="room server advert",
             )
 
-            # Send via dispatcher
-            await self.daemon_instance.dispatcher.send_packet(packet, wait_for_ack=False)
+            injector = getattr(getattr(self.daemon_instance, "router", None), "inject_packet", None)
+            if callable(injector):
+                sent = await injector(packet, wait_for_ack=False)
+            else:
+                sent = await self.daemon_instance.dispatcher.send_packet(packet, wait_for_ack=False)
 
-            # Mark as seen to prevent re-forwarding
-            if self.daemon_instance.repeater_handler:
+            if not sent:
+                logger.error("Failed to send room server advert: packet transmission was rejected")
+                return False
+
+            # Mark as seen only when bypassing the engine and sending directly.
+            if not callable(injector) and self.daemon_instance.repeater_handler:
                 self.daemon_instance.repeater_handler.mark_seen(packet)
                 logger.debug(f"Marked room server advert '{node_name}' as seen in duplicate cache")
 
             logger.info(
                 f"Sent flood advert for room server '{node_name}' at ({latitude:.6f}, {longitude:.6f})"
             )
+            if scoped_region_name:
+                logger.info("Room server advert scoped to default region '%s'", scoped_region_name)
             return True
 
         except Exception as e:
@@ -5253,7 +7275,13 @@ class APIEndpoints:
                                 "public_key": pub_key[:8].hex() + "..." + pub_key[-4:].hex(),
                                 "public_key_full": pub_key.hex(),
                                 "address": address_bytes.hex(),
-                                "permissions": "admin" if client.is_admin() else "guest",
+                                # Accurate role name: with the guest password
+                                # split (repeater=guest, room server=read_write)
+                                # an "admin or guest" label would hide the
+                                # difference between the non-admin roles.
+                                # Read the byte rather than calling a method:
+                                # ACL clients are duck-typed in several places.
+                                "permissions": acl_role_name(getattr(client, "permissions", 0)),
                                 "last_activity": client.last_activity,
                                 "last_login_success": client.last_login_success,
                                 "last_timestamp": client.last_timestamp,
@@ -6124,7 +8152,7 @@ class APIEndpoints:
             import copy
 
             full_backup = str(include_secrets).lower() in ("true", "1", "yes")
-            exported = copy.deepcopy(self.config)
+            exported = normalize_modem_config(copy.deepcopy(self.config))
 
             if full_backup:
                 # Convert binary identity key to hex for JSON serialisation
@@ -6149,6 +8177,8 @@ class APIEndpoints:
                 rep = exported.get("repeater", {})
                 if "identity_key" in rep:
                     del rep["identity_key"]
+
+                redact_modem_tokens_in_place(exported, replacement=REDACTED_CONFIG_VALUE)
 
                 # Redact identity keys in companion / room_server configs
                 for section in ("room_servers", "companions"):
@@ -6202,27 +8232,114 @@ class APIEndpoints:
         Returns: {"success": true, "message": "...", "restart_required": true,
                   "sections_updated": [...]}
         """
+        with self._provisioning_lock:
+            return self._config_import_locked()
+
+    def _config_import_locked(self):
         self._set_cors_headers()
         if cherrypy.request.method == "OPTIONS":
             return ""
         try:
             self._require_post()
+
+            # /api/config_import intentionally has tools.require_auth.off so the
+            # first-run setup wizard can restore a config without a JWT. After
+            # setup completes we must still accept the UI's Bearer/API token by
+            # resolving credentials here (the global auth tool never ran).
+            request_user = self._resolve_optional_request_user()
+            if not request_user:
+                try:
+                    current_config = self.config
+                    if self._config_path:
+                        with open(self._config_path, "r", encoding="utf-8") as f:
+                            current_config = yaml.safe_load(f) or {}
+                except Exception as exc:
+                    logger.debug(
+                        f"config_import could not read persisted config {self._config_path}: {exc}"
+                    )
+                    current_config = self.config
+
+                needs_setup, _ = self._setup_status_from_config(current_config or {})
+                if not needs_setup:
+                    cherrypy.response.status = 403
+                    return {
+                        "success": False,
+                        "error": (
+                            "Unauthorized restore. First-run setup is already complete; "
+                            "authenticate to import configuration."
+                        ),
+                    }
+
             data = cherrypy.request.json
             imported_config = data.get("config")
 
             if not imported_config or not isinstance(imported_config, dict):
                 return self._error("Missing or invalid 'config' object in request body")
 
+            imported_config = normalize_modem_config(imported_config)
+
+            # Redacted exports and browser-originated partial modem updates are
+            # intentionally safe to re-import. Preserve the currently configured
+            # token when the incoming section carries the sentinel or omits the
+            # field; a real incoming token still replaces it.
+            current_config = normalize_modem_config(self.config, warn=False)
+            imported_tcp = imported_config.get("modem_tcp")
+            current_tcp = current_config.get("modem_tcp")
+            if isinstance(imported_tcp, dict) and (
+                "token" not in imported_tcp or imported_tcp.get("token") == REDACTED_CONFIG_VALUE
+            ):
+                if isinstance(current_tcp, dict) and "token" in current_tcp:
+                    imported_tcp["token"] = current_tcp["token"]
+                else:
+                    imported_tcp.pop("token", None)
+
+            current_radios = current_config.get("radios")
+            if not isinstance(current_radios, list):
+                current_radios = []
+            current_radios_by_id = {
+                entry.get("id"): entry
+                for entry in current_radios
+                if isinstance(entry, dict) and entry.get("id") is not None
+            }
+            imported_radios = imported_config.get("radios")
+            if isinstance(imported_radios, list):
+                for index, entry in enumerate(imported_radios):
+                    if not isinstance(entry, dict):
+                        continue
+                    imported_radio_tcp = entry.get("modem_tcp")
+                    if not isinstance(imported_radio_tcp, dict) or (
+                        "token" in imported_radio_tcp
+                        and imported_radio_tcp.get("token") != REDACTED_CONFIG_VALUE
+                    ):
+                        continue
+                    current_entry = current_radios_by_id.get(entry.get("id"))
+                    if current_entry is None and index < len(current_radios):
+                        candidate = current_radios[index]
+                        current_entry = candidate if isinstance(candidate, dict) else None
+                    current_radio_tcp = (
+                        current_entry.get("modem_tcp") if isinstance(current_entry, dict) else None
+                    )
+                    if isinstance(current_radio_tcp, dict) and "token" in current_radio_tcp:
+                        imported_radio_tcp["token"] = current_radio_tcp["token"]
+                    else:
+                        imported_radio_tcp.pop("token", None)
+
             # Sections we allow to be imported
             ALLOWED_SECTIONS = {
                 "repeater",
                 "mesh",
                 "radio",
+                "radios",
+                "fabric",
                 "sx1262",
                 "ch341",
                 "kiss",
-                "pymc_usb",
-                "pymc_tcp",
+                "modem_usb",
+                "modem_tcp",
+                "sensors",
+                "gps",
+                "mqtt_brokers",
+                "mqtt",
                 "identities",
                 "delays",
                 "web",
@@ -6271,20 +8388,41 @@ class APIEndpoints:
                                 existing = cur_by_name.get(entry.get("name"), {})
                                 entry["identity_key"] = existing.get("identity_key", "")
 
+                if section == "mqtt" and isinstance(value, dict):
+                    # Backward compatibility: treat legacy "mqtt" section as
+                    # current "mqtt_brokers" during restore.
+                    section = "mqtt_brokers"
+
                 if section in {
                     "radio",
+                    "radios",
+                    "fabric",
                     "sx1262",
                     "ch341",
                     "kiss",
-                    "pymc_usb",
-                    "pymc_tcp",
+                    "modem_usb",
+                    "modem_tcp",
+                    "sensors",
+                    "gps",
                     "radio_type",
+                    "mqtt_brokers",
+                    "letsmesh",
                 }:
                     restart_required = True
 
                 if section == "radio_type":
                     # radio_type is a top-level scalar, not a dict
                     self.config[section] = value
+                elif section == "radios":
+                    # Multi-radio list must replace wholesale (never dict-merge).
+                    # Allow null/[] to clear multi-radio mode and fall back to
+                    # legacy top-level radio_type/radio/sx1262/....
+                    if value is None:
+                        self.config.pop("radios", None)
+                    elif isinstance(value, list):
+                        self.config["radios"] = value
+                    else:
+                        return self._error("radios must be a list or null")
                 else:
                     if section not in self.config:
                         self.config[section] = {}
@@ -6297,6 +8435,13 @@ class APIEndpoints:
 
             if not updated_sections:
                 return self._error("No valid configuration sections found in import")
+
+            # Keep authenticated restores closed even when restoring defaults.
+            # Partial first-run restores must still allow the existing wizard;
+            # finish provisioning once credentials have actually been supplied.
+            # setup_completed is deliberately not an importable section.
+            if request_user or not self._setup_status_from_config(self.config)[0]:
+                self.config["setup_completed"] = True
 
             # Persist and live-reload
             self.config_manager.update_and_save(
@@ -6463,9 +8608,12 @@ class APIEndpoints:
             storage = self._get_storage()
             stats = storage.sqlite_handler.get_table_stats()
 
-            # Add RRD file size if it exists
             rrd_path = storage.sqlite_handler.storage_dir / "metrics.rrd"
-            stats["rrd_size_bytes"] = rrd_path.stat().st_size if rrd_path.exists() else 0
+            rrd_exists = rrd_path.exists()
+            stats["rrd_enabled"] = bool(getattr(storage, "rrd_enabled", True))
+            stats["rrd_available"] = bool(getattr(storage, "rrd_handler", None)) and rrd_exists
+            stats["metrics_data_source"] = "rrd" if stats["rrd_available"] else "sqlite"
+            stats["rrd_size_bytes"] = rrd_path.stat().st_size if rrd_exists else 0
 
             return {"success": True, "data": stats}
         except Exception as e:

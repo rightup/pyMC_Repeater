@@ -57,8 +57,13 @@ use_runtime_merged_config() {
 
 merge_config_from_example() {
     config_path="$1"
+    # Image defaults evolve on upgrade; preserve the volume's example unchanged.
+    merge_example_path="${EXAMPLE_PATH}"
+    if [ -f "${BUNDLED_EXAMPLE_PATH}" ]; then
+        merge_example_path="${BUNDLED_EXAMPLE_PATH}"
+    fi
 
-    if [ ! -f "${config_path}" ] || [ ! -f "${EXAMPLE_PATH}" ]; then
+    if [ ! -f "${config_path}" ] || [ ! -f "${merge_example_path}" ]; then
         return 0
     fi
 
@@ -79,8 +84,8 @@ merge_config_from_example() {
     # Keep only the example's comments to avoid comment duplication across upgrades.
     "${YQ_CMD}" eval '... comments=""' "${config_path}" > "${stripped_user}" 2>/dev/null || cp "${config_path}" "${stripped_user}"
 
-    if ! "${YQ_CMD}" eval-all '. as $item ireduce ({}; . * $item)' "${EXAMPLE_PATH}" "${stripped_user}" > "${merged_config}" 2>/dev/null; then
-        echo "Failed to merge ${config_path} with ${EXAMPLE_PATH}; keeping the existing config." >&2
+    if ! "${YQ_CMD}" eval-all '. as $item ireduce ({}; . * $item)' "${merge_example_path}" "${stripped_user}" > "${merged_config}" 2>/dev/null; then
+        echo "Failed to merge ${config_path} with ${merge_example_path}; keeping the existing config." >&2
         cleanup_merge
         trap - EXIT HUP INT TERM
         return 0
@@ -127,4 +132,7 @@ fi
 
 merge_config_from_example "${CONFIG_PATH}"
 
-exec python3 -m repeater.main --config "${CONFIG_PATH}"
+# Keep Repeater and its optional plugin manager under one PID 1 supervisor.
+# The supervisor forwards shutdown signals to both process groups and restarts
+# the plugin manager if it exits while Repeater is still running.
+exec python3 -m repeater.plugins.container_supervisor --config "${CONFIG_PATH}"

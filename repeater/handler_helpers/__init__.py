@@ -3,6 +3,7 @@
 from .advert import AdvertHelper
 from .discovery import DiscoveryHelper
 from .login import LoginHelper
+from .neighbor_scopes import NeighborScopeHelper
 from .path import PathHelper
 from .protocol_request import ProtocolRequestHelper
 from .text import TextHelper
@@ -13,6 +14,7 @@ __all__ = [
     "DiscoveryHelper",
     "AdvertHelper",
     "LoginHelper",
+    "NeighborScopeHelper",
     "TextHelper",
     "PathHelper",
     "ProtocolRequestHelper",

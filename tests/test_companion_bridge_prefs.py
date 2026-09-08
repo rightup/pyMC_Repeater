@@ -52,3 +52,35 @@ def test_load_prefs_restores_default_scope_key_as_bytes(identity):
     assert scope is not None
     assert scope[0] == "region1"
     assert scope[1] == bytes(range(16))
+
+
+def test_bridge_accepts_host_radio_callbacks(identity):
+    """Repeater must forward host-radio callbacks required by CompanionBridge."""
+
+    async def inject(pkt, wait_for_ack=False):
+        return True
+
+    bridge = RepeaterCompanionBridge(
+        identity,
+        inject,
+        radio_settings_getter=lambda: {
+            "frequency": 915_000_000,
+            "bandwidth": 250_000,
+            "spreading_factor": 10,
+            "coding_rate": 5,
+            "tx_power": 19,
+        },
+        max_tx_power_getter=lambda: 20,
+    )
+
+    radio = bridge.get_radio_params()
+    assert radio == {
+        "frequency_hz": 915_000_000,
+        "bandwidth_hz": 250_000,
+        "spreading_factor": 10,
+        "coding_rate": 5,
+        "tx_power_dbm": 19,
+        "rx_delay_base": 0,
+        "airtime_factor": 1.0,
+    }
+    assert bridge.get_max_tx_power_dbm() == 20

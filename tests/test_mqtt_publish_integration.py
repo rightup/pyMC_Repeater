@@ -236,3 +236,39 @@ def test_mqtt_published_packet_legacy_mqtt_format_uses_singular_packet_topic():
     payload_dict = json.loads(captured[0]["payload"])
     # Duration still flows through correctly even on the legacy topic
     assert int(payload_dict["duration"]) > 0
+
+
+def test_mqtt_published_packet_legacy_mqtt_format_uses_supplied_base_topic():
+    """When a broker supplies ``base_topic``, downstream publishing must use
+    that value instead of the legacy default prefix.
+    """
+    config = _make_config(format_value="mqtt", iata_code="LAX")
+    config["mqtt_brokers"]["brokers"][0]["base_topic"] = "site/edge/gw1"
+    public_key_hex = "12" * 32
+    identity = _FakeIdentity(public_key_hex)
+
+    pusher = MeshCoreToMqttPusher(local_identity=identity, config=config)
+    captured = _attach_capturing_client(pusher.connections[0])
+
+    raw_bytes = bytes(range(16))
+    airtime_mgr = AirtimeManager(config)
+    packet_record = {
+        "timestamp": 1700000000.0,
+        "type": 1,
+        "route": 1,
+        "rssi": -70,
+        "snr": 6.0,
+        "score": 0.2,
+        "payload_length": 10,
+        "packet_hash": "C0FFEE00" + "00" * 4,
+        "raw_packet": raw_bytes.hex(),
+        "airtime_ms": airtime_mgr.calculate_airtime(len(raw_bytes)),
+    }
+    record = PacketRecord.from_packet_record(
+        packet_record, origin="test-node", origin_id=public_key_hex.upper()
+    )
+    pusher.publish_packet(record.to_dict())
+
+    assert len(captured) == 1
+    # Legacy `mqtt` format still uses singular subtopic, but custom base prefix.
+    assert captured[0]["topic"] == "site/edge/gw1/packet"

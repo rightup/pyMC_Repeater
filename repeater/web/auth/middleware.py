@@ -10,9 +10,10 @@ def require_auth(func):
 
     @wraps(func)
     def wrapper(*args, **kwargs):
-        # Skip authentication for OPTIONS requests (CORS preflight)
+        # Terminate CORS preflight without invoking the protected handler.
         if cherrypy.request.method == "OPTIONS":
-            return func(*args, **kwargs)
+            cherrypy.response.status = 204
+            return b""
 
         # Get auth handlers from global cherrypy config (not app config)
         jwt_handler = cherrypy.config.get("jwt_handler")
@@ -38,6 +39,26 @@ def require_auth(func):
                 return func(*args, **kwargs)
             else:
                 logger.warning("Invalid or expired JWT token")
+
+        request_params = getattr(cherrypy.request, "params", None)
+        if request_params is None:
+            request_params = {}
+
+        query_token = request_params.get("token")
+        if query_token:
+            payload = jwt_handler.verify_jwt(query_token)
+
+            if payload:
+                cherrypy.request.user = {
+                    "username": payload["sub"],
+                    "client_id": payload["client_id"],
+                    "auth_type": "jwt_query",
+                }
+                if hasattr(cherrypy.request, "params") and "token" in cherrypy.request.params:
+                    del cherrypy.request.params["token"]
+                return func(*args, **kwargs)
+            else:
+                logger.warning("Invalid or expired JWT query token")
 
         # Try API token authentication
         api_key = cherrypy.request.headers.get("X-API-Key", "")

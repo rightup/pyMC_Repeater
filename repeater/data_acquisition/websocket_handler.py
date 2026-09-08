@@ -24,15 +24,15 @@ _connected_clients = set()
 PING_INTERVAL = 30  # seconds
 _heartbeat_thread = None
 _heartbeat_running = False
+_websocket_plugin = None
 
 
 class PacketWebSocket(WebSocket):
     def opened(self):
         """Called when a WebSocket connection is established"""
-        # Authenticate using JWT provided as query parameter (token=)
         jwt_handler = cherrypy.config.get("jwt_handler")
+        token_manager = cherrypy.config.get("token_manager")
 
-        # Get query string from environ
         qs = ""
         if hasattr(self, "environ"):
             qs = self.environ.get("QUERY_STRING", "")
@@ -41,38 +41,55 @@ class PacketWebSocket(WebSocket):
         token = params.get("token", [None])[0]
         client_id = params.get("client_id", [None])[0]
 
+        api_key = self.environ.get("HTTP_X_API_KEY", "") if hasattr(self, "environ") else ""
+
         if not jwt_handler:
             logger.warning("WebSocket connection rejected: no JWT handler configured")
             self.close(code=1011, reason="server configuration error")
             return
 
-        if not token:
+        if not token and not api_key:
             logger.warning("WebSocket connection rejected: missing token")
             self.close(code=1008, reason="unauthorized")
             return
 
-        try:
-            payload = jwt_handler.verify_jwt(token)
-            if not payload:
-                logger.warning("WebSocket connection rejected: invalid token")
-                self.close(code=1008, reason="unauthorized")
-                return
-        except Exception as e:
-            logger.warning(f"WebSocket auth error: {e}")
-            self.close(code=1008, reason="unauthorized")
-            return
+        if token:
+            try:
+                payload = jwt_handler.verify_jwt(token)
+                if payload:
+                    if (
+                        client_id
+                        and payload.get("client_id")
+                        and payload.get("client_id") != client_id
+                    ):
+                        logger.warning("WebSocket connection rejected: client_id mismatch")
+                        self.close(code=1008, reason="unauthorized")
+                        return
+                    self.user = payload.get("sub")
+                    _connected_clients.add(self)
+                    logger.info(
+                        f"WebSocket connected ({self.user or 'unknown user'}). Total clients: {len(_connected_clients)}"
+                    )
+                    return
+            except Exception as e:
+                logger.warning(f"WebSocket JWT auth error: {e}")
 
-        if client_id and payload.get("client_id") and payload.get("client_id") != client_id:
-            logger.warning("WebSocket connection rejected: client_id mismatch")
-            self.close(code=1008, reason="unauthorized")
-            return
+        api_token = api_key or token
+        if api_token and token_manager:
+            try:
+                token_info = token_manager.verify_token(api_token)
+                if token_info:
+                    self.user = f"api_token:{token_info.get('name', 'unknown')}"
+                    _connected_clients.add(self)
+                    logger.info(
+                        f"WebSocket connected (API token: {token_info.get('name', 'unknown')}). Total clients: {len(_connected_clients)}"
+                    )
+                    return
+            except Exception as e:
+                logger.warning(f"WebSocket API key auth error: {e}")
 
-        # Auth success - store user and add to connected clients
-        self.user = payload.get("sub")  # type: ignore[attr-defined]
-        _connected_clients.add(self)
-        logger.info(
-            f"WebSocket connected ({self.user or 'unknown user'}). Total clients: {len(_connected_clients)}"
-        )
+        logger.warning("WebSocket connection rejected: no valid authentication")
+        self.close(code=1008, reason="unauthorized")
 
     def closed(self, code, reason=None):
         """Called when a WebSocket connection is closed"""
@@ -152,9 +169,20 @@ def _heartbeat_loop():
 
 def init_websocket():
     """Initialize WebSocket plugin and start heartbeat"""
-    global _heartbeat_thread, _heartbeat_running
+    global _heartbeat_thread, _heartbeat_running, _websocket_plugin
 
-    WebSocketPlugin(cherrypy.engine).subscribe()
+    # Re-initialize plugin safely across CherryPy stop/start cycles.
+    # ws4py's manager thread cannot be started twice, so always tear down
+    # any previously subscribed plugin instance before creating a new one.
+    if _websocket_plugin is not None:
+        try:
+            _websocket_plugin.unsubscribe()
+        except Exception as e:
+            logger.debug(f"WebSocket plugin unsubscribe during init failed: {e}")
+        _websocket_plugin = None
+
+    _websocket_plugin = WebSocketPlugin(cherrypy.engine)
+    _websocket_plugin.subscribe()
     cherrypy.tools.websocket = WebSocketTool()
 
     # Start heartbeat thread
@@ -165,3 +193,19 @@ def init_websocket():
         logger.info(f"WebSocket initialized with {PING_INTERVAL}s heartbeat")
     else:
         logger.info("WebSocket initialized")
+
+
+def shutdown_websocket():
+    """Stop websocket heartbeat and unsubscribe plugin for clean restart."""
+    global _heartbeat_running, _heartbeat_thread, _websocket_plugin
+
+    _heartbeat_running = False
+    _heartbeat_thread = None
+    _connected_clients.clear()
+
+    if _websocket_plugin is not None:
+        try:
+            _websocket_plugin.unsubscribe()
+        except Exception as e:
+            logger.debug(f"WebSocket plugin unsubscribe failed: {e}")
+        _websocket_plugin = None
