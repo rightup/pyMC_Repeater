@@ -15,7 +15,7 @@
             }
         },
         "suggested_radio_settings": {
-            "info_message": "These presets are suggested by the community.",
+            "info_message": "These presets match one-to-one what is provided in https://api.meshcore.nz/api/v1/config.",
             "entries": [
                 {
                     "title": "Australia",
