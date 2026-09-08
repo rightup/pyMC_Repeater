@@ -761,7 +761,7 @@ EOF
     mkdir -p /etc/sudoers.d
     cat > /etc/sudoers.d/openhop-repeater <<'EOF'
 # Allow repeater user to manage the openhop-repeater service without password
-repeater ALL=(root) NOPASSWD: /usr/bin/systemctl restart openhop-repeater, /usr/bin/systemctl stop openhop-repeater, /usr/bin/systemctl start openhop-repeater, /usr/bin/systemctl status openhop-repeater, /usr/local/bin/pymc-do-upgrade
+repeater ALL=(root) NOPASSWD: /usr/bin/systemd-run --quiet --collect --unit=openhop-repeater-restart --on-active=2s --timer-property=AccuracySec=100ms --timer-property=RemainAfterElapse=no /usr/bin/systemctl restart openhop-repeater, /usr/bin/systemctl restart openhop-repeater, /usr/bin/systemctl stop openhop-repeater, /usr/bin/systemctl start openhop-repeater, /usr/bin/systemctl status openhop-repeater, /usr/local/bin/pymc-do-upgrade
 EOF
     chmod 0440 /etc/sudoers.d/openhop-repeater
 
@@ -1312,7 +1312,7 @@ EOF
     mkdir -p /etc/sudoers.d
     cat > /etc/sudoers.d/openhop-repeater <<'EOF'
 # Allow repeater user to manage the openhop-repeater service without password
-repeater ALL=(root) NOPASSWD: /usr/bin/systemctl restart openhop-repeater, /usr/bin/systemctl stop openhop-repeater, /usr/bin/systemctl start openhop-repeater, /usr/bin/systemctl status openhop-repeater, /usr/local/bin/pymc-do-upgrade
+repeater ALL=(root) NOPASSWD: /usr/bin/systemd-run --quiet --collect --unit=openhop-repeater-restart --on-active=2s --timer-property=AccuracySec=100ms --timer-property=RemainAfterElapse=no /usr/bin/systemctl restart openhop-repeater, /usr/bin/systemctl restart openhop-repeater, /usr/bin/systemctl stop openhop-repeater, /usr/bin/systemctl start openhop-repeater, /usr/bin/systemctl status openhop-repeater, /usr/local/bin/pymc-do-upgrade
 EOF
     chmod 0440 /etc/sudoers.d/openhop-repeater
 
