@@ -246,9 +246,9 @@ def restart_service() -> Tuple[bool, str]:
     Restart the openhop-repeater service.
 
     On Buildroot/Luckfox, use the shipped init script directly.
-    On systemd hosts, try polkit-based restart first (plain systemctl), then
-    fall back to sudo-based restart (requires sudoers.d rule installed by
-    manage.sh).
+    On systemd hosts, submit a delayed transient timer through the exact
+    sudo command authorized by manage.sh. The restart runs outside this
+    service's cgroup, after the API can acknowledge successful scheduling.
 
     Returns:
         Tuple[bool, str]: (success, message)
@@ -277,62 +277,48 @@ def restart_service() -> Tuple[bool, str]:
             logger.error(f"Buildroot restart failed: {exc}")
             return False, f"Restart failed: {exc}"
 
-    # Try polkit-based restart first (works on bare metal / VMs with polkit running)
+    # A command launched inside this service shares its cgroup, even with
+    # --no-block or start_new_session. PID 1 must own the delayed restart so
+    # submission can return before our process group receives SIGTERM.
+    command = [
+        "/usr/bin/systemd-run",
+        "--quiet",
+        "--collect",
+        "--unit=openhop-repeater-restart",
+        "--on-active=2s",
+        "--timer-property=AccuracySec=100ms",
+        "--timer-property=RemainAfterElapse=no",
+        _SYSTEMCTL_BIN,
+        "restart",
+        "openhop-repeater",
+    ]
+    if os.geteuid() != 0:
+        command = [_SUDO_BIN, "--non-interactive", *command]
     try:
-        result = subprocess.run(
-            [_SYSTEMCTL_BIN, "restart", "openhop-repeater"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )  # nosec B603
-
+        result = subprocess.run(command, capture_output=True, text=True, timeout=5)  # nosec B603
         if result.returncode == 0:
-            logger.info("Service restart via polkit succeeded")
-            return True, "Service restart initiated"
-
-        stderr = result.stderr or ""
-        if "Access denied" in stderr or "authorization" in stderr.lower():
-            logger.info("Polkit denied restart, trying sudo fallback...")
-        else:
-            # Some other error, still try sudo
-            logger.warning(f"systemctl restart failed ({result.returncode}): {stderr.strip()}")
-
+            logger.info("Service restart scheduled via systemd timer")
+            return True, "Service restart initiated (scheduled in 2 seconds)"
+        if result.returncode < 0:
+            logger.warning("Restart job submission interrupted (%s)", result.returncode)
+            return (
+                False,
+                "Restart unconfirmed: command interrupted; check service status before retrying",
+            )
+        error_msg = result.stderr.strip() or f"exit status {result.returncode}"
+        logger.error("Restart scheduling failed: %s", error_msg)
+        return False, f"Restart failed: {error_msg}"
     except subprocess.TimeoutExpired:
-        # Timeout likely means it's restarting - that's success
-        logger.warning("Service restart command timed out (service may be restarting)")
-        return True, "Service restart initiated (timeout - likely restarting)"
+        logger.warning("Restart scheduling timed out; acceptance is unconfirmed")
+        return (
+            False,
+            "Restart unconfirmed: submission timeout; check service status before retrying",
+        )
     except FileNotFoundError:
-        logger.error("systemctl not found")
-        return False, "systemctl not available"
-    except Exception as e:
-        logger.warning(f"Polkit restart attempt failed: {e}")
-
-    # Fallback: use sudo (requires /etc/sudoers.d/openhop-repeater rule)
-    try:
-        result = subprocess.run(
-            [_SUDO_BIN, "--non-interactive", _SYSTEMCTL_BIN, "restart", "openhop-repeater"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )  # nosec B603
-
-        if result.returncode == 0:
-            logger.info("Service restart via sudo succeeded")
-            return True, "Service restart initiated"
-        else:
-            error_msg = result.stderr or "Unknown error"
-            logger.error(f"Service restart via sudo failed: {error_msg}")
-            return False, f"Restart failed: {error_msg}"
-
-    except subprocess.TimeoutExpired:
-        logger.warning("Sudo restart timed out (service likely restarting)")
-        return True, "Service restart initiated (timeout - likely restarting)"
-    except FileNotFoundError:
-        logger.error("sudo not found - cannot restart service")
-        return False, "Neither polkit nor sudo available for service restart"
-    except Exception as e:
-        logger.error(f"Error executing sudo restart: {e}")
-        return False, f"Restart command failed: {str(e)}"
+        return False, "Restart scheduler unavailable; install systemd-run and sudo via manage.sh"
+    except Exception as exc:
+        logger.error("Error scheduling restart: %s", exc)
+        return False, f"Restart command failed: {exc}"
 
 
 def _is_cherrypy_engine_running() -> Optional[bool]:
