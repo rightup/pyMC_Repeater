@@ -2,6 +2,7 @@
 Authentication endpoints for login and token management
 """
 
+import hashlib
 import logging
 import math
 import threading
@@ -35,20 +36,30 @@ class _LoginThrottle:
         self.base_backoff_sec = base_backoff_sec
         self.max_backoff_sec = max_backoff_sec
         self.window_sec = window_sec
+        self.max_states = 4096
         self._time_fn = time_fn or time.monotonic
         self._lock = threading.Lock()
         self._ip_states = {}
         self._user_states = {}
         self._global_state = {"failures": 0, "last_failure": 0.0, "blocked_until": 0.0}
 
-    def _state(self, bucket: dict, key: str):
+    @staticmethod
+    def _keys(client_ip: str, username: str) -> tuple[bytes, bytes]:
+        # Fixed-size digests also bound storage for oversized attacker input.
+        user_key = hashlib.sha256(
+            ((username or "").strip().lower() or "<unknown>").encode("utf-8")
+        ).digest()
+        ip_key = hashlib.sha256((client_ip or "<unknown>").encode("utf-8")).digest()
+        return ip_key, user_key
+
+    def _state(self, bucket: dict, key: bytes):
         if key not in bucket:
             bucket[key] = {"failures": 0, "last_failure": 0.0, "blocked_until": 0.0}
         return bucket[key]
 
     def _maybe_decay(self, state: dict, now: float) -> None:
         last = state.get("last_failure", 0.0)
-        if last and (now - last) > self.window_sec:
+        if (now - last) > self.window_sec and state.get("blocked_until", 0.0) <= now:
             state["failures"] = 0
             state["blocked_until"] = 0.0
 
@@ -68,21 +79,48 @@ class _LoginThrottle:
             return 0
         return max(1, math.ceil(blocked_until - now))
 
+    def _get_retry_after(self, ip_key: bytes, user_key: bytes, now: float) -> int:
+        # Rejected requests must not allocate attacker-controlled keys.
+        global_retry = self._retry_after(self._global_state, now)
+        if global_retry:
+            return global_retry
+        for bucket in (self._ip_states, self._user_states):
+            expired = [
+                key
+                for key, state in bucket.items()
+                if now - state["last_failure"] > self.window_sec and state["blocked_until"] <= now
+            ]
+            for key in expired:
+                del bucket[key]
+        retry = 0
+        for bucket, key in ((self._ip_states, ip_key), (self._user_states, user_key)):
+            if key in bucket:
+                retry = max(retry, self._retry_after(bucket[key], now))
+            elif len(bucket) >= self.max_states:
+                # Fail closed until space expires; evicting active failures would
+                # let a rotating-key attacker reset another client's backoff.
+                expires = min(
+                    max(state["last_failure"] + self.window_sec, state["blocked_until"])
+                    for state in bucket.values()
+                )
+                retry = max(retry, max(1, math.ceil(expires - now)))
+        return retry
+
     def get_retry_after(self, client_ip: str, username: str) -> int:
         now = self._time_fn()
-        user_key = (username or "").strip().lower() or "<unknown>"
-        ip_key = client_ip or "<unknown>"
+        ip_key, user_key = self._keys(client_ip, username)
         with self._lock:
-            ip_retry = self._retry_after(self._state(self._ip_states, ip_key), now)
-            user_retry = self._retry_after(self._state(self._user_states, user_key), now)
-            global_retry = self._retry_after(self._global_state, now)
-            return max(ip_retry, user_retry, global_retry)
+            return self._get_retry_after(ip_key, user_key, now)
 
     def register_failure(self, client_ip: str, username: str) -> int:
         now = self._time_fn()
-        user_key = (username or "").strip().lower() or "<unknown>"
-        ip_key = client_ip or "<unknown>"
+        ip_key, user_key = self._keys(client_ip, username)
         with self._lock:
+            # Recheck under the lock: other requests may have filled or blocked
+            # the store while this request was validating credentials.
+            retry = self._get_retry_after(ip_key, user_key, now)
+            if retry:
+                return retry
             self._record_failure(self._state(self._ip_states, ip_key), self.per_ip_threshold, now)
             self._record_failure(
                 self._state(self._user_states, user_key), self.per_user_threshold, now
@@ -94,8 +132,7 @@ class _LoginThrottle:
             return max(ip_retry, user_retry, global_retry)
 
     def register_success(self, client_ip: str, username: str) -> None:
-        user_key = (username or "").strip().lower() or "<unknown>"
-        ip_key = client_ip or "<unknown>"
+        ip_key, user_key = self._keys(client_ip, username)
         with self._lock:
             self._ip_states.pop(ip_key, None)
             self._user_states.pop(user_key, None)
