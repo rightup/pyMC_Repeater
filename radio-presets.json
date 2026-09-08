@@ -154,14 +154,6 @@
                     "coding_rate": "7"
                 },
                 {
-                    "title": "USA (Philadelphia Metro)",
-                    "description": "902.250MHz / SF11 / BW500 / CR5",
-                    "frequency": "902.250",
-                    "spreading_factor": "11",
-                    "bandwidth": "500",
-                    "coding_rate": "5"
-                },
-                {
                     "title": "Vietnam",
                     "description": "920.250MHz / SF11 / BW250 / CR5",
                     "frequency": "920.250",
