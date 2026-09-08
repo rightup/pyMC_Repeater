@@ -10,7 +10,7 @@ import threading
 import time
 
 from openhop_core.companion.radio_capabilities import resolve_max_tx_power_dbm
-from openhop_core.protocol.constants import PAYLOAD_TYPE_RAW_CUSTOM
+from openhop_core.protocol.constants import PAYLOAD_TYPE_ACK, PAYLOAD_TYPE_RAW_CUSTOM
 
 from repeater.companion.utils import (
     CompanionContactCapacityError,
@@ -1455,11 +1455,36 @@ class RepeaterDaemon:
         Single entry point for ALL packets.
         Enqueues packets for router processing.
         """
+        try:
+            if (
+                packet.get_payload_type() == PAYLOAD_TYPE_ACK
+                and packet.payload
+                and len(packet.payload) >= 4
+            ):
+                await self._on_ack_for_companions(int.from_bytes(packet.payload[:4], "little"))
+        except Exception as e:
+            logger.warning("ACK companion notify failed: %s", e)
+
         if self.router:
             try:
                 await self.router.enqueue(packet)
             except Exception as e:
                 logger.error(f"Error enqueuing packet in router: {e}", exc_info=True)
+
+    async def _on_ack_for_companions(self, crc: int) -> None:
+        """Fan a received ACK CRC out to every companion bridge.
+
+        Each bridge ignores CRCs not in its own _pending_ack_crcs, so the first
+        one to match owns it.
+        """
+        bridges = getattr(self, "companion_bridges", {})
+        for chash, bridge in bridges.items():
+            try:
+                matched = await bridge._try_confirm_send(crc)
+                if matched:
+                    return
+            except Exception as e:
+                logger.warning("ACK fan-out failed for bridge %s: %s", chash, e)
 
     def register_text_handler_for_identity(
         self, name: str, identity, identity_type: str = "room_server", radio_config: dict = None
