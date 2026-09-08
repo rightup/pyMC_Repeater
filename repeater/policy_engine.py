@@ -57,7 +57,7 @@ class PolicyEngine:
 
         objects = cfg.get("objects")
         self.objects: dict[str, Any] = objects if isinstance(objects, dict) else {}
-        self._channel_decrypt_cache: dict[int, dict[str, Any]] = {}
+        self._channel_decrypt_cache: dict[str, dict[str, Any]] = {}
         self._inline_channel_secrets = self._collect_inline_rule_channel_secrets(self.rules)
 
     @classmethod
@@ -238,7 +238,10 @@ class PolicyEngine:
         return channel_info.get("message_body")
 
     def _get_channel_decrypt_info(self, packet) -> dict[str, Any]:
-        packet_key = id(packet)
+        try:
+            packet_key = packet.calculate_packet_hash().hex().upper()
+        except Exception:
+            packet_key = "id-" + str(id(packet))
         cached = self._channel_decrypt_cache.get(packet_key)
         if isinstance(cached, dict):
             return cached
