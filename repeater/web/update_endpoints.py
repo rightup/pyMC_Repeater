@@ -693,6 +693,10 @@ def _fetch_latest_version(channel: str) -> str:
             raise RuntimeError(
                 f"Could not compare {base_tag}...{channel} on GitHub: {exc}"
             ) from exc
+        # On an exact tag (ahead_by == 0), setuptools-scm reports the tag
+        # itself, not next-patch.dev0.
+        if ahead_by <= 0:
+            return base_tag
         return _next_dev_version(base_tag, ahead_by)
 
     # Static version channel — read the pinned version from pyproject.toml on
