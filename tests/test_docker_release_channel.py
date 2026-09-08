@@ -35,8 +35,12 @@ class ReleaseChannelTests(unittest.TestCase):
         result = subprocess.run(
             ["bash", str(SCRIPT)],
             cwd=self.repo,
-            env={**os.environ, "GITHUB_REF": ref, "PACKAGE_VERSION": version,
-                 "GITHUB_OUTPUT": str(output)},
+            env={
+                **os.environ,
+                "GITHUB_REF": ref,
+                "PACKAGE_VERSION": version,
+                "GITHUB_OUTPUT": str(output),
+            },
             capture_output=True,
             text=True,
         )
