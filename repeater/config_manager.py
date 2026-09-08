@@ -1,5 +1,9 @@
+import copy
 import logging
 import os
+import stat
+import tempfile
+import threading
 from typing import Any, Dict, List, Optional
 
 import yaml
@@ -8,6 +12,9 @@ from repeater.logging_utils import normalize_log_level
 from repeater.modem_config import normalize_modem_config_in_place
 
 logger = logging.getLogger("ConfigManager")
+
+# Serialize staging, persistence and publication across managers in this process.
+_CONFIG_WRITE_LOCK = threading.RLock()
 
 
 class ConfigManager:
@@ -236,32 +243,69 @@ class ConfigManager:
         return True
 
     def save_to_file(self) -> bool:
-        """
-        Save current config to YAML file.
+        """Atomically save current config, normalizing shared state only on success."""
+        with _CONFIG_WRITE_LOCK:
+            try:
+                candidate = copy.deepcopy(self.config)
+                if not self._persist_config(candidate):
+                    return False
+                normalize_modem_config_in_place(self.config)
+                return True
+            except Exception:
+                logger.exception("Failed to save config to %s", self.config_path)
+                return False
 
-        Returns:
-            True if successful, False otherwise
-        """
+    def _persist_config(self, config: dict) -> bool:
+        """Write a private candidate; the atomic replace is the commit point."""
+        temporary_path = None
         try:
-            normalize_modem_config_in_place(self.config)
-            os.makedirs(os.path.dirname(self.config_path), exist_ok=True)
-            with open(self.config_path, "w", encoding="utf-8") as f:
-                # Use safe_dump with explicit width to prevent line wrapping
-                # Setting width to a very large number prevents truncation of long strings like identity keys
+            normalize_modem_config_in_place(config)
+            # Follow existing symlinks rather than replacing the link itself.
+            path = os.path.realpath(self.config_path)
+            directory = os.path.dirname(path)
+            os.makedirs(directory, exist_ok=True)
+            try:
+                previous = os.stat(path)
+            except FileNotFoundError:
+                previous = None
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=directory, prefix=".config-", delete=False
+            ) as f:
+                temporary_path = f.name
                 yaml.safe_dump(
-                    self.config,
+                    config,
                     f,
                     default_flow_style=False,
                     indent=2,
-                    width=1000000,  # Very large width to prevent any line wrapping
+                    width=1000000,
                     sort_keys=False,
                     allow_unicode=True,
                 )
-            logger.info(f"Configuration saved to {self.config_path}")
+                f.flush()
+                if previous is not None:
+                    current = os.fstat(f.fileno())
+                    if (current.st_uid, current.st_gid) != (previous.st_uid, previous.st_gid):
+                        os.fchown(f.fileno(), previous.st_uid, previous.st_gid)
+                    os.fchmod(f.fileno(), stat.S_IMODE(previous.st_mode))
+                os.fsync(f.fileno())
+            os.replace(temporary_path, path)
+            temporary_path = None
+            logger.info("Configuration saved to %s", self.config_path)
             return True
-        except Exception as e:
-            logger.error(f"Failed to save config to {self.config_path}: {e}", exc_info=True)
+        except Exception:
+            logger.exception("Failed to save config to %s", self.config_path)
             return False
+        finally:
+            if temporary_path is not None:
+                os.unlink(temporary_path)
+
+    @staticmethod
+    def _apply_updates(config: dict, updates: dict) -> None:
+        for section, values in updates.items():
+            if isinstance(values, dict):
+                config.setdefault(section, {}).update(values)
+            else:
+                config[section] = values
 
     def live_update_daemon(self, sections: Optional[List[str]] = None) -> bool:
         """
@@ -411,39 +455,37 @@ class ConfigManager:
         """
         result: Dict[str, Any] = {"success": False, "saved": False, "live_updated": False}
 
-        try:
-            # Apply updates to config
-            for section, values in updates.items():
-                if section not in self.config:
-                    self.config[section] = {}
+        with _CONFIG_WRITE_LOCK:
+            try:
+                # Stage privately so a failed write cannot leak into running state.
+                updates = copy.deepcopy(updates)
+                candidate = copy.deepcopy(self.config)
+                self._apply_updates(candidate, updates)
+                result["saved"] = self._persist_config(candidate)
 
-                if isinstance(values, dict):
-                    self.config[section].update(values)
-                else:
-                    self.config[section] = values
+                if not result["saved"]:
+                    result["error"] = "Failed to save config to file"
+                    return result
 
-            # Save to file
-            result["saved"] = self.save_to_file()
+                # Preserve shared section references used by daemon helpers.
+                self._apply_updates(self.config, updates)
+                normalize_modem_config_in_place(self.config)
 
-            if not result["saved"]:
-                result["error"] = "Failed to save config to file"
+                # Live update daemon if requested
+                if live_update:
+                    # Auto-detect sections if not specified
+                    if live_update_sections is None:
+                        live_update_sections = list(updates.keys())
+
+                    result["live_updated"] = self.live_update_daemon(live_update_sections)
+
+                result["success"] = result["saved"]
                 return result
 
-            # Live update daemon if requested
-            if live_update:
-                # Auto-detect sections if not specified
-                if live_update_sections is None:
-                    live_update_sections = list(updates.keys())
-
-                result["live_updated"] = self.live_update_daemon(live_update_sections)
-
-            result["success"] = result["saved"]
-            return result
-
-        except Exception as e:
-            logger.error(f"Error in update_and_save: {e}", exc_info=True)
-            result["error"] = str(e)
-            return result
+            except Exception as e:
+                logger.error(f"Error in update_and_save: {e}", exc_info=True)
+                result["error"] = str(e)
+                return result
 
     def update_nested(self, path: str, value: Any, live_update: bool = True) -> Dict[str, Any]:
         """
