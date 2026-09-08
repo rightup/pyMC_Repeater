@@ -391,11 +391,12 @@ class RepeaterDaemon:
                 meta = getattr(self, "radio_stack_meta", {}) or {}
                 if meta.get("fabric"):
                     logger.info(
-                        "RF fabric active: mode=%s radios=%s default=%s tx_mode=%s",
+                        "RF fabric active: mode=%s radios=%s default=%s tx_mode=%s origin_tx=%s",
                         meta.get("mode"),
                         meta.get("radio_ids"),
                         meta.get("default_radio"),
                         meta.get("tx_mode"),
+                        meta.get("origin_tx"),
                     )
 
                 # Physical radios for per-device setup (CAD, event loop).

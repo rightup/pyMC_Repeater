@@ -838,6 +838,31 @@ def _apply_fabric_tx_mode(fabric, mode: str) -> None:
     raise ValueError(f"Unknown fabric.tx_mode={mode!r}. Supported: default, sticky, bridge")
 
 
+def _apply_fabric_origin_tx(fabric, mode: str) -> None:
+    """Forward fabric.origin_tx onto the core RFFabric.
+
+    Modes:
+    - default: locally originated packets TX ``default_radio`` (current
+               behaviour).
+    - all:     fan origins out to every registered radio, sequentially in
+               registration order. Bridge topologies need this: tx_mode
+               only steers *forwards* (RX radio -> the other radio); an
+               origin packet has no RX side, so without fan-out it leaves
+               on a single radio and never crosses the link.
+    """
+    mode_l = (mode or "default").strip().lower()
+    if mode_l in ("", "default"):
+        return
+    if mode_l != "all":
+        raise ValueError(f"Unknown fabric.origin_tx={mode!r}. Supported: default, all")
+    if not hasattr(fabric, "set_origin_tx"):
+        raise RuntimeError(
+            "fabric.origin_tx requires openhop-core with origin fan-out support; "
+            "upgrade openhop-core."
+        )
+    fabric.set_origin_tx(mode_l)
+
+
 def build_radio_stack(config: dict):
     """Build single- or multi-radio stack for the repeater.
 
@@ -851,6 +876,7 @@ def build_radio_stack(config: dict):
     fabric_cfg = config.get("fabric") if isinstance(config.get("fabric"), dict) else {}
     use_fabric = bool(fabric_cfg.get("use_fabric", False))
     tx_mode = str(fabric_cfg.get("tx_mode", "default"))
+    origin_tx = str(fabric_cfg.get("origin_tx", "default"))
     default_radio = fabric_cfg.get("default_radio") or fabric_cfg.get("default_radio_id")
 
     meta = {
@@ -858,6 +884,7 @@ def build_radio_stack(config: dict):
         "radio_ids": [],
         "default_radio": None,
         "tx_mode": tx_mode,
+        "origin_tx": origin_tx,
         "fabric": False,
     }
 
@@ -880,6 +907,7 @@ def build_radio_stack(config: dict):
         default_id = str(default_radio) if default_radio else pairs[0][1]
         radio = FabricRadio(radios=pairs, default_radio_id=default_id)
         _apply_fabric_tx_mode(radio.fabric, tx_mode)
+        _apply_fabric_origin_tx(radio.fabric, origin_tx)
 
         meta.update(
             {
@@ -905,6 +933,7 @@ def build_radio_stack(config: dict):
         rid = str(default_radio or "radio0")
         radio = FabricRadio(radio=physical, radio_id=rid, default_radio_id=rid)
         _apply_fabric_tx_mode(radio.fabric, tx_mode)
+        _apply_fabric_origin_tx(radio.fabric, origin_tx)
         meta.update(
             {
                 "mode": "single_fabric",
