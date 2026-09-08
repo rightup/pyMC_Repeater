@@ -294,14 +294,17 @@ def restart_service() -> Tuple[bool, str]:
                 logger.info("Service restart via legacy fallback succeeded (%s)", reason)
                 return True, "Service restart initiated (legacy fallback)"
             if legacy.returncode < 0:
+                # When running inside the service cgroup, a direct restart can
+                # terminate this process before subprocess.run returns. Treat
+                # termination by signal as likely success.
                 logger.warning(
-                    "Legacy restart interrupted (%s) after %s",
+                    "Legacy restart interrupted by signal (%s) after %s; treating as likely success",
                     legacy.returncode,
                     reason,
                 )
                 return (
-                    False,
-                    "Restart unconfirmed: legacy fallback interrupted; check service status",
+                    True,
+                    "Service restart likely initiated (legacy fallback interrupted by signal)",
                 )
             legacy_err = legacy.stderr.strip() or f"exit status {legacy.returncode}"
             return False, f"legacy fallback failed: {legacy_err}"
