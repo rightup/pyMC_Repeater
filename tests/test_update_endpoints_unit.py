@@ -337,6 +337,11 @@ def test_fetch_latest_version_dynamic_and_static(monkeypatch):
     dyn = ue._fetch_latest_version("dev")
     assert dyn == "1.0.6.dev3"
 
+    # Exact tag (ahead_by == 0) must resolve to the tag, not next.dev0.
+    monkeypatch.setattr(ue, "_fetch_url", lambda _url, timeout=10: '{"ahead_by": 0}')
+    on_tag = ue._fetch_latest_version("main")
+    assert on_tag == "1.0.5"
+
     # Static branch path parses version from pyproject content.
     monkeypatch.setattr(ue, "_branch_is_dynamic", lambda _ch: False)
     monkeypatch.setattr(
