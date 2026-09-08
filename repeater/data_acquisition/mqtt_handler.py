@@ -22,10 +22,47 @@ except ImportError:
 
 logger = logging.getLogger("MQTTHandler")
 
+# PAYLOAD_TYPES code for ADVERT; used by the per-broker ``publish_tx: advert`` mode.
+ADVERT_PAYLOAD_TYPE = 4
+
 # Custom ultra-verbose level for high-frequency per-broker publish logs.
 # Keeps default DEBUG useful while allowing deep diagnostics when needed.
 TRACE_LEVEL = 5
 logging.addLevelName(TRACE_LEVEL, "TRACE")
+
+
+def _normalize_publish_tx(value: Any, broker_name: Optional[str] = None) -> str:
+    """Normalize a ``publish_tx`` setting to one of ``off``/``advert``/``on``.
+
+    YAML 1.1 (which PyYAML implements) resolves bare ``on``/``off`` to booleans,
+    so ``publish_tx: on`` reaches us as ``True`` rather than the string "on".
+    Quoted forms and the equivalent ``true``/``false`` spellings are accepted
+    too. Anything unrecognized fails closed to ``off`` so a typo can never
+    silently start uplinking this node's traffic.
+    """
+    if value is None:
+        return "off"
+    if isinstance(value, bool):
+        return "on" if value else "off"
+
+    text = str(value).strip().lower()
+    if text in ("on", "true", "yes"):
+        return "on"
+    if text in ("off", "false", "no"):
+        return "off"
+    if text == "advert":
+        return "advert"
+
+    logger.warning(f"Invalid publish_tx '{value}' for {broker_name}, defaulting to 'off'")
+    return "off"
+
+
+def _coerce_packet_type(value: Any) -> Optional[int]:
+    """Best-effort int for a PacketRecord ``packet_type`` (serialized as a string)."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _trace(message: str):
@@ -270,6 +307,22 @@ class _BrokerConnection:
         self.disallowed_types = [
             val for val in self.disallowed_types if val is not None
         ]  # Filter out invalid names
+
+        # Whether this broker receives this node's *own* transmissions.
+        #   off    - never (default; preserves historical behaviour)
+        #   advert - only this node's own adverts
+        #   on     - every packet this node transmits, including relays
+        # A half-duplex radio cannot hear itself, so without this a repeater's
+        # relays are invisible to aggregators unless a second observer is in range.
+        self.publish_tx = _normalize_publish_tx(broker.get("publish_tx"), broker.get("name"))
+
+    def allows_tx_packet(self, packet_type: Optional[int]) -> bool:
+        """Whether a self-reported TX payload of this type may go to this broker."""
+        if self.publish_tx == "on":
+            return True
+        if self.publish_tx == "advert":
+            return packet_type == ADVERT_PAYLOAD_TYPE
+        return False
 
     def _generate_jwt(self) -> str:
         """Generate MeshCore-style Ed25519 JWT token"""
@@ -944,6 +997,15 @@ class MeshCoreToMqttPusher:
     def publish_packet(self, pkt: dict, subtopic="packets", retain=False):
         return self.publish(subtopic, self._process_packet(pkt), retain)
 
+    def wants_own_tx(self) -> bool:
+        """True if any configured broker opted into this node's own transmissions.
+
+        Lets the packet path skip building a tx record entirely in the default
+        ``publish_tx: off`` case.
+        """
+        with self._lock:
+            return any(conn.publish_tx != "off" for conn in self.connections)
+
     def publish_raw_data(self, raw_hex: str, subtopic="raw", retain=False):
         pkt = {"type": "raw", "data": raw_hex, "bytes": len(raw_hex) // 2}
         return self.publish_packet(pkt, subtopic, retain)
@@ -1004,12 +1066,28 @@ class MeshCoreToMqttPusher:
 
         packet_type = payload.get("type")
 
+        # Self-reported transmissions are opt-in per broker (see publish_tx).
+        is_own_tx = payload.get("direction") == "tx"
+        own_tx_type = _coerce_packet_type(payload.get("packet_type"))
+
         results = []
         with self._lock:
             for conn in self.connections:
                 if conn.enabled and conn.is_connected():
                     if packet_type in conn.disallowed_types:
                         _trace(f"Skipped publishing packet type 0x{packet_type:02X} (disallowed)")
+                        continue
+                    if is_own_tx and not conn.allows_tx_packet(own_tx_type):
+                        _trace(
+                            f"Skipped own-TX publish to {conn.broker['name']} "
+                            f"(publish_tx={conn.publish_tx})"
+                        )
+                        # Record the deliberate skip, matching the disabled-broker
+                        # convention below. Without this a tx record that every
+                        # broker declines leaves ``results`` empty and trips the
+                        # "No active broker connections" warning, which points
+                        # operators at a connectivity problem that does not exist.
+                        results.append((conn.broker["name"], "Skipped: publish_tx"))
                         continue
                     result = conn.publish(subtopic, message, retain=retain, qos=qos)
                     results.append((conn.broker["name"], result))

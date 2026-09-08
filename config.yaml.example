@@ -701,6 +701,22 @@ mqtt_brokers:
   #   enabled: true|false # Enable TLS. If the endpoint's certificate is self-signed, the Root CA should be added to the OS's certificate store. 
   #   insecure: true|false # Validate TLS certificates
 
+  # publish_tx: off|advert|on
+  #   Publish this node's OWN transmissions, in addition to what it receives.
+  #   The radio is half-duplex, so a node never hears its own transmission --
+  #   meaning a packet this node relays can never appear in what it publishes.
+  #   Without this, a repeater's relays are invisible to aggregators (CoreScope,
+  #   MeshMapper, LetsMesh) unless a second observer node is in radio range.
+  #     off    - never publish own transmissions (default; unchanged behaviour)
+  #     advert - publish only this node's own adverts
+  #     on     - publish every packet this node transmits, including relays
+  #   YAML resolves bare on/off to booleans; both those and the quoted strings
+  #   ("on"/"off") are accepted, as are true/false.
+  #   Own-TX records are sent with "direction": "tx" and carry the forwarded
+  #   bytes (which include this node's path hash). SNR/RSSI are reported as 0,
+  #   since a node cannot measure the signal of its own transmission.
+  # publish_tx: off
+
   # Block specific packet types from being published to the MQTT endpoint
   # If not specified or empty list, all types are published
   # Available types: REQ, RESPONSE, TXT_MSG, ACK, ADVERT, GRP_TXT,
