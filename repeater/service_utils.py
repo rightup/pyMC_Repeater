@@ -18,6 +18,7 @@ _CONTAINER_RESTART_DELAY_SECONDS = 1.0
 _SH_BIN = shutil.which("sh") or "sh"
 _SYSTEMCTL_BIN = shutil.which("systemctl") or "systemctl"
 _SUDO_BIN = shutil.which("sudo") or "sudo"
+_SUDO_SYSTEMCTL_BIN = "/usr/bin/systemctl"
 
 
 def is_buildroot() -> bool:
@@ -277,9 +278,50 @@ def restart_service() -> Tuple[bool, str]:
             logger.error(f"Buildroot restart failed: {exc}")
             return False, f"Restart failed: {exc}"
 
+    def _try_legacy_restart(reason: str) -> Tuple[bool, str]:
+        """Fallback to the pre-systemd-run direct restart path."""
+        legacy_cmd = [systemctl_bin, "restart", "openhop-repeater"]
+        if os.geteuid() != 0:
+            legacy_cmd = [_SUDO_BIN, "--non-interactive", *legacy_cmd]
+        try:
+            legacy = subprocess.run(
+                legacy_cmd,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )  # nosec B603
+            if legacy.returncode == 0:
+                logger.info("Service restart via legacy fallback succeeded (%s)", reason)
+                return True, "Service restart initiated (legacy fallback)"
+            if legacy.returncode < 0:
+                logger.warning(
+                    "Legacy restart interrupted (%s) after %s",
+                    legacy.returncode,
+                    reason,
+                )
+                return (
+                    False,
+                    "Restart unconfirmed: legacy fallback interrupted; check service status",
+                )
+            legacy_err = legacy.stderr.strip() or f"exit status {legacy.returncode}"
+            return False, f"legacy fallback failed: {legacy_err}"
+        except subprocess.TimeoutExpired:
+            logger.warning("Legacy restart timed out after %s", reason)
+            return True, "Service restart initiated (legacy fallback timeout - likely restarting)"
+        except FileNotFoundError:
+            return False, "legacy fallback unavailable: systemctl/sudo not found"
+        except Exception as exc:
+            return False, f"legacy fallback error: {exc}"
+
     # A command launched inside this service shares its cgroup, even with
     # --no-block or start_new_session. PID 1 must own the delayed restart so
     # submission can return before our process group receives SIGTERM.
+    # Non-root restarts are constrained by manage.sh sudoers allowlists,
+    # which pin /usr/bin/systemctl in the permitted command string.
+    systemctl_bin = _SYSTEMCTL_BIN
+    if os.geteuid() != 0 and os.path.exists(_SUDO_SYSTEMCTL_BIN):
+        systemctl_bin = _SUDO_SYSTEMCTL_BIN
+
     command = [
         "/usr/bin/systemd-run",
         "--quiet",
@@ -288,7 +330,7 @@ def restart_service() -> Tuple[bool, str]:
         "--on-active=2s",
         "--timer-property=AccuracySec=100ms",
         "--timer-property=RemainAfterElapse=no",
-        _SYSTEMCTL_BIN,
+        systemctl_bin,
         "restart",
         "openhop-repeater",
     ]
@@ -306,8 +348,11 @@ def restart_service() -> Tuple[bool, str]:
                 "Restart unconfirmed: command interrupted; check service status before retrying",
             )
         error_msg = result.stderr.strip() or f"exit status {result.returncode}"
+        fallback_ok, fallback_msg = _try_legacy_restart("scheduled restart failure")
+        if fallback_ok:
+            return True, fallback_msg
         logger.error("Restart scheduling failed: %s", error_msg)
-        return False, f"Restart failed: {error_msg}"
+        return False, f"Restart failed: {error_msg}; {fallback_msg}"
     except subprocess.TimeoutExpired:
         logger.warning("Restart scheduling timed out; acceptance is unconfirmed")
         return (
@@ -315,10 +360,19 @@ def restart_service() -> Tuple[bool, str]:
             "Restart unconfirmed: submission timeout; check service status before retrying",
         )
     except FileNotFoundError:
-        return False, "Restart scheduler unavailable; install systemd-run and sudo via manage.sh"
+        fallback_ok, fallback_msg = _try_legacy_restart("missing systemd-run scheduler")
+        if fallback_ok:
+            return True, fallback_msg
+        return False, (
+            "Restart scheduler unavailable; install systemd-run and sudo via manage.sh; "
+            f"{fallback_msg}"
+        )
     except Exception as exc:
+        fallback_ok, fallback_msg = _try_legacy_restart("restart scheduler exception")
+        if fallback_ok:
+            return True, fallback_msg
         logger.error("Error scheduling restart: %s", exc)
-        return False, f"Restart command failed: {exc}"
+        return False, f"Restart command failed: {exc}; {fallback_msg}"
 
 
 def _is_cherrypy_engine_running() -> Optional[bool]:
