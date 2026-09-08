@@ -26,9 +26,8 @@ def _core_accepts_ack_policy() -> bool:
 
     Passing an argument an older core does not know raises TypeError from
     ``register_identity`` -- which would leave the node with no text handler at
-    all, i.e. off the air. `pyproject.toml` tracks `openhop_core@dev` with no
-    version floor, so an older core is an ordinary state to be in, not an
-    error.
+    all, i.e. off the air. Repeater pinning can change over time, so an older
+    core remains an ordinary state to be in, not an error.
     """
     try:
         return "should_ack_fn" in inspect.signature(TextMessageHandler.__init__).parameters

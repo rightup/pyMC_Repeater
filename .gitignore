@@ -71,3 +71,6 @@ syncpi.sh
 /data
 Installing
 syncproxmox.sh
+
+#dev
+pyproject_dev.toml

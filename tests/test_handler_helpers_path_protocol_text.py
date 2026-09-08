@@ -864,11 +864,10 @@ async def test_guest_plain_post_earns_no_ack_on_the_wire(permissions, expect_ack
 def test_register_identity_survives_a_core_without_the_ack_hook():
     """[fails pre-fix] An older core must not take the node off the air.
 
-    `pyproject.toml` tracks `openhop_core@dev` with no version floor, so running
-    against a core that predates should_ack_fn is an ordinary state. Passing the
-    argument regardless raises TypeError out of register_identity, which leaves
-    the node with no text handler at all -- a far worse outcome than an ACK it
-    should have withheld.
+    Even with a pinned baseline, running against a core that predates
+    should_ack_fn can happen. Passing the argument regardless raises TypeError
+    out of register_identity, which leaves the node with no text handler at all
+    -- a far worse outcome than an ACK it should have withheld.
     """
     acl = _FakeACL([_FakeClient(pubkey=bytes([0x35]) + b"x" * 31, shared_secret=b"k" * 32)])
     helper = TextHelper(
